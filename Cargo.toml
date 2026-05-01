@@ -1,0 +1,62 @@
+[package]
+name = "fluor"
+version = "0.0.0"
+edition = "2024"
+authors = ["Nick Spiker <fractaldecoder@proton.me>"]
+license = "MIT OR Apache-2.0"
+description = "First-principles GUI compositor library: center-origin RU coordinates, harmonic-mean span scaling, CPU softbuffer rendering, ARM-first."
+repository = "https://github.com/nickspiker/fluor"
+homepage = "https://github.com/nickspiker/fluor"
+documentation = "https://docs.rs/fluor"
+readme = "README.md"
+keywords = ["gui", "compositor", "windowing", "graphics", "ui"]
+categories = ["gui", "graphics", "rendering"]
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+# host-bare is the no_std path used by ferros and other bare-metal consumers.
+# host-winit / host-softbuffer / text imply std.
+default = ["std", "host-winit", "text", "simd"]
+std = []
+host-winit = ["std", "dep:winit", "dep:softbuffer"]
+host-softbuffer = ["std", "dep:softbuffer"]
+host-bare = []
+text = ["std", "dep:cosmic-text"]
+simd = []
+
+[dependencies]
+# spirix is kept as an opt-in dep for precision-critical rasterizer paths and a future
+# `spirix-coord` feature; layout types default to f32 so f32-native consumers (photon,
+# rhe, basecalc) match their pre-fluor speed. `path` is for local development; `version`
+# is required for crates.io publish.
+spirix = { version = "0.0.12", path = "../spirix", default-features = false, features = ["alloc"] }
+
+winit = { version = "0.30", optional = true }
+softbuffer = { version = "0.4", optional = true }
+cosmic-text = { version = "0.14", optional = true }
+
+[dev-dependencies]
+proptest = "1.5"
+
+[profile.dev]
+opt-level = 2
+overflow-checks = false
+debug = false
+debug-assertions = false
+lto = false
+codegen-units = 16
+incremental = true
+
+[profile.debuggable]
+inherits = "dev"
+debug = "line-tables-only"
+
+[profile.release]
+opt-level = 3
+overflow-checks = false
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
