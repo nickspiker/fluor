@@ -4,7 +4,7 @@
 
 use super::chrome::{self, ResizeEdge, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE};
 use crate::paint;
-use crate::paint::Transform;
+use crate::paint::{snap_rotation, Transform};
 use crate::text::TextRenderer;
 use crate::theme;
 use crate::Compositor;
@@ -101,11 +101,13 @@ impl DesktopApp {
             start,
             &crossings,
         );
-        // 6. Title text in the top-left of the chrome strip — left-aligned, vertically centered in the button row, sized relative to button height.
+        // 6. Title text in the top-left of the chrome strip — left-aligned, vertically centered in the button row, sized relative to button height. `bw` matches chrome's button_height formula (MIN + scaled) so text aligns with the buttons.
+        // Title text is skipped below a readable size — controls (which always render) are the load-bearing UI; text is visual decoration that shouldn't smear into illegibility.
+        let span = 2.0 * vp.width_px as f32 * vp.height_px as f32 / (vp.width_px as f32 + vp.height_px as f32);
+        let bw = chrome::MIN_BUTTON_HEIGHT_PX as f32 + (span / 32.0).ceil();
+        let title_size = bw * 0.55;
+        if title_size >= 6.0 {
         if let Some(text) = self.text.as_mut() {
-            let span = 2.0 * vp.width_px as f32 * vp.height_px as f32 / (vp.width_px as f32 + vp.height_px as f32);
-            let bw = (span / 32.0).ceil();
-            let title_size = bw * 0.55;
             let pad = bw * 0.5;
             let baseline_y = bw * 0.5;
             let _ = text.draw_text_left_u32(
@@ -124,22 +126,23 @@ impl DesktopApp {
                 None,
             );
 
-            // Aspect-ratio-driven rotation demo. Rotation = (aspect - 1) × π, so a square window (1:1) is upright, a 2:1 landscape window is upside-down, a 1:2 portrait window tilts the other way. Resize and watch — it's a live demo of fluor's response-to-viewport at no extra cost (swash's internal outline cache makes per-frame retransform cheap; if it ever isn't, the cache notes in src/text.rs sketch a thin Vec-LRU layer around the rasterized output).
+            // Aspect-ratio-driven rotation demo. Rotation = (aspect - 1) × π, so a square window (1:1) is upright, a 2:1 landscape window is upside-down, a 1:2 portrait window tilts the other way. Snapped to the per-font-size quantization grid (1-pixel-arc-at-radius rule, K=8) so consecutive frames at the same aspect hit the rasterized-glyph cache in `text::TextRenderer`. Pivots on the text's own midpoint via `draw_text_center_u32` + a rotate-about-anchor transform — the run spins like a clock hand, not a flag flapping from one end.
             let aspect = vp.width_px as f32 / vp.height_px as f32;
-            let theta = (aspect - 1.0) * core::f32::consts::PI;
-            let demo_anchor_x = pad;
-            let demo_anchor_y = bw * 3.5;
+            let demo_size = title_size * 0.85;
+            let theta = snap_rotation((aspect - 1.0) * core::f32::consts::PI, demo_size, 8);
+            let demo_anchor_x = vp.width_px as f32 * 0.5;
+            let demo_anchor_y = bw * 4.0;
             let demo_transform = Transform::translate(-demo_anchor_x, -demo_anchor_y)
                 .then(Transform::rotate(theta))
                 .then(Transform::translate(demo_anchor_x, demo_anchor_y));
-            let _ = text.draw_text_left_u32(
+            let _ = text.draw_text_center_u32(
                 &mut buffer,
                 buf_w,
                 buf_h,
                 "rotation tracks viewport aspect ratio (proper AA via swash::scale)",
                 demo_anchor_x,
                 demo_anchor_y,
-                title_size * 0.85,
+                demo_size,
                 400,
                 theme::TEXT_COLOUR,
                 "Open Sans",
@@ -147,6 +150,7 @@ impl DesktopApp {
                 None,
                 Some(demo_transform),
             );
+        }
         }
 
         // 7. Hover overlay on whichever button is hovered.
@@ -190,6 +194,8 @@ impl ApplicationHandler for DesktopApp {
         let attrs = WindowAttributes::default()
             .with_title(&self.title)
             .with_inner_size(initial)
+            // 24 × 8 minimum: chosen so the controls strip is **always visible** at any non-degenerate window size. With chrome's `button_height = MIN_BUTTON_HEIGHT_PX + ceil(span/32)` formula and `MIN_BUTTON_HEIGHT_PX = 4`, the maximum button_height as height → ∞ at width=W is `4 + ceil(2W/32) = 4 + ceil(W/16)`, giving total_width = `7*(4 + ceil(W/16))/2`. Setting `width >= 24` guarantees `total_width <= 21 <= 24` at all heights; `height >= 8` guarantees the strip fits vertically (button_height <= 6 at min).
+            .with_min_inner_size(winit::dpi::PhysicalSize::new(24u32, 8u32))
             .with_decorations(false)
             .with_transparent(true)
             .with_resizable(cfg!(not(target_os = "macos")));
@@ -212,7 +218,11 @@ impl ApplicationHandler for DesktopApp {
 
         // Compositor must match the actual surface size.
         self.compositor.resize(initial.width, initial.height);
-        self.hit_test_map = vec![HIT_NONE; (initial.width * initial.height) as usize];
+        // Rule 0: `width * height` as u32 can overflow on absurd sizes (4G+ pixels). `checked_mul` returns None and we cap at 0 (rendering produces no hits). PREVENTS: silent u32 wrap → wrong allocation size → either OOM on a tiny vec or panicky out-of-bounds reads.
+        let map_size = (initial.width as usize)
+            .checked_mul(initial.height as usize)
+            .unwrap_or(0);
+        self.hit_test_map = vec![HIT_NONE; map_size];
 
         // Lazily build the text renderer (FontSystem creation parses bundled TTFs).
         if self.text.is_none() {
@@ -224,12 +234,18 @@ impl ApplicationHandler for DesktopApp {
         window.request_redraw();
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                event_loop.exit();
+                // Killswitch-compliant exit: hand the process back to the kernel directly. No Drop chain, no surface teardown, no font-cache release — all of that is process-scoped state the kernel reclaims in microseconds anyway. Per AGENT.md's persistence cadence rule, every state change is already on disk within 1 s of the change, so there's nothing to flush. "Ring always valid; any state is a valid checkpoint." Same path as ferros's hardware power cutoff, just at the OS-process level.
+                std::process::exit(0);
             }
             WindowEvent::Resized(size) => {
+                // Coalesce no-op resizes. Some compositors (Wayland especially) send a flood of same-size Resized events while the user drags past the other edge with min_inner_size clamping in effect — each one would request_redraw and re-thrash the glyph cache, pegging CPU. Bail if nothing actually changed.
+                let current_vp = self.compositor.viewport();
+                if size.width == current_vp.width_px && size.height == current_vp.height_px {
+                    return;
+                }
                 if let (Some(surface), Some(width), Some(height)) = (
                     self.surface.as_mut(),
                     NonZeroU32::new(size.width),
@@ -237,7 +253,10 @@ impl ApplicationHandler for DesktopApp {
                 ) {
                     surface.resize(width, height).expect("softbuffer Surface::resize");
                     self.compositor.resize(size.width, size.height);
-                    self.hit_test_map.resize((size.width * size.height) as usize, HIT_NONE);
+                    let map_size = (size.width as usize)
+                        .checked_mul(size.height as usize)
+                        .unwrap_or(0);
+                    self.hit_test_map.resize(map_size, HIT_NONE);
                     if let Some(window) = self.window.as_ref() { window.request_redraw(); }
                 }
             }
@@ -266,7 +285,7 @@ impl ApplicationHandler for DesktopApp {
                 let Some(window) = self.window.as_ref() else { return; };
                 // Photon's priority: window controls > resize edges > drag.
                 match self.hit_at_cursor() {
-                    HIT_CLOSE_BUTTON => { event_loop.exit(); return; }
+                    HIT_CLOSE_BUTTON => { std::process::exit(0); }
                     HIT_MINIMIZE_BUTTON => { window.set_minimized(true); return; }
                     HIT_MAXIMIZE_BUTTON => { window.set_maximized(!window.is_maximized()); return; }
                     _ => {}

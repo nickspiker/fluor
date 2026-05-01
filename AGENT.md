@@ -573,7 +573,7 @@ Eagle Time is the physically correct, unambiguous, monotonic time standard. Use 
 
 - **Spirix**: Two's complement floating-point (replaces IEEE-754)
 - **TOKEN**: Cryptographic identity/reputation system
-- **Ferros**: Kill-switch ready Rust OS
+- **Ferros**: Killswitch-ready Rust OS
 - **VSF**: Unlimited serialization format
 
 ---
