@@ -4,6 +4,8 @@
 
 use super::chrome::{self, ResizeEdge, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE};
 use crate::paint;
+use crate::text::TextRenderer;
+use crate::theme;
 use crate::Compositor;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -33,6 +35,8 @@ struct DesktopApp {
     hover_state: u8,
     /// Cached pixel list for the currently hovered button — recomputed on hover-state change.
     hover_pixel_list: Vec<usize>,
+    /// Font system + glyph cache, lazily initialized on first `resumed`.
+    text: Option<TextRenderer>,
 }
 
 impl DesktopApp {
@@ -47,6 +51,7 @@ impl DesktopApp {
             cursor_y: 0.0,
             hover_state: chrome::HIT_NONE,
             hover_pixel_list: Vec::new(),
+            text: None,
         }
     }
 
@@ -95,7 +100,27 @@ impl DesktopApp {
             start,
             &crossings,
         );
-        // 6. Hover overlay on whichever button is hovered.
+        // 6. Title text in the top-left of the chrome strip — left-aligned, vertically centered in the button row, sized relative to button height.
+        if let Some(text) = self.text.as_mut() {
+            let span = 2.0 * vp.width_px as f32 * vp.height_px as f32 / (vp.width_px as f32 + vp.height_px as f32);
+            let bw = (span / 32.0).ceil();
+            let title_size = bw * 0.55;
+            let pad = bw * 0.5;
+            let baseline_y = bw * 0.5;
+            let _ = text.draw_text_left_u32(
+                &mut buffer,
+                buf_w,
+                &self.title,
+                pad,
+                baseline_y,
+                title_size,
+                400,
+                theme::TEXT_COLOUR,
+                "Open Sans",
+            );
+        }
+
+        // 7. Hover overlay on whichever button is hovered.
         self.hover_pixel_list = chrome::pixels_for_button(&self.hit_test_map, self.hover_state);
         chrome::draw_button_hover_by_pixels(&mut buffer, &self.hover_pixel_list, true, self.hover_state);
         buffer.present().expect("softbuffer buffer.present");
@@ -155,6 +180,11 @@ impl ApplicationHandler for DesktopApp {
         // Compositor must match the actual surface size.
         self.compositor.resize(initial.width, initial.height);
         self.hit_test_map = vec![HIT_NONE; (initial.width * initial.height) as usize];
+
+        // Lazily build the text renderer (FontSystem creation parses bundled TTFs).
+        if self.text.is_none() {
+            self.text = Some(TextRenderer::new());
+        }
 
         self.window = Some(window.clone());
         self.surface = Some(surface);

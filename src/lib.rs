@@ -12,6 +12,9 @@ pub mod paint;
 pub mod pane;
 pub mod theme;
 
+#[cfg(feature = "text")]
+pub mod text;
+
 pub use coord::{Coord, RuVec2};
 pub use geom::Viewport;
 pub use pane::{Compositor, Pane, PaneId};

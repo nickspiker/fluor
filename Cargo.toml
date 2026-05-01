@@ -18,9 +18,10 @@ crate-type = ["rlib"]
 [features]
 # host-bare is the no_std path used by ferros and other bare-metal consumers.
 # host-winit / host-softbuffer / text imply std.
-default = ["std", "host-winit", "text", "simd"]
+default = ["std", "host-winit", "simd"]
 std = []
-host-winit = ["std", "dep:winit", "dep:softbuffer"]
+# host-winit transitively requires text — desktop chrome wants real glyphs out of the box.
+host-winit = ["std", "text", "dep:winit", "dep:softbuffer"]
 host-softbuffer = ["std", "dep:softbuffer"]
 host-bare = []
 text = ["std", "dep:cosmic-text"]
