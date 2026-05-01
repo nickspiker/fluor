@@ -19,6 +19,9 @@ pub mod theme;
 #[cfg(feature = "text")]
 pub mod text;
 
+#[cfg(feature = "text")]
+pub mod widgets;
+
 pub use coord::{Coord, RuVec2};
 pub use geom::Viewport;
 pub use pane::{Compositor, Pane, PaneId};

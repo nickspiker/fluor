@@ -40,3 +40,8 @@ pub const CLOSE_GLYPH: u32 = fmt(0xFF_80_20_20);
 pub const MAXIMIZE_GLYPH: u32 = fmt(0xFF_48_6B_3A);
 pub const MAXIMIZE_GLYPH_INTERIOR: u32 = fmt(0xFF_28_2D_2E);
 pub const MINIMIZE_GLYPH: u32 = fmt(0xFF_33_30_C7);
+
+// Textbox.
+pub const TEXTBOX_FILL: u32 = fmt(0xFF_06_08_09);
+pub const TEXTBOX_LIGHT_EDGE: u32 = fmt(0xFF_44_41_37);
+pub const TEXTBOX_SHADOW_EDGE: u32 = fmt(0xFF_2B_34_37);
