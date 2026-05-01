@@ -6,20 +6,21 @@ Named for **fluorite** — the mineral that gave us "fluorescence" — and ***fl
 
 The name is also the differentiator. Every mainstream layout system is pixel-anchored: Android `dp`, CSS `px`, WPF DIPs, iOS `pt`, Flutter `dp` — every one of them is just a scale factor on a fixed physical reference. Even CSS `vmin` (the closest "viewport-relative" unit) uses `min(w, h)` and inherits a discontinuity at the diagonal. Fluor uses **harmonic-mean span** `2wh/(w+h)` as its scaling base, with the origin at the viewport center and `+y` down. As far as I can tell, that combination — center-origin + harmonic-mean unit + dominant convention (not opt-in) — is unoccupied territory among compositors and toolkits. Fluorite glows on a band nothing else emits in; fluor occupies a layout band nothing else occupies.
 
-`fluor` exists to deduplicate the bespoke compositor code currently sitting inside [photon](https://github.com/nickspiker/photon), [rhe](https://github.com/nickspiker/rhe), and [mandelbrot-exploder](https://github.com/nickspiker/mandelbrot-exploder), and to be the eventual compositor for [ferros](https://github.com/nickspiker/ferros) — a kill-switch-ready Rust OS targeting ARM-only with no GPU drivers. Today it is a thin layer of shared chrome + paint primitives; consumer migrations begin once text rendering lands.
+`fluor` exists to deduplicate the bespoke compositor code currently sitting inside [photon](https://github.com/nickspiker/photon), [rhe](https://github.com/nickspiker/rhe), and [mandelbrot-exploder](https://github.com/nickspiker/mandelbrot-exploder), and to be the eventual compositor for [ferros](https://github.com/nickspiker/ferros) — a Killswitch-ready Rust OS targeting ARM-only with no GPU drivers. Today it is a thin layer of shared chrome + paint primitives; consumer migrations begin once text rendering lands.
 
 ## Status
 
-**v0 — pre-alpha.** Window chrome (borderless with squircle-clipped corners, two-tone edges, top-right control buttons, hover state, hairline separators) and pane composition work end-to-end. Text rendering, widgets, and layout persistence are not yet built. Expect breaking changes at every layer until the first consumer migration validates the API.
+**v0 — pre-alpha.** Window chrome, pane composition, and transform-aware text rendering all work end-to-end. Textboxes, widgets, and layout persistence are not yet built. Expect breaking changes at every layer until the first consumer migration validates the API.
 
 | Layer | State |
 |---|---|
 | Center-origin coords (`RuVec2`, `Viewport`) | ✓ f32 storage, harmonic-mean span/perimeter/diagonal_sq |
 | Pane tree (`Compositor`) | ✓ insert / remove / get / hit-test / focus / z-order / render |
-| Paint primitives | ✓ ARGB blend, fill_rect (solid + blend), stroke_rect, circle_filled, glyph rasterizers, background noise |
-| Window chrome | ✓ controls strip, edges-and-mask, hairlines, hover overlay (lifted verbatim from photon) |
-| Drag / resize | ✓ drag-to-move + 8-region edge resize via winit |
-| Text rendering | ✗ planned — cosmic-text wrapper port |
+| Paint primitives | ✓ ARGB blend, fill_rect (solid + blend), stroke_rect, circle_filled, glyph rasterizers, background noise; `Clip` + `AlphaMask` + `Transform` types; `quantize_rotation` / `snap_rotation` helpers |
+| Window chrome | ✓ controls strip, edges-and-mask, hairlines, hover overlay (lifted verbatim from photon); always-visible at minimum window size via `MIN_BUTTON_HEIGHT_PX + ceil(span/32)` formula |
+| Drag / resize | ✓ drag-to-move + 8-region edge resize via winit; WM-enforced `min_inner_size = (24, 8)` |
+| Text rendering | ✓ cosmic-text + swash; Open Sans bundled; **transform-aware** (arbitrary rotation / skew / scale via `swash::scale`, glyph contour transformed in font space for proper hinting + AA); per-glyph LRU image cache keyed on `(font, glyph, size, transform)` |
+| Killswitch close | ✓ `std::process::exit(0)` on close button + `CloseRequested` — no Drop chain, kernel reclaims everything in microseconds; same semantics as ferros's hardware power cutoff |
 | Textbox / widgets | ✗ planned |
 | Layout persistence (VSF) | ✗ planned — 1 Hz / release debounce |
 | `host-bare` (ferros, no_std framebuffer) | ✗ planned |
@@ -79,22 +80,23 @@ A pleasant side effect: the same rendering code runs on bare-metal targets like 
 fluor (lib)
 ├── coord       — RuVec2, Coord (= f32)
 ├── geom        — Viewport with span/perimeter/diagonal_sq + RU↔pixel
-├── paint       — blend, fill_rect, stroke_rect, circle_filled, glyph::*, scale_alpha, blend_rgb_only, background_noise
+├── paint       — blend, fill_rect, stroke_rect, circle_filled, glyph::*, scale_alpha, blend_rgb_only, background_noise; Clip / AlphaMask / Transform; quantize_rotation + snap_rotation
 ├── pane        — Pane, PaneId, Compositor (tree + hit-test + focus + z-order + render)
+├── text        — TextRenderer (cosmic-text + swash); transform-aware glyph rasterization via swash::scale; LRU glyph cache keyed on (font, glyph, size, transform's linear part)
 ├── theme       — color constants (Android byte-swap behind cfg)
 └── host/
-    ├── chrome  — draw_window_controls, draw_window_edges_and_mask, draw_button_hairlines, draw_button_hover_by_pixels, get_resize_edge, hit_test_map (verbatim photon port)
-    └── desktop — winit + softbuffer host (feature `host-winit`, default)
+    ├── chrome  — draw_window_controls, draw_window_edges_and_mask, draw_button_hairlines, draw_button_hover_by_pixels, get_resize_edge, hit_test_map (verbatim photon port; MIN_BUTTON_HEIGHT_PX floor for guaranteed visibility at any legal window size)
+    └── desktop — winit + softbuffer host (feature `host-winit`, default; std::process::exit(0) on close for Killswitch compliance)
 ```
 
-Future: `host-bare` (no_std framebuffer for ferros), `text` (cosmic-text wrapper), widgets, SIMD kernels, layout VSF persistence.
+Future: `host-bare` (no_std framebuffer for ferros), textbox + widget kit, SIMD kernels, layout VSF persistence.
 
 ## Features
 
-- `default = ["std", "host-winit", "text", "simd"]`
-- `host-winit` — winit + softbuffer desktop host (default)
+- `default = ["std", "host-winit", "simd"]`
+- `host-winit` — winit + softbuffer desktop host (default; transitively requires `text`)
 - `host-bare` — bare-metal `&mut [u32]` framebuffer host (planned, gated for `no_std`)
-- `text` — cosmic-text wrapper (planned)
+- `text` — cosmic-text + swash text rendering with transform support
 - `simd` — runtime-dispatched NEON / SSE2 / AVX2 blit kernels (planned)
 
 ## Building

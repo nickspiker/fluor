@@ -125,6 +125,17 @@ pub fn quantize_rotation(radians: f32, font_size_px: f32, k: u32) -> u16 {
     (bin % divs.max(1)) as u16
 }
 
+/// Snap a continuous rotation angle to the nearest quantization bin and return the bin's representative angle (in radians, range `[0, 2π)`). Same quantization grid as [`quantize_rotation`]. Use this when constructing a [`Transform`] for text that should benefit from the rasterized-glyph cache: animated rotation that varies continuously per frame would miss the cache every frame; pre-snapping to bins makes consecutive frames within the same bin cache-hit.
+pub fn snap_rotation(radians: f32, font_size_px: f32, k: u32) -> f32 {
+    let radius = font_size_px * 0.5;
+    let raw_divs = (core::f32::consts::TAU * radius).ceil() as u32;
+    let divs = ((raw_divs + k - 1) / k) * k;
+    if divs == 0 { return 0.0; }
+    let step = core::f32::consts::TAU / divs as f32;
+    let theta = radians.rem_euclid(core::f32::consts::TAU);
+    (theta / step).floor() * step
+}
+
 /// Per-pixel alpha mask sized to the framebuffer. Multiplies into rendered alpha for soft clipping (textbox shapes, squircle pane corners, scroll fades). Carries its dimensions so primitives can panic on mismatch (per AGENT.md: init bugs fail loud, not silently render garbage).
 pub struct AlphaMask<'a> {
     pub pixels: &'a [u8],

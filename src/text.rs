@@ -4,14 +4,54 @@
 
 use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
 use crate::paint::{AlphaMask, Clip, Transform};
-use swash::scale::{Render, ScaleContext, Source};
+use swash::scale::{image::Image as SwashImage, Render, ScaleContext, Source};
 use swash::zeno::Transform as ZenoTransform;
+
+/// Cache key for rasterized transformed-glyph images. The full linear part (`a, b, c, d`) of the transform is included as bit-pattern equality so any unique linear transform — pure rotation, scale, skew, mirror, mix — gets its own cache entry. Translation is excluded because it doesn't affect the glyph bitmap, only where it gets composited. Callers that want cache hits across small angle changes should snap with [`crate::paint::snap_rotation`] before constructing the Transform.
+#[derive(Copy, Clone, PartialEq, Eq)]
+struct TransformGlyphKey {
+    font_id: cosmic_text::fontdb::ID,
+    glyph_id: u16,
+    size_bits: u32,
+    a_bits: u32, b_bits: u32, c_bits: u32, d_bits: u32,
+}
+
+/// Linear-scan + bump-to-front LRU cache for swash-rasterized transformed glyphs. Capacity-bounded; tail-evicts on overflow. No `HashMap` — the keyspace is small (visible glyphs at active rotations) and a Vec scan with cache-friendly contiguous layout beats hashing at the N we care about.
+struct TransformGlyphCache {
+    entries: Vec<(TransformGlyphKey, SwashImage)>,
+    cap: usize,
+}
+
+impl TransformGlyphCache {
+    fn new(cap: usize) -> Self {
+        Self { entries: Vec::with_capacity(cap.min(64)), cap }
+    }
+
+    /// Look up a key. On hit, bumps the entry to the front (LRU). Returns the slice index of the (front) entry on hit, `None` on miss.
+    fn lookup(&mut self, key: TransformGlyphKey) -> Option<()> {
+        let pos = self.entries.iter().position(|(k, _)| *k == key)?;
+        if pos != 0 {
+            self.entries[..=pos].rotate_right(1);
+        }
+        Some(())
+    }
+
+    /// Insert at the front, evict tail if over capacity.
+    fn insert(&mut self, key: TransformGlyphKey, image: SwashImage) {
+        self.entries.insert(0, (key, image));
+        if self.entries.len() > self.cap {
+            self.entries.pop();
+        }
+    }
+}
 
 pub struct TextRenderer {
     font_system: FontSystem,
     swash_cache: SwashCache,
     /// Owned by `TextRenderer` for the transform-aware glyph path. Cosmic-text's `SwashCache` only handles identity-transform glyphs; for any rotated / scaled / skewed text we go to swash directly so the glyph contour transforms in font space (proper hinting + AA), then composite the result.
     scale_context: ScaleContext,
+    /// Cache for transform-rasterized glyph images. Identity transforms use cosmic-text's own cache; only non-identity rasterizations land here.
+    transform_cache: TransformGlyphCache,
 }
 
 impl TextRenderer {
@@ -32,6 +72,8 @@ impl TextRenderer {
             font_system,
             swash_cache: SwashCache::new(),
             scale_context: ScaleContext::new(),
+            // Cap at 1024 glyph-images. At ~256 visible glyphs × 4 active rotation bins it never trips; bigger workloads tail-evict the coldest entries first.
+            transform_cache: TransformGlyphCache::new(1024),
         }
     }
 
@@ -350,33 +392,51 @@ impl TextRenderer {
         colour_wide = (colour_wide | (colour_wide << 16)) & 0x0000FFFF0000FFFF;
         colour_wide = (colour_wide | (colour_wide << 8)) & 0x00FF00FF00FF00FF;
 
-        // Identity-or-None: cosmic-text's SwashCache fast path. Non-identity transform: route per glyph through swash::scale::ScaleContext directly so the contour is rotated/skewed/scaled in font space (proper hinting + AA), AND apply the same transform to the glyph's run-local position so the entire text run rotates as one piece, not each glyph independently around its own origin.
+        // Identity-or-None: cosmic-text's SwashCache fast path. Non-identity transform splits two ways:
+        //   1. **Contour transform** (linear part only — `a, b, c, d`, *no translation*) → fed to swash::scale to rotate/skew/scale the glyph outline in font space. Translation is intentionally stripped here because swash applies its transform to the contour in glyph-local coords (origin at 0,0 baseline-left); leaving translation in would translate the contour itself, blowing the placement bbox out into absolute pixel space.
+        //   2. **Position transform** (full transform — linear *plus* translation) → applied to each glyph's run-local position, so the run translates + rotates as a rigid body around the chosen anchor.
         // zeno's Transform constructor takes (xx, xy, yx, yy, x, y) where the matrix is `[xx xy x; yx yy y]`. Our `Transform` stores `[a c tx; b d ty]` — same layout, just renamed: xx=a, xy=c, yx=b, yy=d, x=tx, y=ty.
         let active_transform = transform.filter(|t| !t.is_identity());
-        let zeno_transform = active_transform.map(|t| ZenoTransform::new(t.a, t.c, t.b, t.d, t.tx, t.ty));
+        let zeno_transform = active_transform.map(|t| ZenoTransform::new(t.a, t.c, t.b, t.d, 0.0, 0.0));
 
         for run in buffer.layout_runs() {
             let baseline_offset = run.line_y;
             for glyph in run.glyphs {
                 let physical_glyph = glyph.physical((offset_x, offset_y), 1.);
 
-                let image_owned;
                 let (glyph_data, placement_left, placement_top, placement_w, placement_h) = match zeno_transform {
                     None => {
-                        // Identity fast path: cosmic-text owns the cache.
+                        // Identity fast path: cosmic-text's SwashCache owns the rasterized-image cache for non-transformed glyphs.
                         let Some(image) = self.swash_cache.get_image(&mut self.font_system, physical_glyph.cache_key) else { continue; };
                         let p = image.placement;
                         (&image.data[..], p.left, p.top, p.width, p.height)
                     }
                     Some(zt) => {
-                        // Transform path: rasterize with swash directly so contour is properly transformed in font space.
-                        let Some(font) = self.font_system.get_font(glyph.font_id) else { continue; };
-                        let swash_font = font.as_swash();
-                        let mut scaler = self.scale_context.builder(swash_font).size(glyph.font_size).build();
-                        let Some(image) = Render::new(&[Source::Outline]).transform(Some(zt)).render(&mut scaler, glyph.glyph_id) else { continue; };
-                        image_owned = image;
-                        let p = image_owned.placement;
-                        (&image_owned.data[..], p.left, p.top, p.width, p.height)
+                        // Transform path: check our own LRU cache first; on miss, rasterize via swash directly (contour transformed in font space → proper hinting + AA), then insert at front.
+                        let t = active_transform.expect("zeno_transform set implies active_transform set");
+                        let key = TransformGlyphKey {
+                            font_id: glyph.font_id,
+                            glyph_id: glyph.glyph_id,
+                            size_bits: glyph.font_size.to_bits(),
+                            a_bits: t.a.to_bits(),
+                            b_bits: t.b.to_bits(),
+                            c_bits: t.c.to_bits(),
+                            d_bits: t.d.to_bits(),
+                        };
+                        if self.transform_cache.lookup(key).is_none() {
+                            let Some(font) = self.font_system.get_font(glyph.font_id) else { continue; };
+                            let image = {
+                                let swash_font = font.as_swash();
+                                let mut scaler = self.scale_context.builder(swash_font).size(glyph.font_size).build();
+                                let Some(img) = Render::new(&[Source::Outline]).transform(Some(zt)).render(&mut scaler, glyph.glyph_id) else { continue; };
+                                img
+                            };
+                            self.transform_cache.insert(key, image);
+                        }
+                        // Cache front entry is the one we just looked up or inserted.
+                        let entry = &self.transform_cache.entries[0];
+                        let p = entry.1.placement;
+                        (&entry.1.data[..], p.left, p.top, p.width, p.height)
                     }
                 };
 

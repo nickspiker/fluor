@@ -13,6 +13,9 @@ pub const HIT_MINIMIZE_BUTTON: u8 = 1;
 pub const HIT_MAXIMIZE_BUTTON: u8 = 2;
 pub const HIT_CLOSE_BUTTON: u8 = 3;
 
+/// Pixel floor for the controls-strip button height. The actual height is `MIN_BUTTON_HEIGHT_PX + ceil(span/32)` so it always grows with viewport but never collapses to a degenerate size where: (a) the symbol rasterizers' integer math floors to zero (`maximize_symbol` divides by `r_inner³` where `r_inner = (r*4 + 4) / 5`), or (b) a 1-pixel feature can't be antialiased meaningfully. Pair with a window `min_inner_size` that guarantees the chrome strip can horizontally fit (`window_width >= 7 * MIN_BUTTON_HEIGHT_PX / 2 = 14`).
+pub const MIN_BUTTON_HEIGHT_PX: usize = 4;
+
 /// Resize edge classification, photon's enum verbatim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResizeEdge {
@@ -61,12 +64,17 @@ pub fn draw_window_controls(
     let window_width = window_width as usize;
     let window_height = window_height as usize;
 
-    // Calculate button dimensions using harmonic mean (span) scaled by ru span = 2wh/(w+h), base button size = span/32, scaled by ru (zoom multiplier)
+    // Calculate button dimensions: a fixed minimum + harmonic-mean span scaled by ru. The minimum guarantees controls are always visible (and that the symbol rasterizers' integer math never floors to zero), and the +scaled term gives smooth growth with viewport size — same growth rate as photon's pure-scaled version, just with a floor.
     let span = 2.0 * window_width as f32 * window_height as f32
         / (window_width as f32 + window_height as f32);
-    let button_height = (span / 32.0 * ru).ceil() as usize;
+    let button_height = MIN_BUTTON_HEIGHT_PX + (span / 32.0 * ru).ceil() as usize;
     let button_width = button_height;
     let total_width = button_width * 7 / 2;
+
+    // If the controls strip wouldn't fit horizontally or vertically, give up gracefully. With min_inner_size enforced at the host level the strip always fits at any non-degenerate window size, so this guards against pathological intermediate states only.
+    if total_width >= window_width || button_height >= window_height {
+        return (0, Vec::new(), 0, 0);
+    }
 
     // Buttons extend to top-right corner of window
     let mut x_start = window_width - total_width;
@@ -165,6 +173,11 @@ pub fn draw_window_controls(
     let crossing_limit = crossings.len().min(window_width - (x_start + start));
     for &(inset, l, h) in &crossings[..crossing_limit] {
         let i = inset as usize;
+        // Skip crossings whose inset extends past the strip's vertical height — `py = button_height - 1 - (i + 1)` would underflow usize. Crossings are sorted descending after reversal, so the early iterations may exceed button_height; subsequent ones are progressively smaller and become safe.
+        if i + 1 >= button_height {
+            x_offset += 1;
+            continue;
+        }
         let px = x_start + x_offset;
 
         let py = y_start + button_height - 1 - i;
@@ -275,6 +288,15 @@ pub fn draw_window_edges_and_mask(
     start: usize,
     crossings: &[(u16, u8, u8)],
 ) {
+    // External-input guard: degenerate sizes underflow `(height - 1) * width` and the per-crossing index math. Same Rule 0 justification as draw_window_controls — WM can send tiny sizes during drag.
+    if width < 2 || height < 2 {
+        return;
+    }
+    // If the squircle inset doesn't fit the window, the four-corner-square / per-row math underflows. Return without drawing edges; the chrome strip already short-circuited above too.
+    if start * 2 >= width as usize || start * 2 >= height as usize {
+        return;
+    }
+
     let light_colour = theme::WINDOW_LIGHT_EDGE;
     let shadow_colour = theme::WINDOW_SHADOW_EDGE;
 
@@ -551,6 +573,10 @@ pub fn draw_button_hairlines(
     _start: usize,
     _crossings: &[(u16, u8, u8)],
 ) {
+    // No-op when chrome was skipped. button_height = 0 means draw_window_controls returned early.
+    if button_height == 0 || window_width == 0 {
+        return;
+    }
     let width = window_width as usize;
     let y_start = 0;
 
