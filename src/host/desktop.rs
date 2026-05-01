@@ -7,6 +7,7 @@ use crate::paint;
 use crate::paint::{snap_rotation, Transform};
 use crate::text::TextRenderer;
 use crate::theme;
+use crate::widgets::Textbox;
 use crate::Compositor;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use winit::application::ApplicationHandler;
 use winit::error::EventLoopError;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::{Key, NamedKey};
 use winit::window::{CursorIcon, ResizeDirection, Window, WindowAttributes, WindowId};
 
 /// Run the desktop host until the window closes.
@@ -38,6 +40,8 @@ struct DesktopApp {
     hover_pixel_list: Vec<usize>,
     /// Font system + glyph cache, lazily initialized on first `resumed`.
     text: Option<TextRenderer>,
+    /// Demo textbox living in the panes example. Edit it with the keyboard once you click in.
+    demo_textbox: Option<Textbox>,
 }
 
 impl DesktopApp {
@@ -53,6 +57,28 @@ impl DesktopApp {
             hover_state: chrome::HIT_NONE,
             hover_pixel_list: Vec::new(),
             text: None,
+            demo_textbox: None,
+        }
+    }
+
+    /// Reposition + resize the demo textbox to match the current viewport. Called after window create + on resize so the textbox tracks the viewport span.
+    fn update_textbox_layout(&mut self) {
+        let vp = self.compositor.viewport();
+        let span = 2.0 * vp.width_px as f32 * vp.height_px as f32 / (vp.width_px as f32 + vp.height_px as f32);
+        let bw = chrome::MIN_BUTTON_HEIGHT_PX as f32 + (span / 32.0).ceil();
+        let center_x = vp.width_px as f32 * 0.5;
+        let center_y = bw * 7.0;
+        let width = (vp.width_px as f32 * 0.5).max(bw * 8.0);
+        let height = bw * 1.6;
+        let font_size = bw * 0.55;
+        let text = match self.text.as_mut() { Some(t) => t, None => return };
+        if let Some(tb) = self.demo_textbox.as_mut() {
+            tb.set_rect(center_x, center_y, width, height);
+            tb.set_font_size(font_size, text);
+        } else {
+            let mut tb = Textbox::new(center_x, center_y, width, height, font_size);
+            tb.set_font_size(font_size, text);
+            self.demo_textbox = Some(tb);
         }
     }
 
@@ -153,7 +179,14 @@ impl DesktopApp {
         }
         }
 
-        // 7. Hover overlay on whichever button is hovered.
+        // 7. Demo textbox — sits below the rotation demo, accepts focus + keyboard input.
+        if let Some(tb) = self.demo_textbox.as_ref() {
+            if let Some(text) = self.text.as_mut() {
+                tb.render(&mut buffer, buf_w, buf_h, text, None, None);
+            }
+        }
+
+        // 8. Hover overlay on whichever button is hovered.
         self.hover_pixel_list = chrome::pixels_for_button(&self.hit_test_map, self.hover_state);
         chrome::draw_button_hover_by_pixels(&mut buffer, &self.hover_pixel_list, true, self.hover_state);
         buffer.present().expect("softbuffer buffer.present");
@@ -228,6 +261,7 @@ impl ApplicationHandler for DesktopApp {
         if self.text.is_none() {
             self.text = Some(TextRenderer::new());
         }
+        self.update_textbox_layout();
 
         self.window = Some(window.clone());
         self.surface = Some(surface);
@@ -257,6 +291,7 @@ impl ApplicationHandler for DesktopApp {
                         .checked_mul(size.height as usize)
                         .unwrap_or(0);
                     self.hit_test_map.resize(map_size, HIT_NONE);
+                    self.update_textbox_layout();
                     if let Some(window) = self.window.as_ref() { window.request_redraw(); }
                 }
             }
@@ -264,8 +299,17 @@ impl ApplicationHandler for DesktopApp {
                 self.cursor_x = position.x as f32;
                 self.cursor_y = position.y as f32;
                 let new_hit = self.hit_at_cursor();
+                let over_textbox = self
+                    .demo_textbox
+                    .as_ref()
+                    .map_or(false, |tb| tb.contains(self.cursor_x, self.cursor_y));
+                let icon = if new_hit == HIT_NONE && over_textbox {
+                    CursorIcon::Text
+                } else {
+                    cursor_for_state(new_hit, self.cursor_x, self.cursor_y, &self.compositor)
+                };
                 if let Some(window) = self.window.as_ref() {
-                    window.set_cursor(cursor_for_state(new_hit, self.cursor_x, self.cursor_y, &self.compositor));
+                    window.set_cursor(icon);
                 }
                 if new_hit != self.hover_state {
                     self.hover_state = new_hit;
@@ -296,7 +340,44 @@ impl ApplicationHandler for DesktopApp {
                     let _ = window.drag_resize_window(dir);
                     return;
                 }
+                // Textbox click — focus + cursor positioning if inside, defocus otherwise. Either way request a redraw because the focus border + cursor visibility changes.
+                if let Some(tb) = self.demo_textbox.as_mut() {
+                    let was_focused = tb.focused;
+                    tb.handle_click(self.cursor_x, self.cursor_y);
+                    if tb.focused || was_focused {
+                        window.request_redraw();
+                        if tb.focused { return; }
+                    }
+                }
                 let _ = window.drag_window();
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state != ElementState::Pressed { return; }
+                let Some(tb) = self.demo_textbox.as_mut() else { return; };
+                if !tb.focused { return; }
+                let Some(text) = self.text.as_mut() else { return; };
+                let mut changed = false;
+                match &event.logical_key {
+                    Key::Named(NamedKey::Backspace) => { tb.backspace(text); changed = true; }
+                    Key::Named(NamedKey::Delete) => { tb.delete_forward(text); changed = true; }
+                    Key::Named(NamedKey::ArrowLeft) => { tb.cursor_left(); changed = true; }
+                    Key::Named(NamedKey::ArrowRight) => { tb.cursor_right(); changed = true; }
+                    Key::Named(NamedKey::Home) => { tb.cursor_home(); changed = true; }
+                    Key::Named(NamedKey::End) => { tb.cursor_end(); changed = true; }
+                    _ => {
+                        if let Some(s) = &event.text {
+                            for c in s.chars() {
+                                if !c.is_control() {
+                                    tb.insert_char(c, text);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if changed {
+                    if let Some(window) = self.window.as_ref() { window.request_redraw(); }
+                }
             }
             WindowEvent::RedrawRequested => {
                 self.render_frame();
