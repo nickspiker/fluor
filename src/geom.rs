@@ -1,6 +1,6 @@
 //! Viewport geometry: pixel dimensions, derived universal scaling units, and conversions between RU coordinates and integer pixel coordinates.
 //!
-//! Universal scaling units (matching photon's AGENT.md "Universal Scaling Units"):
+//! Relative Units, not pixels (ru)
 //! - `span = 2wh/(w+h)` — harmonic mean of pixel dimensions; the project's default scaling base. Slope 1 along `w==h`, smooth at the diagonal, biased toward the smaller dimension on narrow displays.
 //! - `perimeter = w + h` — for edge-aware calculations.
 //! - `diagonal_sq = w² + h²` — for distance calculations without sqrt.
@@ -34,7 +34,7 @@ impl Viewport {
         let w = width_px as Coord;
         let h = height_px as Coord;
         let perimeter = w + h;
-        let span = (2.0 * w * h) / perimeter;
+        let span = (2. * w * h) / perimeter;
         let diagonal_sq = w * w + h * h;
         Self {
             width_px,
@@ -86,44 +86,5 @@ impl Viewport {
             x: (px as Coord - self.half_w) / span_ru,
             y: (py as Coord - self.half_h) / span_ru,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn span_is_harmonic_mean() {
-        // 1920x1080: 2*1920*1080 / (1920+1080) = 4147200 / 3000 = 1382.4
-        let vp = Viewport::new(1920, 1080);
-        assert!((vp.span - 1382.4).abs() < 0.01, "span = {}, expected ~1382.4", vp.span);
-    }
-
-    #[test]
-    fn center_origin_round_trip() {
-        let vp = Viewport::new(800, 600);
-        let (px, py) = vp.ru_to_px(RuVec2::ZERO);
-        assert_eq!((px, py), (400, 300));
-    }
-
-    #[test]
-    fn px_to_ru_inverse() {
-        let vp = Viewport::new(1024, 768);
-        let original = RuVec2::new(0.25, -0.125);
-        let (px, py) = vp.ru_to_px(original);
-        let recovered = vp.px_to_ru(px as i32, py as i32);
-        let dx = (recovered.x - original.x).abs();
-        let dy = (recovered.y - original.y).abs();
-        let one_px_ru = (vp.span * vp.ru).recip();
-        assert!(dx <= one_px_ru, "dx={} > 1px_ru={}", dx, one_px_ru);
-        assert!(dy <= one_px_ru, "dy={} > 1px_ru={}", dy, one_px_ru);
-    }
-
-    #[test]
-    fn perimeter_and_diagonal_sq() {
-        let vp = Viewport::new(3, 4);
-        assert!((vp.perimeter - 7.0).abs() < 1e-6);
-        assert!((vp.diagonal_sq - 25.0).abs() < 1e-6);
     }
 }

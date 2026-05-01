@@ -24,7 +24,7 @@ std = []
 host-winit = ["std", "text", "dep:winit", "dep:softbuffer"]
 host-softbuffer = ["std", "dep:softbuffer"]
 host-bare = []
-text = ["std", "dep:cosmic-text"]
+text = ["std", "dep:cosmic-text", "dep:swash"]
 simd = []
 
 [dependencies]
@@ -37,6 +37,10 @@ spirix = { version = "0.0.12", path = "../spirix", default-features = false, fea
 winit = { version = "0.30", optional = true }
 softbuffer = { version = "0.4", optional = true }
 cosmic-text = { version = "0.14", optional = true }
+# swash is pulled in transitively by cosmic-text but we use it directly for transform-aware
+# glyph rasterization (rotated/skewed text). Pinning the same version cosmic-text uses keeps
+# FontRef + ScaleContext interop trivial.
+swash = { version = "0.2", optional = true }
 
 [dev-dependencies]
 proptest = "1.5"

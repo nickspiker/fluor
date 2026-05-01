@@ -77,21 +77,21 @@ mod tests {
         let a = RuVec2::new(1.5, -2.25);
         let b = RuVec2::new(0.5, 0.25);
         let sum = a + b;
-        assert_eq!(sum, RuVec2::new(2.0, -2.0));
+        assert_eq!(sum, RuVec2::new(2., -2.));
         assert_eq!(sum - b, a);
         assert_eq!(-a, RuVec2::new(-1.5, 2.25));
     }
 
     #[test]
     fn zero_is_identity() {
-        let v = RuVec2::new(3.0, -1.0);
+        let v = RuVec2::new(3., -1.);
         assert_eq!(v + RuVec2::ZERO, v);
     }
 
     #[test]
     fn scalar_mul_div() {
-        let v = RuVec2::new(2.0, -4.0);
-        assert_eq!(v * 0.5, RuVec2::new(1.0, -2.0));
-        assert_eq!(v / 2.0, RuVec2::new(1.0, -2.0));
+        let v = RuVec2::new(2., -4.);
+        assert_eq!(v * 0.5, RuVec2::new(1., -2.));
+        assert_eq!(v / 2., RuVec2::new(1., -2.));
     }
 }

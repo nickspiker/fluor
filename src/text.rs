@@ -3,10 +3,15 @@
 //! Photon's full version bundles Oxanium and Josefin Slab too; those are dropped here to keep the v0 crate small (~260 KB instead of ~2 MB). They'll be added back when a consumer needs them.
 
 use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
+use crate::paint::{AlphaMask, Clip, Transform};
+use swash::scale::{Render, ScaleContext, Source};
+use swash::zeno::Transform as ZenoTransform;
 
 pub struct TextRenderer {
     font_system: FontSystem,
     swash_cache: SwashCache,
+    /// Owned by `TextRenderer` for the transform-aware glyph path. Cosmic-text's `SwashCache` only handles identity-transform glyphs; for any rotated / scaled / skewed text we go to swash directly so the glyph contour transforms in font space (proper hinting + AA), then composite the result.
+    scale_context: ScaleContext,
 }
 
 impl TextRenderer {
@@ -26,6 +31,7 @@ impl TextRenderer {
         Self {
             font_system,
             swash_cache: SwashCache::new(),
+            scale_context: ScaleContext::new(),
         }
     }
 
@@ -37,22 +43,22 @@ impl TextRenderer {
     pub fn draw_text_center_u32(
         &mut self,
         pixels: &mut [u32],
-        width: usize,
+        buf_w: usize,
+        buf_h: usize,
         text: &str,
         x: f32,
         y: f32,
         size: f32,
         weight: u16,
-        colour: u32, // [RGBA]
+        colour: u32,
         font: &str,
+        clip: Option<Clip>,
+        mask: Option<&AlphaMask>,
+        transform: Option<Transform>,
     ) -> f32 {
-        let attrs = Attrs::new()
-            .family(Family::Name(font))
-            .weight(Weight(weight));
-
+        let attrs = Attrs::new().family(Family::Name(font)).weight(Weight(weight));
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
-
         buffer.set_size(&mut self.font_system, None, None);
         buffer.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced);
         buffer.shape_until_scroll(&mut self.font_system, false);
@@ -60,27 +66,14 @@ impl TextRenderer {
         if let Some(run) = buffer.layout_runs().next() {
             let mut min_x = f32::MAX;
             let mut max_x = f32::MIN;
-
             for glyph in run.glyphs {
                 min_x = min_x.min(glyph.x);
                 max_x = max_x.max(glyph.x + glyph.w);
             }
-
             let text_width = max_x - min_x;
             let text_height = run.line_height;
 
-            self.render_buffer_u32(
-                &mut buffer,
-                pixels,
-                width,
-                x,
-                y,
-                text_width,
-                text_height,
-                colour,
-                0, // center alignment
-            );
-
+            self.render_buffer_u32(&mut buffer, pixels, buf_w, buf_h, x, y, text_width, text_height, colour, 0, clip, mask, transform);
             text_width
         } else {
             0.
@@ -90,7 +83,8 @@ impl TextRenderer {
     pub fn draw_text_left_u32(
         &mut self,
         pixels: &mut [u32],
-        width: usize,
+        buf_w: usize,
+        buf_h: usize,
         text: &str,
         x: f32,
         y: f32,
@@ -98,14 +92,13 @@ impl TextRenderer {
         weight: u16,
         colour: u32,
         font: &str,
+        clip: Option<Clip>,
+        mask: Option<&AlphaMask>,
+        transform: Option<Transform>,
     ) -> f32 {
-        let attrs = Attrs::new()
-            .family(Family::Name(font))
-            .weight(Weight(weight));
-
+        let attrs = Attrs::new().family(Family::Name(font)).weight(Weight(weight));
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
-
         buffer.set_size(&mut self.font_system, None, None);
         buffer.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced);
         buffer.shape_until_scroll(&mut self.font_system, false);
@@ -116,19 +109,7 @@ impl TextRenderer {
                 text_width = text_width.max(glyph.x + glyph.w);
             }
             let text_height = run.line_height;
-
-            self.render_buffer_u32(
-                &mut buffer,
-                pixels,
-                width,
-                x,
-                y,
-                text_width,
-                text_height,
-                colour,
-                1, // left alignment
-            );
-
+            self.render_buffer_u32(&mut buffer, pixels, buf_w, buf_h, x, y, text_width, text_height, colour, 1, clip, mask, transform);
             text_width
         } else {
             0.
@@ -138,7 +119,8 @@ impl TextRenderer {
     pub fn draw_text_right_u32(
         &mut self,
         pixels: &mut [u32],
-        width: usize,
+        buf_w: usize,
+        buf_h: usize,
         text: &str,
         x: f32,
         y: f32,
@@ -146,14 +128,13 @@ impl TextRenderer {
         weight: u16,
         colour: u32,
         font: &str,
+        clip: Option<Clip>,
+        mask: Option<&AlphaMask>,
+        transform: Option<Transform>,
     ) -> f32 {
-        let attrs = Attrs::new()
-            .family(Family::Name(font))
-            .weight(Weight(weight));
-
+        let attrs = Attrs::new().family(Family::Name(font)).weight(Weight(weight));
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
-
         buffer.set_size(&mut self.font_system, None, None);
         buffer.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced);
         buffer.shape_until_scroll(&mut self.font_system, false);
@@ -164,19 +145,7 @@ impl TextRenderer {
                 text_width = text_width.max(glyph.x + glyph.w);
             }
             let text_height = run.line_height;
-
-            self.render_buffer_u32(
-                &mut buffer,
-                pixels,
-                width,
-                x,
-                y,
-                text_width,
-                text_height,
-                colour,
-                2, // right alignment
-            );
-
+            self.render_buffer_u32(&mut buffer, pixels, buf_w, buf_h, x, y, text_width, text_height, colour, 2, clip, mask, transform);
             text_width
         } else {
             0.
@@ -345,78 +314,118 @@ impl TextRenderer {
         }
     }
 
-    /// Render buffer to u32 packed pixel array
+    /// Render shaped text into a u32 ARGB pixel buffer with explicit clip + optional mask.
+    ///
+    /// **Per-glyph entry-point clamp:** the glyph's natural pixel rect `[glyph_x, glyph_x + glyph_w) × [glyph_y, glyph_y + glyph_h)` is intersected with `clip` once at the start of each glyph. The `cx`/`cy` inner-loop ranges are then pre-clamped so the loop body carries **no per-pixel bounds checks** — the math at entry is the proof. Photon's old per-pixel `if final_x < 0 || final_y >= height` is gone.
+    ///
+    /// **Mask:** if `Some(&AlphaMask)`, `mask.pixels[idx]` multiplies into the glyph alpha (effective_alpha = glyph_alpha × mask_alpha / 256). Used for soft-clipping text by textbox shape, scroll fade, etc.
     fn render_buffer_u32(
         &mut self,
         buffer: &mut Buffer,
-        pixels: &mut [u32], // [ARGB]
-        width: usize,
+        pixels: &mut [u32],
+        buf_w: usize,
+        buf_h: usize,
         anchor_x: f32,
         anchor_y: f32,
         text_width: f32,
         text_height: f32,
-        colour: u32,   // [ARGB]
+        colour: u32,
         alignment: u8, // 0=center, 1=left, 2=right
+        clip: Option<Clip>,
+        mask: Option<&AlphaMask>,
+        transform: Option<Transform>,
     ) {
-        // Calculate offset based on alignment
+        let clip = Clip::resolve(clip, buf_w, buf_h);
+        if let Some(m) = mask { crate::paint::assert_mask_matches_buffer(m, buf_w, buf_h); }
+
         let (offset_x, offset_y) = match alignment {
-            0 => (anchor_x - text_width / 2., anchor_y - text_height / 2.), // center
-            1 => (anchor_x, anchor_y - text_height / 2.),                   // left
-            2 => (anchor_x - text_width, anchor_y - text_height / 2.),      // right
+            0 => (anchor_x - text_width / 2., anchor_y - text_height / 2.),
+            1 => (anchor_x, anchor_y - text_height / 2.),
+            2 => (anchor_x - text_width, anchor_y - text_height / 2.),
             _ => (anchor_x, anchor_y),
         };
 
-        let mut colour = colour as u64;
-        colour = (colour | (colour << 16)) & 0x0000FFFF0000FFFF;
-        colour = (colour | (colour << 8)) & 0x00FF00FF00FF00FF;
+        // Widen colour to packed-channel u64 once.
+        let mut colour_wide = colour as u64;
+        colour_wide = (colour_wide | (colour_wide << 16)) & 0x0000FFFF0000FFFF;
+        colour_wide = (colour_wide | (colour_wide << 8)) & 0x00FF00FF00FF00FF;
+
+        // Identity-or-None: cosmic-text's SwashCache fast path. Non-identity transform: route per glyph through swash::scale::ScaleContext directly so the contour is rotated/skewed/scaled in font space (proper hinting + AA), AND apply the same transform to the glyph's run-local position so the entire text run rotates as one piece, not each glyph independently around its own origin.
+        // zeno's Transform constructor takes (xx, xy, yx, yy, x, y) where the matrix is `[xx xy x; yx yy y]`. Our `Transform` stores `[a c tx; b d ty]` — same layout, just renamed: xx=a, xy=c, yx=b, yy=d, x=tx, y=ty.
+        let active_transform = transform.filter(|t| !t.is_identity());
+        let zeno_transform = active_transform.map(|t| ZenoTransform::new(t.a, t.c, t.b, t.d, t.tx, t.ty));
 
         for run in buffer.layout_runs() {
             let baseline_offset = run.line_y;
-
             for glyph in run.glyphs {
                 let physical_glyph = glyph.physical((offset_x, offset_y), 1.);
 
-                if let Some(image) = self
-                    .swash_cache
-                    .get_image(&mut self.font_system, physical_glyph.cache_key)
-                {
-                    let glyph_x = physical_glyph.x + image.placement.left;
-                    let glyph_y = physical_glyph.y + baseline_offset as i32 - image.placement.top;
+                let image_owned;
+                let (glyph_data, placement_left, placement_top, placement_w, placement_h) = match zeno_transform {
+                    None => {
+                        // Identity fast path: cosmic-text owns the cache.
+                        let Some(image) = self.swash_cache.get_image(&mut self.font_system, physical_glyph.cache_key) else { continue; };
+                        let p = image.placement;
+                        (&image.data[..], p.left, p.top, p.width, p.height)
+                    }
+                    Some(zt) => {
+                        // Transform path: rasterize with swash directly so contour is properly transformed in font space.
+                        let Some(font) = self.font_system.get_font(glyph.font_id) else { continue; };
+                        let swash_font = font.as_swash();
+                        let mut scaler = self.scale_context.builder(swash_font).size(glyph.font_size).build();
+                        let Some(image) = Render::new(&[Source::Outline]).transform(Some(zt)).render(&mut scaler, glyph.glyph_id) else { continue; };
+                        image_owned = image;
+                        let p = image_owned.placement;
+                        (&image_owned.data[..], p.left, p.top, p.width, p.height)
+                    }
+                };
 
-                    let glyph_width = image.placement.width as usize;
-                    let glyph_height = image.placement.height as usize;
+                // Glyph origin: cosmic-text gives integer (px, py) at the run-local position. Under transform we rotate that position too so the run reads as one rotated piece.
+                let (origin_x, origin_y) = match active_transform {
+                    Some(t) => {
+                        let (rx, ry) = t.apply(physical_glyph.x as f32, (physical_glyph.y + baseline_offset as i32) as f32);
+                        (rx as i32, ry as i32)
+                    }
+                    None => (physical_glyph.x, physical_glyph.y + baseline_offset as i32),
+                };
+                let glyph_x = origin_x + placement_left;
+                let glyph_y = origin_y - placement_top;
+                let gw = placement_w as i32;
+                let gh = placement_h as i32;
 
-                    for cy in 0..glyph_height {
-                        for cx in 0..glyph_width {
-                            let alpha = image.data[cy * glyph_width + cx];
-                            if alpha > 0 {
-                                let final_x = glyph_x as isize + cx as isize;
-                                let final_y = glyph_y as isize + cy as isize;
+                // Per-glyph clamp: intersect glyph rect with clip → cx/cy ranges that are guaranteed in-bounds for both image.data[] and pixels[] indexing, no per-pixel checks.
+                let cx_min = (clip.x_start as i32 - glyph_x).max(0).min(gw) as usize;
+                let cy_min = (clip.y_start as i32 - glyph_y).max(0).min(gh) as usize;
+                let cx_max = (clip.x_end as i32 - glyph_x).max(0).min(gw) as usize;
+                let cy_max = (clip.y_end as i32 - glyph_y).max(0).min(gh) as usize;
+                if cx_min >= cx_max || cy_min >= cy_max { continue; }
 
-                                // Bounds check to prevent underflow/overflow
-                                if final_x < 0 || final_y < 0 || final_x >= width as isize {
-                                    continue;
-                                }
-                                let idx = final_y as usize * width + final_x as usize;
-                                if idx >= pixels.len() {
-                                    continue;
-                                }
+                let gw_us = gw as usize;
+                for cy in cy_min..cy_max {
+                    let final_y = (glyph_y + cy as i32) as usize;
+                    let row_offset_buf = final_y * buf_w;
+                    let row_offset_glyph = cy * gw_us;
+                    for cx in cx_min..cx_max {
+                        let alpha = glyph_data[row_offset_glyph + cx];
+                        if alpha == 0 { continue; }
+                        let final_x = (glyph_x + cx as i32) as usize;
+                        let idx = row_offset_buf + final_x;
 
-                                let mut bg = pixels[idx] as u64;
-                                let alpha = alpha as u64;
-                                let inv_alpha = (255 - alpha) as u64;
+                        let alpha_u64 = match mask {
+                            Some(m) => (alpha as u64 * m.pixels[idx] as u64) >> 8,
+                            None => alpha as u64,
+                        };
+                        let inv_alpha = 255 - alpha_u64;
 
-                                bg = (bg | (bg << 16)) & 0x0000FFFF0000FFFF;
-                                bg = (bg | (bg << 8)) & 0x00FF00FF00FF00FF;
+                        let mut bg = pixels[idx] as u64;
+                        bg = (bg | (bg << 16)) & 0x0000FFFF0000FFFF;
+                        bg = (bg | (bg << 8)) & 0x00FF00FF00FF00FF;
 
-                                let mut blended = bg * inv_alpha + colour * alpha;
-
-                                blended = (blended >> 8) & 0x00FF00FF00FF00FF;
-                                blended = (blended | (blended >> 8)) & 0x0000FFFF0000FFFF;
-                                blended = blended | (blended >> 16);
-                                pixels[idx] = blended as u32;
-                            }
-                        }
+                        let mut blended = bg * inv_alpha + colour_wide * alpha_u64;
+                        blended = (blended >> 8) & 0x00FF00FF00FF00FF;
+                        blended = (blended | (blended >> 8)) & 0x0000FFFF0000FFFF;
+                        blended = blended | (blended >> 16);
+                        pixels[idx] = blended as u32;
                     }
                 }
             }

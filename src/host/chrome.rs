@@ -540,7 +540,7 @@ pub fn draw_window_edges_and_mask(
     }
 }
 
-/// Verbatim port of photon's `draw_button_hairlines`. Vertical 1-px hairlines between minimize/maximize and maximize/close, drawn from the strip's vertical center outward until they hit a pixel of a different color (so they stop cleanly at the squircle edge above and the bottom edge below).
+/// Verbatim port of photon's `draw_button_hairlines`. Vertical 1-px hairlines between minimize/maximize and maximize/close, drawn from the strip's vertical center outward until they hit a pixel of a different colour (so they stop cleanly at the squircle edge above and the bottom edge below).
 pub fn draw_button_hairlines(
     pixels: &mut [u32],
     hit_test_map: &mut [u8],

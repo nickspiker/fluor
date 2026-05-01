@@ -4,6 +4,7 @@
 
 use super::chrome::{self, ResizeEdge, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE};
 use crate::paint;
+use crate::paint::Transform;
 use crate::text::TextRenderer;
 use crate::theme;
 use crate::Compositor;
@@ -69,7 +70,7 @@ impl DesktopApp {
         }
 
         // 1. Background noise — full buffer fill
-        paint::background_noise(&mut buffer, buf_w, buf_h, 0, true, 0);
+        paint::background_noise(&mut buffer, buf_w, buf_h, 0, true, 0, None);
         // 2. Panes on top of background
         self.compositor.render(&mut buffer, buf_w, buf_h);
         // 3. Chrome controls strip (writes hit_test_map for click routing).
@@ -110,6 +111,7 @@ impl DesktopApp {
             let _ = text.draw_text_left_u32(
                 &mut buffer,
                 buf_w,
+                buf_h,
                 &self.title,
                 pad,
                 baseline_y,
@@ -117,6 +119,33 @@ impl DesktopApp {
                 400,
                 theme::TEXT_COLOUR,
                 "Open Sans",
+                None,
+                None,
+                None,
+            );
+
+            // Aspect-ratio-driven rotation demo. Rotation = (aspect - 1) × π, so a square window (1:1) is upright, a 2:1 landscape window is upside-down, a 1:2 portrait window tilts the other way. Resize and watch — it's a live demo of fluor's response-to-viewport at no extra cost (swash's internal outline cache makes per-frame retransform cheap; if it ever isn't, the cache notes in src/text.rs sketch a thin Vec-LRU layer around the rasterized output).
+            let aspect = vp.width_px as f32 / vp.height_px as f32;
+            let theta = (aspect - 1.0) * core::f32::consts::PI;
+            let demo_anchor_x = pad;
+            let demo_anchor_y = bw * 3.5;
+            let demo_transform = Transform::translate(-demo_anchor_x, -demo_anchor_y)
+                .then(Transform::rotate(theta))
+                .then(Transform::translate(demo_anchor_x, demo_anchor_y));
+            let _ = text.draw_text_left_u32(
+                &mut buffer,
+                buf_w,
+                buf_h,
+                "rotation tracks viewport aspect ratio (proper AA via swash::scale)",
+                demo_anchor_x,
+                demo_anchor_y,
+                title_size * 0.85,
+                400,
+                theme::TEXT_COLOUR,
+                "Open Sans",
+                None,
+                None,
+                Some(demo_transform),
             );
         }
 
@@ -126,15 +155,19 @@ impl DesktopApp {
         buffer.present().expect("softbuffer buffer.present");
     }
 
+    /// Look up the chrome hit-id under the current cursor. Cursor coordinates are external input — winit reports positions outside the window during drag-resize and during the moment cursor leaves.
+    ///
+    /// **Rule 0 — WHY/PROOF/PREVENTS:** WHY: a negative `mx` cast to `usize` wraps to a huge value; without the check, `hit_test_map[idx]` panics. PROOF: indexing past the slice panics. PREVENTS: panic on cursor outside window.
     fn hit_at_cursor(&self) -> u8 {
         let vp = self.compositor.viewport();
         let mx = self.cursor_x as i32;
         let my = self.cursor_y as i32;
-        if mx < 0 || my < 0 || mx >= vp.width_px as i32 || my >= vp.height_px as i32 {
-            return HIT_NONE;
+        // Cast-and-compare: negative i32 casts to a huge usize, fails the `< width` check naturally.
+        if (mx as usize) < (vp.width_px as usize) && (my as usize) < (vp.height_px as usize) {
+            self.hit_test_map[(my as usize) * (vp.width_px as usize) + (mx as usize)]
+        } else {
+            HIT_NONE
         }
-        let idx = (my as usize) * (vp.width_px as usize) + (mx as usize);
-        if idx < self.hit_test_map.len() { self.hit_test_map[idx] } else { HIT_NONE }
     }
 }
 
@@ -142,12 +175,12 @@ impl ApplicationHandler for DesktopApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() { return; }
 
-        // Photon's recipe: window dimensions derived from the monitor so HiDPI scales correctly. Falls back to the compositor's viewport size if no monitor info is available.
+        // Default initial size: 4:3 window scaled to the monitor's short edge. `short = min(w,h)` is orientation-independent (works the same on portrait, landscape, square monitors). Window height = 3/4 of the short edge leaves a quarter-edge of breathing room for OS chrome / dock / taskbars; width = 4h/3 = the full short edge gives a classic 4:3 aspect ratio. Numbers are arbitrary defaults — consumers override by passing their preferred Viewport size and we'll honor it next session when the API is wired through. Falls back to the compositor's existing viewport size when no monitor info is available.
         let initial = if let Some(monitor) = event_loop.primary_monitor() {
             let size = monitor.size();
             let short = size.width.min(size.height);
-            let h = (short * 3 / 4).max(480);
-            let w = (h * 4 / 3).min(size.width).max(640);
+            let h = short * 3 / 4;
+            let w = h * 4 / 3;
             winit::dpi::PhysicalSize::new(w, h)
         } else {
             let vp = self.compositor.viewport();

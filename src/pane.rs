@@ -132,9 +132,9 @@ impl Compositor {
             let w = ex + ex;
             let h = ey + ey;
             if (pane.background >> 24) == 0xFF {
-                paint::fill_rect_solid(target, buf_w, buf_h, x, y, w, h, pane.background);
+                paint::fill_rect_solid(target, buf_w, buf_h, x, y, w, h, pane.background, None);
             } else {
-                paint::fill_rect_blend(target, buf_w, buf_h, x, y, w, h, pane.background);
+                paint::fill_rect_blend(target, buf_w, buf_h, x, y, w, h, pane.background, None, None);
             }
         }
     }

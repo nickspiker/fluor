@@ -2,6 +2,10 @@
 
 **First-principles GUI compositor library — center-origin coordinates, harmonic-mean relative units, CPU softbuffer rendering, ARM-first.**
 
+Named for **fluorite** — the mineral that gave us "fluorescence" — and ***fluere***, Latin for "to flow." Liquid stone. Hard substrate of pane geometry and chrome shared across consumers, fluid coordinates that flow with the viewport so the same layout reads correctly and identically on a watch, a 8K monitor, or any size limited only by hardware.
+
+The name is also the differentiator. Every mainstream layout system is pixel-anchored: Android `dp`, CSS `px`, WPF DIPs, iOS `pt`, Flutter `dp` — every one of them is just a scale factor on a fixed physical reference. Even CSS `vmin` (the closest "viewport-relative" unit) uses `min(w, h)` and inherits a discontinuity at the diagonal. Fluor uses **harmonic-mean span** `2wh/(w+h)` as its scaling base, with the origin at the viewport center and `+y` down. As far as I can tell, that combination — center-origin + harmonic-mean unit + dominant convention (not opt-in) — is unoccupied territory among compositors and toolkits. Fluorite glows on a band nothing else emits in; fluor occupies a layout band nothing else occupies.
+
 `fluor` exists to deduplicate the bespoke compositor code currently sitting inside [photon](https://github.com/nickspiker/photon), [rhe](https://github.com/nickspiker/rhe), and [mandelbrot-exploder](https://github.com/nickspiker/mandelbrot-exploder), and to be the eventual compositor for [ferros](https://github.com/nickspiker/ferros) — a kill-switch-ready Rust OS targeting ARM-only with no GPU drivers. Today it is a thin layer of shared chrome + paint primitives; consumer migrations begin once text rendering lands.
 
 ## Status
