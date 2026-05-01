@@ -45,15 +45,15 @@
 
 ### When Bounds Checks ARE Required:
 ```rust
-// Example from text rendering:
+// When final_x and final_y are negative, when cast to usize they fail the width/height check
 if (final_x as usize) < width && (final_y as usize) < height {
     let idx = final_y as usize * width as usize + final_x as usize;
-    pixels[idx] = blended as u32;  // Would segfault without the check
+    pixels[idx] = blended as u32;  // Would panic without the check
 }
 ```
 **WHY**: `final_x` and `final_y` come from glyph positioning math and can be negative or exceed buffer dimensions. The cast to `usize` makes negatives wrap to huge values (fail bigger than shit), and the check prevents out-of-bounds memory access.
 
-**PROOF**: Without this check, we'd write outside the pixel buffer and corrupt memory/segfault.
+**PROOF**: Without this check, we'd attempt to write outside the pixel buffer and panic.
 
 ### When Bounds Checks Are FORBIDDEN:
 ```rust
@@ -109,6 +109,82 @@ unsafe { pixels.get_unchecked_mut(idx) }
 ```
 If there's a SAFETY comment, **read it**. It's there because the human proved correctness.
 HashMap shall NOT be used without explicit consent and proof showing how it is faster/better than a linear search or a simple lookup.
+
+## The Clamp Trap
+
+**`clamp()` is defensive programming that hides bugs.**
+
+```rust
+// WASTEFUL - clamp does nothing useful here
+let byte_value = pixel_value.clamp(0.0, 255.0) as u8;
+
+// CORRECT - cast already handles bounds
+let byte_value = pixel_value as u8;
+```
+
+**Why clamp is probably wrong:**
+0. **Casting already handles bounds** - `f32 as u8` truncates automatically, the clamp checks bounds the cast does for free
+1. **Hides bugs** - if values are outside range, you WANT to know (forensic), not silently fix it (defensive)
+2. **Assumes your math is broken** - if calculations are correct, values should never be out of range anyway
+
+**The forensic approach:** If the cast wraps/truncates unexpectedly, that exposes the real bug in your math. Fix the math, don't hide the symptoms.
+
+## When Unsure
+
+**ASK.** Don't add "defensive" checks. If you're not sure whether a bounds check is needed:
+0. State what you're unsure about
+1. Show the code without the check
+2. Explain what would happen if the invariant is violated
+3. Let the human decide
+
+## When Needed
+
+**PROOF REQUIRED** Don't add clamping, min, max, saturating or any other clamping ops unless it has been proven necessary AND accepted by the user!
+
+## Error Handling Philosophy
+
+0. **Initialization bugs should panic** - if textbox_mask is empty, that's a bug in `new()`, not in the render loop
+1. **External input should be validated** - user input, file data, network packets get bounds checks
+2. **Internal invariants should be maintained** - if your loop guarantees safety, assert it in debug builds if needed, but don't check in release
+
+## Dimensional Units
+
+**NEVER use fixed pixel values.** 20px on an 8K TV ≠ 20px on a watch. Use relative scaling:
+
+```rust
+// WRONG - fixed pixels break across displays
+let margin_pixels = 20;
+
+// CORRECT - scale to display dimensions
+let margin = box_width / 40;  // 2.5% of textbox width
+let margin = self.span / 64;  // Fraction of span
+```
+
+**Physics scales, pixels don't.** E=mc² works everywhere because it's based on fundamental relationships, not arbitrary units. Your code should too.
+
+### Universal Scaling Units (Already Available):
+- `self.span` - harmonic mean of width and height = 2wh/(w+h), universal scaling base
+- `self.perimeter` - width + height, for edge-aware calculations
+- `self.diagonal_sq` - width² + height², for distance calculations
+
+### Why Span Uses Harmonic Mean
+
+The harmonic mean `2wh/(w+h)` has unique properties that make it ideal for UI scaling:
+
+0. **Smooth at w==h** - No discontinuity when aspect ratio crosses 1:1 (unlike min/max)
+1. **Finite slope at axes** - Behaves well as either dimension approaches zero
+2. **Slope exactly 1 along diagonal** - Natural scaling along the w==h line
+3. **Biased toward smaller dimension** - UI elements scale appropriately on narrow displays
+
+Compare alternatives:
+- `min(w,h)` - Discontinuous derivative at w==h, creates visual "jumps"
+- `max(w,h)` - Same discontinuity problem
+- `sqrt(w*h)` (geometric mean) - Smooth, but infinite slope at axes
+- `(w+h)/2` (arithmetic mean) - Doesn't bias toward smaller dimension
+
+The harmonic mean is the unique function with all desired properties.
+
+Use these. Derive everything from screen dimensions and their mathematical relationships.
 
 ## Decimal Indexing is FORBIDDEN
 
@@ -355,82 +431,6 @@ if let Some(pixel) = pixels.get_mut(idx) {
     *pixel = color;
 }
 ```
-
-## The Clamp Trap
-
-**`clamp()` is defensive programming that hides bugs.**
-
-```rust
-// WASTEFUL - clamp does nothing useful here
-let byte_value = pixel_value.clamp(0.0, 255.0) as u8;
-
-// CORRECT - cast already handles bounds
-let byte_value = pixel_value as u8;
-```
-
-**Why clamp is probably wrong:**
-0. **Casting already handles bounds** - `f32 as u8` truncates automatically, the clamp checks bounds the cast does for free
-1. **Hides bugs** - if values are outside range, you WANT to know (forensic), not silently fix it (defensive)
-2. **Assumes your math is broken** - if calculations are correct, values should never be out of range anyway
-
-**The forensic approach:** If the cast wraps/truncates unexpectedly, that exposes the real bug in your math. Fix the math, don't hide the symptoms.
-
-## When Unsure
-
-**ASK.** Don't add "defensive" checks. If you're not sure whether a bounds check is needed:
-0. State what you're unsure about
-1. Show the code without the check
-2. Explain what would happen if the invariant is violated
-3. Let the human decide
-
-## When Needed
-
-**PROOF REQUIRED** Don't add clamping, min, max, saturating or any other clamping ops unless it has been proven necessary AND accepted by the user!
-
-## Error Handling Philosophy
-
-0. **Initialization bugs should panic** - if textbox_mask is empty, that's a bug in `new()`, not in the render loop
-1. **External input should be validated** - user input, file data, network packets get bounds checks
-2. **Internal invariants should be maintained** - if your loop guarantees safety, assert it in debug builds if needed, but don't check in release
-
-## Dimensional Units
-
-**NEVER use fixed pixel values.** 20px on an 8K TV ≠ 20px on a watch. Use relative scaling:
-
-```rust
-// WRONG - fixed pixels break across displays
-let margin_pixels = 20;
-
-// CORRECT - scale to display dimensions
-let margin = box_width / 40;  // 2.5% of textbox width
-let margin = self.span / 64;  // Fraction of span
-```
-
-**Physics scales, pixels don't.** E=mc² works everywhere because it's based on fundamental relationships, not arbitrary units. Your code should too.
-
-### Universal Scaling Units (Already Available):
-- `self.span` - harmonic mean of width and height = 2wh/(w+h), universal scaling base
-- `self.perimeter` - width + height, for edge-aware calculations
-- `self.diagonal_sq` - width² + height², for distance calculations
-
-### Why Span Uses Harmonic Mean
-
-The harmonic mean `2wh/(w+h)` has unique properties that make it ideal for UI scaling:
-
-0. **Smooth at w==h** - No discontinuity when aspect ratio crosses 1:1 (unlike min/max)
-1. **Finite slope at axes** - Behaves well as either dimension approaches zero
-2. **Slope exactly 1 along diagonal** - Natural scaling along the w==h line
-3. **Biased toward smaller dimension** - UI elements scale appropriately on narrow displays
-
-Compare alternatives:
-- `min(w,h)` - Discontinuous derivative at w==h, creates visual "jumps"
-- `max(w,h)` - Same discontinuity problem
-- `sqrt(w*h)` (geometric mean) - Smooth, but infinite slope at axes
-- `(w+h)/2` (arithmetic mean) - Doesn't bias toward smaller dimension
-
-The harmonic mean is the unique function with all desired properties.
-
-Use these. Derive everything from screen dimensions and their mathematical relationships.
 
 ## When Unsure
 

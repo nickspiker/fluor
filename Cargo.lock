@@ -432,6 +432,7 @@ dependencies = [
  "proptest",
  "softbuffer",
  "spirix",
+ "swash",
  "winit",
 ]
 

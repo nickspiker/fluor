@@ -1,6 +1,6 @@
-//! Theme constants — colors and geometry shared between paint primitives, chrome, and (eventually) widgets. Sourced verbatim from photon's [theme.rs](/mnt/Octopus/Code/photon/src/ui/theme.rs); names match photon exactly so cross-codebase greps work.
+//! Theme constants — colours and geometry shared between paint primitives, chrome, and (eventually) widgets. Sourced verbatim from photon's [theme.rs](/mnt/Octopus/Code/photon/src/ui/theme.rs); names match photon exactly so cross-codebase greps work.
 //!
-//! All colors are u32 in packed ARGB format `0xAARRGGBB`. Android byte-swap (ARGB → ABGR) lives behind a cfg here so call sites stay platform-neutral.
+//! All colours are u32 in packed ARGB format `0xAARRGGBB`. Android byte-swap (ARGB → ABGR) lives behind a cfg here so call sites stay platform-neutral.
 
 #[cfg(target_os = "android")]
 const fn fmt(argb: u32) -> u32 {
