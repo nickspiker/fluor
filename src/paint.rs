@@ -6,6 +6,8 @@
 //!
 //! Every blending primitive accepts an optional [`Clip`] (defaults to full buffer when `None`) and an optional [`AlphaMask`] (full-frame, multiplies into per-pixel alpha for soft clipping — rounded textboxes, squircle pane corners, scroll fades). The clip is resolved once at entry into `(x_min, y_min, x_max, y_max)` loop bounds, so the inner loops carry **zero per-pixel bounds checks** — the math at the entry is the proof. AlphaMask dimensions must equal the buffer's `(buf_w, buf_h)`; mismatches panic per AGENT.md "fail loud."
 
+use crate::coord::Coord;
+
 /// Clipping rectangle in buffer pixel coordinates. `x_end` and `y_end` are exclusive (matches Rust ranges). Construct via [`Clip::new`] or [`Clip::buffer`] for a full-buffer clip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Clip {
@@ -38,37 +40,37 @@ impl Clip {
 /// 2D affine transform — a 2×3 matrix laid out as `[a c tx; b d ty]`. Applied to a point `(x, y)` as `(a*x + c*y + tx, b*x + d*y + ty)`. Composes via [`then`](Self::then) (`a.then(b)` = "do `a` first, then `b`"). Used by the text path so glyph contours rotate / scale / skew *before* swash rasterizes them — proper hinting and AA on rotated glyphs, not a post-rotation pixel-shuffle.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Transform {
-    pub a: f32, pub b: f32,
-    pub c: f32, pub d: f32,
-    pub tx: f32, pub ty: f32,
+    pub a: Coord, pub b: Coord,
+    pub c: Coord, pub d: Coord,
+    pub tx: Coord, pub ty: Coord,
 }
 
 impl Transform {
     pub const IDENTITY: Transform = Transform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx: 0.0, ty: 0.0 };
 
     #[inline]
-    pub const fn new(a: f32, b: f32, c: f32, d: f32, tx: f32, ty: f32) -> Self {
+    pub const fn new(a: Coord, b: Coord, c: Coord, d: Coord, tx: Coord, ty: Coord) -> Self {
         Self { a, b, c, d, tx, ty }
     }
 
     #[inline]
-    pub fn rotate(radians: f32) -> Self {
-        let (s, co) = radians.sin_cos();
+    pub fn rotate(radians: Coord) -> Self {
+        let (s, co) = crate::math::sin_cos(radians);
         Self { a: co, b: s, c: -s, d: co, tx: 0.0, ty: 0.0 }
     }
 
     #[inline]
-    pub fn scale(sx: f32, sy: f32) -> Self {
+    pub fn scale(sx: Coord, sy: Coord) -> Self {
         Self { a: sx, b: 0.0, c: 0.0, d: sy, tx: 0.0, ty: 0.0 }
     }
 
     #[inline]
-    pub fn skew(kx: f32, ky: f32) -> Self {
+    pub fn skew(kx: Coord, ky: Coord) -> Self {
         Self { a: 1.0, b: ky, c: kx, d: 1.0, tx: 0.0, ty: 0.0 }
     }
 
     #[inline]
-    pub fn translate(tx: f32, ty: f32) -> Self {
+    pub fn translate(tx: Coord, ty: Coord) -> Self {
         Self { a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx, ty }
     }
 
@@ -87,7 +89,7 @@ impl Transform {
 
     /// Apply to a point.
     #[inline]
-    pub fn apply(self, x: f32, y: f32) -> (f32, f32) {
+    pub fn apply(self, x: Coord, y: Coord) -> (Coord, Coord) {
         (self.a * x + self.c * y + self.tx, self.b * x + self.d * y + self.ty)
     }
 
@@ -98,17 +100,15 @@ impl Transform {
     }
 
     /// Axis-aligned bounding box of the transformed rectangle `[0, w] × [0, h]`. Returns `(min_x, min_y, max_x, max_y)` in transformed coordinates. Used by text rasterizers to compute the clip-clamp range for a transformed glyph.
-    pub fn aabb_of_rect(self, w: f32, h: f32) -> (f32, f32, f32, f32) {
+    pub fn aabb_of_rect(self, w: Coord, h: Coord) -> (Coord, Coord, Coord, Coord) {
         let p0 = self.apply(0.0, 0.0);
         let p1 = self.apply(w, 0.0);
         let p2 = self.apply(0.0, h);
         let p3 = self.apply(w, h);
-        let xs = [p0.0, p1.0, p2.0, p3.0];
-        let ys = [p0.1, p1.1, p2.1, p3.1];
-        let min_x = xs.iter().copied().fold(f32::INFINITY, f32::min);
-        let max_x = xs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let min_y = ys.iter().copied().fold(f32::INFINITY, f32::min);
-        let max_y = ys.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let min_x = p0.0.min(p1.0).min(p2.0).min(p3.0);
+        let max_x = p0.0.max(p1.0).max(p2.0).max(p3.0);
+        let min_y = p0.1.min(p1.1).min(p2.1).min(p3.1);
+        let max_y = p0.1.max(p1.1).max(p2.1).max(p3.1);
         (min_x, min_y, max_x, max_y)
     }
 }
@@ -118,22 +118,22 @@ impl Transform {
 /// Use `.floor()` (not `.round()`) for monotonic bin assignment — `rem_euclid` handles negative angles cleanly and `.floor()` is single-uop on aarch64 NEON / x86 SSE4 ROUNDSS, so the legacy "subtract epsilon, use round" workaround is unnecessary.
 pub fn quantize_rotation(radians: f32, font_size_px: f32, k: u32) -> u16 {
     let radius = font_size_px * 0.5;
-    let raw_divs = (core::f32::consts::TAU * radius).ceil() as u32;
+    let raw_divs = crate::math::ceil(core::f32::consts::TAU * radius) as u32;
     let divs = ((raw_divs + k - 1) / k) * k;
-    let theta = radians.rem_euclid(core::f32::consts::TAU);
-    let bin = (theta / core::f32::consts::TAU * divs as f32).floor() as u32;
+    let theta = crate::math::rem_euclid(radians, core::f32::consts::TAU);
+    let bin = crate::math::floor(theta / core::f32::consts::TAU * divs as f32) as u32;
     (bin % divs.max(1)) as u16
 }
 
 /// Snap a continuous rotation angle to the nearest quantization bin and return the bin's representative angle (in radians, range `[0, 2π)`). Same quantization grid as [`quantize_rotation`]. Use this when constructing a [`Transform`] for text that should benefit from the rasterized-glyph cache: animated rotation that varies continuously per frame would miss the cache every frame; pre-snapping to bins makes consecutive frames within the same bin cache-hit.
 pub fn snap_rotation(radians: f32, font_size_px: f32, k: u32) -> f32 {
     let radius = font_size_px * 0.5;
-    let raw_divs = (core::f32::consts::TAU * radius).ceil() as u32;
+    let raw_divs = crate::math::ceil(core::f32::consts::TAU * radius) as u32;
     let divs = ((raw_divs + k - 1) / k) * k;
     if divs == 0 { return 0.0; }
     let step = core::f32::consts::TAU / divs as f32;
-    let theta = radians.rem_euclid(core::f32::consts::TAU);
-    (theta / step).floor() * step
+    let theta = crate::math::rem_euclid(radians, core::f32::consts::TAU);
+    crate::math::floor(theta / step) * step
 }
 
 /// Per-pixel alpha mask sized to the framebuffer. Multiplies into rendered alpha for soft clipping (textbox shapes, squircle pane corners, scroll fades). Carries its dimensions so primitives can panic on mismatch (per AGENT.md: init bugs fail loud, not silently render garbage).
@@ -550,7 +550,7 @@ pub mod glyph {
         let cy = y1 + t_clamped * dy;
         let ex = px - cx;
         let ey = py - cy;
-        (ex * ex + ey * ey).sqrt() - radius
+        crate::math::sqrt(ex * ex + ey * ey) - radius
     }
 
     /// Pre-multiplied SWAR blend of `fg` over `bg` with explicit `alpha` (0..=256). Photon's exact pattern: widen each 32-bit pixel to 64 bits with each channel in its own 16-bit slot, do `bg*(256-α) + fg*α` in parallel, narrow back.
@@ -829,11 +829,11 @@ mod tests {
     fn quantize_rotation_scales_with_font_size() {
         // Bigger font → more divisions.
         let small = {
-            let raw = (core::f32::consts::TAU * 10.0 * 0.5).ceil() as u32;
+            let raw = crate::math::ceil(core::f32::consts::TAU * 10.0 * 0.5) as u32;
             ((raw + 7) / 8) * 8
         };
         let big = {
-            let raw = (core::f32::consts::TAU * 100.0 * 0.5).ceil() as u32;
+            let raw = crate::math::ceil(core::f32::consts::TAU * 100.0 * 0.5) as u32;
             ((raw + 7) / 8) * 8
         };
         assert!(big > small);

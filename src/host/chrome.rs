@@ -4,6 +4,9 @@
 //!
 //! Chrome here = window controls strip + edges. Title-bar text, scroll bars, status bar, tooltips, context menus, per-pane chrome — all not yet built.
 
+use alloc::vec::Vec;
+use crate::coord::Coord;
+use crate::math;
 use crate::paint;
 use crate::theme;
 
@@ -31,14 +34,14 @@ pub enum ResizeEdge {
 }
 
 /// Photon's `get_resize_edge`. Edge thickness derived from harmonic-mean span.
-pub fn get_resize_edge(window_width: u32, window_height: u32, x: f32, y: f32) -> ResizeEdge {
-    let span = 2.0 * window_width as f32 * window_height as f32 / (window_width as f32 + window_height as f32);
-    let resize_border = (span / 32.0).ceil();
+pub fn get_resize_edge(window_width: u32, window_height: u32, x: Coord, y: Coord) -> ResizeEdge {
+    let span = 2.0 * window_width as Coord * window_height as Coord / (window_width as Coord + window_height as Coord);
+    let resize_border = math::ceil(span / 32.0);
 
     let at_left = x < resize_border;
-    let at_right = x > (window_width as f32 - resize_border);
+    let at_right = x > (window_width as Coord - resize_border);
     let at_top = y < resize_border;
-    let at_bottom = y > (window_height as f32 - resize_border);
+    let at_bottom = y > (window_height as Coord - resize_border);
 
     if at_top && at_left { ResizeEdge::TopLeft }
     else if at_top && at_right { ResizeEdge::TopRight }
@@ -59,15 +62,15 @@ pub fn draw_window_controls(
     hit_test_map: &mut [u8],
     window_width: u32,
     window_height: u32,
-    ru: f32,
+    ru: Coord,
 ) -> (usize, Vec<(u16, u8, u8)>, usize, usize) {
     let window_width = window_width as usize;
     let window_height = window_height as usize;
 
     // Calculate button dimensions: a fixed minimum + harmonic-mean span scaled by ru. The minimum guarantees controls are always visible (and that the symbol rasterizers' integer math never floors to zero), and the +scaled term gives smooth growth with viewport size — same growth rate as photon's pure-scaled version, just with a floor.
-    let span = 2.0 * window_width as f32 * window_height as f32
-        / (window_width as f32 + window_height as f32);
-    let button_height = MIN_BUTTON_HEIGHT_PX + (span / 32.0 * ru).ceil() as usize;
+    let span = 2.0 * window_width as Coord * window_height as Coord
+        / (window_width as Coord + window_height as Coord);
+    let button_height = MIN_BUTTON_HEIGHT_PX + math::ceil(span / 32.0 * ru) as usize;
     let button_width = button_height;
     let total_width = button_width * 7 / 2;
 
@@ -81,21 +84,21 @@ pub fn draw_window_controls(
     let y_start = 0;
 
     // Build squircle crossings for bottom-left corner
-    let radius = span * ru / 4.;
+    let radius = span * ru / 4.0;
     let squirdleyness = 24;
 
     let mut crossings: Vec<(u16, u8, u8)> = Vec::new();
     let mut y = 1f32;
     loop {
         let y_norm = y / radius;
-        let x_norm = (1.0 - y_norm.powi(squirdleyness)).powf(1.0 / squirdleyness as f32);
+        let x_norm = math::powf(1.0 - math::powi(y_norm, squirdleyness), 1.0 / squirdleyness as Coord);
         let x = x_norm * radius;
         let inset = radius - x;
         if inset > 0. {
             crossings.push((
                 inset as u16,
-                (inset.fract().sqrt() * 256.) as u8,
-                ((1. - inset.fract()).sqrt() * 256.) as u8,
+                (math::sqrt(math::fract(inset)) * 256.) as u8,
+                (math::sqrt(1. - math::fract(inset)) * 256.) as u8,
             ));
         }
         if x < y {
