@@ -182,7 +182,7 @@ impl Textbox {
         self.cursor = self.chars.len();
     }
 
-    fn delete_selection(&mut self, text: &mut TextRenderer) {
+    pub fn delete_selection(&mut self, text: &mut TextRenderer) {
         if let Some((start, end)) = self.selection_range() {
             self.chars.drain(start..end);
             self.cursor = start;
