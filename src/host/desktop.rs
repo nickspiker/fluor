@@ -11,6 +11,7 @@ use super::chrome::{self, ResizeEdge, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT
 use crate::coord::Coord;
 use crate::paint;
 use crate::paint::{snap_rotation, Transform};
+use crate::rpn::{Op, RpnCompositor};
 use crate::text::TextRenderer;
 use crate::theme;
 use crate::widgets::Textbox;
@@ -57,6 +58,13 @@ struct DesktopApp {
     /// Demo textbox living in the panes example. Edit it with the keyboard once you click in.
     demo_textbox: Option<Textbox>,
 
+    // --- RPN compositing ---
+    rpn: Option<RpnCompositor>,
+    /// Layer indices in the RPN compositor.
+    layer_base: usize,
+    layer_textbox: usize,
+    layer_blinkey: usize,
+
     // --- macOS manual resize tracking ---
     // winit stops delivering CursorMoved when the cursor leaves the window during a
     // resize drag on macOS. We poll NSEvent.mouseLocation directly via objc_msgSend
@@ -102,6 +110,10 @@ impl DesktopApp {
             hover_pixel_list: Vec::new(),
             text: None,
             demo_textbox: None,
+            rpn: None,
+            layer_base: 0,
+            layer_textbox: 0,
+            layer_blinkey: 0,
             #[cfg(target_os = "macos")]
             is_dragging_resize: false,
             #[cfg(target_os = "macos")]
@@ -165,119 +177,98 @@ impl DesktopApp {
             self.hit_test_map.fill(HIT_NONE);
         }
 
+        let Some(rpn) = self.rpn.as_mut() else { return; };
+
+        // --- Rasterize dirty layers ---
+
+        // Layer 0: base (background + panes + chrome + title)
+        if rpn.layers[self.layer_base].dirty {
+            let base = &mut rpn.layers[self.layer_base].pixels;
+            base.fill(0);
+            paint::background_noise(base, buf_w, buf_h, 0, true, 0, None);
+            self.compositor.render(base, buf_w, buf_h);
+            let (start, crossings, button_x_start, button_height) = chrome::draw_window_controls(
+                base, &mut self.hit_test_map, vp_w, vp_h, 1.0,
+            );
+            chrome::draw_window_edges_and_mask(
+                base, &mut self.hit_test_map, vp_w, vp_h, start, &crossings,
+            );
+            chrome::draw_button_hairlines(
+                base, &mut self.hit_test_map, vp_w, vp_h,
+                button_x_start, button_height, start, &crossings,
+            );
+            let span = 2.0 * vp_w as Coord * vp_h as Coord / (vp_w as Coord + vp_h as Coord);
+            let bw = chrome::MIN_BUTTON_HEIGHT_PX as Coord + crate::math::ceil(span / 32.0);
+            let title_size = bw * 0.55;
+            if title_size >= 6.0 {
+                if let Some(text) = self.text.as_mut() {
+                    let pad = bw * 0.5;
+                    let baseline_y = bw * 0.5;
+                    let _ = text.draw_text_left_u32(
+                        base, buf_w, buf_h, &self.title,
+                        pad, baseline_y, title_size, 400,
+                        theme::TEXT_COLOUR, "Open Sans", None, None, None,
+                    );
+                    let aspect = vp_w as Coord / vp_h as Coord;
+                    let demo_size = title_size * 0.85;
+                    let theta = snap_rotation((aspect - 1.0) * core::f32::consts::PI, demo_size, 8);
+                    let demo_anchor_x = vp_w as Coord * 0.5;
+                    let demo_anchor_y = bw * 4.0;
+                    let demo_transform = Transform::translate(-demo_anchor_x, -demo_anchor_y)
+                        .then(Transform::rotate(theta))
+                        .then(Transform::translate(demo_anchor_x, demo_anchor_y));
+                    let _ = text.draw_text_center_u32(
+                        base, buf_w, buf_h,
+                        "rotation tracks viewport aspect ratio (proper AA via swash::scale)",
+                        demo_anchor_x, demo_anchor_y, demo_size, 400,
+                        theme::TEXT_COLOUR, "Open Sans", None, None, Some(demo_transform),
+                    );
+                }
+            }
+        }
+
+        // Layer 1: textbox (pill + glow + text + selection — everything except blinkey)
+        if rpn.layers[self.layer_textbox].dirty {
+            let tb_buf = &mut rpn.layers[self.layer_textbox].pixels;
+            tb_buf.fill(0);
+            if let Some(tb) = self.demo_textbox.as_mut() {
+                if let Some(text) = self.text.as_mut() {
+                    tb.render(tb_buf, buf_w, buf_h, text, None, None);
+                }
+            }
+        }
+
+        // Layer 2: blinkey (wave cursor only — additive)
+        if rpn.layers[self.layer_blinkey].dirty {
+            let bk_buf = &mut rpn.layers[self.layer_blinkey].pixels;
+            bk_buf.fill(0);
+            if let Some(tb) = self.demo_textbox.as_ref() {
+                tb.render_blinkey_into(bk_buf, buf_w, buf_h);
+            }
+        }
+
+        // --- Evaluate RPN program → composite ---
+        let composite = rpn.evaluate();
+
+        // --- Copy composite to present buffer + apply hover overlay ---
         #[cfg(target_os = "macos")]
         {
             let Some(renderer) = self.renderer.as_mut() else { return; };
             let mut buffer = renderer.lock_buffer();
-            Self::render_into(&mut self.compositor, &mut self.hit_test_map, &self.title, self.text.as_mut(), self.demo_textbox.as_mut(), &mut self.hover_pixel_list, self.hover_state, &mut buffer, buf_w, buf_h, vp_w, vp_h);
+            buffer.copy_from_slice(composite);
+            self.hover_pixel_list = chrome::pixels_for_button(&self.hit_test_map, self.hover_state);
+            chrome::draw_button_hover_by_pixels(&mut buffer, &self.hover_pixel_list, true, self.hover_state);
             let _ = buffer.present();
         }
         #[cfg(not(target_os = "macos"))]
         {
             let Some(surface) = self.surface.as_mut() else { return; };
             let mut buffer = surface.buffer_mut().expect("softbuffer buffer_mut");
-            Self::render_into(&mut self.compositor, &mut self.hit_test_map, &self.title, self.text.as_mut(), self.demo_textbox.as_mut(), &mut self.hover_pixel_list, self.hover_state, &mut buffer, buf_w, buf_h, vp_w, vp_h);
+            buffer.copy_from_slice(composite);
+            self.hover_pixel_list = chrome::pixels_for_button(&self.hit_test_map, self.hover_state);
+            chrome::draw_button_hover_by_pixels(&mut buffer, &self.hover_pixel_list, true, self.hover_state);
             buffer.present().expect("softbuffer buffer.present");
         }
-    }
-
-    /// Paint everything into the given pixel buffer. Shared between wgpu and softbuffer paths.
-    fn render_into(compositor: &mut Compositor, hit_test_map: &mut Vec<u8>, title: &str, mut text: Option<&mut TextRenderer>, demo_textbox: Option<&mut Textbox>, hover_pixel_list: &mut Vec<usize>, hover_state: u8, buffer: &mut [u32], buf_w: usize, buf_h: usize, vp_w: u32, vp_h: u32) {
-        // 1. Background noise — full buffer fill
-        paint::background_noise(buffer, buf_w, buf_h, 0, true, 0, None);
-        // 2. Panes on top of background
-        compositor.render(buffer, buf_w, buf_h);
-        // 3. Chrome controls strip (writes hit_test_map for click routing).
-        let (start, crossings, button_x_start, button_height) = chrome::draw_window_controls(
-            buffer,
-            hit_test_map,
-            vp_w,
-            vp_h,
-            1.0,
-        );
-        // 4. Two-tone window edges + squircle corner mask (verbatim photon)
-        chrome::draw_window_edges_and_mask(
-            buffer,
-            hit_test_map,
-            vp_w,
-            vp_h,
-            start,
-            &crossings,
-        );
-        // 5. Vertical hairlines between control buttons (verbatim photon)
-        chrome::draw_button_hairlines(
-            buffer,
-            hit_test_map,
-            vp_w,
-            vp_h,
-            button_x_start,
-            button_height,
-            start,
-            &crossings,
-        );
-        // 6. Title text — left-aligned, vertically centered in the button row, sized relative to button height.
-        // Skipped below a readable size — controls are the load-bearing UI; text shouldn't smear into illegibility.
-        let span = 2.0 * vp_w as Coord * vp_h as Coord / (vp_w as Coord + vp_h as Coord);
-        let bw = chrome::MIN_BUTTON_HEIGHT_PX as Coord + crate::math::ceil(span / 32.0);
-        let title_size = bw * 0.55;
-        if title_size >= 6.0 {
-        if let Some(ref mut text) = text {
-            let pad = bw * 0.5;
-            let baseline_y = bw * 0.5;
-            let _ = text.draw_text_left_u32(
-                buffer,
-                buf_w,
-                buf_h,
-                title,
-                pad,
-                baseline_y,
-                title_size,
-                400,
-                theme::TEXT_COLOUR,
-                "Open Sans",
-                None,
-                None,
-                None,
-            );
-
-            // Aspect-ratio-driven rotation demo.
-            let aspect = vp_w as Coord / vp_h as Coord;
-            let demo_size = title_size * 0.85;
-            let theta = snap_rotation((aspect - 1.0) * core::f32::consts::PI, demo_size, 8);
-            let demo_anchor_x = vp_w as Coord * 0.5;
-            let demo_anchor_y = bw * 4.0;
-            let demo_transform = Transform::translate(-demo_anchor_x, -demo_anchor_y)
-                .then(Transform::rotate(theta))
-                .then(Transform::translate(demo_anchor_x, demo_anchor_y));
-            let _ = text.draw_text_center_u32(
-                buffer,
-                buf_w,
-                buf_h,
-                "rotation tracks viewport aspect ratio (proper AA via swash::scale)",
-                demo_anchor_x,
-                demo_anchor_y,
-                demo_size,
-                400,
-                theme::TEXT_COLOUR,
-                "Open Sans",
-                None,
-                None,
-                Some(demo_transform),
-            );
-        }
-        }
-
-        // 7. Demo textbox — sits below the rotation demo, accepts focus + keyboard input.
-        if let Some(tb) = demo_textbox {
-            if let Some(ref mut text) = text {
-                tb.render(buffer, buf_w, buf_h, text, None, None);
-            }
-        }
-
-
-        // 8. Hover overlay on whichever button is hovered.
-        *hover_pixel_list = chrome::pixels_for_button(hit_test_map, hover_state);
-        chrome::draw_button_hover_by_pixels(buffer, hover_pixel_list, true, hover_state);
     }
 
     /// Look up the chrome hit-id under the current cursor. Cursor coordinates are external input — winit reports positions outside the window during drag-resize and during the moment cursor leaves.
@@ -488,6 +479,24 @@ impl ApplicationHandler for DesktopApp {
         }
         self.update_textbox_layout();
 
+        // Initialize RPN compositor with 3 layers:
+        //   0: base (background + panes + chrome + title)  — dirty on resize
+        //   1: textbox (pill + glow + text + selection)    — dirty on edit/focus
+        //   2: blinkey (wave cursor)                       — dirty on blink tick
+        // Program: Push 0, Push 1, AlphaOver, Push 2, Add
+        let mut rpn = RpnCompositor::new(initial.width as usize, initial.height as usize);
+        self.layer_base = rpn.add_layer();
+        self.layer_textbox = rpn.add_layer();
+        self.layer_blinkey = rpn.add_layer();
+        rpn.set_program(vec![
+            Op::Push(self.layer_base),
+            Op::Push(self.layer_textbox),
+            Op::AlphaOver,
+            Op::Push(self.layer_blinkey),
+            Op::Add,
+        ]);
+        self.rpn = Some(rpn);
+
         self.window = Some(window.clone());
         window.request_redraw();
     }
@@ -550,6 +559,9 @@ impl ApplicationHandler for DesktopApp {
             if now >= when {
                 if let Some(tb) = self.demo_textbox.as_mut() {
                     if tb.flip_blinkey() {
+                        if let Some(rpn) = self.rpn.as_mut() {
+                            rpn.layers[self.layer_blinkey].dirty = true;
+                        }
                         if let Some(window) = self.window.as_ref() { window.request_redraw(); }
                     }
                 }
@@ -587,6 +599,9 @@ impl ApplicationHandler for DesktopApp {
                 }
 
                 self.compositor.resize(size.width, size.height);
+                if let Some(rpn) = self.rpn.as_mut() {
+                    rpn.resize(size.width as usize, size.height as usize);
+                }
                 let map_size = (size.width as usize)
                     .checked_mul(size.height as usize)
                     .unwrap_or(0);
@@ -609,6 +624,9 @@ impl ApplicationHandler for DesktopApp {
                         let tr = tb.center_x + tb.width * 0.5 - tb.font_size * 0.4;
                         let clamped_x = self.cursor_x.clamp(tl, tr);
                         tb.cursor = tb.cursor_index_from_x(clamped_x);
+                    }
+                    if let Some(rpn) = self.rpn.as_mut() {
+                        rpn.layers[self.layer_textbox].dirty = true;
                     }
                     if let Some(window) = self.window.as_ref() { window.request_redraw(); }
                     return;
@@ -705,9 +723,12 @@ impl ApplicationHandler for DesktopApp {
                     let was_focused = tb.focused;
                     tb.handle_click(self.cursor_x, self.cursor_y);
                     if tb.focused {
-                        // Start drag selection — anchor is set in handle_click, track drag state.
                         self.is_dragging_select = true;
                         self.selection_scroll_time = None;
+                        if let Some(rpn) = self.rpn.as_mut() {
+                            rpn.layers[self.layer_textbox].dirty = true;
+                            rpn.layers[self.layer_blinkey].dirty = true;
+                        }
                         let interval = self.next_blink_interval();
                         self.next_blink = Some(std::time::Instant::now() + interval);
                         window.request_redraw();
@@ -715,6 +736,10 @@ impl ApplicationHandler for DesktopApp {
                     } else if was_focused {
                         self.next_blink = None;
                         self.is_dragging_select = false;
+                        if let Some(rpn) = self.rpn.as_mut() {
+                            rpn.layers[self.layer_textbox].dirty = true;
+                            rpn.layers[self.layer_blinkey].dirty = true;
+                        }
                         window.request_redraw();
                     }
                 }
@@ -821,6 +846,10 @@ impl ApplicationHandler for DesktopApp {
                     }
                 }
                 if changed {
+                    if let Some(rpn) = self.rpn.as_mut() {
+                        rpn.layers[self.layer_textbox].dirty = true;
+                        rpn.layers[self.layer_blinkey].dirty = true;
+                    }
                     let interval = self.next_blink_interval();
                     self.next_blink = Some(std::time::Instant::now() + interval);
                     if let Some(window) = self.window.as_ref() { window.request_redraw(); }
