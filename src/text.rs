@@ -393,16 +393,33 @@ impl TextRenderer {
         colour_wide = (colour_wide | (colour_wide << 8)) & 0x00FF00FF00FF00FF;
 
         // Identity-or-None: cosmic-text's SwashCache fast path. Non-identity transform splits two ways:
-        //   1. **Contour transform** (linear part only — `a, b, c, d`, *no translation*) → fed to swash::scale to rotate/skew/scale the glyph outline in font space. Translation is intentionally stripped here because swash applies its transform to the contour in glyph-local coords (origin at 0,0 baseline-left); leaving translation in would translate the contour itself, blowing the placement bbox out into absolute pixel space.
-        //   2. **Position transform** (full transform — linear *plus* translation) → applied to each glyph's run-local position, so the run translates + rotates as a rigid body around the chosen anchor.
+        //   1. **Contour transform** (linear part only — `a, b, c, d`, *no translation*) → fed to swash::scale to rotate/skew/scale the glyph outline in font space. Translation is intentionally stripped here because swash applies its transform to the contour in glyph-local coords (origin at 0,0 baseline-left); leaving translation in would translate the contour itself, blowing the placement bbox out into absolute pixel space. The linear part is *snapped* per-glyph to the 1-pixel-arc rotation grid via [`crate::paint::snap_rotation`], so consecutive frames within the same rotation bin reuse the same rasterized glyph (cache hit). Snapping the contour but **not** the position lets the run slide smoothly along its arc while each glyph's orientation steps in cache-friendly bins.
+        //   2. **Position transform** (full transform — linear *plus* translation, *unsnapped*) → applied to each glyph's run-local position, so the run translates + rotates as a rigid body around the chosen anchor with sub-bin precision.
         // zeno's Transform constructor takes (xx, xy, yx, yy, x, y) where the matrix is `[xx xy x; yx yy y]`. Our `Transform` stores `[a c tx; b d ty]` — same layout, just renamed: xx=a, xy=c, yx=b, yy=d, x=tx, y=ty.
         let active_transform = transform.filter(|t| !t.is_identity());
-        let zeno_transform = active_transform.map(|t| ZenoTransform::new(t.a, t.c, t.b, t.d, 0.0, 0.0));
+        // Continuous rotation angle of the linear part (radians). atan2 of the rotated +X axis. For pure rotation `R(θ)` this returns θ exactly; for rotation+uniform-scale the magnitude factors out; for skew/non-uniform scale this picks the angle of the first column as the "rotation component" — fine for our text use case (titles rotate, scale stays uniform).
+        let base_theta = active_transform.map(|t| crate::math::atan2(t.b, t.a));
 
         for run in buffer.layout_runs() {
             let baseline_offset = run.line_y;
             for glyph in run.glyphs {
                 let physical_glyph = glyph.physical((offset_x, offset_y), 1.);
+
+                // Per-glyph snapped contour matrix. Snap radius is `glyph.font_size / 2` (the 1-pixel-arc rule, evaluated at the font size of *this* glyph since runs may mix sizes). Compose `R(δ) ∘ M_linear` where δ = θ_snapped − θ_actual: this rotates the original linear matrix forward by the snap delta, preserving any scale/skew while landing the rotation component on a bin boundary.
+                let contour_transform = match (active_transform, base_theta) {
+                    (Some(t), Some(theta)) => {
+                        let theta_snapped = crate::paint::snap_rotation(theta, glyph.font_size, 8);
+                        let delta = theta_snapped - theta;
+                        if delta == 0.0 {
+                            Some(Transform { a: t.a, b: t.b, c: t.c, d: t.d, tx: 0.0, ty: 0.0 })
+                        } else {
+                            let linear_only = Transform { a: t.a, b: t.b, c: t.c, d: t.d, tx: 0.0, ty: 0.0 };
+                            Some(linear_only.then(Transform::rotate(delta)))
+                        }
+                    }
+                    _ => None,
+                };
+                let zeno_transform = contour_transform.map(|t| ZenoTransform::new(t.a, t.c, t.b, t.d, 0.0, 0.0));
 
                 let (glyph_data, placement_left, placement_top, placement_w, placement_h) = match zeno_transform {
                     None => {
@@ -412,8 +429,8 @@ impl TextRenderer {
                         (&image.data[..], p.left, p.top, p.width, p.height)
                     }
                     Some(zt) => {
-                        // Transform path: check our own LRU cache first; on miss, rasterize via swash directly (contour transformed in font space → proper hinting + AA), then insert at front.
-                        let t = active_transform.expect("zeno_transform set implies active_transform set");
+                        // Transform path: check our own LRU cache first; on miss, rasterize via swash directly (contour transformed in font space → proper hinting + AA), then insert at front. Cache key uses the *snapped* linear part so consecutive frames in the same rotation bin hit.
+                        let t = contour_transform.expect("zeno_transform set implies contour_transform set");
                         let key = TransformGlyphKey {
                             font_id: glyph.font_id,
                             glyph_id: glyph.glyph_id,
