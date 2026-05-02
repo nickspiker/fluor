@@ -10,7 +10,7 @@
 use super::chrome::{self, ResizeEdge, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE};
 use crate::coord::Coord;
 use crate::paint;
-use crate::paint::{snap_rotation, Transform};
+use crate::paint::Transform;
 use crate::rpn::{Op, RpnCompositor};
 use crate::text::TextRenderer;
 use crate::theme;
@@ -221,7 +221,8 @@ impl DesktopApp {
                     );
                     let aspect = vp_w as Coord / vp_h as Coord;
                     let demo_size = title_size * 0.85;
-                    let theta = snap_rotation((aspect - 1.0) * core::f32::consts::PI, demo_size, 8);
+                    // Continuous theta — snapping happens per-glyph inside the text path (contour only; placement stays smooth).
+                    let theta = (aspect - 1.0) * core::f32::consts::PI;
                     let demo_anchor_x = vp_w as Coord * 0.5;
                     let demo_anchor_y = bw * 4.0;
                     let demo_transform = Transform::translate(-demo_anchor_x, -demo_anchor_y)
