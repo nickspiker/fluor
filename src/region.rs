@@ -123,6 +123,24 @@ impl Region {
         result
     }
 
+    // --- Rectangle relationships ---
+
+    /// True if this region's interior overlaps `other`'s interior. Edges-only contact returns false (consistent with `contains` being half-open on right/bottom).
+    #[inline]
+    pub fn intersects(&self, other: &Region) -> bool {
+        self.x < other.right() && other.x < self.right() && self.y < other.bottom() && other.y < self.bottom()
+    }
+
+    /// Smallest region containing both `self` and `other`. Span is recomputed for the union dimensions, not interpolated.
+    #[inline]
+    pub fn union(&self, other: &Region) -> Region {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let r = self.right().max(other.right());
+        let b = self.bottom().max(other.bottom());
+        Region::new(x, y, r - x, b - y)
+    }
+
     // --- Reshaping ---
 
     /// Shrink by `frac` of each dimension on each side.
