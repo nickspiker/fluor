@@ -387,15 +387,23 @@ impl Textbox {
         }
 
         // 5. Cursor (blinkey) — only when focused, no selection active, and visible.
+        // When using layered rendering, call render_blinkey into a separate layer instead.
         if self.focused && !self.has_selection() && self.blinkey_visible {
-            let cpx = self.cursor_pixel_x();
-            let blinkey_x = cpx as usize;
-            let blinkey_y = (self.center_y - self.font_size * 0.5) as usize;
-            let blinkey_h = self.font_size as usize;
-            // Only draw if blinkey is within safe bounds (±7 horizontal spread).
-            if blinkey_x >= 7 && blinkey_x + 7 < buf_w && blinkey_y + blinkey_h < buf_h {
-                paint::draw_blinkey(pixels, buf_w, blinkey_x, blinkey_y, blinkey_h, self.blinkey_wave_top, true);
-            }
+            self.render_blinkey_into(pixels, buf_w, buf_h);
+        }
+    }
+
+    /// Render only the blinkey wave cursor into the given buffer. Used by the RPN compositor
+    /// to rasterize the blinkey into its own additive layer, separate from the textbox content.
+    /// The buffer should be zeroed — the blinkey writes non-zero pixels where the wave is.
+    pub fn render_blinkey_into(&self, pixels: &mut [u32], buf_w: usize, buf_h: usize) {
+        if !self.focused || self.has_selection() || !self.blinkey_visible { return; }
+        let cpx = self.cursor_pixel_x();
+        let blinkey_x = cpx as usize;
+        let blinkey_y = (self.center_y - self.font_size * 0.5) as usize;
+        let blinkey_h = self.font_size as usize;
+        if blinkey_x >= 7 && blinkey_x + 7 < buf_w && blinkey_y + blinkey_h < buf_h {
+            paint::draw_blinkey(pixels, buf_w, blinkey_x, blinkey_y, blinkey_h, self.blinkey_wave_top, true);
         }
     }
 }
