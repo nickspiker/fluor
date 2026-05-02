@@ -4,6 +4,7 @@
 //!
 //! `Compositor` owns the pane tree, the active `Viewport`, and the focus state. Per `## API / Implementation Separation` in AGENT.md, the renderer underneath is an implementation detail — `Compositor::render` currently calls into [`crate::paint`] directly, but a future enum-dispatched backend (CPU SIMD / GPU / Spirix-AA) plugs in here without changing the API.
 
+use alloc::vec::Vec;
 use crate::coord::RuVec2;
 use crate::geom::Viewport;
 use crate::paint;

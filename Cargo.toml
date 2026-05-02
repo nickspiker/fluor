@@ -21,7 +21,9 @@ crate-type = ["rlib"]
 default = ["std", "host-winit", "simd"]
 std = []
 # host-winit transitively requires text — desktop chrome wants real glyphs out of the box.
-host-winit = ["std", "text", "dep:winit", "dep:softbuffer"]
+# macOS uses wgpu/Metal for PostMultiplied alpha (transparent squircle corners);
+# Linux/Windows use softbuffer (CPU blit, no GPU dependency).
+host-winit = ["std", "text", "dep:winit", "dep:softbuffer", "dep:wgpu", "dep:pollster"]
 host-softbuffer = ["std", "dep:softbuffer"]
 host-bare = []
 text = ["std", "dep:cosmic-text", "dep:swash"]
@@ -34,8 +36,11 @@ simd = []
 # is required for crates.io publish.
 spirix = { version = "0.0.12", path = "../spirix", default-features = false, features = ["alloc"] }
 
+libm = "0.2"
 winit = { version = "0.30", optional = true }
 softbuffer = { version = "0.4", optional = true }
+wgpu = { version = "28", default-features = false, features = ["metal"], optional = true }
+pollster = { version = "0.4", optional = true }
 cosmic-text = { version = "0.14", optional = true }
 # swash is pulled in transitively by cosmic-text but we use it directly for transform-aware
 # glyph rasterization (rotated/skewed text). Pinning the same version cosmic-text uses keeps

@@ -2,6 +2,7 @@
 //!
 //! Patterns lifted from photon's [text_editing.rs](/mnt/Octopus/Code/photon/src/ui/text_editing.rs) — `chars + widths + cursor` model, Vec<usize> per-char widths cached for click-to-cursor mapping. Photon's wave-animated blinkey and multi-line / selection / scrolling features are deferred; v0 textbox is single-line, solid cursor, no selection.
 
+use crate::coord::Coord;
 use crate::paint::{self, AlphaMask, Clip};
 use crate::text::TextRenderer;
 use crate::theme;
@@ -13,19 +14,19 @@ pub struct Textbox {
     pub cursor: usize,
     pub focused: bool,
     /// Pixel rect (center-anchored).
-    pub center_x: f32,
-    pub center_y: f32,
-    pub width: f32,
-    pub height: f32,
+    pub center_x: Coord,
+    pub center_y: Coord,
+    pub width: Coord,
+    pub height: Coord,
     /// Font size in pixels.
-    pub font_size: f32,
+    pub font_size: Coord,
     /// Per-char pixel widths cached after the last edit. `widths[i]` = pixel width of `chars[i]`.
-    widths: Vec<f32>,
+    widths: Vec<Coord>,
     font: &'static str,
 }
 
 impl Textbox {
-    pub fn new(center_x: f32, center_y: f32, width: f32, height: f32, font_size: f32) -> Self {
+    pub fn new(center_x: Coord, center_y: Coord, width: Coord, height: Coord, font_size: Coord) -> Self {
         Self {
             chars: Vec::new(),
             cursor: 0,
@@ -41,7 +42,7 @@ impl Textbox {
     }
 
     /// True if pixel `(x, y)` is inside the textbox rect.
-    pub fn contains(&self, x: f32, y: f32) -> bool {
+    pub fn contains(&self, x: Coord, y: Coord) -> bool {
         let half_w = self.width * 0.5;
         let half_h = self.height * 0.5;
         x >= self.center_x - half_w && x < self.center_x + half_w
@@ -49,14 +50,14 @@ impl Textbox {
     }
 
     /// Reposition + resize, e.g., on viewport resize. Doesn't invalidate text content; recalc_widths is still required after a font_size change.
-    pub fn set_rect(&mut self, center_x: f32, center_y: f32, width: f32, height: f32) {
+    pub fn set_rect(&mut self, center_x: Coord, center_y: Coord, width: Coord, height: Coord) {
         self.center_x = center_x;
         self.center_y = center_y;
         self.width = width;
         self.height = height;
     }
 
-    pub fn set_font_size(&mut self, font_size: f32, text: &mut TextRenderer) {
+    pub fn set_font_size(&mut self, font_size: Coord, text: &mut TextRenderer) {
         self.font_size = font_size;
         self.recalc_widths(text);
     }
@@ -108,7 +109,7 @@ impl Textbox {
     pub fn cursor_end(&mut self) { self.cursor = self.chars.len(); }
 
     /// Convert a click x-coordinate (in window pixel space) to a cursor index. Walks the cached `widths` array, picking the nearest char boundary.
-    pub fn cursor_index_from_x(&self, click_x: f32) -> usize {
+    pub fn cursor_index_from_x(&self, click_x: Coord) -> usize {
         let text_left = self.text_left();
         if click_x <= text_left { return 0; }
         let mut accum = text_left;
@@ -121,7 +122,7 @@ impl Textbox {
     }
 
     /// Handle a mouse click. Sets focus + cursor position if the click is inside; clears focus otherwise.
-    pub fn handle_click(&mut self, x: f32, y: f32) {
+    pub fn handle_click(&mut self, x: Coord, y: Coord) {
         if self.contains(x, y) {
             self.focused = true;
             self.cursor = self.cursor_index_from_x(x);
@@ -131,12 +132,12 @@ impl Textbox {
     }
 
     /// Pixel x of the leftmost glyph (left edge of the textbox + a small inset).
-    fn text_left(&self) -> f32 {
+    fn text_left(&self) -> Coord {
         self.center_x - self.width * 0.5 + self.padding()
     }
 
     /// Symmetric inset between the textbox border and the text, scaled with font size.
-    fn padding(&self) -> f32 {
+    fn padding(&self) -> Coord {
         self.font_size * 0.4
     }
 
@@ -183,7 +184,7 @@ impl Textbox {
 
         // 4. Cursor — solid 1-px-or-thicker vertical bar at the cursor's pixel x. Only when focused.
         if self.focused {
-            let cursor_x = self.text_left() + self.widths[..self.cursor].iter().sum::<f32>();
+            let cursor_x = self.text_left() + self.widths[..self.cursor].iter().sum::<Coord>();
             let cursor_h = self.font_size;
             let cy_top = self.center_y - cursor_h * 0.5;
             let thickness = (self.font_size * 0.06).max(1.0) as isize;
