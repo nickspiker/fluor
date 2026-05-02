@@ -20,7 +20,7 @@ use winit::application::ApplicationHandler;
 use winit::error::EventLoopError;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 /// Run the desktop host until the window closes.
@@ -47,6 +47,7 @@ struct DesktopApp {
     hit_test_map: Vec<u8>,
     cursor_x: Coord,
     cursor_y: Coord,
+    modifiers: ModifiersState,
     /// Currently hovered chrome button id (HIT_NONE if none). Drives the hover overlay.
     hover_state: u8,
     /// Cached pixel list for the currently hovered button — recomputed on hover-state change.
@@ -72,6 +73,9 @@ struct DesktopApp {
     drag_start_cursor_screen_pos: (f64, f64),
     #[cfg(target_os = "macos")]
     screen_height: u32,
+
+    /// Next blinkey flip time. The blink cycle alternates the wave cursor between top-bright and bottom-bright. When `Instant::now() >= next_blink`, we flip and schedule the next one.
+    next_blink: Option<std::time::Instant>,
 }
 
 impl DesktopApp {
@@ -87,6 +91,7 @@ impl DesktopApp {
             hit_test_map: Vec::new(),
             cursor_x: 0.0,
             cursor_y: 0.0,
+            modifiers: ModifiersState::empty(),
             hover_state: chrome::HIT_NONE,
             hover_pixel_list: Vec::new(),
             text: None,
@@ -103,6 +108,7 @@ impl DesktopApp {
             drag_start_cursor_screen_pos: (0.0, 0.0),
             #[cfg(target_os = "macos")]
             screen_height: 0,
+            next_blink: None,
         }
     }
 
@@ -144,20 +150,20 @@ impl DesktopApp {
         {
             let Some(renderer) = self.renderer.as_mut() else { return; };
             let mut buffer = renderer.lock_buffer();
-            Self::render_into(&mut self.compositor, &mut self.hit_test_map, &self.title, self.text.as_mut(), self.demo_textbox.as_ref(), &mut self.hover_pixel_list, self.hover_state, &mut buffer, buf_w, buf_h, vp_w, vp_h);
+            Self::render_into(&mut self.compositor, &mut self.hit_test_map, &self.title, self.text.as_mut(), self.demo_textbox.as_mut(), &mut self.hover_pixel_list, self.hover_state, &mut buffer, buf_w, buf_h, vp_w, vp_h);
             let _ = buffer.present();
         }
         #[cfg(not(target_os = "macos"))]
         {
             let Some(surface) = self.surface.as_mut() else { return; };
             let mut buffer = surface.buffer_mut().expect("softbuffer buffer_mut");
-            Self::render_into(&mut self.compositor, &mut self.hit_test_map, &self.title, self.text.as_mut(), self.demo_textbox.as_ref(), &mut self.hover_pixel_list, self.hover_state, &mut buffer, buf_w, buf_h, vp_w, vp_h);
+            Self::render_into(&mut self.compositor, &mut self.hit_test_map, &self.title, self.text.as_mut(), self.demo_textbox.as_mut(), &mut self.hover_pixel_list, self.hover_state, &mut buffer, buf_w, buf_h, vp_w, vp_h);
             buffer.present().expect("softbuffer buffer.present");
         }
     }
 
     /// Paint everything into the given pixel buffer. Shared between wgpu and softbuffer paths.
-    fn render_into(compositor: &mut Compositor, hit_test_map: &mut Vec<u8>, title: &str, mut text: Option<&mut TextRenderer>, demo_textbox: Option<&Textbox>, hover_pixel_list: &mut Vec<usize>, hover_state: u8, buffer: &mut [u32], buf_w: usize, buf_h: usize, vp_w: u32, vp_h: u32) {
+    fn render_into(compositor: &mut Compositor, hit_test_map: &mut Vec<u8>, title: &str, mut text: Option<&mut TextRenderer>, demo_textbox: Option<&mut Textbox>, hover_pixel_list: &mut Vec<usize>, hover_state: u8, buffer: &mut [u32], buf_w: usize, buf_h: usize, vp_w: u32, vp_h: u32) {
         // 1. Background noise — full buffer fill
         paint::background_noise(buffer, buf_w, buf_h, 0, true, 0, None);
         // 2. Panes on top of background
@@ -248,6 +254,7 @@ impl DesktopApp {
                 tb.render(buffer, buf_w, buf_h, text, None, None);
             }
         }
+
 
         // 8. Hover overlay on whichever button is hovered.
         *hover_pixel_list = chrome::pixels_for_button(hit_test_map, hover_state);
@@ -467,9 +474,7 @@ impl ApplicationHandler for DesktopApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // macOS resize polling: when dragging a resize edge, winit stops delivering
-        // CursorMoved once the cursor leaves the window. We poll NSEvent.mouseLocation
-        // directly and apply resizes each tick until the button is released.
+        // macOS resize polling.
         #[cfg(target_os = "macos")]
         if self.is_dragging_resize {
             if self.poll_macos_resize() {
@@ -479,6 +484,22 @@ impl ApplicationHandler for DesktopApp {
                 std::time::Instant::now() + std::time::Duration::from_millis(16),
             ));
             return;
+        }
+
+        // Blinkey timer: flip the wave cursor on schedule.
+        if let Some(when) = self.next_blink {
+            let now = std::time::Instant::now();
+            if now >= when {
+                if let Some(tb) = self.demo_textbox.as_mut() {
+                    if tb.flip_blinkey() {
+                        if let Some(window) = self.window.as_ref() { window.request_redraw(); }
+                    }
+                }
+                self.next_blink = Some(now + std::time::Duration::from_millis(500));
+            }
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                self.next_blink.unwrap(),
+            ));
         }
     }
 
@@ -544,6 +565,9 @@ impl ApplicationHandler for DesktopApp {
                     }
                 }
             }
+            WindowEvent::ModifiersChanged(mods) => {
+                self.modifiers = mods.state();
+            }
             WindowEvent::Focused(false) => {
                 // Cancel any in-progress resize drag when the window loses focus —
                 // we won't receive a MouseInput Released event in that case.
@@ -604,9 +628,13 @@ impl ApplicationHandler for DesktopApp {
                 if let Some(tb) = self.demo_textbox.as_mut() {
                     let was_focused = tb.focused;
                     tb.handle_click(self.cursor_x, self.cursor_y);
-                    if tb.focused || was_focused {
+                    if tb.focused {
+                        self.next_blink = Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
                         window.request_redraw();
-                        if tb.focused { return; }
+                        return;
+                    } else if was_focused {
+                        self.next_blink = None;
+                        window.request_redraw();
                     }
                 }
                 let _ = window.drag_window();
@@ -624,26 +652,55 @@ impl ApplicationHandler for DesktopApp {
                 let Some(tb) = self.demo_textbox.as_mut() else { return; };
                 if !tb.focused { return; }
                 let Some(text) = self.text.as_mut() else { return; };
+                let shift = self.modifiers.shift_key();
+                let ctrl = self.modifiers.super_key() || self.modifiers.control_key();
                 let mut changed = false;
                 match &event.logical_key {
                     Key::Named(NamedKey::Backspace) => { tb.backspace(text); changed = true; }
                     Key::Named(NamedKey::Delete) => { tb.delete_forward(text); changed = true; }
-                    Key::Named(NamedKey::ArrowLeft) => { tb.cursor_left(); changed = true; }
-                    Key::Named(NamedKey::ArrowRight) => { tb.cursor_right(); changed = true; }
-                    Key::Named(NamedKey::Home) => { tb.cursor_home(); changed = true; }
-                    Key::Named(NamedKey::End) => { tb.cursor_end(); changed = true; }
+                    Key::Named(NamedKey::ArrowLeft) => {
+                        if shift && tb.selection_anchor.is_none() { tb.selection_anchor = Some(tb.cursor); }
+                        else if !shift { tb.selection_anchor = None; }
+                        tb.cursor_left();
+                        changed = true;
+                    }
+                    Key::Named(NamedKey::ArrowRight) => {
+                        if shift && tb.selection_anchor.is_none() { tb.selection_anchor = Some(tb.cursor); }
+                        else if !shift { tb.selection_anchor = None; }
+                        tb.cursor_right();
+                        changed = true;
+                    }
+                    Key::Named(NamedKey::Home) => {
+                        if shift && tb.selection_anchor.is_none() { tb.selection_anchor = Some(tb.cursor); }
+                        else if !shift { tb.selection_anchor = None; }
+                        tb.cursor_home();
+                        changed = true;
+                    }
+                    Key::Named(NamedKey::End) => {
+                        if shift && tb.selection_anchor.is_none() { tb.selection_anchor = Some(tb.cursor); }
+                        else if !shift { tb.selection_anchor = None; }
+                        tb.cursor_end();
+                        changed = true;
+                    }
+                    Key::Character(c) if ctrl && (c == "a" || c == "A") => {
+                        tb.select_all();
+                        changed = true;
+                    }
                     _ => {
                         if let Some(s) = &event.text {
-                            for c in s.chars() {
-                                if !c.is_control() {
-                                    tb.insert_char(c, text);
-                                    changed = true;
+                            if !ctrl {
+                                for c in s.chars() {
+                                    if !c.is_control() {
+                                        tb.insert_char(c, text);
+                                        changed = true;
+                                    }
                                 }
                             }
                         }
                     }
                 }
                 if changed {
+                    self.next_blink = Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
                     if let Some(window) = self.window.as_ref() { window.request_redraw(); }
                 }
             }
