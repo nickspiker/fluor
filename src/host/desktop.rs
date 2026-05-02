@@ -74,8 +74,14 @@ struct DesktopApp {
     #[cfg(target_os = "macos")]
     screen_height: u32,
 
-    /// Next blinkey flip time. The blink cycle alternates the wave cursor between top-bright and bottom-bright. When `Instant::now() >= next_blink`, we flip and schedule the next one.
+    /// Next blinkey flip time. Stochastic interval (0-300ms) like photon.
     next_blink: Option<std::time::Instant>,
+    /// Simple xorshift state for stochastic blink intervals. Seeded from system time.
+    blink_rng: u32,
+    /// Mouse drag selection in progress.
+    is_dragging_select: bool,
+    /// Last time we updated selection scroll (for time-based auto-scroll speed).
+    selection_scroll_time: Option<std::time::Instant>,
 }
 
 impl DesktopApp {
@@ -109,7 +115,20 @@ impl DesktopApp {
             #[cfg(target_os = "macos")]
             screen_height: 0,
             next_blink: None,
+            blink_rng: 0xDEAD_BEEF,
+            is_dragging_select: false,
+            selection_scroll_time: None,
         }
+    }
+
+    /// Stochastic blink interval: 0-300ms via xorshift32. Same feel as photon's `rand::gen_range(0..=300)`.
+    fn next_blink_interval(&mut self) -> std::time::Duration {
+        // xorshift32
+        self.blink_rng ^= self.blink_rng << 13;
+        self.blink_rng ^= self.blink_rng >> 17;
+        self.blink_rng ^= self.blink_rng << 5;
+        let ms = self.blink_rng % 301; // 0..=300
+        std::time::Duration::from_millis(ms as u64)
     }
 
     /// Reposition + resize the demo textbox to match the current viewport. Called after window create + on resize so the textbox tracks the viewport span.
@@ -486,6 +505,45 @@ impl ApplicationHandler for DesktopApp {
             return;
         }
 
+        // Selection drag auto-scroll: when mouse is outside textbox bounds during
+        // a selection drag, scroll the text at a speed proportional to distance outside.
+        if self.is_dragging_select {
+            if let Some(tb) = self.demo_textbox.as_mut() {
+                let tl = tb.center_x - tb.width * 0.5 + tb.font_size * 0.4;
+                let tr = tb.center_x + tb.width * 0.5 - tb.font_size * 0.4;
+                let distance_outside = if self.cursor_x < tl {
+                    tl - self.cursor_x
+                } else if self.cursor_x > tr {
+                    self.cursor_x - tr
+                } else {
+                    0.0
+                };
+                if distance_outside > 0.0 {
+                    let now = std::time::Instant::now();
+                    let dt = self.selection_scroll_time
+                        .map(|t| now.duration_since(t).as_secs_f32())
+                        .unwrap_or(0.0);
+                    self.selection_scroll_time = Some(now);
+                    let uw = tb.width - tb.font_size * 0.8;
+                    let speed = 1000.0 * distance_outside / uw;
+                    let delta = speed * dt;
+                    if self.cursor_x < tl {
+                        tb.scroll_offset += delta;
+                    } else {
+                        tb.scroll_offset -= delta;
+                    }
+                    // Update cursor position for the new scroll state.
+                    let clamped_x = self.cursor_x.clamp(tl, tr);
+                    tb.cursor = tb.cursor_index_from_x(clamped_x);
+                    if let Some(window) = self.window.as_ref() { window.request_redraw(); }
+                } else {
+                    self.selection_scroll_time = None;
+                }
+            }
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+            return;
+        }
+
         // Blinkey timer: flip the wave cursor on schedule.
         if let Some(when) = self.next_blink {
             let now = std::time::Instant::now();
@@ -495,7 +553,8 @@ impl ApplicationHandler for DesktopApp {
                         if let Some(window) = self.window.as_ref() { window.request_redraw(); }
                     }
                 }
-                self.next_blink = Some(now + std::time::Duration::from_millis(500));
+                let interval = self.next_blink_interval();
+                self.next_blink = Some(now + interval);
             }
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
                 self.next_blink.unwrap(),
@@ -538,6 +597,23 @@ impl ApplicationHandler for DesktopApp {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_x = position.x as Coord;
                 self.cursor_y = position.y as Coord;
+
+                // Mouse drag selection: update cursor position while dragging.
+                if self.is_dragging_select {
+                    if let Some(tb) = self.demo_textbox.as_mut() {
+                        if tb.selection_anchor.is_none() {
+                            tb.selection_anchor = Some(tb.cursor);
+                        }
+                        // Clamp mouse X to textbox text area for cursor calculation.
+                        let tl = tb.center_x - tb.width * 0.5 + tb.font_size * 0.4;
+                        let tr = tb.center_x + tb.width * 0.5 - tb.font_size * 0.4;
+                        let clamped_x = self.cursor_x.clamp(tl, tr);
+                        tb.cursor = tb.cursor_index_from_x(clamped_x);
+                    }
+                    if let Some(window) = self.window.as_ref() { window.request_redraw(); }
+                    return;
+                }
+
                 let new_hit = self.hit_at_cursor();
                 let over_textbox = self
                     .demo_textbox
@@ -578,7 +654,7 @@ impl ApplicationHandler for DesktopApp {
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-                let Some(window) = self.window.as_ref() else { return; };
+                let Some(window) = self.window.clone() else { return; };
                 // Priority: window controls > resize edges > textbox > drag.
                 match self.hit_at_cursor() {
                     HIT_CLOSE_BUTTON => { std::process::exit(0); }
@@ -629,21 +705,40 @@ impl ApplicationHandler for DesktopApp {
                     let was_focused = tb.focused;
                     tb.handle_click(self.cursor_x, self.cursor_y);
                     if tb.focused {
-                        self.next_blink = Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
+                        // Start drag selection — anchor is set in handle_click, track drag state.
+                        self.is_dragging_select = true;
+                        self.selection_scroll_time = None;
+                        let interval = self.next_blink_interval();
+                        self.next_blink = Some(std::time::Instant::now() + interval);
                         window.request_redraw();
                         return;
                     } else if was_focused {
                         self.next_blink = None;
+                        self.is_dragging_select = false;
                         window.request_redraw();
                     }
                 }
                 let _ = window.drag_window();
             }
-            #[cfg(target_os = "macos")]
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                #[cfg(target_os = "macos")]
                 if self.is_dragging_resize {
                     self.is_dragging_resize = false;
                     self.resize_edge = ResizeEdge::None;
+                    if let Some(window) = self.window.as_ref() { window.request_redraw(); }
+                }
+                // End mouse drag selection.
+                if self.is_dragging_select {
+                    self.is_dragging_select = false;
+                    self.selection_scroll_time = None;
+                    // If anchor == cursor, it was a click not a drag — clear selection.
+                    if let Some(tb) = self.demo_textbox.as_mut() {
+                        if tb.selection_anchor == Some(tb.cursor) {
+                            tb.selection_anchor = None;
+                        }
+                    }
+                    let interval = self.next_blink_interval();
+                    self.next_blink = Some(std::time::Instant::now() + interval);
                     if let Some(window) = self.window.as_ref() { window.request_redraw(); }
                 }
             }
@@ -686,6 +781,32 @@ impl ApplicationHandler for DesktopApp {
                         tb.select_all();
                         changed = true;
                     }
+                    Key::Character(c) if ctrl && (c == "c" || c == "C") => {
+                        if let Some(selected) = tb.selected_text() {
+                            if let Ok(mut clip) = arboard::Clipboard::new() {
+                                let _ = clip.set_text(selected);
+                            }
+                        }
+                    }
+                    Key::Character(c) if ctrl && (c == "x" || c == "X") => {
+                        if let Some(selected) = tb.selected_text() {
+                            let ok = arboard::Clipboard::new()
+                                .and_then(|mut clip| clip.set_text(selected))
+                                .is_ok();
+                            if ok {
+                                tb.delete_selection(text);
+                                changed = true;
+                            }
+                        }
+                    }
+                    Key::Character(c) if ctrl && (c == "v" || c == "V") => {
+                        if let Ok(mut clip) = arboard::Clipboard::new() {
+                            if let Ok(paste) = clip.get_text() {
+                                tb.insert_str(&paste, text);
+                                changed = true;
+                            }
+                        }
+                    }
                     _ => {
                         if let Some(s) = &event.text {
                             if !ctrl {
@@ -700,7 +821,8 @@ impl ApplicationHandler for DesktopApp {
                     }
                 }
                 if changed {
-                    self.next_blink = Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
+                    let interval = self.next_blink_interval();
+                    self.next_blink = Some(std::time::Instant::now() + interval);
                     if let Some(window) = self.window.as_ref() { window.request_redraw(); }
                 }
             }
