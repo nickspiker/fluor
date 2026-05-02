@@ -12,10 +12,13 @@ extern crate alloc;
 pub mod coord;
 pub mod geom;
 pub mod host;
+pub mod layer;
 pub(crate) mod math;
 pub mod paint;
 pub mod pane;
+pub mod pixel;
 pub mod region;
+pub mod rpn;
 pub mod theme;
 
 #[cfg(feature = "text")]
@@ -26,5 +29,8 @@ pub mod widgets;
 
 pub use coord::{Coord, RuVec2};
 pub use geom::Viewport;
+pub use layer::{Layer, LayerStack};
+pub use paint::BlendMode;
 pub use pane::{Compositor, Pane, PaneId};
+pub use pixel::Argb8;
 pub use region::Region;
