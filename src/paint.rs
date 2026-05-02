@@ -204,6 +204,129 @@ pub fn blend(bg: u32, fg: u32) -> u32 {
     blended as u32
 }
 
+/// Layer blend mode — selects which math op the flatten kernel applies when compositing a source layer onto the destination composite.
+///
+/// Each variant is a branchless kernel that runs over the entire layer buffer. The blend mode is per-layer, not per-pixel, so there's no branching in the inner loop. Alpha participation varies by mode — see each variant's doc comment for the exact channel math.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlendMode {
+    /// Overwrite destination with source where source alpha > 0. Background layers use this.
+    /// `if src != 0 { dst = src }`
+    Replace,
+    /// Standard Porter-Duff alpha-over. Source alpha controls blending.
+    /// `dst = src * α + dst * (1 - α)` per channel, using SWAR /256 approximation.
+    AlphaOver,
+    /// Additive blend. Source is added to destination directly (intensity baked into src pixels).
+    /// `dst = dst.wrapping_add(src)` — overflow wraps intentionally (packed channel isolation).
+    /// Used for glow, blinkey wave, any emissive effect.
+    Add,
+    /// XOR RGB channels, preserve destination alpha. Source alpha is ignored.
+    /// `dst.rgb ^= src.rgb` where `src != 0`.
+    /// Used for selection highlight inversion.
+    Xor,
+    /// Multiplicative darkening. Transparent source pixels don't darken (blend toward white at low alpha).
+    /// `dst = dst * lerp(255, src, α) >> 8` per channel.
+    Multiply,
+    /// Screen (inverse multiply). Transparent source pixels don't lighten.
+    /// `dst = 255 - ((255 - dst) * (255 - lerp(0, src, α)) >> 8)` per channel.
+    Screen,
+}
+
+impl BlendMode {
+    /// Run this blend mode's kernel over the entire buffer. `dst` is the composite being built; `src` is the layer being flattened onto it. Both must be the same length.
+    #[inline]
+    pub fn flatten(self, dst: &mut [u32], src: &[u32]) {
+        match self {
+            BlendMode::Replace => flatten_replace(dst, src),
+            BlendMode::AlphaOver => flatten_alpha_over(dst, src),
+            BlendMode::Add => flatten_add(dst, src),
+            BlendMode::Xor => flatten_xor(dst, src),
+            BlendMode::Multiply => flatten_multiply(dst, src),
+            BlendMode::Screen => flatten_screen(dst, src),
+        }
+    }
+}
+
+fn flatten_replace(dst: &mut [u32], src: &[u32]) {
+    for i in 0..dst.len() {
+        if src[i] != 0 { dst[i] = src[i]; }
+    }
+}
+
+fn flatten_alpha_over(dst: &mut [u32], src: &[u32]) {
+    for i in 0..dst.len() {
+        let s = src[i];
+        if s == 0 { continue; }
+        let alpha = ((s >> 24) & 0xFF) as u64;
+        if alpha == 255 { dst[i] = s; continue; }
+        let inv = 256 - alpha;
+        let mut bg = dst[i] as u64;
+        bg = (bg | (bg << 16)) & 0x0000_FFFF_0000_FFFF;
+        bg = (bg | (bg << 8)) & 0x00FF_00FF_00FF_00FF;
+        let mut fg = s as u64;
+        fg = (fg | (fg << 16)) & 0x0000_FFFF_0000_FFFF;
+        fg = (fg | (fg << 8)) & 0x00FF_00FF_00FF_00FF;
+        let mut blended = bg * inv + fg * alpha;
+        blended = (blended >> 8) & 0x00FF_00FF_00FF_00FF;
+        blended = (blended | (blended >> 8)) & 0x0000_FFFF_0000_FFFF;
+        blended = blended | (blended >> 16);
+        dst[i] = blended as u32;
+    }
+}
+
+fn flatten_add(dst: &mut [u32], src: &[u32]) {
+    for i in 0..dst.len() {
+        if src[i] != 0 { dst[i] = dst[i].wrapping_add(src[i]); }
+    }
+}
+
+fn flatten_xor(dst: &mut [u32], src: &[u32]) {
+    for i in 0..dst.len() {
+        if src[i] != 0 { dst[i] ^= src[i] & 0x00FF_FFFF; }
+    }
+}
+
+fn flatten_multiply(dst: &mut [u32], src: &[u32]) {
+    for i in 0..dst.len() {
+        let s = src[i];
+        if s == 0 { continue; }
+        let alpha = ((s >> 24) & 0xFF) as u64;
+        // Effective source = lerp(255, src_channel, alpha) = 255 + (src - 255) * alpha / 256
+        // dst_channel = dst_channel * effective / 256
+        let d = dst[i];
+        let dr = ((d >> 16) & 0xFF) as u64;
+        let dg = ((d >> 8) & 0xFF) as u64;
+        let db = (d & 0xFF) as u64;
+        let sr = 255 + ((((s >> 16) & 0xFF) as i64 - 255) * alpha as i64 >> 8) as u64;
+        let sg = 255 + ((((s >> 8) & 0xFF) as i64 - 255) * alpha as i64 >> 8) as u64;
+        let sb = 255 + (((s & 0xFF) as i64 - 255) * alpha as i64 >> 8) as u64;
+        let rr = (dr * sr) >> 8;
+        let rg = (dg * sg) >> 8;
+        let rb = (db * sb) >> 8;
+        dst[i] = (d & 0xFF00_0000) | ((rr as u32) << 16) | ((rg as u32) << 8) | (rb as u32);
+    }
+}
+
+fn flatten_screen(dst: &mut [u32], src: &[u32]) {
+    for i in 0..dst.len() {
+        let s = src[i];
+        if s == 0 { continue; }
+        let alpha = ((s >> 24) & 0xFF) as u64;
+        // Effective source = lerp(0, src_channel, alpha) = src * alpha / 256
+        // Screen: dst = 255 - (255 - dst) * (255 - eff) / 256
+        let d = dst[i];
+        let dr = ((d >> 16) & 0xFF) as u64;
+        let dg = ((d >> 8) & 0xFF) as u64;
+        let db = (d & 0xFF) as u64;
+        let sr = (((s >> 16) & 0xFF) as u64 * alpha) >> 8;
+        let sg = (((s >> 8) & 0xFF) as u64 * alpha) >> 8;
+        let sb = ((s & 0xFF) as u64 * alpha) >> 8;
+        let rr = 255 - ((255 - dr) * (255 - sr) >> 8);
+        let rg = 255 - ((255 - dg) * (255 - sg) >> 8);
+        let rb = 255 - ((255 - db) * (255 - sb) >> 8);
+        dst[i] = (d & 0xFF00_0000) | ((rr as u32) << 16) | ((rg as u32) << 8) | (rb as u32);
+    }
+}
+
 /// Intersect a caller-supplied `(x, y, w, h)` rect (in pixels, top-left origin, may be negative or extend off-clip) with a `Clip`. Returns `(x_min, y_min, x_max, y_max)` in `usize`, all guaranteed in-bounds for `pixels[y * buf_w + x]` indexing **as long as the supplied `Clip` is itself within the buffer**. Returns an empty range (x_min >= x_max or y_min >= y_max) if the rect lies entirely outside the clip.
 ///
 /// **Rule 0 — WHY/PROOF/PREVENTS:** rect coords are external inputs (caller can pass a pane dragged off the window edge). WHY: compositor semantics demand "draw the intersection with the clip." PROOF without it: a negative `x as usize` wraps to a huge value, indexing past the pixel slice panics. PREVENTS: panic on partial-offscreen rects, which is a normal use case. The clip happens once per rect; inner loops trust the math.
@@ -403,6 +526,453 @@ pub fn blend_rgb_only(bg_colour: u32, fg_colour: u32, weight_bg: u8, weight_fg: 
     blended = blended | (blended >> 16) | 0xFF000000;
 
     blended as u32
+}
+
+/// Draw a pill-shaped textbox (semicircular ends, squirdleyness=3) with two-tone AA edges and generate an alpha mask. Ported from photon's `draw_textbox` in compositing.rs.
+///
+/// Writes into `pixels` (fill + AA edges) and `mask` (0 outside, 255 interior, AA values on edges). The mask is used downstream by the glow effect, text clipping, and blinkey. `center_x`/`center_y` are pixel coordinates; `box_width`/`box_height` in pixels.
+///
+/// **Rule 0 — WHY/PROOF/PREVENTS:** `center_y` is signed because scroll can push the textbox off-screen (negative Y). The function clips to `[0, buf_h)` using signed arithmetic. PREVENTS: out-of-bounds pixel access on partial visibility.
+pub fn draw_textbox_pill(
+    pixels: &mut [u32],
+    mask: &mut [u8],
+    buf_w: usize,
+    buf_h: usize,
+    center_x: usize,
+    center_y: isize,
+    box_width: usize,
+    box_height: usize,
+) {
+    use crate::theme;
+
+    let height = buf_h;
+    let height_signed = height as isize;
+
+    let x = center_x.wrapping_sub(box_width / 2);
+    let y_signed = center_y - (box_height as isize / 2);
+    let y = if y_signed >= 0 { y_signed as usize } else { 0usize.wrapping_sub((-y_signed) as usize) };
+
+    // Early out if entirely off-screen.
+    let box_top = y_signed;
+    let box_bottom = y_signed + box_height as isize;
+    if box_bottom <= 0 || box_top >= height_signed { return; }
+
+    let light = theme::TEXTBOX_LIGHT_EDGE;
+    let shadow = theme::TEXTBOX_SHADOW_EDGE;
+    let fill = theme::TEXTBOX_FILL;
+    let radius = box_height as f32 / 2.0;
+    let squirdleyness = 3i32;
+
+    // Generate squircle crossings from edge toward diagonal.
+    let mut crossings: alloc::vec::Vec<(u16, u8, u8)> = alloc::vec::Vec::new();
+    let mut offset = 0f32;
+    loop {
+        let y_norm = offset / radius;
+        let x_norm = crate::math::powf(1.0 - crate::math::powi(y_norm, squirdleyness), 1.0 / squirdleyness as f32);
+        let cx = x_norm * radius;
+        let inset = radius - cx;
+        if inset >= 0.0 {
+            let l = (crate::math::sqrt(crate::math::fract(inset)) * 256.0) as u8;
+            let h = (crate::math::sqrt(1.0 - crate::math::fract(inset)) * 256.0) as u8;
+            crossings.push((inset as u16, l, h));
+        }
+        if cx < offset { break; }
+        offset += 1.0;
+    }
+
+    // Helper: draw one corner's crossings.
+    // flip_x: false=left, true=right. flip_y: false=top, true=bottom.
+    // Each crossing generates: vertical edge pixel, horizontal edge pixel, diagonal fill between them.
+    for (i, &(inset, l, h)) in crossings.iter().enumerate() {
+        if inset as usize > i { break; }
+
+        // --- Top-left corner ---
+        {
+            let py = y.wrapping_add(radius as usize).wrapping_sub(i);
+            let px = x.wrapping_add(inset as usize);
+            if py < height && px < buf_w {
+                let idx = py * buf_w + px;
+                pixels[idx] = blend_rgb_only(pixels[idx], light, l, h);
+            }
+            let px1 = px.wrapping_add(1);
+            if py < height && px1 < buf_w {
+                let idx = py * buf_w + px1;
+                pixels[idx] = blend_rgb_only(light, fill, l, h);
+                mask[idx] = h;
+            }
+            if py < height {
+                let diag_x = x.wrapping_add(radius as usize).wrapping_sub(i).min(buf_w);
+                for fill_x in px.wrapping_add(2)..=diag_x {
+                    if fill_x >= buf_w { continue; }
+                    let idx = py * buf_w + fill_x;
+                    pixels[idx] = fill;
+                    mask[idx] = 255;
+                }
+            }
+            let hx = x.wrapping_add(radius as usize).wrapping_sub(i);
+            let hy = y.wrapping_add(inset as usize);
+            if hy < height && hx < buf_w {
+                let idx = hy * buf_w + hx;
+                pixels[idx] = blend_rgb_only(pixels[idx], light, l, h);
+            }
+            let hy1 = hy.wrapping_add(1);
+            if hy1 < height && hx < buf_w {
+                let idx = hy1 * buf_w + hx;
+                pixels[idx] = blend_rgb_only(light, fill, l, h);
+                mask[idx] = h;
+            }
+            let hy_s = y_signed + inset as isize;
+            let diag_y_s = y_signed + radius as isize - i as isize;
+            let fs = (hy_s + 2).max(0).min(height_signed) as usize;
+            let fe = diag_y_s.max(0).min(height_signed) as usize;
+            if hx < buf_w && fs < fe {
+                for fy in fs..fe { let idx = fy * buf_w + hx; pixels[idx] = fill; mask[idx] = 255; }
+            }
+        }
+
+        // --- Top-right corner ---
+        {
+            let py = y.wrapping_add(radius as usize).wrapping_sub(i);
+            let px = x.wrapping_add(box_width).wrapping_sub(1).wrapping_sub(inset as usize);
+            if py < height && px < buf_w {
+                let idx = py * buf_w + px;
+                pixels[idx] = blend_rgb_only(pixels[idx], shadow, l, h);
+            }
+            let px1 = px.wrapping_sub(1);
+            if py < height && px1 < buf_w {
+                let idx = py * buf_w + px1;
+                pixels[idx] = blend_rgb_only(shadow, fill, l, h);
+                mask[idx] = h;
+            }
+            if py < height {
+                let diag_x = x.wrapping_add(box_width).wrapping_sub(1).wrapping_sub(radius as usize).wrapping_add(i);
+                for fill_x in diag_x..px.wrapping_sub(1) {
+                    if fill_x >= buf_w { continue; }
+                    let idx = py * buf_w + fill_x;
+                    pixels[idx] = fill;
+                    mask[idx] = 255;
+                }
+            }
+            let hx = x.wrapping_add(box_width).wrapping_sub(1).wrapping_sub(radius as usize).wrapping_add(i);
+            let hy = y.wrapping_add(inset as usize);
+            if hy < height && hx < buf_w {
+                let idx = hy * buf_w + hx;
+                pixels[idx] = blend_rgb_only(pixels[idx], light, l, h);
+            }
+            let hy1 = hy.wrapping_add(1);
+            if hy1 < height && hx < buf_w {
+                let idx = hy1 * buf_w + hx;
+                pixels[idx] = blend_rgb_only(light, fill, l, h);
+                mask[idx] = h;
+            }
+            let hy_s = y_signed + inset as isize;
+            let diag_y_s = y_signed + radius as isize - i as isize;
+            let fs = (hy_s + 2).max(0).min(height_signed) as usize;
+            let fe = diag_y_s.max(0).min(height_signed) as usize;
+            if hx < buf_w && fs < fe {
+                for fy in fs..fe { let idx = fy * buf_w + hx; pixels[idx] = fill; mask[idx] = 255; }
+            }
+        }
+
+        // --- Bottom-left corner ---
+        {
+            let py = y.wrapping_add(box_height).wrapping_sub(radius as usize).wrapping_add(i);
+            let px = x.wrapping_add(inset as usize);
+            if py < height && px < buf_w {
+                let idx = py * buf_w + px;
+                pixels[idx] = blend_rgb_only(pixels[idx], light, l, h);
+            }
+            let px1 = px.wrapping_add(1);
+            if py < height && px1 < buf_w {
+                let idx = py * buf_w + px1;
+                pixels[idx] = blend_rgb_only(light, fill, l, h);
+                mask[idx] = h;
+            }
+            if py < height {
+                let diag_x = x.wrapping_add(radius as usize).wrapping_sub(i).min(buf_w);
+                for fill_x in px.wrapping_add(2)..=diag_x {
+                    if fill_x >= buf_w { continue; }
+                    let idx = py * buf_w + fill_x;
+                    pixels[idx] = fill;
+                    mask[idx] = 255;
+                }
+            }
+            let hx = x.wrapping_add(radius as usize).wrapping_sub(i);
+            let hy = y.wrapping_add(box_height).wrapping_sub(inset as usize);
+            if hy < height && hx < buf_w {
+                let idx = hy * buf_w + hx;
+                pixels[idx] = blend_rgb_only(pixels[idx], shadow, l, h);
+            }
+            let hy1 = hy.wrapping_sub(1);
+            if hy1 < height && hx < buf_w {
+                let idx = hy1 * buf_w + hx;
+                pixels[idx] = blend_rgb_only(shadow, fill, l, h);
+                mask[idx] = h;
+            }
+            let diag_y_s = y_signed + box_height as isize - radius as isize + i as isize;
+            let hy_s = y_signed + box_height as isize - inset as isize;
+            let fs = (diag_y_s + 1).max(0).min(height_signed) as usize;
+            let fe = (hy_s - 1).max(0).min(height_signed) as usize;
+            if hx < buf_w && fs < fe {
+                for fy in fs..fe { let idx = fy * buf_w + hx; pixels[idx] = fill; mask[idx] = 255; }
+            }
+        }
+
+        // --- Bottom-right corner ---
+        {
+            let py = y.wrapping_add(box_height).wrapping_sub(radius as usize).wrapping_add(i);
+            let px = x.wrapping_add(box_width).wrapping_sub(1).wrapping_sub(inset as usize);
+            if py < height && px < buf_w {
+                let idx = py * buf_w + px;
+                pixels[idx] = blend_rgb_only(pixels[idx], shadow, l, h);
+            }
+            let px1 = px.wrapping_sub(1);
+            if py < height && px1 < buf_w {
+                let idx = py * buf_w + px1;
+                pixels[idx] = blend_rgb_only(shadow, fill, l, h);
+                mask[idx] = h;
+            }
+            if py < height {
+                let diag_x = x.wrapping_add(box_width).wrapping_sub(1).wrapping_sub(radius as usize).wrapping_add(i);
+                for fill_x in diag_x..px.wrapping_sub(1) {
+                    if fill_x >= buf_w { continue; }
+                    let idx = py * buf_w + fill_x;
+                    pixels[idx] = fill;
+                    mask[idx] = 255;
+                }
+            }
+            let hx = x.wrapping_add(box_width).wrapping_sub(1).wrapping_sub(radius as usize).wrapping_add(i);
+            let hy = y.wrapping_add(box_height).wrapping_sub(inset as usize);
+            if hy < height && hx < buf_w {
+                let idx = hy * buf_w + hx;
+                pixels[idx] = blend_rgb_only(pixels[idx], shadow, l, h);
+            }
+            let hy1 = hy.wrapping_sub(1);
+            if hy1 < height && hx < buf_w {
+                let idx = hy1 * buf_w + hx;
+                pixels[idx] = blend_rgb_only(shadow, fill, l, h);
+                mask[idx] = h;
+            }
+            let diag_y_s = y_signed + box_height as isize - radius as isize + i as isize;
+            let hy_s = y_signed + box_height as isize - inset as isize;
+            let fs = (diag_y_s + 1).max(0).min(height_signed) as usize;
+            let fe = (hy_s - 1).max(0).min(height_signed) as usize;
+            if hx < buf_w && fs < fe {
+                for fy in fs..fe { let idx = fy * buf_w + hx; pixels[idx] = fill; mask[idx] = 255; }
+            }
+        }
+    }
+
+    // Fill center and straight edges.
+    let radius_int = radius as isize;
+    if box_width > box_height {
+        // Fat box: top/bottom straight edges + center fill.
+        let left_edge = x.wrapping_add(radius as usize);
+        let right_edge = x.wrapping_add(box_width).wrapping_sub(radius as usize);
+        // Top edge hairline.
+        if y_signed >= 0 && y_signed < height_signed {
+            let top_y = y_signed as usize;
+            for px in left_edge..right_edge {
+                if px >= buf_w { continue; }
+                pixels[top_y * buf_w + px] = light;
+            }
+        }
+        // Bottom edge hairline.
+        let bot_y_s = y_signed + box_height as isize;
+        if bot_y_s >= 0 && bot_y_s < height_signed {
+            let bot_y = bot_y_s as usize;
+            for px in left_edge..right_edge {
+                if px >= buf_w { continue; }
+                pixels[bot_y * buf_w + px] = shadow;
+            }
+        }
+        // Center fill.
+        let fill_top = (y_signed + 1).max(0).min(height_signed) as usize;
+        let fill_bot = (y_signed + box_height as isize).max(0).min(height_signed) as usize;
+        for py in fill_top..fill_bot {
+            for px in left_edge..right_edge {
+                if px >= buf_w { continue; }
+                let idx = py * buf_w + px;
+                pixels[idx] = fill;
+                mask[idx] = 255;
+            }
+        }
+    } else {
+        // Skinny box: left/right straight edges + center fill.
+        let top_edge = (y_signed + radius_int).max(0).min(height_signed) as usize;
+        let bot_edge = (y_signed + box_height as isize - radius_int).max(0).min(height_signed) as usize;
+        if x < buf_w {
+            for py in top_edge..bot_edge { pixels[py * buf_w + x] = light; }
+        }
+        let right_x = x.wrapping_add(box_width);
+        if right_x < buf_w {
+            for py in top_edge..bot_edge { pixels[py * buf_w + right_x] = shadow; }
+        }
+        for py in top_edge..bot_edge {
+            for px in x.wrapping_add(1)..x.wrapping_add(box_width).wrapping_sub(1) {
+                if px >= buf_w { continue; }
+                let idx = py * buf_w + px;
+                pixels[idx] = fill;
+                mask[idx] = 255;
+            }
+        }
+    }
+}
+
+/// Add or remove a wave-shaped cursor (blinkey) at `(bx, by)` with `height` pixels tall.
+/// `top_bright`: true = intensity concentrated at top, false = bottom.
+/// `add`: true = additive blend, false = subtractive (undo).
+///
+/// Wave polynomial: `(1 - t²)(1 ∓ t)²` where t ∈ [-1, 1] maps over the cursor height.
+/// Spreads ±7 pixels horizontally with intensity falling off by bit-shift: `wave >> |x|`.
+///
+/// **Rule 0 — WHY/PROOF/PREVENTS:** `bx` must be ≥ 7 and < `buf_w - 7` for the ±7 spread.
+/// Caller must ensure the blinkey is within textbox bounds (which are inset from window edges).
+/// PREVENTS: out-of-bounds writes on the horizontal spread.
+pub fn draw_blinkey(
+    pixels: &mut [u32],
+    buf_w: usize,
+    bx: usize,
+    by: usize,
+    height: usize,
+    top_bright: bool,
+    add: bool,
+) {
+    let half = height / 2;
+    for y in by..by + height {
+        let idx = y * buf_w + bx;
+        let t = (y - by - half) as isize as f32 / half as f32;
+        let wave = if top_bright {
+            (1.0 - t * t) * (1.0 - t) * (1.0 - t) * crate::theme::CURSOR_BRIGHTNESS
+        } else {
+            (1.0 - t * t) * (1.0 + t) * (1.0 + t) * crate::theme::CURSOR_BRIGHTNESS
+        };
+        let w = wave as u32;
+        for dx in -7i32..=7 {
+            let pixel = 0x00010101u32 * (w >> dx.unsigned_abs());
+            if add {
+                pixels[(idx as isize + dx as isize) as usize] += pixel;
+            } else {
+                pixels[(idx as isize + dx as isize) as usize] -= pixel;
+            }
+        }
+    }
+}
+
+/// Apply or remove a 4-directional blur glow effect around a textbox. Ported from photon's `apply_textbox_glow`. Reads the `mask` to determine interior/exterior and blurs outward from the textbox edges.
+///
+/// `add`: true = apply glow (focus gain), false = remove glow (focus loss).
+/// `glow_colour`: `0x00RRGGBB` — alpha channel unused, intensity computed from mask inverse.
+pub fn apply_textbox_glow(
+    pixels: &mut [u32],
+    mask: &[u8],
+    buf_w: usize,
+    buf_h: usize,
+    center_y: isize,
+    box_width: usize,
+    box_height: usize,
+    add: bool,
+    glow_colour: u32,
+) {
+    let blur_h = 32usize;
+    let blur_v = 16usize;
+
+    let half_h = (box_height / 2) as isize;
+    if (center_y - half_h) as usize >= buf_h || (center_y + half_h) as usize >= buf_h { return; }
+    let cy = center_y as usize;
+
+    let y_top = cy - box_height / 2;
+    let y_bot = cy + box_height / 2;
+
+    // Find horizontal bounds by scanning mask at center row.
+    let center_x = buf_w / 2;
+    let mut x_left = center_x;
+    let mut x_right = center_x;
+    let scan = cy * buf_w;
+    for lx in (0..center_x).rev() {
+        if mask[scan + lx] > 0 { x_left = lx; } else { break; }
+    }
+    for rx in center_x..buf_w {
+        if mask[scan + rx] > 0 { x_right = rx; } else { break; }
+    }
+
+    let corner_r = 2 * box_width * box_height / (box_width + box_height);
+    let xvs = x_left + corner_r;
+    let xve = x_right - corner_r;
+    let yhs = y_top + corner_r;
+    let yhe = y_bot - corner_r;
+
+    // Macro for the 4-pass blur — identical math, just ±= and direction differ.
+    macro_rules! blur_pass {
+        ($op:tt) => {
+            // Right blur
+            for y in y_top..y_bot {
+                let mut adder = 0u32;
+                let start = x_right - (yhs as isize - y as isize).max(0) as usize - (y as isize - yhe as isize).max(0) as usize;
+                for bx in start..x_right + blur_h {
+                    if bx >= buf_w { break; }
+                    let idx = y * buf_w + bx;
+                    if bx > 0 && mask[idx] < mask[idx - 1] { adder += (mask[idx - 1] - mask[idx]) as u32; }
+                    adder = (adder * 15 >> 4).min(71);
+                    let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
+                    let r = ((glow_colour >> 16) & 0xFF) * intensity >> 8;
+                    let g = ((glow_colour >> 8) & 0xFF) * intensity >> 8;
+                    let b = (glow_colour & 0xFF) * intensity >> 8;
+                    pixels[idx] $op (r << 16) | (g << 8) | b;
+                }
+            }
+            // Left blur
+            for y in y_top..y_bot {
+                let mut adder = 0u32;
+                let end = x_left + (yhs as isize - y as isize).max(0) as usize + (y as isize - yhe as isize).max(0) as usize;
+                for bx in (x_left.saturating_sub(blur_h)..=end).rev() {
+                    let idx = y * buf_w + bx;
+                    if bx + 1 < buf_w && mask[idx] < mask[idx + 1] { adder += (mask[idx + 1] - mask[idx]) as u32; }
+                    adder = (adder * 15 >> 4).min(71);
+                    let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
+                    let r = ((glow_colour >> 16) & 0xFF) * intensity >> 8;
+                    let g = ((glow_colour >> 8) & 0xFF) * intensity >> 8;
+                    let b = (glow_colour & 0xFF) * intensity >> 8;
+                    pixels[idx] $op (r << 16) | (g << 8) | b;
+                }
+            }
+            // Down blur
+            for bx in x_left..x_right {
+                let mut adder = 0u32;
+                let start = y_bot - (xvs as isize - bx as isize).max(0) as usize - (bx as isize - xve as isize).max(0) as usize;
+                for by in start..y_bot + blur_v {
+                    if by >= buf_h { break; }
+                    let idx = by * buf_w + bx;
+                    if by > 0 { let ia = (by - 1) * buf_w + bx; if mask[idx] < mask[ia] { adder += (mask[ia] - mask[idx]) as u32; } }
+                    adder = (adder * 3 >> 2).min(70);
+                    let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
+                    let r = ((glow_colour >> 16) & 0xFF) * intensity >> 8;
+                    let g = ((glow_colour >> 8) & 0xFF) * intensity >> 8;
+                    let b = (glow_colour & 0xFF) * intensity >> 8;
+                    pixels[idx] $op (r << 16) | (g << 8) | b;
+                }
+            }
+            // Up blur
+            for bx in x_left..x_right {
+                let mut adder = 0u32;
+                let end = y_top + (xvs as isize - bx as isize).max(0) as usize + (bx as isize - xve as isize).max(0) as usize;
+                for by in (0..=end).rev() {
+                    if by + blur_v < y_top { break; }
+                    if by >= buf_h { continue; }
+                    let idx = by * buf_w + bx;
+                    if by + 1 < buf_h { let ib = (by + 1) * buf_w + bx; if mask[idx] < mask[ib] { adder += (mask[ib] - mask[idx]) as u32; } }
+                    adder = (adder * 3 >> 2).min(70);
+                    let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
+                    let r = ((glow_colour >> 16) & 0xFF) * intensity >> 8;
+                    let g = ((glow_colour >> 8) & 0xFF) * intensity >> 8;
+                    let b = (glow_colour & 0xFF) * intensity >> 8;
+                    pixels[idx] $op (r << 16) | (g << 8) | b;
+                }
+            }
+        };
+    }
+
+    if add { blur_pass!(+=); } else { blur_pass!(-=); }
 }
 
 /// Glyph rasterizers for window controls. Ported verbatim from photon's [compositing.rs](/mnt/Octopus/Code/photon/src/ui/compositing.rs) — the squircle minus / squircle ring / capsule X — so chrome looks identical to photon.

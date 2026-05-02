@@ -45,3 +45,11 @@ pub const MINIMIZE_GLYPH: u32 = fmt(0xFF_33_30_C7);
 pub const TEXTBOX_FILL: u32 = fmt(0xFF_06_08_09);
 pub const TEXTBOX_LIGHT_EDGE: u32 = fmt(0xFF_44_41_37);
 pub const TEXTBOX_SHADOW_EDGE: u32 = fmt(0xFF_2B_34_37);
+
+// Cursor (blinkey).
+pub const CURSOR_BRIGHTNESS: f32 = 100.0;
+
+// Textbox glow colours (0x00RRGGBB — alpha channel unused, intensity computed from mask).
+pub const GLOW_DEFAULT: u32 = fmt(0x00_FF_FF_FF);
+pub const GLOW_SUCCESS: u32 = fmt(0x00_40_FF_40);
+pub const GLOW_ERROR: u32 = fmt(0x00_FF_60_60);
