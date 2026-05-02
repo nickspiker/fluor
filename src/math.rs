@@ -8,6 +8,7 @@
 #[inline] pub fn floor(x: f32) -> f32 { libm::floorf(x) }
 #[inline] pub fn sqrt(x: f32) -> f32 { libm::sqrtf(x) }
 #[inline] pub fn sin_cos(x: f32) -> (f32, f32) { (libm::sinf(x), libm::cosf(x)) }
+#[inline] pub fn atan2(y: f32, x: f32) -> f32 { libm::atan2f(y, x) }
 #[inline] pub fn powf(x: f32, y: f32) -> f32 { libm::powf(x, y) }
 #[inline] pub fn powi(x: f32, n: i32) -> f32 { libm::powf(x, n as f32) }
 #[inline] pub fn fract(x: f32) -> f32 { x - libm::floorf(x) }
