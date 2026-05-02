@@ -1,22 +1,27 @@
-//! Desktop host: winit window + softbuffer CPU framebuffer. Available under feature `host-winit` (on by default).
+//! Desktop host: winit window + platform-appropriate framebuffer.
+//!
+//! macOS: wgpu/Metal renderer with PostMultiplied alpha (transparent squircle corners).
+//! Linux/Windows: softbuffer CPU framebuffer.
 //!
 //! Borderless window. Chrome is rendered by photon's `draw_window_controls` (verbatim, see [`super::chrome`]). Click routing uses photon's `hit_test_map` (per-pixel button ID) + `get_resize_edge`. Window setup matches photon's main.rs: `with_decorations(false)`, `with_transparent(true)`, `with_resizable(...)`, monitor-relative initial size, macOS drop shadow off.
+//!
+//! macOS resize uses manual mouse tracking via direct NSEvent polling (photon's approach) because winit stops delivering CursorMoved events once the cursor leaves the window during a resize drag. Linux uses native `drag_resize_window`.
 
 use super::chrome::{self, ResizeEdge, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE};
+use crate::coord::Coord;
 use crate::paint;
 use crate::paint::{snap_rotation, Transform};
 use crate::text::TextRenderer;
 use crate::theme;
 use crate::widgets::Textbox;
 use crate::Compositor;
-use std::num::NonZeroU32;
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::error::EventLoopError;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{CursorIcon, ResizeDirection, Window, WindowAttributes, WindowId};
+use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 /// Run the desktop host until the window closes.
 pub fn run(compositor: Compositor, title: &str) -> Result<(), EventLoopError> {
@@ -29,11 +34,19 @@ struct DesktopApp {
     compositor: Compositor,
     title: String,
     window: Option<Arc<Window>>,
+
+    // --- Renderer ---
+    // macOS: wgpu/Metal renderer (PostMultiplied alpha for transparent corners).
+    #[cfg(target_os = "macos")]
+    renderer: Option<super::renderer_wgpu::Renderer>,
+    // Linux/Windows: softbuffer CPU framebuffer.
+    #[cfg(not(target_os = "macos"))]
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+
     /// Per-pixel button-id map written by `draw_window_controls` and read on click.
     hit_test_map: Vec<u8>,
-    cursor_x: f32,
-    cursor_y: f32,
+    cursor_x: Coord,
+    cursor_y: Coord,
     /// Currently hovered chrome button id (HIT_NONE if none). Drives the hover overlay.
     hover_state: u8,
     /// Cached pixel list for the currently hovered button — recomputed on hover-state change.
@@ -42,6 +55,23 @@ struct DesktopApp {
     text: Option<TextRenderer>,
     /// Demo textbox living in the panes example. Edit it with the keyboard once you click in.
     demo_textbox: Option<Textbox>,
+
+    // --- macOS manual resize tracking ---
+    // winit stops delivering CursorMoved when the cursor leaves the window during a
+    // resize drag on macOS. We poll NSEvent.mouseLocation directly via objc_msgSend
+    // and apply resizes manually via request_inner_size + set_outer_position.
+    #[cfg(target_os = "macos")]
+    is_dragging_resize: bool,
+    #[cfg(target_os = "macos")]
+    resize_edge: ResizeEdge,
+    #[cfg(target_os = "macos")]
+    drag_start_size: (u32, u32),
+    #[cfg(target_os = "macos")]
+    drag_start_window_pos: (i32, i32),
+    #[cfg(target_os = "macos")]
+    drag_start_cursor_screen_pos: (f64, f64),
+    #[cfg(target_os = "macos")]
+    screen_height: u32,
 }
 
 impl DesktopApp {
@@ -50,6 +80,9 @@ impl DesktopApp {
             compositor,
             title,
             window: None,
+            #[cfg(target_os = "macos")]
+            renderer: None,
+            #[cfg(not(target_os = "macos"))]
             surface: None,
             hit_test_map: Vec::new(),
             cursor_x: 0.0,
@@ -58,17 +91,29 @@ impl DesktopApp {
             hover_pixel_list: Vec::new(),
             text: None,
             demo_textbox: None,
+            #[cfg(target_os = "macos")]
+            is_dragging_resize: false,
+            #[cfg(target_os = "macos")]
+            resize_edge: ResizeEdge::None,
+            #[cfg(target_os = "macos")]
+            drag_start_size: (0, 0),
+            #[cfg(target_os = "macos")]
+            drag_start_window_pos: (0, 0),
+            #[cfg(target_os = "macos")]
+            drag_start_cursor_screen_pos: (0.0, 0.0),
+            #[cfg(target_os = "macos")]
+            screen_height: 0,
         }
     }
 
     /// Reposition + resize the demo textbox to match the current viewport. Called after window create + on resize so the textbox tracks the viewport span.
     fn update_textbox_layout(&mut self) {
         let vp = self.compositor.viewport();
-        let span = 2.0 * vp.width_px as f32 * vp.height_px as f32 / (vp.width_px as f32 + vp.height_px as f32);
-        let bw = chrome::MIN_BUTTON_HEIGHT_PX as f32 + (span / 32.0).ceil();
-        let center_x = vp.width_px as f32 * 0.5;
+        let span = 2.0 * vp.width_px as Coord * vp.height_px as Coord / (vp.width_px as Coord + vp.height_px as Coord);
+        let bw = chrome::MIN_BUTTON_HEIGHT_PX as Coord + crate::math::ceil(span / 32.0);
+        let center_x = vp.width_px as Coord * 0.5;
         let center_y = bw * 7.0;
-        let width = (vp.width_px as f32 * 0.5).max(bw * 8.0);
+        let width = (vp.width_px as Coord * 0.5).max(bw * 8.0);
         let height = bw * 1.6;
         let font_size = bw * 0.55;
         let text = match self.text.as_mut() { Some(t) => t, None => return };
@@ -83,11 +128,11 @@ impl DesktopApp {
     }
 
     fn render_frame(&mut self) {
-        let Some(surface) = self.surface.as_mut() else { return; };
-        let mut buffer = surface.buffer_mut().expect("softbuffer buffer_mut");
         let vp = self.compositor.viewport();
         let buf_w = vp.width_px as usize;
         let buf_h = vp.height_px as usize;
+        let vp_w = vp.width_px;
+        let vp_h = vp.height_px;
         let needed = buf_w * buf_h;
         if self.hit_test_map.len() != needed {
             self.hit_test_map.resize(needed, HIT_NONE);
@@ -95,52 +140,70 @@ impl DesktopApp {
             self.hit_test_map.fill(HIT_NONE);
         }
 
+        #[cfg(target_os = "macos")]
+        {
+            let Some(renderer) = self.renderer.as_mut() else { return; };
+            let mut buffer = renderer.lock_buffer();
+            Self::render_into(&mut self.compositor, &mut self.hit_test_map, &self.title, self.text.as_mut(), self.demo_textbox.as_ref(), &mut self.hover_pixel_list, self.hover_state, &mut buffer, buf_w, buf_h, vp_w, vp_h);
+            let _ = buffer.present();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let Some(surface) = self.surface.as_mut() else { return; };
+            let mut buffer = surface.buffer_mut().expect("softbuffer buffer_mut");
+            Self::render_into(&mut self.compositor, &mut self.hit_test_map, &self.title, self.text.as_mut(), self.demo_textbox.as_ref(), &mut self.hover_pixel_list, self.hover_state, &mut buffer, buf_w, buf_h, vp_w, vp_h);
+            buffer.present().expect("softbuffer buffer.present");
+        }
+    }
+
+    /// Paint everything into the given pixel buffer. Shared between wgpu and softbuffer paths.
+    fn render_into(compositor: &mut Compositor, hit_test_map: &mut Vec<u8>, title: &str, mut text: Option<&mut TextRenderer>, demo_textbox: Option<&Textbox>, hover_pixel_list: &mut Vec<usize>, hover_state: u8, buffer: &mut [u32], buf_w: usize, buf_h: usize, vp_w: u32, vp_h: u32) {
         // 1. Background noise — full buffer fill
-        paint::background_noise(&mut buffer, buf_w, buf_h, 0, true, 0, None);
+        paint::background_noise(buffer, buf_w, buf_h, 0, true, 0, None);
         // 2. Panes on top of background
-        self.compositor.render(&mut buffer, buf_w, buf_h);
+        compositor.render(buffer, buf_w, buf_h);
         // 3. Chrome controls strip (writes hit_test_map for click routing).
         let (start, crossings, button_x_start, button_height) = chrome::draw_window_controls(
-            &mut buffer,
-            &mut self.hit_test_map,
-            vp.width_px,
-            vp.height_px,
+            buffer,
+            hit_test_map,
+            vp_w,
+            vp_h,
             1.0,
         );
         // 4. Two-tone window edges + squircle corner mask (verbatim photon)
         chrome::draw_window_edges_and_mask(
-            &mut buffer,
-            &mut self.hit_test_map,
-            vp.width_px,
-            vp.height_px,
+            buffer,
+            hit_test_map,
+            vp_w,
+            vp_h,
             start,
             &crossings,
         );
         // 5. Vertical hairlines between control buttons (verbatim photon)
         chrome::draw_button_hairlines(
-            &mut buffer,
-            &mut self.hit_test_map,
-            vp.width_px,
-            vp.height_px,
+            buffer,
+            hit_test_map,
+            vp_w,
+            vp_h,
             button_x_start,
             button_height,
             start,
             &crossings,
         );
-        // 6. Title text in the top-left of the chrome strip — left-aligned, vertically centered in the button row, sized relative to button height. `bw` matches chrome's button_height formula (MIN + scaled) so text aligns with the buttons.
-        // Title text is skipped below a readable size — controls (which always render) are the load-bearing UI; text is visual decoration that shouldn't smear into illegibility.
-        let span = 2.0 * vp.width_px as f32 * vp.height_px as f32 / (vp.width_px as f32 + vp.height_px as f32);
-        let bw = chrome::MIN_BUTTON_HEIGHT_PX as f32 + (span / 32.0).ceil();
+        // 6. Title text — left-aligned, vertically centered in the button row, sized relative to button height.
+        // Skipped below a readable size — controls are the load-bearing UI; text shouldn't smear into illegibility.
+        let span = 2.0 * vp_w as Coord * vp_h as Coord / (vp_w as Coord + vp_h as Coord);
+        let bw = chrome::MIN_BUTTON_HEIGHT_PX as Coord + crate::math::ceil(span / 32.0);
         let title_size = bw * 0.55;
         if title_size >= 6.0 {
-        if let Some(text) = self.text.as_mut() {
+        if let Some(ref mut text) = text {
             let pad = bw * 0.5;
             let baseline_y = bw * 0.5;
             let _ = text.draw_text_left_u32(
-                &mut buffer,
+                buffer,
                 buf_w,
                 buf_h,
-                &self.title,
+                title,
                 pad,
                 baseline_y,
                 title_size,
@@ -152,17 +215,17 @@ impl DesktopApp {
                 None,
             );
 
-            // Aspect-ratio-driven rotation demo. Rotation = (aspect - 1) × π, so a square window (1:1) is upright, a 2:1 landscape window is upside-down, a 1:2 portrait window tilts the other way. Snapped to the per-font-size quantization grid (1-pixel-arc-at-radius rule, K=8) so consecutive frames at the same aspect hit the rasterized-glyph cache in `text::TextRenderer`. Pivots on the text's own midpoint via `draw_text_center_u32` + a rotate-about-anchor transform — the run spins like a clock hand, not a flag flapping from one end.
-            let aspect = vp.width_px as f32 / vp.height_px as f32;
+            // Aspect-ratio-driven rotation demo.
+            let aspect = vp_w as Coord / vp_h as Coord;
             let demo_size = title_size * 0.85;
             let theta = snap_rotation((aspect - 1.0) * core::f32::consts::PI, demo_size, 8);
-            let demo_anchor_x = vp.width_px as f32 * 0.5;
+            let demo_anchor_x = vp_w as Coord * 0.5;
             let demo_anchor_y = bw * 4.0;
             let demo_transform = Transform::translate(-demo_anchor_x, -demo_anchor_y)
                 .then(Transform::rotate(theta))
                 .then(Transform::translate(demo_anchor_x, demo_anchor_y));
             let _ = text.draw_text_center_u32(
-                &mut buffer,
+                buffer,
                 buf_w,
                 buf_h,
                 "rotation tracks viewport aspect ratio (proper AA via swash::scale)",
@@ -180,16 +243,15 @@ impl DesktopApp {
         }
 
         // 7. Demo textbox — sits below the rotation demo, accepts focus + keyboard input.
-        if let Some(tb) = self.demo_textbox.as_ref() {
-            if let Some(text) = self.text.as_mut() {
-                tb.render(&mut buffer, buf_w, buf_h, text, None, None);
+        if let Some(tb) = demo_textbox {
+            if let Some(ref mut text) = text {
+                tb.render(buffer, buf_w, buf_h, text, None, None);
             }
         }
 
         // 8. Hover overlay on whichever button is hovered.
-        self.hover_pixel_list = chrome::pixels_for_button(&self.hit_test_map, self.hover_state);
-        chrome::draw_button_hover_by_pixels(&mut buffer, &self.hover_pixel_list, true, self.hover_state);
-        buffer.present().expect("softbuffer buffer.present");
+        *hover_pixel_list = chrome::pixels_for_button(hit_test_map, hover_state);
+        chrome::draw_button_hover_by_pixels(buffer, hover_pixel_list, true, hover_state);
     }
 
     /// Look up the chrome hit-id under the current cursor. Cursor coordinates are external input — winit reports positions outside the window during drag-resize and during the moment cursor leaves.
@@ -199,12 +261,130 @@ impl DesktopApp {
         let vp = self.compositor.viewport();
         let mx = self.cursor_x as i32;
         let my = self.cursor_y as i32;
-        // Cast-and-compare: negative i32 casts to a huge usize, fails the `< width` check naturally.
         if (mx as usize) < (vp.width_px as usize) && (my as usize) < (vp.height_px as usize) {
             self.hit_test_map[(my as usize) * (vp.width_px as usize) + (mx as usize)]
         } else {
             HIT_NONE
         }
+    }
+
+    // --- macOS manual resize ---
+
+    /// macOS: poll mouse position and button state directly from AppKit.
+    /// Called from `about_to_wait()` to track the cursor even when it's outside the window
+    /// (winit stops delivering CursorMoved once the cursor leaves during resize).
+    #[cfg(target_os = "macos")]
+    fn poll_macos_resize(&mut self) -> bool {
+        let Some(window) = self.window.as_ref() else { return false; };
+        use std::ffi::{c_char, c_void};
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct NSPoint { x: f64, y: f64 }
+
+        unsafe extern "C" {
+            fn objc_msgSend(receiver: *const c_void, sel: *const c_void) -> usize;
+            fn sel_registerName(name: *const c_char) -> *const c_void;
+            fn objc_getClass(name: *const c_char) -> *const c_void;
+        }
+
+        unsafe {
+            let cls = objc_getClass(b"NSEvent\0".as_ptr() as *const c_char);
+
+            let sel_loc = sel_registerName(b"mouseLocation\0".as_ptr() as *const c_char);
+            let mouse_location: extern "C" fn(*const c_void, *const c_void) -> NSPoint =
+                std::mem::transmute(objc_msgSend as *const ());
+            let ns_point = mouse_location(cls, sel_loc);
+
+            let sel_btn = sel_registerName(b"pressedMouseButtons\0".as_ptr() as *const c_char);
+            let buttons = objc_msgSend(cls, sel_btn);
+            let left_held = buttons & 1 != 0;
+
+            // Convert AppKit coords (logical, bottom-left) to winit coords (physical, top-left)
+            let scale = window.scale_factor();
+            let phys_x = ns_point.x * scale;
+            let phys_y = self.screen_height as f64 - ns_point.y * scale;
+
+            if let Ok(window_pos) = window.outer_position() {
+                self.cursor_x = (phys_x - window_pos.x as f64) as Coord;
+                self.cursor_y = (phys_y - window_pos.y as f64) as Coord;
+            }
+
+            if !left_held {
+                self.is_dragging_resize = false;
+                self.resize_edge = ResizeEdge::None;
+                return true;
+            }
+
+            self.apply_resize();
+        }
+        false
+    }
+
+    /// macOS: compute new window size from current mouse delta and apply via `request_inner_size` + `set_outer_position`.
+    #[cfg(target_os = "macos")]
+    fn apply_resize(&self) {
+        let Some(window) = self.window.as_ref() else { return; };
+        let Ok(window_pos) = window.outer_position() else { return; };
+
+        let current_screen_x = window_pos.x as f64 + self.cursor_x as f64;
+        let current_screen_y = window_pos.y as f64 + self.cursor_y as f64;
+
+        let dx = (current_screen_x - self.drag_start_cursor_screen_pos.0) as Coord;
+        let dy = (current_screen_y - self.drag_start_cursor_screen_pos.1) as Coord;
+
+        let min_size: Coord = 128.0;
+
+        let (new_width, new_height, should_move, new_x, new_y) = match self.resize_edge {
+            ResizeEdge::Right => {
+                let w = (self.drag_start_size.0 as Coord + dx).max(min_size) as u32;
+                (w, self.drag_start_size.1, false, 0, 0)
+            }
+            ResizeEdge::Left => {
+                let w = (self.drag_start_size.0 as Coord - dx).max(min_size) as u32;
+                let width_change = self.drag_start_size.0 as i32 - w as i32;
+                (w, self.drag_start_size.1, true, self.drag_start_window_pos.0 + width_change, self.drag_start_window_pos.1)
+            }
+            ResizeEdge::Bottom => {
+                let h = (self.drag_start_size.1 as Coord + dy).max(min_size) as u32;
+                (self.drag_start_size.0, h, false, 0, 0)
+            }
+            ResizeEdge::Top => {
+                let h = (self.drag_start_size.1 as Coord - dy).max(min_size) as u32;
+                let height_change = self.drag_start_size.1 as i32 - h as i32;
+                (self.drag_start_size.0, h, true, self.drag_start_window_pos.0, self.drag_start_window_pos.1 + height_change)
+            }
+            ResizeEdge::TopRight => {
+                let w = (self.drag_start_size.0 as Coord + dx).max(min_size) as u32;
+                let h = (self.drag_start_size.1 as Coord - dy).max(min_size) as u32;
+                let height_change = self.drag_start_size.1 as i32 - h as i32;
+                (w, h, true, self.drag_start_window_pos.0, self.drag_start_window_pos.1 + height_change)
+            }
+            ResizeEdge::TopLeft => {
+                let w = (self.drag_start_size.0 as Coord - dx).max(min_size) as u32;
+                let h = (self.drag_start_size.1 as Coord - dy).max(min_size) as u32;
+                let width_change = self.drag_start_size.0 as i32 - w as i32;
+                let height_change = self.drag_start_size.1 as i32 - h as i32;
+                (w, h, true, self.drag_start_window_pos.0 + width_change, self.drag_start_window_pos.1 + height_change)
+            }
+            ResizeEdge::BottomRight => {
+                let w = (self.drag_start_size.0 as Coord + dx).max(min_size) as u32;
+                let h = (self.drag_start_size.1 as Coord + dy).max(min_size) as u32;
+                (w, h, false, 0, 0)
+            }
+            ResizeEdge::BottomLeft => {
+                let w = (self.drag_start_size.0 as Coord - dx).max(min_size) as u32;
+                let h = (self.drag_start_size.1 as Coord + dy).max(min_size) as u32;
+                let width_change = self.drag_start_size.0 as i32 - w as i32;
+                (w, h, true, self.drag_start_window_pos.0 + width_change, self.drag_start_window_pos.1)
+            }
+            ResizeEdge::None => return,
+        };
+
+        if should_move {
+            let _ = window.set_outer_position(winit::dpi::PhysicalPosition::new(new_x, new_y));
+        }
+        let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(new_width, new_height));
     }
 }
 
@@ -212,9 +392,12 @@ impl ApplicationHandler for DesktopApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() { return; }
 
-        // Default initial size: 4:3 window scaled to the monitor's short edge. `short = min(w,h)` is orientation-independent (works the same on portrait, landscape, square monitors). Window height = 3/4 of the short edge leaves a quarter-edge of breathing room for OS chrome / dock / taskbars; width = 4h/3 = the full short edge gives a classic 4:3 aspect ratio. Numbers are arbitrary defaults — consumers override by passing their preferred Viewport size and we'll honor it next session when the API is wired through. Falls back to the compositor's existing viewport size when no monitor info is available.
-        let initial = if let Some(monitor) = event_loop.primary_monitor() {
-            let size = monitor.size();
+        let monitor = event_loop.primary_monitor()
+            .or_else(|| event_loop.available_monitors().next());
+
+        // Default initial size: 4:3 window scaled to the monitor's short edge.
+        let initial = if let Some(ref mon) = monitor {
+            let size = mon.size();
             let short = size.width.min(size.height);
             let h = short * 3 / 4;
             let w = h * 4 / 3;
@@ -224,13 +407,20 @@ impl ApplicationHandler for DesktopApp {
             winit::dpi::PhysicalSize::new(vp.width_px, vp.height_px)
         };
 
+        // Store screen height for macOS NSEvent coordinate conversion (AppKit uses bottom-left origin).
+        #[cfg(target_os = "macos")]
+        if let Some(ref mon) = monitor {
+            self.screen_height = mon.size().height;
+        }
+
         let attrs = WindowAttributes::default()
             .with_title(&self.title)
             .with_inner_size(initial)
-            // 24 × 8 minimum: chosen so the controls strip is **always visible** at any non-degenerate window size. With chrome's `button_height = MIN_BUTTON_HEIGHT_PX + ceil(span/32)` formula and `MIN_BUTTON_HEIGHT_PX = 4`, the maximum button_height as height → ∞ at width=W is `4 + ceil(2W/32) = 4 + ceil(W/16)`, giving total_width = `7*(4 + ceil(W/16))/2`. Setting `width >= 24` guarantees `total_width <= 21 <= 24` at all heights; `height >= 8` guarantees the strip fits vertically (button_height <= 6 at min).
             .with_min_inner_size(winit::dpi::PhysicalSize::new(24u32, 8u32))
             .with_decorations(false)
             .with_transparent(true)
+            // macOS: start non-resizable so AppKit doesn't override our cursor near edges.
+            // We track resize manually via NSEvent polling.
             .with_resizable(cfg!(not(target_os = "macos")));
         let window = Arc::new(event_loop.create_window(attrs).expect("create_window"));
 
@@ -240,22 +430,31 @@ impl ApplicationHandler for DesktopApp {
             window.set_has_shadow(false);
         }
 
-        let context = softbuffer::Context::new(window.clone()).expect("softbuffer Context::new");
-        let mut surface = softbuffer::Surface::new(&context, window.clone()).expect("softbuffer Surface::new");
-        surface
-            .resize(
-                NonZeroU32::new(initial.width).expect("nonzero width"),
-                NonZeroU32::new(initial.height).expect("nonzero height"),
-            )
-            .expect("softbuffer Surface::resize");
-
         // Compositor must match the actual surface size.
         self.compositor.resize(initial.width, initial.height);
-        // Rule 0: `width * height` as u32 can overflow on absurd sizes (4G+ pixels). `checked_mul` returns None and we cap at 0 (rendering produces no hits). PREVENTS: silent u32 wrap → wrong allocation size → either OOM on a tiny vec or panicky out-of-bounds reads.
         let map_size = (initial.width as usize)
             .checked_mul(initial.height as usize)
             .unwrap_or(0);
         self.hit_test_map = vec![HIT_NONE; map_size];
+
+        // --- Platform renderer init ---
+        #[cfg(target_os = "macos")]
+        {
+            self.renderer = Some(super::renderer_wgpu::Renderer::new(&window, initial.width, initial.height));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            use std::num::NonZeroU32;
+            let context = softbuffer::Context::new(window.clone()).expect("softbuffer Context::new");
+            let mut surface = softbuffer::Surface::new(&context, window.clone()).expect("softbuffer Surface::new");
+            surface
+                .resize(
+                    NonZeroU32::new(initial.width).expect("nonzero width"),
+                    NonZeroU32::new(initial.height).expect("nonzero height"),
+                )
+                .expect("softbuffer Surface::resize");
+            self.surface = Some(surface);
+        }
 
         // Lazily build the text renderer (FontSystem creation parses bundled TTFs).
         if self.text.is_none() {
@@ -264,40 +463,60 @@ impl ApplicationHandler for DesktopApp {
         self.update_textbox_layout();
 
         self.window = Some(window.clone());
-        self.surface = Some(surface);
         window.request_redraw();
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // macOS resize polling: when dragging a resize edge, winit stops delivering
+        // CursorMoved once the cursor leaves the window. We poll NSEvent.mouseLocation
+        // directly and apply resizes each tick until the button is released.
+        #[cfg(target_os = "macos")]
+        if self.is_dragging_resize {
+            if self.poll_macos_resize() {
+                if let Some(window) = self.window.as_ref() { window.request_redraw(); }
+            }
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                std::time::Instant::now() + std::time::Duration::from_millis(16),
+            ));
+            return;
+        }
     }
 
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                // Killswitch-compliant exit: hand the process back to the kernel directly. No Drop chain, no surface teardown, no font-cache release — all of that is process-scoped state the kernel reclaims in microseconds anyway. Per AGENT.md's persistence cadence rule, every state change is already on disk within 1 s of the change, so there's nothing to flush. "Ring always valid; any state is a valid checkpoint." Same path as ferros's hardware power cutoff, just at the OS-process level.
                 std::process::exit(0);
             }
             WindowEvent::Resized(size) => {
-                // Coalesce no-op resizes. Some compositors (Wayland especially) send a flood of same-size Resized events while the user drags past the other edge with min_inner_size clamping in effect — each one would request_redraw and re-thrash the glyph cache, pegging CPU. Bail if nothing actually changed.
                 let current_vp = self.compositor.viewport();
                 if size.width == current_vp.width_px && size.height == current_vp.height_px {
                     return;
                 }
-                if let (Some(surface), Some(width), Some(height)) = (
-                    self.surface.as_mut(),
-                    NonZeroU32::new(size.width),
-                    NonZeroU32::new(size.height),
-                ) {
-                    surface.resize(width, height).expect("softbuffer Surface::resize");
-                    self.compositor.resize(size.width, size.height);
-                    let map_size = (size.width as usize)
-                        .checked_mul(size.height as usize)
-                        .unwrap_or(0);
-                    self.hit_test_map.resize(map_size, HIT_NONE);
-                    self.update_textbox_layout();
-                    if let Some(window) = self.window.as_ref() { window.request_redraw(); }
+                if size.width == 0 || size.height == 0 { return; }
+
+                #[cfg(target_os = "macos")]
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.resize(size.width, size.height);
                 }
+                #[cfg(not(target_os = "macos"))]
+                if let Some(surface) = self.surface.as_mut() {
+                    use std::num::NonZeroU32;
+                    if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
+                        surface.resize(w, h).expect("softbuffer Surface::resize");
+                    }
+                }
+
+                self.compositor.resize(size.width, size.height);
+                let map_size = (size.width as usize)
+                    .checked_mul(size.height as usize)
+                    .unwrap_or(0);
+                self.hit_test_map.resize(map_size, HIT_NONE);
+                self.update_textbox_layout();
+                if let Some(window) = self.window.as_ref() { window.request_redraw(); }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor_x = position.x as f32;
-                self.cursor_y = position.y as f32;
+                self.cursor_x = position.x as Coord;
+                self.cursor_y = position.y as Coord;
                 let new_hit = self.hit_at_cursor();
                 let over_textbox = self
                     .demo_textbox
@@ -325,9 +544,18 @@ impl ApplicationHandler for DesktopApp {
                     }
                 }
             }
+            WindowEvent::Focused(false) => {
+                // Cancel any in-progress resize drag when the window loses focus —
+                // we won't receive a MouseInput Released event in that case.
+                #[cfg(target_os = "macos")]
+                {
+                    self.is_dragging_resize = false;
+                    self.resize_edge = ResizeEdge::None;
+                }
+            }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 let Some(window) = self.window.as_ref() else { return; };
-                // Photon's priority: window controls > resize edges > drag.
+                // Priority: window controls > resize edges > textbox > drag.
                 match self.hit_at_cursor() {
                     HIT_CLOSE_BUTTON => { std::process::exit(0); }
                     HIT_MINIMIZE_BUTTON => { window.set_minimized(true); return; }
@@ -336,11 +564,43 @@ impl ApplicationHandler for DesktopApp {
                 }
                 let vp = self.compositor.viewport();
                 let edge = chrome::get_resize_edge(vp.width_px, vp.height_px, self.cursor_x, self.cursor_y);
-                if let Some(dir) = resize_direction(edge) {
-                    let _ = window.drag_resize_window(dir);
-                    return;
+                if edge != ResizeEdge::None {
+                    // Linux: native resize protocol.
+                    #[cfg(target_os = "linux")]
+                    {
+                        use winit::window::ResizeDirection;
+                        if let Some(dir) = resize_direction(edge) {
+                            let _ = window.drag_resize_window(dir);
+                        }
+                        return;
+                    }
+                    // macOS/Windows: manual resize tracking.
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        #[cfg(target_os = "macos")]
+                        {
+                            self.is_dragging_resize = true;
+                            self.resize_edge = edge;
+                            self.drag_start_size = (vp.width_px, vp.height_px);
+                            if let Ok(window_pos) = window.outer_position() {
+                                self.drag_start_window_pos = (window_pos.x, window_pos.y);
+                                self.drag_start_cursor_screen_pos = (
+                                    window_pos.x as f64 + self.cursor_x as f64,
+                                    window_pos.y as f64 + self.cursor_y as f64,
+                                );
+                            }
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            use winit::window::ResizeDirection;
+                            if let Some(dir) = resize_direction(edge) {
+                                let _ = window.drag_resize_window(dir);
+                            }
+                        }
+                        return;
+                    }
                 }
-                // Textbox click — focus + cursor positioning if inside, defocus otherwise. Either way request a redraw because the focus border + cursor visibility changes.
+                // Textbox click — focus + cursor positioning if inside, defocus otherwise.
                 if let Some(tb) = self.demo_textbox.as_mut() {
                     let was_focused = tb.focused;
                     tb.handle_click(self.cursor_x, self.cursor_y);
@@ -350,6 +610,14 @@ impl ApplicationHandler for DesktopApp {
                     }
                 }
                 let _ = window.drag_window();
+            }
+            #[cfg(target_os = "macos")]
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                if self.is_dragging_resize {
+                    self.is_dragging_resize = false;
+                    self.resize_edge = ResizeEdge::None;
+                    if let Some(window) = self.window.as_ref() { window.request_redraw(); }
+                }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed { return; }
@@ -387,7 +655,10 @@ impl ApplicationHandler for DesktopApp {
     }
 }
 
-fn resize_direction(edge: ResizeEdge) -> Option<ResizeDirection> {
+/// Map resize edge to winit's `ResizeDirection` (used on Linux/Windows where native resize works).
+#[cfg(not(target_os = "macos"))]
+fn resize_direction(edge: ResizeEdge) -> Option<winit::window::ResizeDirection> {
+    use winit::window::ResizeDirection;
     Some(match edge {
         ResizeEdge::Top => ResizeDirection::North,
         ResizeEdge::Bottom => ResizeDirection::South,
@@ -401,7 +672,7 @@ fn resize_direction(edge: ResizeEdge) -> Option<ResizeDirection> {
     })
 }
 
-fn cursor_for_state(hit: u8, x: f32, y: f32, compositor: &Compositor) -> CursorIcon {
+fn cursor_for_state(hit: u8, x: Coord, y: Coord, compositor: &Compositor) -> CursorIcon {
     match hit {
         HIT_CLOSE_BUTTON | HIT_MINIMIZE_BUTTON | HIT_MAXIMIZE_BUTTON => return CursorIcon::Pointer,
         _ => {}

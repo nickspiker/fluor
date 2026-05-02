@@ -6,3 +6,7 @@ pub mod chrome;
 
 #[cfg(feature = "host-winit")]
 pub mod desktop;
+
+/// macOS renderer — wgpu/Metal with PostMultiplied alpha for transparent corners.
+#[cfg(all(feature = "host-winit", target_os = "macos"))]
+pub mod renderer_wgpu;
