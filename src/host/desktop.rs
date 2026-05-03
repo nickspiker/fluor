@@ -9,9 +9,11 @@
 
 use super::chrome::{self, ResizeEdge, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE};
 use crate::coord::Coord;
+use crate::group::Group;
 use crate::paint;
-use crate::paint::Transform;
-use crate::rpn::{Op, RpnCompositor};
+use crate::paint::{BlendMode, Transform};
+use crate::region::Region;
+use crate::stack::Op;
 use crate::text::TextRenderer;
 use crate::theme;
 use crate::widgets::Textbox;
@@ -58,14 +60,18 @@ struct DesktopApp {
     /// Demo textbox living in the panes example. Edit it with the keyboard once you click in.
     demo_textbox: Option<Textbox>,
 
-    // --- RPN compositing ---
-    rpn: Option<RpnCompositor>,
-    /// Layer indices in the RPN compositor.
-    layer_bg: usize,      // background noise + panes
-    layer_chrome: usize,   // controls + edges + hairlines + title
-    layer_textbox: usize,  // pill + glow + text + selection
-    layer_blinkey: usize,  // wave cursor
-    layer_hover: usize,    // button hover overlay
+    // --- Group compositing ---
+    /// Full-viewport bg + chrome + hover overlay. Replace blend onto target. Sub-Stack: Push bg, Push chrome, AlphaOver, Push hover, Add.
+    chrome_group: Option<Group>,
+    /// Textbox-bbox-sized pill + text + selection. AlphaOver onto target.
+    textbox_group: Option<Group>,
+    /// Cursor-smear-bbox-sized blinkey wave (~16 × font_size pixels). Add onto target. Re-flattens on blink ticks ONLY — touches a few hundred pixels instead of the whole viewport.
+    cursor_group: Option<Group>,
+
+    /// Internal layer indices inside `chrome_group.rpn`.
+    chrome_layer_bg: usize,
+    chrome_layer_chrome: usize,
+    chrome_layer_hover: usize,
 
     // --- macOS manual resize tracking ---
     // winit stops delivering CursorMoved when the cursor leaves the window during a
@@ -112,12 +118,12 @@ impl DesktopApp {
             hover_pixel_list: Vec::new(),
             text: None,
             demo_textbox: None,
-            rpn: None,
-            layer_bg: 0,
-            layer_chrome: 0,
-            layer_textbox: 0,
-            layer_blinkey: 0,
-            layer_hover: 0,
+            chrome_group: None,
+            textbox_group: None,
+            cursor_group: None,
+            chrome_layer_bg: 0,
+            chrome_layer_chrome: 0,
+            chrome_layer_hover: 0,
             #[cfg(target_os = "macos")]
             is_dragging_resize: false,
             #[cfg(target_os = "macos")]
@@ -147,7 +153,7 @@ impl DesktopApp {
         std::time::Duration::from_millis(ms as u64)
     }
 
-    /// Reposition + resize the demo textbox to match the current viewport. Called after window create + on resize so the textbox tracks the viewport span.
+    /// Reposition + resize the demo textbox to match the current viewport. Also resizes `textbox_group` + `cursor_group` if they exist (initial creation happens in `resumed`).
     fn update_textbox_layout(&mut self) {
         let vp = self.compositor.viewport();
         let span = 2.0 * vp.width_px as Coord * vp.height_px as Coord / (vp.width_px as Coord + vp.height_px as Coord);
@@ -166,6 +172,13 @@ impl DesktopApp {
             tb.set_font_size(font_size, text);
             self.demo_textbox = Some(tb);
         }
+        // Sync the groups' bboxes with the textbox's new geometry (no-op on first call before groups exist).
+        if let Some(tb) = self.demo_textbox.as_ref() {
+            let bbox = tb.bbox();
+            let cbox = tb.cursor_bbox();
+            if let Some(g) = self.textbox_group.as_mut() { g.resize(bbox); }
+            if let Some(g) = self.cursor_group.as_mut() { g.resize(cbox); }
+        }
     }
 
     fn render_frame(&mut self) {
@@ -181,118 +194,145 @@ impl DesktopApp {
             self.hit_test_map.fill(HIT_NONE);
         }
 
-        let Some(rpn) = self.rpn.as_mut() else { return; };
-
-        // --- Rasterize dirty layers ---
-
-        // Layer 0: background noise + panes
-        if rpn.layers[self.layer_bg].dirty {
-            let bg = &mut rpn.layers[self.layer_bg].pixels;
-            bg.fill(0);
-            paint::background_noise(bg, buf_w, buf_h, 0, true, 0, None);
-            self.compositor.render(bg, buf_w, buf_h);
+        // Sync cursor_group region with current cursor position (cursor may have moved since last frame).
+        if let (Some(tb), Some(cg)) = (self.demo_textbox.as_ref(), self.cursor_group.as_mut()) {
+            cg.set_region(tb.cursor_bbox());
         }
 
-        // Layer 1: chrome controls + edges + hairlines + title text + rotation demo
-        if rpn.layers[self.layer_chrome].dirty {
-            let chrome_buf = &mut rpn.layers[self.layer_chrome].pixels;
-            chrome_buf.fill(0);
-            let (start, crossings, button_x_start, button_height) = chrome::draw_window_controls(
-                chrome_buf, &mut self.hit_test_map, vp_w, vp_h, 1.0,
-            );
-            chrome::draw_window_edges_and_mask(
-                chrome_buf, &mut self.hit_test_map, vp_w, vp_h, start, &crossings,
-            );
-            chrome::draw_button_hairlines(
-                chrome_buf, &mut self.hit_test_map, vp_w, vp_h,
-                button_x_start, button_height, start, &crossings,
-            );
-            let span = 2.0 * vp_w as Coord * vp_h as Coord / (vp_w as Coord + vp_h as Coord);
-            let bw = chrome::MIN_BUTTON_HEIGHT_PX as Coord + crate::math::ceil(span / 32.0);
-            let title_size = bw * 0.55;
-            if title_size >= 6.0 {
-                if let Some(text) = self.text.as_mut() {
-                    let pad = bw * 0.5;
-                    let baseline_y = bw * 0.5;
-                    let _ = text.draw_text_left_u32(
-                        chrome_buf, buf_w, buf_h, &self.title,
-                        pad, baseline_y, title_size, 400,
-                        theme::TEXT_COLOUR, "Open Sans", None, None, None,
-                    );
-                    let aspect = vp_w as Coord / vp_h as Coord;
-                    let demo_size = title_size * 0.85;
-                    // Continuous theta — snapping happens per-glyph inside the text path (contour only; placement stays smooth).
-                    let theta = (aspect - 1.0) * core::f32::consts::PI;
-                    let demo_anchor_x = vp_w as Coord * 0.5;
-                    let demo_anchor_y = bw * 4.0;
-                    let demo_transform = Transform::translate(-demo_anchor_x, -demo_anchor_y)
-                        .then(Transform::rotate(theta))
-                        .then(Transform::translate(demo_anchor_x, demo_anchor_y));
-                    let _ = text.draw_text_center_u32(
-                        chrome_buf, buf_w, buf_h,
-                        "rotation tracks viewport aspect ratio (proper AA via swash::scale)",
-                        demo_anchor_x, demo_anchor_y, demo_size, 400,
-                        theme::TEXT_COLOUR, "Open Sans", None, None, Some(demo_transform),
-                    );
+        // Split-borrow self so the per-group rasterization can call into self.compositor / self.text without re-borrowing self.
+        let DesktopApp {
+            compositor,
+            title,
+            chrome_group,
+            textbox_group,
+            cursor_group,
+            chrome_layer_bg,
+            chrome_layer_chrome,
+            chrome_layer_hover,
+            hit_test_map,
+            hover_state,
+            hover_pixel_list,
+            text,
+            demo_textbox,
+            ..
+        } = self;
+
+        // --- chrome_group: bg + chrome + hover (full viewport, Replace onto target) ---
+        if let Some(cg) = chrome_group.as_mut() {
+            let layers = &mut cg.rpn.layers;
+
+            // Layer bg: background noise + panes.
+            if layers[*chrome_layer_bg].dirty {
+                let bg = &mut layers[*chrome_layer_bg].pixels;
+                bg.fill(0);
+                paint::background_noise(bg, buf_w, buf_h, 0, true, 0, None);
+                compositor.render(bg, buf_w, buf_h);
+            }
+
+            // Layer chrome: controls + edges + hairlines + title text + rotation demo.
+            if layers[*chrome_layer_chrome].dirty {
+                let chrome_buf = &mut layers[*chrome_layer_chrome].pixels;
+                chrome_buf.fill(0);
+                let (start, crossings, button_x_start, button_height) = chrome::draw_window_controls(
+                    chrome_buf, hit_test_map, vp_w, vp_h, 1.0,
+                );
+                chrome::draw_window_edges_and_mask(
+                    chrome_buf, hit_test_map, vp_w, vp_h, start, &crossings,
+                );
+                chrome::draw_button_hairlines(
+                    chrome_buf, hit_test_map, vp_w, vp_h,
+                    button_x_start, button_height, start, &crossings,
+                );
+                let span = 2.0 * vp_w as Coord * vp_h as Coord / (vp_w as Coord + vp_h as Coord);
+                let bw = chrome::MIN_BUTTON_HEIGHT_PX as Coord + crate::math::ceil(span / 32.0);
+                let title_size = bw * 0.55;
+                if title_size >= 6.0 {
+                    if let Some(t) = text.as_mut() {
+                        let pad = bw * 0.5;
+                        let baseline_y = bw * 0.5;
+                        let _ = t.draw_text_left_u32(
+                            chrome_buf, buf_w, buf_h, title,
+                            pad, baseline_y, title_size, 400,
+                            theme::TEXT_COLOUR, "Open Sans", None, None, None,
+                        );
+                        let aspect = vp_w as Coord / vp_h as Coord;
+                        let demo_size = title_size * 0.85;
+                        let theta = (aspect - 1.0) * core::f32::consts::PI;
+                        let demo_anchor_x = vp_w as Coord * 0.5;
+                        let demo_anchor_y = bw * 4.0;
+                        let demo_transform = Transform::translate(-demo_anchor_x, -demo_anchor_y)
+                            .then(Transform::rotate(theta))
+                            .then(Transform::translate(demo_anchor_x, demo_anchor_y));
+                        let _ = t.draw_text_center_u32(
+                            chrome_buf, buf_w, buf_h,
+                            "rotation tracks viewport aspect ratio (proper AA via swash::scale)",
+                            demo_anchor_x, demo_anchor_y, demo_size, 400,
+                            theme::TEXT_COLOUR, "Open Sans", None, None, Some(demo_transform),
+                        );
+                    }
+                }
+            }
+
+            // Layer hover: additive delta on control buttons.
+            if layers[*chrome_layer_hover].dirty {
+                let hov_buf = &mut layers[*chrome_layer_hover].pixels;
+                hov_buf.fill(0);
+                *hover_pixel_list = chrome::pixels_for_button(hit_test_map, *hover_state);
+                let hover_delta = match *hover_state {
+                    HIT_CLOSE_BUTTON => theme::CLOSE_HOVER,
+                    HIT_MAXIMIZE_BUTTON => theme::MAXIMIZE_HOVER,
+                    HIT_MINIMIZE_BUTTON => theme::MINIMIZE_HOVER,
+                    _ => 0,
+                };
+                if hover_delta != 0 {
+                    for &idx in hover_pixel_list.iter() {
+                        hov_buf[idx] = hover_delta;
+                    }
                 }
             }
         }
 
-        // Layer 2: textbox (pill + glow + text + selection — everything except blinkey)
-        if rpn.layers[self.layer_textbox].dirty {
-            let tb_buf = &mut rpn.layers[self.layer_textbox].pixels;
-            tb_buf.fill(0);
-            if let Some(tb) = self.demo_textbox.as_mut() {
-                if let Some(text) = self.text.as_mut() {
-                    tb.render(tb_buf, buf_w, buf_h, text, None, None);
+        // --- textbox_group: pill + glow + text + selection (bbox-sized, AlphaOver onto target) ---
+        if let (Some(tg), Some(tb)) = (textbox_group.as_mut(), demo_textbox.as_mut()) {
+            if tg.rpn.layers[0].dirty {
+                let (tw, th) = tg.dims();
+                let bbox = tb.bbox();
+                let buf = &mut tg.rpn.layers[0].pixels;
+                buf.fill(0);
+                if let Some(t) = text.as_mut() {
+                    tb.render(buf, tw, th, bbox.x, bbox.y, t, None, None);
                 }
             }
         }
 
-        // Layer 3: blinkey (wave cursor only — additive)
-        if rpn.layers[self.layer_blinkey].dirty {
-            let bk_buf = &mut rpn.layers[self.layer_blinkey].pixels;
-            bk_buf.fill(0);
-            if let Some(tb) = self.demo_textbox.as_ref() {
-                tb.render_blinkey_into(bk_buf, buf_w, buf_h);
+        // --- cursor_group: blinkey wave (cursor-smear-bbox-sized, Add onto target) ---
+        if let (Some(cg), Some(tb)) = (cursor_group.as_mut(), demo_textbox.as_ref()) {
+            if cg.rpn.layers[0].dirty {
+                let (cw, ch) = cg.dims();
+                let cbox = tb.cursor_bbox();
+                let buf = &mut cg.rpn.layers[0].pixels;
+                buf.fill(0);
+                tb.render_blinkey_into(buf, cw, ch, cbox.x, cbox.y);
             }
         }
 
-        // Layer 4: hover overlay (additive delta on control buttons)
-        if rpn.layers[self.layer_hover].dirty {
-            let hov_buf = &mut rpn.layers[self.layer_hover].pixels;
-            hov_buf.fill(0);
-            self.hover_pixel_list = chrome::pixels_for_button(&self.hit_test_map, self.hover_state);
-            // Write the hover delta into the layer buffer at the button pixel positions.
-            let hover_delta = match self.hover_state {
-                HIT_CLOSE_BUTTON => theme::CLOSE_HOVER,
-                HIT_MAXIMIZE_BUTTON => theme::MAXIMIZE_HOVER,
-                HIT_MINIMIZE_BUTTON => theme::MINIMIZE_HOVER,
-                _ => 0,
-            };
-            if hover_delta != 0 {
-                for &idx in &self.hover_pixel_list {
-                    hov_buf[idx] = hover_delta;
-                }
-            }
-        }
-
-        // --- Evaluate RPN program → composite ---
-        let composite = rpn.evaluate();
-
-        // --- Copy composite to present buffer ---
+        // --- Flatten groups onto the present buffer ---
         #[cfg(target_os = "macos")]
         {
             let Some(renderer) = self.renderer.as_mut() else { return; };
             let mut buffer = renderer.lock_buffer();
-            buffer.copy_from_slice(composite);
+            if let Some(g) = self.chrome_group.as_mut() { g.flatten_into(&mut buffer, buf_w, buf_h); }
+            if let Some(g) = self.textbox_group.as_mut() { g.flatten_into(&mut buffer, buf_w, buf_h); }
+            if let Some(g) = self.cursor_group.as_mut() { g.flatten_into(&mut buffer, buf_w, buf_h); }
             let _ = buffer.present();
         }
         #[cfg(not(target_os = "macos"))]
         {
             let Some(surface) = self.surface.as_mut() else { return; };
             let mut buffer = surface.buffer_mut().expect("softbuffer buffer_mut");
-            buffer.copy_from_slice(composite);
+            if let Some(g) = self.chrome_group.as_mut() { g.flatten_into(&mut buffer, buf_w, buf_h); }
+            if let Some(g) = self.textbox_group.as_mut() { g.flatten_into(&mut buffer, buf_w, buf_h); }
+            if let Some(g) = self.cursor_group.as_mut() { g.flatten_into(&mut buffer, buf_w, buf_h); }
             buffer.present().expect("softbuffer buffer.present");
         }
     }
@@ -313,9 +353,7 @@ impl DesktopApp {
 
     // --- macOS manual resize ---
 
-    /// macOS: poll mouse position and button state directly from AppKit.
-    /// Called from `about_to_wait()` to track the cursor even when it's outside the window
-    /// (winit stops delivering CursorMoved once the cursor leaves during resize).
+    /// macOS: poll mouse position and button state directly from AppKit. Called from `about_to_wait()` to track the cursor even when it's outside the window (winit stops delivering CursorMoved once the cursor leaves during resize).
     #[cfg(target_os = "macos")]
     fn poll_macos_resize(&mut self) -> bool {
         let Some(window) = self.window.as_ref() else { return false; };
@@ -505,29 +543,36 @@ impl ApplicationHandler for DesktopApp {
         }
         self.update_textbox_layout();
 
-        // Initialize RPN compositor with 3 layers:
-        //   0: base (background + panes + chrome + title)  — dirty on resize
-        //   1: textbox (pill + glow + text + selection)    — dirty on edit/focus
-        //   2: blinkey (wave cursor)                       — dirty on blink tick
-        // Program: Push 0, Push 1, AlphaOver, Push 2, Add
-        let mut rpn = RpnCompositor::new(initial.width as usize, initial.height as usize);
-        self.layer_bg = rpn.add_layer();
-        self.layer_chrome = rpn.add_layer();
-        self.layer_textbox = rpn.add_layer();
-        self.layer_blinkey = rpn.add_layer();
-        self.layer_hover = rpn.add_layer();
-        rpn.set_program(vec![
-            Op::Push(self.layer_bg),
-            Op::Push(self.layer_chrome),
+        // Initialize the three composite groups.
+        let viewport_region = Region::new(0.0, 0.0, initial.width as Coord, initial.height as Coord);
+
+        // chrome_group: full viewport. Inside Stack: bg (Replace) + chrome (AlphaOver) + hover (Add).
+        let mut cg = Group::new(viewport_region, BlendMode::Replace);
+        self.chrome_layer_bg = cg.new_layer();
+        self.chrome_layer_chrome = cg.new_layer();
+        self.chrome_layer_hover = cg.new_layer();
+        cg.set_program(vec![
+            Op::Push(self.chrome_layer_bg),
+            Op::Push(self.chrome_layer_chrome),
             Op::AlphaOver,
-            Op::Push(self.layer_textbox),
-            Op::AlphaOver,
-            Op::Push(self.layer_blinkey),
-            Op::Add,
-            Op::Push(self.layer_hover),
+            Op::Push(self.chrome_layer_hover),
             Op::Add,
         ]);
-        self.rpn = Some(rpn);
+        self.chrome_group = Some(cg);
+
+        // textbox_group: bbox = textbox rect. Inside Stack: one layer for pill+text+selection.
+        if let Some(tb) = self.demo_textbox.as_ref() {
+            let mut tg = Group::new(tb.bbox(), BlendMode::AlphaOver);
+            let l = tg.new_layer();
+            tg.set_program(vec![Op::Push(l)]);
+            self.textbox_group = Some(tg);
+
+            // cursor_group: bbox = cursor smear (~16 × font_size pixels). Add onto target. Re-flattens on blink ticks.
+            let mut crg = Group::new(tb.cursor_bbox(), BlendMode::Add);
+            let l = crg.new_layer();
+            crg.set_program(vec![Op::Push(l)]);
+            self.cursor_group = Some(crg);
+        }
 
         self.window = Some(window.clone());
         window.request_redraw();
@@ -585,15 +630,13 @@ impl ApplicationHandler for DesktopApp {
             return;
         }
 
-        // Blinkey timer: flip the wave cursor on schedule.
+        // Blinkey timer: flip the wave cursor on schedule. Touches only the cursor_group's tiny bbox (~16 × font_size pixels) — not the whole viewport.
         if let Some(when) = self.next_blink {
             let now = std::time::Instant::now();
             if now >= when {
                 if let Some(tb) = self.demo_textbox.as_mut() {
                     if tb.flip_blinkey() {
-                        if let Some(rpn) = self.rpn.as_mut() {
-                            rpn.layers[self.layer_blinkey].dirty = true;
-                        }
+                        if let Some(g) = self.cursor_group.as_mut() { g.invalidate(); }
                         if let Some(window) = self.window.as_ref() { window.request_redraw(); }
                     }
                 }
@@ -631,8 +674,8 @@ impl ApplicationHandler for DesktopApp {
                 }
 
                 self.compositor.resize(size.width, size.height);
-                if let Some(rpn) = self.rpn.as_mut() {
-                    rpn.resize(size.width as usize, size.height as usize);
+                if let Some(g) = self.chrome_group.as_mut() {
+                    g.resize(Region::new(0.0, 0.0, size.width as Coord, size.height as Coord));
                 }
                 let map_size = (size.width as usize)
                     .checked_mul(size.height as usize)
@@ -657,9 +700,8 @@ impl ApplicationHandler for DesktopApp {
                         let clamped_x = self.cursor_x.clamp(tl, tr);
                         tb.cursor = tb.cursor_index_from_x(clamped_x);
                     }
-                    if let Some(rpn) = self.rpn.as_mut() {
-                        rpn.layers[self.layer_textbox].dirty = true;
-                    }
+                    if let Some(g) = self.textbox_group.as_mut() { g.invalidate(); }
+                    if let Some(g) = self.cursor_group.as_mut() { g.invalidate(); }
                     if let Some(window) = self.window.as_ref() { window.request_redraw(); }
                     return;
                 }
@@ -679,8 +721,8 @@ impl ApplicationHandler for DesktopApp {
                 }
                 if new_hit != self.hover_state {
                     self.hover_state = new_hit;
-                    if let Some(rpn) = self.rpn.as_mut() {
-                        rpn.layers[self.layer_hover].dirty = true;
+                    if let Some(g) = self.chrome_group.as_mut() {
+                        g.rpn.layers[self.chrome_layer_hover].dirty = true;
                     }
                     if let Some(window) = self.window.as_ref() { window.request_redraw(); }
                 }
@@ -688,8 +730,8 @@ impl ApplicationHandler for DesktopApp {
             WindowEvent::CursorLeft { .. } => {
                 if self.hover_state != chrome::HIT_NONE {
                     self.hover_state = chrome::HIT_NONE;
-                    if let Some(rpn) = self.rpn.as_mut() {
-                        rpn.layers[self.layer_hover].dirty = true;
+                    if let Some(g) = self.chrome_group.as_mut() {
+                        g.rpn.layers[self.chrome_layer_hover].dirty = true;
                     }
                     if let Some(window) = self.window.as_ref() {
                         window.set_cursor(CursorIcon::Default);
@@ -763,10 +805,8 @@ impl ApplicationHandler for DesktopApp {
                     if tb.focused {
                         self.is_dragging_select = true;
                         self.selection_scroll_time = None;
-                        if let Some(rpn) = self.rpn.as_mut() {
-                            rpn.layers[self.layer_textbox].dirty = true;
-                            rpn.layers[self.layer_blinkey].dirty = true;
-                        }
+                        if let Some(g) = self.textbox_group.as_mut() { g.invalidate(); }
+                        if let Some(g) = self.cursor_group.as_mut() { g.invalidate(); }
                         let interval = self.next_blink_interval();
                         self.next_blink = Some(std::time::Instant::now() + interval);
                         window.request_redraw();
@@ -774,10 +814,8 @@ impl ApplicationHandler for DesktopApp {
                     } else if was_focused {
                         self.next_blink = None;
                         self.is_dragging_select = false;
-                        if let Some(rpn) = self.rpn.as_mut() {
-                            rpn.layers[self.layer_textbox].dirty = true;
-                            rpn.layers[self.layer_blinkey].dirty = true;
-                        }
+                        if let Some(g) = self.textbox_group.as_mut() { g.invalidate(); }
+                        if let Some(g) = self.cursor_group.as_mut() { g.invalidate(); }
                         window.request_redraw();
                     }
                 }
@@ -884,10 +922,8 @@ impl ApplicationHandler for DesktopApp {
                     }
                 }
                 if changed {
-                    if let Some(rpn) = self.rpn.as_mut() {
-                        rpn.layers[self.layer_textbox].dirty = true;
-                        rpn.layers[self.layer_blinkey].dirty = true;
-                    }
+                    if let Some(g) = self.textbox_group.as_mut() { g.invalidate(); }
+                    if let Some(g) = self.cursor_group.as_mut() { g.invalidate(); }
                     let interval = self.next_blink_interval();
                     self.next_blink = Some(std::time::Instant::now() + interval);
                     if let Some(window) = self.window.as_ref() { window.request_redraw(); }
