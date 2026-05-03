@@ -2,5 +2,7 @@
 //!
 //! Widgets are positioned in **pixel coordinates** for now. Once consumers are migrating, this will move to RU coords matching the rest of the layout.
 
+pub mod blink;
 pub mod textbox;
+pub use blink::BlinkTimer;
 pub use textbox::Textbox;
