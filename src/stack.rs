@@ -1,19 +1,15 @@
-//! RPN compositing engine — layers as operands, blend ops as operators.
+//! Stack Notation compositing engine — layers as operands, blend ops as operators.
 //!
-//! The compositor is a reverse-polish-notation calculator. `Push` loads a layer's pixel
-//! buffer onto the evaluation stack; operators pop their inputs and push results. The same
-//! evaluator handles simple ordered stacks (`Push 0, Push 1, AlphaOver`) and complex
-//! expressions (`Push 0, Push 1, Mul, Push 2, Add`).
+//! "Stack Notation" describes the mechanism directly: data flows through a stack in execution order, operators are stack transformations. No precedence tables, no ambiguity. (Often called "RPN" in calculator history; that name carries decades of irrelevant baggage and the geographic branding of its inventor — neither describes what it actually does. Contrast with "Infix Notation" — the broken sibling whose arbitrary operator placement creates all the precedence/associativity problems Stack Notation sidesteps.)
 //!
-//! Dirty tracking: hot layers (blinkey, text) go at the end of the program. When a layer
-//! changes, re-evaluation starts from the earliest dirty `Push` — the tail of the program.
-//! A blink tick re-runs one `Add` pass. A keystroke re-runs two or three. Only a resize
-//! re-evaluates the full program.
+//! `Push` loads a layer's pixel buffer onto the evaluation stack; operators pop their inputs and push results. The same evaluator handles simple ordered stacks (`Push 0, Push 1, AlphaOver`) and complex expressions (`Push 0, Push 1, Mul, Push 2, Add`).
+//!
+//! Dirty tracking: hot layers (blinkey, text) go at the end of the program. When a layer changes, re-evaluation starts from the earliest dirty `Push` — the tail of the program. A blink tick re-runs one `Add` pass. A keystroke re-runs two or three. Only a resize re-evaluates the full program.
 
 use alloc::vec::Vec;
 use crate::pixel::Argb8;
 
-/// RPN instruction — either a data push or a channel operation.
+/// Stack Notation instruction — either a data push or a channel operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
     /// Push layer `idx` onto the evaluation stack.
@@ -28,11 +24,13 @@ pub enum Op {
     Sub,
     /// Per-channel multiply: `(a * b) >> 8`.
     Mul,
+    /// Per-channel integer Euclidean divide: `(a << 8) / b`, saturated at 0xFF, divide-by-zero saturates to 0xFF. Slow path (no NEON SIMD integer div); use sparingly.
+    Div,
     /// Porter-Duff source-over: `src * α + dst * (1 - α)`.
     AlphaOver,
     /// Screen: `inv(mul(inv(a), inv(b)))`.
     Screen,
-    /// XOR RGB, preserve alpha from `a`.
+    /// Per-channel XOR across all four channels (its own inverse: `a ^ b ^ b = a`).
     Xor,
 
     // --- Unary (pop 1, push 1) ---
@@ -41,12 +39,12 @@ pub enum Op {
 }
 
 /// A named pixel buffer that the consumer rasterizes into.
-pub struct RpnLayer {
+pub struct StackLayer {
     pub pixels: Vec<u32>,
     pub dirty: bool,
 }
 
-impl RpnLayer {
+impl StackLayer {
     pub fn new(size: usize) -> Self {
         Self { pixels: alloc::vec![0u32; size], dirty: true }
     }
@@ -62,10 +60,10 @@ impl RpnLayer {
     }
 }
 
-/// RPN compositing engine.
-pub struct RpnCompositor {
+/// Stack compositing engine.
+pub struct StackCompositor {
     /// Named pixel buffers, indexed by `Op::Push(idx)`.
-    pub layers: Vec<RpnLayer>,
+    pub layers: Vec<StackLayer>,
     /// The compositing program.
     pub program: Vec<Op>,
     /// Evaluation stack (reused across evaluations to avoid re-alloc).
@@ -82,7 +80,7 @@ pub struct RpnCompositor {
     size: usize,
 }
 
-impl RpnCompositor {
+impl StackCompositor {
     pub fn new(width: usize, height: usize) -> Self {
         Self {
             layers: Vec::new(),
@@ -96,9 +94,9 @@ impl RpnCompositor {
     }
 
     /// Add a layer. Returns its index for use in `Op::Push`.
-    pub fn add_layer(&mut self) -> usize {
+    pub fn new_layer(&mut self) -> usize {
         let idx = self.layers.len();
-        self.layers.push(RpnLayer::new(self.size));
+        self.layers.push(StackLayer::new(self.size));
         idx
     }
 
@@ -192,6 +190,7 @@ impl RpnCompositor {
                 Op::Add => self.binary_op(Argb8::add),
                 Op::Sub => self.binary_op(Argb8::sub),
                 Op::Mul => self.binary_op(Argb8::mul),
+                Op::Div => self.binary_op(Argb8::div),
                 Op::AlphaOver => self.binary_op(Argb8::alpha_over),
                 Op::Screen => self.binary_op(Argb8::screen),
                 Op::Xor => self.binary_op(Argb8::xor),
@@ -231,8 +230,8 @@ impl RpnCompositor {
 
     /// Apply a binary op: pop top two, apply f(second, top) in-place on second, push result.
     fn binary_op(&mut self, f: fn(Argb8, Argb8) -> Argb8) {
-        let b = self.stack.pop().expect("RPN stack underflow on binary op");
-        let a = self.stack.last_mut().expect("RPN stack underflow on binary op");
+        let b = self.stack.pop().expect("Stack stack underflow on binary op");
+        let a = self.stack.last_mut().expect("Stack stack underflow on binary op");
         for i in 0..a.len() {
             a[i] = f(Argb8(a[i]), Argb8(b[i])).0;
         }
@@ -241,7 +240,7 @@ impl RpnCompositor {
 
     /// Apply a unary op: pop top, apply f(x) in-place, push result.
     fn unary_op(&mut self, f: fn(Argb8) -> Argb8) {
-        let a = self.stack.last_mut().expect("RPN stack underflow on unary op");
+        let a = self.stack.last_mut().expect("Stack stack underflow on unary op");
         for i in 0..a.len() {
             a[i] = f(Argb8(a[i])).0;
         }
@@ -252,44 +251,44 @@ impl RpnCompositor {
 mod tests {
     use super::*;
 
-    fn make_rpn(size: usize) -> RpnCompositor {
-        RpnCompositor::new(size, 1)
+    fn make_stack(size: usize) -> StackCompositor {
+        StackCompositor::new(size, 1)
     }
 
     #[test]
     fn single_push_returns_layer() {
-        let mut rpn = make_rpn(4);
-        let l0 = rpn.add_layer();
-        rpn.layers[l0].pixels = alloc::vec![0xFF_11_22_33; 4];
-        rpn.set_program(alloc::vec![Op::Push(0)]);
-        let result = rpn.evaluate();
+        let mut stk = make_stack(4);
+        let l0 = stk.new_layer();
+        stk.layers[l0].pixels = alloc::vec![0xFF_11_22_33; 4];
+        stk.set_program(alloc::vec![Op::Push(0)]);
+        let result = stk.evaluate();
         assert_eq!(result, &[0xFF_11_22_33; 4]);
     }
 
     #[test]
     fn add_two_layers() {
-        let mut rpn = make_rpn(2);
-        let l0 = rpn.add_layer();
-        let l1 = rpn.add_layer();
-        rpn.layers[l0].pixels = alloc::vec![0xFF_10_00_00; 2];
-        rpn.layers[l1].pixels = alloc::vec![0x00_00_00_10; 2];
-        rpn.set_program(alloc::vec![Op::Push(l0), Op::Push(l1), Op::Add]);
-        let result = rpn.evaluate();
+        let mut stk = make_stack(2);
+        let l0 = stk.new_layer();
+        let l1 = stk.new_layer();
+        stk.layers[l0].pixels = alloc::vec![0xFF_10_00_00; 2];
+        stk.layers[l1].pixels = alloc::vec![0x00_00_00_10; 2];
+        stk.set_program(alloc::vec![Op::Push(l0), Op::Push(l1), Op::Add]);
+        let result = stk.evaluate();
         assert_eq!(result, &[0xFF_10_00_10; 2]);
     }
 
     #[test]
     fn mul_expression() {
-        // (a + b) * c via RPN: Push a, Push b, Add, Push c, Mul
-        let mut rpn = make_rpn(1);
-        let a = rpn.add_layer();
-        let b = rpn.add_layer();
-        let c = rpn.add_layer();
-        rpn.layers[a].pixels = alloc::vec![0xFF_40_00_00];
-        rpn.layers[b].pixels = alloc::vec![0x00_40_00_00];
-        rpn.layers[c].pixels = alloc::vec![0xFF_80_80_80]; // multiply by ~0.5
-        rpn.set_program(alloc::vec![Op::Push(a), Op::Push(b), Op::Add, Op::Push(c), Op::Mul]);
-        let result = rpn.evaluate();
+        // (a + b) * c via Stack Notation: Push a, Push b, Add, Push c, Mul
+        let mut stk = make_stack(1);
+        let a = stk.new_layer();
+        let b = stk.new_layer();
+        let c = stk.new_layer();
+        stk.layers[a].pixels = alloc::vec![0xFF_40_00_00];
+        stk.layers[b].pixels = alloc::vec![0x00_40_00_00];
+        stk.layers[c].pixels = alloc::vec![0xFF_80_80_80]; // multiply by ~0.5
+        stk.set_program(alloc::vec![Op::Push(a), Op::Push(b), Op::Add, Op::Push(c), Op::Mul]);
+        let result = stk.evaluate();
         // (0x40 + 0x40) * 0x80 >> 8 = 0x80 * 0x80 >> 8 = 0x40
         let r = (result[0] >> 16) & 0xFF;
         assert!(r >= 0x3F && r <= 0x41, "expected ~0x40, got {:#x}", r);
@@ -299,66 +298,85 @@ mod tests {
     fn inv_then_mul_is_screen() {
         // screen(a, b) = inv(mul(inv(a), inv(b)))
         // Verify our Screen op matches this identity.
-        let mut rpn = make_rpn(1);
-        let a = rpn.add_layer();
-        let b = rpn.add_layer();
-        rpn.layers[a].pixels = alloc::vec![0xFF_80_40_C0];
-        rpn.layers[b].pixels = alloc::vec![0xFF_40_80_20];
+        let mut stk = make_stack(1);
+        let a = stk.new_layer();
+        let b = stk.new_layer();
+        stk.layers[a].pixels = alloc::vec![0xFF_80_40_C0];
+        stk.layers[b].pixels = alloc::vec![0xFF_40_80_20];
 
         // Manual: inv(a), inv(b), mul, inv
-        rpn.set_program(alloc::vec![
+        stk.set_program(alloc::vec![
             Op::Push(a), Op::Inv, Op::Push(b), Op::Inv, Op::Mul, Op::Inv,
         ]);
-        let manual = rpn.evaluate()[0];
+        let manual = stk.evaluate()[0];
 
         // Via Screen op
-        rpn.set_program(alloc::vec![Op::Push(a), Op::Push(b), Op::Screen]);
+        stk.set_program(alloc::vec![Op::Push(a), Op::Push(b), Op::Screen]);
         // Force full re-eval
-        for l in &mut rpn.layers { l.dirty = true; }
-        rpn.snapshots.clear();
-        let via_op = rpn.evaluate()[0];
+        for l in &mut stk.layers { l.dirty = true; }
+        stk.snapshots.clear();
+        let via_op = stk.evaluate()[0];
 
         assert_eq!(manual, via_op);
     }
 
     #[test]
     fn dirty_tracking_partial_reeval() {
-        let mut rpn = make_rpn(2);
-        let l0 = rpn.add_layer();
-        let l1 = rpn.add_layer();
-        rpn.layers[l0].pixels = alloc::vec![0xFF_10_00_00; 2];
-        rpn.layers[l1].pixels = alloc::vec![0x00_00_00_10; 2];
-        rpn.set_program(alloc::vec![Op::Push(l0), Op::Push(l1), Op::Add]);
+        let mut stk = make_stack(2);
+        let l0 = stk.new_layer();
+        let l1 = stk.new_layer();
+        stk.layers[l0].pixels = alloc::vec![0xFF_10_00_00; 2];
+        stk.layers[l1].pixels = alloc::vec![0x00_00_00_10; 2];
+        stk.set_program(alloc::vec![Op::Push(l0), Op::Push(l1), Op::Add]);
 
         // First eval: both dirty.
-        let _ = rpn.evaluate();
+        let _ = stk.evaluate();
 
         // Modify only layer 1.
-        rpn.layers[l1].pixels = alloc::vec![0x00_00_00_20; 2];
-        rpn.layers[l1].dirty = true;
-        let result = rpn.evaluate();
+        stk.layers[l1].pixels = alloc::vec![0x00_00_00_20; 2];
+        stk.layers[l1].dirty = true;
+        let result = stk.evaluate();
         assert_eq!(result, &[0xFF_10_00_20; 2]);
     }
 
     #[test]
     fn constant_op() {
-        let mut rpn = make_rpn(3);
-        let l0 = rpn.add_layer();
-        rpn.layers[l0].pixels = alloc::vec![0xFF_00_00_00; 3];
-        rpn.set_program(alloc::vec![Op::Push(l0), Op::Constant(0x00_10_10_10), Op::Add]);
-        let result = rpn.evaluate();
+        let mut stk = make_stack(3);
+        let l0 = stk.new_layer();
+        stk.layers[l0].pixels = alloc::vec![0xFF_00_00_00; 3];
+        stk.set_program(alloc::vec![Op::Push(l0), Op::Constant(0x00_10_10_10), Op::Add]);
+        let result = stk.evaluate();
         assert_eq!(result, &[0xFF_10_10_10; 3]);
     }
 
     #[test]
+    fn div_in_program_recovers_mul() {
+        // Push a, Push b, Mul, Push b, Div ≈ a (within 1 LSB per channel).
+        let mut stk = make_stack(1);
+        let a = stk.new_layer();
+        let b = stk.new_layer();
+        stk.layers[a].pixels = alloc::vec![0xFF_80_40_C0];
+        stk.layers[b].pixels = alloc::vec![0xFF_FF_80_C0];
+        stk.set_program(alloc::vec![
+            Op::Push(a), Op::Push(b), Op::Mul, Op::Push(b), Op::Div,
+        ]);
+        let recovered = stk.evaluate()[0];
+        for shift in [24, 16, 8, 0] {
+            let orig = ((0xFF_80_40_C0u32 >> shift) & 0xFF) as i32;
+            let got = ((recovered >> shift) & 0xFF) as i32;
+            assert!((orig - got).abs() <= 1, "channel at shift {} off by more than 1", shift);
+        }
+    }
+
+    #[test]
     fn xor_in_program() {
-        let mut rpn = make_rpn(1);
-        let l0 = rpn.add_layer();
-        let l1 = rpn.add_layer();
-        rpn.layers[l0].pixels = alloc::vec![0xFF_FF_FF_FF];
-        rpn.layers[l1].pixels = alloc::vec![0x00_FF_00_FF];
-        rpn.set_program(alloc::vec![Op::Push(l0), Op::Push(l1), Op::Xor]);
-        let result = rpn.evaluate();
+        let mut stk = make_stack(1);
+        let l0 = stk.new_layer();
+        let l1 = stk.new_layer();
+        stk.layers[l0].pixels = alloc::vec![0xFF_FF_FF_FF];
+        stk.layers[l1].pixels = alloc::vec![0x00_FF_00_FF];
+        stk.set_program(alloc::vec![Op::Push(l0), Op::Push(l1), Op::Xor]);
+        let result = stk.evaluate();
         assert_eq!(result, &[0xFF_00_FF_00]);
     }
 }

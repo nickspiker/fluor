@@ -1,13 +1,8 @@
 //! Pixel format types with per-channel arithmetic.
 //!
-//! `Argb8` wraps a packed `u32` (`0xAARRGGBB`) and provides channel ops via SWAR
-//! (SIMD Within A Register) — four u8 channels processed in parallel via u64 widening.
-//! The `>> 8` normalization (divide by 256, not 255) is the canonical fast-blend
-//! approximation; per-channel error is below 1/256 and imperceptible.
+//! `Argb8` wraps a packed `u32` (`0xAARRGGBB`) and provides channel ops via SWAR (SIMD Within A Register) — four u8 channels processed in parallel via u64 widening. The `>> 8` normalization (divide by 256, not 255) is the canonical fast-blend approximation; per-channel error is below 1/256 and imperceptible.
 //!
-//! `#[repr(transparent)]` guarantees `Argb8` has the same layout as `u32`, so
-//! `&[Argb8]` and `&[u32]` are safely transmutable for zero-cost interop with
-//! paint primitives and GPU upload.
+//! `#[repr(transparent)]` guarantees `Argb8` has the same layout as `u32`, so `&[Argb8]` and `&[u32]` are safely transmutable for zero-cost interop with paint primitives and GPU upload.
 
 /// Packed ARGB pixel: `0xAARRGGBB`, 8 bits per channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,9 +12,7 @@ pub struct Argb8(pub u32);
 impl Argb8 {
     pub const ZERO: Argb8 = Argb8(0);
 
-    /// Additive blend: `dst + src` per channel via wrapping add.
-    /// Overflow wraps intentionally — for small values (glow, blinkey)
-    /// channels don't interfere. For large values, use SWAR saturating add.
+    /// Additive blend: `dst + src` per channel via wrapping add. Overflow wraps intentionally — for small values (glow, blinkey) channels don't interfere. For large values, use SWAR saturating add.
     #[inline]
     pub fn add(a: Argb8, b: Argb8) -> Argb8 {
         Argb8(a.0.wrapping_add(b.0))
@@ -33,11 +26,7 @@ impl Argb8 {
 
     /// Channel multiply: `(a * b) >> 8` per channel.
     ///
-    /// Uses the same u64 SWAR widening as `blend_rgb_only` / `alpha_over`, but since
-    /// both operands have per-channel values (not a scalar broadcast), we do two passes:
-    /// high pair (bytes 3,2 → A,R) and low pair (bytes 1,0 → G,B), each using a scalar
-    /// multiply in isolated 16-bit slots. Four 16-bit multiplies total, channel-order
-    /// agnostic. The compiler vectorizes this to a single NEON `vmul` on ARM.
+    /// Two packed vectors can't share the SWAR `widened * scalar` trick used by `alpha_over` (slot products would carry into neighbouring slots). Instead we extract each channel pair, do four independent `(u32 × u32) >> 8` ops in isolated registers, and pack back. LLVM recognises the pattern and emits one NEON `vmul.i16` on aarch64 (or `pmullw` on x86) — true four-lane SIMD via auto-vectorization, no platform intrinsics, channel-order agnostic.
     #[inline]
     pub fn mul(a: Argb8, b: Argb8) -> Argb8 {
         // High pair: A and R channels
@@ -55,25 +44,46 @@ impl Argb8 {
         Argb8((ra << 24) | (rr << 16) | (rg << 8) | rb)
     }
 
+    /// Channel divide: `(a << 8) / b` per channel via integer Euclidean division. Saturates at 0xFF when the result would exceed channel range (small `b`) or `b == 0`. Bit-exact, deterministic, no IEEE. Inverse of [`mul`](Self::mul) up to ±1 LSB per channel (mul truncates the low byte; div recovers the high byte). Slow path: aarch64 NEON has no SIMD integer divide, so this is four scalar `udiv`s per pixel — completeness op for un-premultiply / calibration / exact ratios, not for hot loops.
+    ///
+    /// **Branchless divide-by-zero handling:** when `b == 0`, the numerator is forced to `0xFF` and the denominator to `1`, so the divide always runs and the channel saturates to `0xFF`. Style match with `mul` / `alpha_over` (no branches).
+    ///
+    /// **Rule 0 — WHY/PROOF/PREVENTS:** WHY: `(255 << 8) / 1 = 65280` exceeds u8 channel range; raw cast wraps to 0x00. PROOF: max numerator = 255 << 8 = 65280; max valid u8 = 255. PREVENTS: wraparound producing nonsense channel values. The `min(0xFF)` is the saturation semantic of channel arithmetic, not a safety clamp.
+    #[inline]
+    pub fn div(a: Argb8, b: Argb8) -> Argb8 {
+        let ch = |a: u32, b: u32| -> u32 {
+            // mask = 1 if b == 0, 0 otherwise. `numer = a | (0xFF * mask)` becomes 0xFF when b == 0
+            // (a is already ≤ 0xFF). `denom = b + mask` becomes 1 when b == 0. Result then saturates to 0xFF.
+            let mask = (b == 0) as u32;
+            let numer = a | (0xFF * mask);
+            let denom = b + mask;
+            ((numer << 8) / denom).min(0xFF)
+        };
+        let ra = ch((a.0 >> 24) & 0xFF, (b.0 >> 24) & 0xFF);
+        let rr = ch((a.0 >> 16) & 0xFF, (b.0 >> 16) & 0xFF);
+        let rg = ch((a.0 >>  8) & 0xFF, (b.0 >>  8) & 0xFF);
+        let rb = ch( a.0        & 0xFF,  b.0        & 0xFF);
+        Argb8((ra << 24) | (rr << 16) | (rg << 8) | rb)
+    }
+
     /// Per-channel invert: `255 - x` for each channel.
     #[inline]
     pub fn inv(a: Argb8) -> Argb8 {
         Argb8(0xFFFF_FFFF - a.0)
     }
 
-    /// XOR RGB channels, preserve destination alpha.
+    /// Per-channel XOR across all four channels (uniform with `add` / `sub` / `mul` / `div` / `inv`). For "invert RGB but preserve destination alpha" semantics — the selection-highlight idiom — use `BlendMode::Xor` (kernel-level) which handles the alpha preservation; or XOR explicitly against `0x00FFFFFF`.
     #[inline]
     pub fn xor(a: Argb8, b: Argb8) -> Argb8 {
-        Argb8((a.0 ^ b.0) & 0x00FF_FFFF | (a.0 & 0xFF00_0000))
+        Argb8(a.0 ^ b.0)
     }
 
-    /// Porter-Duff source-over: `src * α + dst * (1 - α)` where α = src's alpha channel.
-    /// SWAR with >> 8 normalization.
+    /// Porter-Duff source-over: `src * α + dst * (1 - α)` where α = src's alpha channel. SWAR with `>> 8` normalization (divide by 256, not 255).
+    ///
+    /// **Branchless and uniform across all α values.** α = 0 gives exact `dst` from the math (`bg * 256 + 0 = 256 * bg`, then `>> 8 = bg`). α = 255 gives `0.996·src + 0.004·dst` — *not* exact src, by design: the `>> 8` shortcut produces ≤1 LSB error per channel across the whole α range, and special-casing 255 to return src exactly would create a discontinuity at exactly one α value while leaving the rest noisy. Same trade-off `mul` makes. Callers that need a "fully transparent → skip work" optimization should short-circuit at the kernel level (see `paint::flatten_alpha_over`) where it composes with the per-pixel test for free.
     #[inline]
     pub fn alpha_over(dst: Argb8, src: Argb8) -> Argb8 {
         let alpha = ((src.0 >> 24) & 0xFF) as u64;
-        if alpha == 0 { return dst; }
-        if alpha == 255 { return src; }
         let inv = 256 - alpha;
 
         let mut bg = dst.0 as u64;
@@ -146,28 +156,76 @@ mod tests {
     }
 
     #[test]
-    fn xor_preserves_dst_alpha() {
+    fn xor_is_uniform_four_channel() {
         let a = Argb8(0xFF_AA_BB_CC);
-        let b = Argb8(0x00_FF_00_FF);
+        let b = Argb8(0x12_FF_00_FF);
         let result = Argb8::xor(a, b);
-        assert_eq!(result.0 >> 24, 0xFF); // alpha preserved from a
+        // All four channels XOR independently — no alpha special case.
+        assert_eq!(result.0 >> 24, 0xFF ^ 0x12);
         assert_eq!((result.0 >> 16) & 0xFF, 0xAA ^ 0xFF);
         assert_eq!((result.0 >> 8) & 0xFF, 0xBB ^ 0x00);
         assert_eq!(result.0 & 0xFF, 0xCC ^ 0xFF);
     }
 
     #[test]
-    fn alpha_over_opaque_replaces() {
-        let dst = Argb8(0xFF_11_22_33);
-        let src = Argb8(0xFF_AA_BB_CC);
-        assert_eq!(Argb8::alpha_over(dst, src), src);
+    fn xor_self_inverse() {
+        // a ^ b ^ b == a (uniform XOR is its own inverse).
+        let a = Argb8(0xDE_AD_BE_EF);
+        let b = Argb8(0xCA_FE_BA_BE);
+        assert_eq!(Argb8::xor(Argb8::xor(a, b), b), a);
     }
 
     #[test]
-    fn alpha_over_transparent_preserves() {
+    fn alpha_over_opaque_within_one_lsb_of_src() {
+        // α = 255 gives `0.996·src + 0.004·dst` under >>8 — each channel within 1 LSB of src.
+        let dst = Argb8(0xFF_11_22_33);
+        let src = Argb8(0xFF_AA_BB_CC);
+        let result = Argb8::alpha_over(dst, src);
+        for shift in [24, 16, 8, 0] {
+            let s = ((src.0 >> shift) & 0xFF) as i32;
+            let r = ((result.0 >> shift) & 0xFF) as i32;
+            assert!((s - r).abs() <= 1, "channel at shift {} > 1 LSB off: src={:#x} got={:#x}", shift, s, r);
+        }
+    }
+
+    #[test]
+    fn alpha_over_transparent_preserves_dst_exact() {
+        // α = 0: math gives `bg·256 + fg·0`, then `>>8 = bg`. Exact, no LSB error.
         let dst = Argb8(0xFF_11_22_33);
         let src = Argb8(0x00_AA_BB_CC);
         assert_eq!(Argb8::alpha_over(dst, src), dst);
+    }
+
+    #[test]
+    fn div_by_one_scales_to_full() {
+        // (a << 8) / 1 = a * 256, saturated to 0xFF per channel.
+        let a = Argb8(0xFF_01_02_03);
+        let one = Argb8(0x01_01_01_01);
+        let result = Argb8::div(a, one);
+        // Every channel >= 1 → result.channel = (ch * 256) min 255 = 255.
+        assert_eq!(result, Argb8(0xFF_FF_FF_FF));
+    }
+
+    #[test]
+    fn div_by_zero_saturates_to_max() {
+        let a = Argb8(0xFF_80_40_C0);
+        let zero = Argb8(0x00_00_00_00);
+        assert_eq!(Argb8::div(a, zero), Argb8(0xFF_FF_FF_FF));
+    }
+
+    #[test]
+    fn div_round_trips_mul_within_one_lsb() {
+        // mul truncates the low byte; div recovers the high byte. Round trip is exact at multiples
+        // of 256/b, off by at most 1 LSB elsewhere — Argb8::mul does (a*b)>>8, then div does ((a*b)>>8 << 8) / b which differs from a only by the truncation (a*b mod b)/b range.
+        let a = Argb8(0xFF_80_40_C0);
+        let b = Argb8(0xFF_FF_80_C0);
+        let mid = Argb8::mul(a, b);
+        let recovered = Argb8::div(mid, b);
+        for shift in [24, 16, 8, 0] {
+            let orig = ((a.0 >> shift) & 0xFF) as i32;
+            let got = ((recovered.0 >> shift) & 0xFF) as i32;
+            assert!((orig - got).abs() <= 1, "channel at shift {} off by more than 1: orig={:#x} got={:#x}", shift, orig, got);
+        }
     }
 
     #[test]

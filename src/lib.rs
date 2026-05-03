@@ -18,7 +18,7 @@ pub mod paint;
 pub mod pane;
 pub mod pixel;
 pub mod region;
-pub mod rpn;
+pub mod stack;
 pub mod theme;
 
 #[cfg(feature = "text")]

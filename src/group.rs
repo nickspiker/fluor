@@ -1,24 +1,24 @@
 //! Group — the unit of cached, hit-routable, text-clippable composite.
 //!
-//! A `Group` wraps a [`Region`] (pixel-space bbox in target-buffer coordinates), an [`RpnCompositor`] for internal RGB compositing, and optional side channels: a binary hit mask (`Option<Vec<u8>>`, one byte per pixel, 0 or 1) and a per-pixel text-clip alpha mask (`Option<Vec<u8>>`). All buffers are sized to the group's bbox — *not* the viewport — so memory scales with content area, not with viewport size.
+//! A `Group` wraps a [`Region`] (pixel-space bbox in target-buffer coordinates), an [`StackCompositor`] for internal RGB compositing, and optional side channels: a binary hit mask (`Option<Vec<u8>>`, one byte per pixel, 0 or 1) and a per-pixel text-clip alpha mask (`Option<Vec<u8>>`). All buffers are sized to the group's bbox — *not* the viewport — so memory scales with content area, not with viewport size.
 //!
 //! Groups are leaf-ish: there is no `children` field. The tree IS the consumer's code, exactly like [`Region`]'s "no parent pointers" doctrine. Consumers compose by holding a `Vec<Group>` (or any structure they prefer) and calling [`Group::flatten_into`] in order; hit testing iterates the same vec in reverse.
 //!
-//! Coordinate translation: paint primitives take buffer-relative pixel coordinates. When rasterizing into a group's RPN layer, the buffer is sized to `(region.w, region.h)`, so consumers must subtract `region.x, region.y` from any viewport-relative coordinate. There is deliberately no wrapper "GroupCanvas" type — per AGENT.md "no design for hypothetical futures," we add one only when a real consumer hurts.
+//! Coordinate translation: paint primitives take buffer-relative pixel coordinates. When rasterizing into a group's Stack layer, the buffer is sized to `(region.w, region.h)`, so consumers must subtract `region.x, region.y` from any viewport-relative coordinate. There is deliberately no wrapper "GroupCanvas" type — per AGENT.md "no design for hypothetical futures," we add one only when a real consumer hurts.
 //!
-//! Damage tracking: [`mark_damage`](Group::mark_damage) coalesces overlapping rects on insert. [`is_dirty`](Group::is_dirty) lets consumers gate their rasterization. [`flatten_into`](Group::flatten_into) re-runs the whole RPN program when *anything* is dirty (per-pixel partial RPN re-evaluation is a future optimization). The savings come from gating consumer-side rasterization (text shaping, glyph rasterization, squircle math) — that's where the cycles live.
+//! Damage tracking: [`mark_damage`](Group::mark_damage) coalesces overlapping rects on insert. [`is_dirty`](Group::is_dirty) lets consumers gate their rasterization. [`flatten_into`](Group::flatten_into) re-runs the whole Stack program when *anything* is dirty (per-pixel partial Stack re-evaluation is a future optimization). The savings come from gating consumer-side rasterization (text shaping, glyph rasterization, squircle math) — that's where the cycles live.
 
 use alloc::vec::Vec;
 use crate::coord::Coord;
 use crate::paint::BlendMode;
 use crate::region::Region;
-use crate::rpn::{Op, RpnCompositor};
+use crate::stack::{Op, StackCompositor};
 
 pub struct Group {
-    /// Pixel-space bbox in target-buffer coordinates. Buffers (RPN layers, hitmask, text_clip) are sized to `(region.w, region.h)`.
+    /// Pixel-space bbox in target-buffer coordinates. Buffers (Stack layers, hitmask, text_clip) are sized to `(region.w, region.h)`.
     pub region: Region,
-    /// Internal RGB compositing — bbox-sized layer buffers + RPN program.
-    pub rpn: RpnCompositor,
+    /// Internal RGB compositing — bbox-sized layer buffers + Stack program.
+    pub rpn: StackCompositor,
     /// Binary hit mask (group-local, one byte per pixel, 0 or 1). `None` = decorative; clicks pass through.
     pub hitmask: Option<Vec<u8>>,
     /// Per-pixel alpha mask consumed by text rasterizers drawing into this group's RGB layers (group-local). `None` = no soft clip.
@@ -30,13 +30,13 @@ pub struct Group {
 }
 
 impl Group {
-    /// New group with bbox = `region`, no side channels, RPN with no layers and an empty program. Allocate side channels separately via [`enable_hitmask`](Self::enable_hitmask) / [`enable_text_clip`](Self::enable_text_clip); add layers via [`add_layer`](Self::add_layer); set the compositing program via [`set_program`](Self::set_program).
+    /// New group with bbox = `region`, no side channels, Stack with no layers and an empty program. Allocate side channels separately via [`enable_hitmask`](Self::enable_hitmask) / [`enable_text_clip`](Self::enable_text_clip); add layers via [`new_layer`](Self::new_layer); set the compositing program via [`set_program`](Self::set_program).
     pub fn new(region: Region, blend: BlendMode) -> Self {
         let w = region.w as usize;
         let h = region.h as usize;
         Self {
             region,
-            rpn: RpnCompositor::new(w, h),
+            rpn: StackCompositor::new(w, h),
             hitmask: None,
             text_clip: None,
             damage: Vec::new(),
@@ -50,12 +50,12 @@ impl Group {
         (self.region.w as usize, self.region.h as usize)
     }
 
-    /// Add an RPN layer; returns its index for use in `Op::Push(idx)`. The layer's pixel buffer is bbox-sized.
-    pub fn add_layer(&mut self) -> usize {
-        self.rpn.add_layer()
+    /// Add an Stack layer; returns its index for use in `Op::Push(idx)`. The layer's pixel buffer is bbox-sized.
+    pub fn new_layer(&mut self) -> usize {
+        self.rpn.new_layer()
     }
 
-    /// Replace the RPN compositing program.
+    /// Replace the Stack compositing program.
     pub fn set_program(&mut self, program: Vec<Op>) {
         self.rpn.set_program(program);
     }
@@ -82,7 +82,7 @@ impl Group {
         self.text_clip.as_deref_mut()
     }
 
-    /// Resize bbox + reallocate internal buffers. All RPN layers are marked dirty (re-rasterization is the consumer's responsibility); hit + text-clip masks are zeroed; damage list is cleared.
+    /// Resize bbox + reallocate internal buffers. All Stack layers are marked dirty (re-rasterization is the consumer's responsibility); hit + text-clip masks are zeroed; damage list is cleared.
     pub fn resize(&mut self, region: Region) {
         let (w, h) = (region.w as usize, region.h as usize);
         self.region = region;
@@ -96,6 +96,17 @@ impl Group {
             m.fill(0);
         }
         self.damage.clear();
+    }
+
+    /// Reposition (and optionally resize) the bbox. If dimensions are unchanged, only `region.x/y` update — buffers preserved, but every layer is marked dirty so the next `flatten_into` re-blits at the new target offset (the Stack cache is per-content; the *position on target* is a separate concern). If dimensions change, behaves like [`resize`](Self::resize).
+    pub fn set_region(&mut self, region: Region) {
+        let same_dims = (region.w as usize) == (self.region.w as usize) && (region.h as usize) == (self.region.h as usize);
+        if same_dims {
+            self.region = region;
+            self.invalidate();
+        } else {
+            self.resize(region);
+        }
     }
 
     /// Group-local hit query. `(x, y)` is in target-buffer pixel space; subtracts `region.x/y` and reads the hitmask byte. Returns false for decorative groups (`hitmask = None`) or out-of-bbox points.
@@ -137,13 +148,10 @@ impl Group {
         }
     }
 
-    /// Flatten the internal RPN onto `target` at `region.x, region.y` using `self.blend`. Skips entirely when no RPN layer is dirty *and* the damage list is empty — consumers must call [`invalidate`](Self::invalidate) when the target is overwritten externally (e.g., the host clears the frame buffer between paints).
+    /// Flatten the internal Stack onto `target` at `region.x, region.y` using `self.blend`. Always blits — the host's present buffer may be double-buffered, and downstream groups composited above this one may have overwritten our pixels last frame. The internal `StackCompositor::evaluate` cheaply returns a cached composite when no layer is dirty, so the per-frame cost when nothing changed is just the blit (one pass over the bbox area, not over the viewport).
     ///
     /// Pixels that would land outside the target's bounds are clipped row-by-row before the per-row blend kernel runs; the blend kernel itself sees only in-bounds slices.
     pub fn flatten_into(&mut self, target: &mut [u32], target_w: usize, target_h: usize) {
-        let needs_flatten = self.rpn.layers.iter().any(|l| l.dirty) || !self.damage.is_empty();
-        if !needs_flatten { return; }
-
         let composite = self.rpn.evaluate();
         if composite.is_empty() { self.damage.clear(); return; }
 
@@ -202,7 +210,7 @@ mod tests {
     fn flatten_replace_blits_at_offset() {
         // Group at (1, 1), 2x2, Replace blend, single layer = solid red.
         let mut g = Group::new(Region::new(1.0, 1.0, 2.0, 2.0), BlendMode::Replace);
-        let l = g.add_layer();
+        let l = g.new_layer();
         g.rpn.layers[l].pixels = alloc::vec![opaque(0xFF0000); 4];
         g.set_program(alloc::vec![Op::Push(l)]);
 
@@ -222,7 +230,7 @@ mod tests {
     fn flatten_clips_to_target_bounds() {
         // Group at (-1, -1), 4x4 (extends past target's left and top edges into the buffer).
         let mut g = Group::new(Region::new(-1.0, -1.0, 4.0, 4.0), BlendMode::Replace);
-        let l = g.add_layer();
+        let l = g.new_layer();
         g.rpn.layers[l].pixels = alloc::vec![opaque(0x00FF00); 16];
         g.set_program(alloc::vec![Op::Push(l)]);
 
@@ -236,10 +244,11 @@ mod tests {
     }
 
     #[test]
-    fn flatten_skips_when_clean() {
-        // First flatten dirties + paints; second flatten with no changes should skip (target unchanged).
+    fn flatten_always_blits_for_double_buffering_safety() {
+        // The host's present buffer may be double-buffered; flatten must always write the
+        // group's content into target even when nothing internal is dirty.
         let mut g = Group::new(Region::new(0.0, 0.0, 2.0, 1.0), BlendMode::Replace);
-        let l = g.add_layer();
+        let l = g.new_layer();
         g.rpn.layers[l].pixels = alloc::vec![opaque(0xAABBCC); 2];
         g.set_program(alloc::vec![Op::Push(l)]);
 
@@ -247,13 +256,9 @@ mod tests {
         g.flatten_into(&mut target, 2, 2);
         assert_eq!(target[0], opaque(0xAABBCC));
 
-        // Externally clear target; without invalidate, flatten should skip and leave target zero.
+        // Simulate a back-buffer swap: target is now zeroed (the OTHER frame buffer).
         target.fill(0);
-        g.flatten_into(&mut target, 2, 2);
-        assert_eq!(target[0], 0, "flatten should skip when nothing dirty");
-
-        // After invalidate, flatten re-blits.
-        g.invalidate();
+        // Flatten must still write our content even though no layer is dirty.
         g.flatten_into(&mut target, 2, 2);
         assert_eq!(target[0], opaque(0xAABBCC));
     }
@@ -323,7 +328,7 @@ mod tests {
     #[test]
     fn flatten_clears_damage() {
         let mut g = Group::new(Region::new(0.0, 0.0, 2.0, 1.0), BlendMode::Replace);
-        let l = g.add_layer();
+        let l = g.new_layer();
         g.rpn.layers[l].pixels = alloc::vec![opaque(0x112233); 2];
         g.set_program(alloc::vec![Op::Push(l)]);
         g.mark_damage(Region::new(0.0, 0.0, 1.0, 1.0));
