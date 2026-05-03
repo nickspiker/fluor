@@ -4,6 +4,9 @@
 
 pub mod chrome;
 
+#[cfg(feature = "text")]
+pub mod chrome_widget;
+
 #[cfg(feature = "host-winit")]
 pub mod desktop;
 
