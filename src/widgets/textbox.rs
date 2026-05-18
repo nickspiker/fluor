@@ -305,9 +305,15 @@ impl Textbox {
         Region::new(x, y, 16.0, self.font_size)
     }
 
-    /// Bounding rect (viewport coords) of the textbox's pill — the natural bbox for a `textbox_group`.
+    /// Bounding rect (viewport coords) of the textbox + glow halo. Pads the pill rect by `font_size` on each side so `apply_textbox_glow`'s outward blur has room to fade — without this the glow clips at the bbox edge of the sub-viewport `textbox_group` buffer.
     pub fn bbox(&self) -> Region {
-        Region::new(self.center_x - self.width * 0.5, self.center_y - self.height * 0.5, self.width, self.height)
+        let glow_pad = self.font_size;
+        Region::new(
+            self.center_x - self.width  * 0.5 - glow_pad,
+            self.center_y - self.height * 0.5 - glow_pad,
+            self.width  + 2.0 * glow_pad,
+            self.height + 2.0 * glow_pad,
+        )
     }
 
     // --- Rendering ---

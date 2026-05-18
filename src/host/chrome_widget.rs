@@ -31,20 +31,26 @@ pub struct DefaultChrome {
     /// Cached pixel index list for the currently hovered button — recomputed on hover-state change.
     pub hover_pixel_list: Vec<usize>,
     layer_bg: usize,
+    layer_silhouette: usize,
     layer_chrome: usize,
     layer_hover: usize,
 }
 
 impl DefaultChrome {
-    /// Allocate the chrome group + hit_test_map sized to `viewport`. All three layers start dirty so the first frame paints from scratch.
+    /// Allocate the chrome group + hit_test_map sized to `viewport`. Four layers (bg, silhouette, chrome, hover) all start dirty so the first frame paints from scratch.
+    ///
+    /// Stack program: `Push bg, Push silhouette, Mul, Push chrome, AlphaOver, Push hover, Add`. The `Mul` step zeros the bg at the four squircle corner cutouts so the final composite has alpha=0 there (transparent on macOS PostMultiplied; compositor-honored on Linux).
     pub fn new(viewport: Viewport, title: impl Into<String>) -> Self {
         let region = Region::new(0.0, 0.0, viewport.width_px as Coord, viewport.height_px as Coord);
         let mut group = Group::new(region, BlendMode::Replace);
         let layer_bg = group.new_layer();
+        let layer_silhouette = group.new_layer();
         let layer_chrome = group.new_layer();
         let layer_hover = group.new_layer();
         group.set_program(alloc::vec![
             Op::Push(layer_bg),
+            Op::Push(layer_silhouette),
+            Op::Mul,
             Op::Push(layer_chrome),
             Op::AlphaOver,
             Op::Push(layer_hover),
@@ -58,6 +64,7 @@ impl DefaultChrome {
             hover_state: HIT_NONE,
             hover_pixel_list: Vec::new(),
             layer_bg,
+            layer_silhouette,
             layer_chrome,
             layer_hover,
         }
@@ -85,21 +92,22 @@ impl DefaultChrome {
         paint(&mut layer.pixels, w, h);
     }
 
-    /// Paint controls + edges + hairlines + title text into the chrome layer if dirty. Clears + rewrites `hit_test_map` as a side effect (chrome buttons stamp their IDs there). Title is skipped silently when the computed title size falls below 6 px (tiny windows where text would be unreadable).
+    /// Paint controls + edges + hairlines + title text into the chrome layer AND the matching window silhouette into the silhouette layer if either is dirty. Clears + rewrites `hit_test_map` as a side effect (chrome buttons stamp their IDs there). Title is skipped silently when the computed title size falls below 6 px (tiny windows where text would be unreadable).
     pub fn rasterize_chrome(&mut self, text: &mut TextRenderer) {
         let (buf_w, buf_h) = self.dims();
         let vp_w = buf_w as u32;
         let vp_h = buf_h as u32;
 
-        let layer = &mut self.group.rpn.layers[self.layer_chrome];
-        if !layer.dirty { return; }
+        let chrome_dirty = self.group.rpn.layers[self.layer_chrome].dirty;
+        let silhouette_dirty = self.group.rpn.layers[self.layer_silhouette].dirty;
+        if !chrome_dirty && !silhouette_dirty { return; }
 
         // Reset hit_test_map for the new chrome rasterization.
         self.hit_test_map.fill(HIT_NONE);
 
-        let chrome_buf = &mut layer.pixels;
+        // Stage 1: paint chrome strip + capture `start` / `crossings` from the controls pass.
+        let chrome_buf = &mut self.group.rpn.layers[self.layer_chrome].pixels;
         chrome_buf.fill(0);
-
         let (start, crossings, button_x_start, button_height) = chrome::draw_window_controls(
             chrome_buf, &mut self.hit_test_map, vp_w, vp_h, 1.0,
         );
@@ -111,7 +119,7 @@ impl DefaultChrome {
             button_x_start, button_height, start, &crossings,
         );
 
-        // Title text.
+        // Stage 2: title text.
         let span = 2.0 * vp_w as Coord * vp_h as Coord / (vp_w as Coord + vp_h as Coord);
         let bw = MIN_BUTTON_HEIGHT_PX as Coord + crate::math::ceil(span / 32.0);
         let title_size = bw * 0.55;
@@ -124,6 +132,10 @@ impl DefaultChrome {
                 theme::TEXT_COLOUR, "Open Sans", None, None, None,
             );
         }
+
+        // Stage 3: silhouette mask (uses the same start/crossings — they define the squircle shape).
+        let silhouette_buf = &mut self.group.rpn.layers[self.layer_silhouette].pixels;
+        chrome::rasterize_window_silhouette(silhouette_buf, vp_w, vp_h, start, &crossings);
     }
 
     /// Paint the hover-overlay delta if the hover layer is dirty. The delta is added (per-channel wrap) onto the chrome layer at the currently-hovered button's pixel positions; on hover_state == HIT_NONE the layer is just zeroed (Add of 0 = no-op).

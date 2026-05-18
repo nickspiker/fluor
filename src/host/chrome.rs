@@ -565,6 +565,103 @@ pub fn draw_window_edges_and_mask(
     }
 }
 
+/// Rasterize the window-silhouette mask: `0xFF_FF_FF_FF` inside the squircle (window interior + chrome strip), `0x00_00_00_00` outside (the four corner cutouts). Used as a layer in [`super::chrome_widget::DefaultChrome`]'s Stack program — `Push bg, Push silhouette, Mul, …` knocks out the bg's pixels at the corners so the final composite has alpha=0 there (transparent on macOS PostMultiplied; compositor-honored on Linux).
+///
+/// Same zeroing pattern as [`draw_window_edges_and_mask`] (corner squares + per-crossing fill + outer-AA pixel) — the silhouette is binary, so the AA edge counts as "outside" and the chrome layer's own perimeter pixels handle the visible squircle curve via AlphaOver.
+pub fn rasterize_window_silhouette(
+    silhouette: &mut [u32],
+    width: u32,
+    height: u32,
+    start: usize,
+    crossings: &[(u16, u8, u8)],
+) {
+    // Default everything to opaque-white (binary "keep"). Buffers come in zeroed from `Group::resize`; the fill makes the function self-contained.
+    silhouette.fill(0xFF_FF_FF_FF);
+
+    if width < 2 || height < 2 { return; }
+    if start * 2 >= width as usize || start * 2 >= height as usize { return; }
+
+    let w = width as usize;
+    let h = height as usize;
+
+    // Four corner squares (size `start × start`) — outside the squircle.
+    for row in 0..start {
+        for col in 0..start {
+            silhouette[row * w + col] = 0;
+        }
+        for col in (w - start)..w {
+            silhouette[row * w + col] = 0;
+        }
+    }
+    for row in (h - start)..h {
+        for col in 0..start {
+            silhouette[row * w + col] = 0;
+        }
+        for col in (w - start)..w {
+            silhouette[row * w + col] = 0;
+        }
+    }
+
+    // Top-left/right squircle rows.
+    let mut y_top = start;
+    for &(inset, _l, _h) in crossings {
+        let row_base = y_top * w;
+        // Left side: cols [0, inset] outside (including outer AA pixel).
+        for col in 0..=(inset as usize).min(w - 1) {
+            silhouette[row_base + col] = 0;
+        }
+        // Right side: cols [w - 1 - inset, w-1] outside.
+        let right_start = w.saturating_sub(inset as usize + 1);
+        for col in right_start..w {
+            silhouette[row_base + col] = 0;
+        }
+        y_top += 1;
+    }
+
+    // Bottom-left/right squircle rows.
+    let mut y_bottom = h - start - 1;
+    for &(inset, _l, _h) in crossings {
+        let row_base = y_bottom * w;
+        for col in 0..=(inset as usize).min(w - 1) {
+            silhouette[row_base + col] = 0;
+        }
+        let right_start = w.saturating_sub(inset as usize + 1);
+        for col in right_start..w {
+            silhouette[row_base + col] = 0;
+        }
+        if y_bottom == 0 { break; }
+        y_bottom -= 1;
+    }
+
+    // Left/right squircle columns (the curve seen from the side — symmetric set).
+    let mut x_left = start;
+    for &(inset, _l, _h) in crossings {
+        // Top: rows [0, inset] in this column → outside.
+        for row in 0..=(inset as usize).min(h - 1) {
+            silhouette[row * w + x_left] = 0;
+        }
+        // Bottom: rows [h - 1 - inset, h - 1] → outside.
+        let bottom_start = h.saturating_sub(inset as usize + 1);
+        for row in bottom_start..h {
+            silhouette[row * w + x_left] = 0;
+        }
+        x_left += 1;
+    }
+
+    let mut x_right = w - start - 1;
+    for &(inset, _l, _h) in crossings {
+        for row in 0..=(inset as usize).min(h - 1) {
+            silhouette[row * w + x_right] = 0;
+        }
+        let bottom_start = h.saturating_sub(inset as usize + 1);
+        for row in bottom_start..h {
+            silhouette[row * w + x_right] = 0;
+        }
+        if x_right == 0 { break; }
+        x_right -= 1;
+    }
+}
+
 /// Verbatim port of photon's `draw_button_hairlines`. Vertical 1-px hairlines between minimize/maximize and maximize/close, drawn from the strip's vertical center outward until they hit a pixel of a different colour (so they stop cleanly at the squircle edge above and the bottom edge below).
 pub fn draw_button_hairlines(
     pixels: &mut [u32],
