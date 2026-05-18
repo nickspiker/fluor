@@ -859,7 +859,7 @@ pub fn draw_blinkey(
 /// Apply or remove a 4-directional blur glow effect around a textbox. Ported from photon's `apply_textbox_glow`. Reads the `mask` to determine interior/exterior and blurs outward from the textbox edges.
 ///
 /// `add`: true = apply glow (focus gain), false = remove glow (focus loss).
-/// `glow_colour`: `0x00RRGGBB` — alpha channel unused, intensity computed from mask inverse.
+/// `glow_colour`: `0x00RRGGBB` — alpha channel of the input is ignored; each written pixel gets alpha = per-pass intensity (capped at 63 so four-direction accumulation stays within the byte). The alpha-bearing pixel is required so a downstream AlphaOver flatten (textbox_group → chrome composite) actually shows the glow — photon's original wrote RGB only because its compositor painted directly into the alpha=255 chrome buffer.
 pub fn apply_textbox_glow(
     pixels: &mut [u32],
     mask: &[u8],
@@ -915,7 +915,8 @@ pub fn apply_textbox_glow(
                     let r = ((glow_colour >> 16) & 0xFF) * intensity >> 8;
                     let g = ((glow_colour >> 8) & 0xFF) * intensity >> 8;
                     let b = (glow_colour & 0xFF) * intensity >> 8;
-                    pixels[idx] $op (r << 16) | (g << 8) | b;
+                    let a = intensity.min(63);
+                    pixels[idx] $op (a << 24) | (r << 16) | (g << 8) | b;
                 }
             }
             // Left blur
@@ -930,7 +931,8 @@ pub fn apply_textbox_glow(
                     let r = ((glow_colour >> 16) & 0xFF) * intensity >> 8;
                     let g = ((glow_colour >> 8) & 0xFF) * intensity >> 8;
                     let b = (glow_colour & 0xFF) * intensity >> 8;
-                    pixels[idx] $op (r << 16) | (g << 8) | b;
+                    let a = intensity.min(63);
+                    pixels[idx] $op (a << 24) | (r << 16) | (g << 8) | b;
                 }
             }
             // Down blur
@@ -946,7 +948,8 @@ pub fn apply_textbox_glow(
                     let r = ((glow_colour >> 16) & 0xFF) * intensity >> 8;
                     let g = ((glow_colour >> 8) & 0xFF) * intensity >> 8;
                     let b = (glow_colour & 0xFF) * intensity >> 8;
-                    pixels[idx] $op (r << 16) | (g << 8) | b;
+                    let a = intensity.min(63);
+                    pixels[idx] $op (a << 24) | (r << 16) | (g << 8) | b;
                 }
             }
             // Up blur
@@ -963,7 +966,8 @@ pub fn apply_textbox_glow(
                     let r = ((glow_colour >> 16) & 0xFF) * intensity >> 8;
                     let g = ((glow_colour >> 8) & 0xFF) * intensity >> 8;
                     let b = (glow_colour & 0xFF) * intensity >> 8;
-                    pixels[idx] $op (r << 16) | (g << 8) | b;
+                    let a = intensity.min(63);
+                    pixels[idx] $op (a << 24) | (r << 16) | (g << 8) | b;
                 }
             }
         };
