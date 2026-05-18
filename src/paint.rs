@@ -905,7 +905,7 @@ pub fn apply_textbox_glow(
 
     let glow_rgb = glow_colour & 0x00FF_FFFF;
 
-    /// Saturating per-byte add. Caps each channel at 0xFF — prevents the carry-into-next-channel corruption that bare `u32 +=` would cause when channel sums exceed 0xFF over multiple blur passes.
+    /// Saturating per-byte add. The 4-direction passes SUM into alpha — corner pixels (touched by multiple directions) get extra brightness, matching photon's effect where corners look slightly brighter than straight-edge regions. Saturating prevents byte-wrap producing dark stripes at the over-saturation points.
     #[inline]
     fn sat_byte_add(dst: u32, add: u32) -> u32 {
         let mut result = 0u32;

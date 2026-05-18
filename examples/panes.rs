@@ -58,13 +58,16 @@ impl PanesDemo {
         let chrome = DefaultChrome::new(viewport, title.clone());
 
         // Placeholder textbox + groups — actual geometry computed in `init`/`on_resize`.
-        // textbox_group has two layers: glow (under) + content (on top), composed via AlphaOver inside the group so the pill's AA edge blends correctly with the glow halo instead of saturating to glow color.
+        // textbox_group has two layers: content (under) + glow (on top, pre-knocked by (255-mask)).
+        // Stack: Push content, Push glow, AlphaOver. Inside the pill: glow's intensity=0 leaves
+        // pill pure. At AA edge: glow's small alpha lightly tints the pill's AA without staining
+        // the body. Outside pill: glow alone over bg below.
         let textbox = Textbox::new(0.0, 0.0, 1.0, 1.0, 12.0);
         let placeholder_region = Region::new(0.0, 0.0, 1.0, 1.0);
         let mut textbox_group = Group::new(placeholder_region, BlendMode::AlphaOver);
-        let glow_layer = textbox_group.new_layer();
         let content_layer = textbox_group.new_layer();
-        textbox_group.set_program(vec![Op::Push(glow_layer), Op::Push(content_layer), Op::AlphaOver]);
+        let glow_layer = textbox_group.new_layer();
+        textbox_group.set_program(vec![Op::Push(content_layer), Op::Push(glow_layer), Op::AlphaOver]);
         let mut cursor_group = Group::new(placeholder_region, BlendMode::Add);
         let l = cursor_group.new_layer();
         cursor_group.set_program(vec![Op::Push(l)]);
@@ -326,11 +329,13 @@ impl FluorApp for PanesDemo {
             let (tw, th) = self.textbox_group.dims();
             let bbox = self.textbox.bbox();
 
-            let content = &mut self.textbox_group.rpn.layers[1].pixels;
+            // Layer 0 = content (created first), layer 1 = glow. Content rasterizes first so its
+            // pill paint populates `self.textbox.mask`, which the glow path reads.
+            let content = &mut self.textbox_group.rpn.layers[0].pixels;
             content.fill(0);
             self.textbox.render_content_into(content, tw, th, bbox.x, bbox.y, ctx.text, None, None);
 
-            let glow = &mut self.textbox_group.rpn.layers[0].pixels;
+            let glow = &mut self.textbox_group.rpn.layers[1].pixels;
             glow.fill(0);
             self.textbox.render_glow_into(glow, tw, th, bbox.x, bbox.y);
         }
