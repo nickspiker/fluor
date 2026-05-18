@@ -856,10 +856,11 @@ pub fn draw_blinkey(
     }
 }
 
-/// Apply or remove a 4-directional blur glow effect around a textbox. Ported from photon's `apply_textbox_glow`. Reads the `mask` to determine interior/exterior and blurs outward from the textbox edges.
+/// Apply a 4-directional blur glow effect around a textbox. Reads `mask` to find the pill silhouette, then blurs outward in 4 directions, painting per-pixel alpha + RGB based on the falloff intensity.
 ///
-/// `add`: true = apply glow (focus gain), false = remove glow (focus loss).
-/// `glow_colour`: `0x00RRGGBB` — alpha channel of the input is ignored; each written pixel gets alpha = per-pass intensity (capped at 63 so four-direction accumulation stays within the byte). The alpha-bearing pixel is required so a downstream AlphaOver flatten (textbox_group → chrome composite) actually shows the glow — photon's original wrote RGB only because its compositor painted directly into the alpha=255 chrome buffer.
+/// Adapted from photon's `apply_textbox_glow` — photon wrote RGB-only with `+=` into its alpha=255 chrome composite buffer; here in fluor's layered model the textbox_group's buffer starts cleared, so the glow writes alpha AND uses saturating per-byte add (so 4-direction accumulation doesn't wrap and produce dark stripes where the glow should be brightest).
+///
+/// `glow_colour`: `0x00RRGGBB` — input alpha ignored; each pixel's output alpha is the per-pass intensity (capped at 63 so 4-pass max sum = 252 ≤ 255).
 pub fn apply_textbox_glow(
     pixels: &mut [u32],
     mask: &[u8],
@@ -868,7 +869,6 @@ pub fn apply_textbox_glow(
     center_y: isize,
     box_width: usize,
     box_height: usize,
-    add: bool,
     glow_colour: u32,
 ) {
     let blur_h = 32usize;
@@ -899,81 +899,87 @@ pub fn apply_textbox_glow(
     let yhs = y_top + corner_r;
     let yhe = y_bot - corner_r;
 
-    // Macro for the 4-pass blur — identical math, just ±= and direction differ.
-    macro_rules! blur_pass {
-        ($op:tt) => {
-            // Right blur
-            for y in y_top..y_bot {
-                let mut adder = 0u32;
-                let start = x_right - (yhs as isize - y as isize).max(0) as usize - (y as isize - yhe as isize).max(0) as usize;
-                for bx in start..x_right + blur_h {
-                    if bx >= buf_w { break; }
-                    let idx = y * buf_w + bx;
-                    if bx > 0 && mask[idx] < mask[idx - 1] { adder += (mask[idx - 1] - mask[idx]) as u32; }
-                    adder = (adder * 15 >> 4).min(71);
-                    let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
-                    let r = ((glow_colour >> 16) & 0xFF) * intensity >> 8;
-                    let g = ((glow_colour >> 8) & 0xFF) * intensity >> 8;
-                    let b = (glow_colour & 0xFF) * intensity >> 8;
-                    let a = intensity.min(63);
-                    pixels[idx] $op (a << 24) | (r << 16) | (g << 8) | b;
-                }
-            }
-            // Left blur
-            for y in y_top..y_bot {
-                let mut adder = 0u32;
-                let end = x_left + (yhs as isize - y as isize).max(0) as usize + (y as isize - yhe as isize).max(0) as usize;
-                for bx in (x_left.saturating_sub(blur_h)..=end).rev() {
-                    let idx = y * buf_w + bx;
-                    if bx + 1 < buf_w && mask[idx] < mask[idx + 1] { adder += (mask[idx + 1] - mask[idx]) as u32; }
-                    adder = (adder * 15 >> 4).min(71);
-                    let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
-                    let r = ((glow_colour >> 16) & 0xFF) * intensity >> 8;
-                    let g = ((glow_colour >> 8) & 0xFF) * intensity >> 8;
-                    let b = (glow_colour & 0xFF) * intensity >> 8;
-                    let a = intensity.min(63);
-                    pixels[idx] $op (a << 24) | (r << 16) | (g << 8) | b;
-                }
-            }
-            // Down blur
-            for bx in x_left..x_right {
-                let mut adder = 0u32;
-                let start = y_bot - (xvs as isize - bx as isize).max(0) as usize - (bx as isize - xve as isize).max(0) as usize;
-                for by in start..y_bot + blur_v {
-                    if by >= buf_h { break; }
-                    let idx = by * buf_w + bx;
-                    if by > 0 { let ia = (by - 1) * buf_w + bx; if mask[idx] < mask[ia] { adder += (mask[ia] - mask[idx]) as u32; } }
-                    adder = (adder * 3 >> 2).min(70);
-                    let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
-                    let r = ((glow_colour >> 16) & 0xFF) * intensity >> 8;
-                    let g = ((glow_colour >> 8) & 0xFF) * intensity >> 8;
-                    let b = (glow_colour & 0xFF) * intensity >> 8;
-                    let a = intensity.min(63);
-                    pixels[idx] $op (a << 24) | (r << 16) | (g << 8) | b;
-                }
-            }
-            // Up blur
-            for bx in x_left..x_right {
-                let mut adder = 0u32;
-                let end = y_top + (xvs as isize - bx as isize).max(0) as usize + (bx as isize - xve as isize).max(0) as usize;
-                for by in (0..=end).rev() {
-                    if by + blur_v < y_top { break; }
-                    if by >= buf_h { continue; }
-                    let idx = by * buf_w + bx;
-                    if by + 1 < buf_h { let ib = (by + 1) * buf_w + bx; if mask[idx] < mask[ib] { adder += (mask[ib] - mask[idx]) as u32; } }
-                    adder = (adder * 3 >> 2).min(70);
-                    let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
-                    let r = ((glow_colour >> 16) & 0xFF) * intensity >> 8;
-                    let g = ((glow_colour >> 8) & 0xFF) * intensity >> 8;
-                    let b = (glow_colour & 0xFF) * intensity >> 8;
-                    let a = intensity.min(63);
-                    pixels[idx] $op (a << 24) | (r << 16) | (g << 8) | b;
-                }
-            }
-        };
+    /// Saturating add per byte — prevents the carry-into-next-channel corruption that bare `u32 += u32` would cause when channel sums exceed 0xFF over multiple blur passes.
+    #[inline]
+    fn sat_byte_add(dst: u32, add: u32) -> u32 {
+        let mut result = 0u32;
+        for shift in [0u32, 8, 16, 24] {
+            let d = (dst >> shift) & 0xFF;
+            let a = (add >> shift) & 0xFF;
+            let sum = (d + a).min(0xFF);
+            result |= sum << shift;
+        }
+        result
     }
 
-    if add { blur_pass!(+=); } else { blur_pass!(-=); }
+    // Right blur.
+    for y in y_top..y_bot {
+        let mut adder = 0u32;
+        let start = x_right - (yhs as isize - y as isize).max(0) as usize - (y as isize - yhe as isize).max(0) as usize;
+        for bx in start..x_right + blur_h {
+            if bx >= buf_w { break; }
+            let idx = y * buf_w + bx;
+            if bx > 0 && mask[idx] < mask[idx - 1] { adder += (mask[idx - 1] - mask[idx]) as u32; }
+            adder = (adder * 15 >> 4).min(71);
+            let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
+            let r = ((glow_colour >> 16) & 0xFF) * intensity >> 8;
+            let g = ((glow_colour >> 8) & 0xFF) * intensity >> 8;
+            let b = (glow_colour & 0xFF) * intensity >> 8;
+            let a = intensity.min(63);
+            pixels[idx] = sat_byte_add(pixels[idx], (a << 24) | (r << 16) | (g << 8) | b);
+        }
+    }
+    // Left blur.
+    for y in y_top..y_bot {
+        let mut adder = 0u32;
+        let end = x_left + (yhs as isize - y as isize).max(0) as usize + (y as isize - yhe as isize).max(0) as usize;
+        for bx in (x_left.saturating_sub(blur_h)..=end).rev() {
+            let idx = y * buf_w + bx;
+            if bx + 1 < buf_w && mask[idx] < mask[idx + 1] { adder += (mask[idx + 1] - mask[idx]) as u32; }
+            adder = (adder * 15 >> 4).min(71);
+            let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
+            let r = ((glow_colour >> 16) & 0xFF) * intensity >> 8;
+            let g = ((glow_colour >> 8) & 0xFF) * intensity >> 8;
+            let b = (glow_colour & 0xFF) * intensity >> 8;
+            let a = intensity.min(63);
+            pixels[idx] = sat_byte_add(pixels[idx], (a << 24) | (r << 16) | (g << 8) | b);
+        }
+    }
+    // Down blur.
+    for bx in x_left..x_right {
+        let mut adder = 0u32;
+        let start = y_bot - (xvs as isize - bx as isize).max(0) as usize - (bx as isize - xve as isize).max(0) as usize;
+        for by in start..y_bot + blur_v {
+            if by >= buf_h { break; }
+            let idx = by * buf_w + bx;
+            if by > 0 { let ia = (by - 1) * buf_w + bx; if mask[idx] < mask[ia] { adder += (mask[ia] - mask[idx]) as u32; } }
+            adder = (adder * 3 >> 2).min(70);
+            let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
+            let r = ((glow_colour >> 16) & 0xFF) * intensity >> 8;
+            let g = ((glow_colour >> 8) & 0xFF) * intensity >> 8;
+            let b = (glow_colour & 0xFF) * intensity >> 8;
+            let a = intensity.min(63);
+            pixels[idx] = sat_byte_add(pixels[idx], (a << 24) | (r << 16) | (g << 8) | b);
+        }
+    }
+    // Up blur.
+    for bx in x_left..x_right {
+        let mut adder = 0u32;
+        let end = y_top + (xvs as isize - bx as isize).max(0) as usize + (bx as isize - xve as isize).max(0) as usize;
+        for by in (0..=end).rev() {
+            if by + blur_v < y_top { break; }
+            if by >= buf_h { continue; }
+            let idx = by * buf_w + bx;
+            if by + 1 < buf_h { let ib = (by + 1) * buf_w + bx; if mask[idx] < mask[ib] { adder += (mask[ib] - mask[idx]) as u32; } }
+            adder = (adder * 3 >> 2).min(70);
+            let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
+            let r = ((glow_colour >> 16) & 0xFF) * intensity >> 8;
+            let g = ((glow_colour >> 8) & 0xFF) * intensity >> 8;
+            let b = (glow_colour & 0xFF) * intensity >> 8;
+            let a = intensity.min(63);
+            pixels[idx] = sat_byte_add(pixels[idx], (a << 24) | (r << 16) | (g << 8) | b);
+        }
+    }
 }
 
 /// Glyph rasterizers for window controls. Ported verbatim from photon's [compositing.rs](/mnt/Octopus/Code/photon/src/ui/compositing.rs) — the squircle minus / squircle ring / capsule X — so chrome looks identical to photon.

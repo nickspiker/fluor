@@ -347,7 +347,7 @@ impl Textbox {
 
         // 2. Glow (if focused). Fluor's Group model fully re-rasterizes the layer each dirty cycle, so we always paint the glow when focused — no `glow_applied` latch needed (that was a photon incremental-update relic; here it caused the glow to render exactly once then vanish on the next redraw).
         if self.focused {
-            paint::apply_textbox_glow(pixels, &self.mask, buf_w, buf_h, cy_l, bw, bh, true, theme::GLOW_DEFAULT);
+            paint::apply_textbox_glow(pixels, &self.mask, buf_w, buf_h, cy_l, bw, bh, theme::GLOW_DEFAULT);
         }
 
         // 3. Text — buffer-local positions: subtract offset from every viewport coord.
