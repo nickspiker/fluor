@@ -16,6 +16,8 @@ pub struct Textbox {
     /// Insertion point in `[0, chars.len()]`.
     pub cursor: usize,
     pub focused: bool,
+    /// Cursor is currently hovering over the textbox rect. Drives the hover fill colour.
+    pub hovered: bool,
     /// Pixel rect (center-anchored).
     pub center_x: Coord,
     pub center_y: Coord,
@@ -55,6 +57,7 @@ impl Textbox {
             chars: Vec::new(),
             cursor: 0,
             focused: false,
+            hovered: false,
             center_x,
             center_y,
             width,
@@ -314,13 +317,14 @@ impl Textbox {
 
     // --- Rendering ---
 
-    /// Render the textbox interior (hard-edged rectangle fill) into a buffer. **Step 1 of an
-    /// incremental rebuild** — no AA on the edges (hairlines will cover the transition when added
-    /// later), no rounded pill ends, no text, no selection, no glow. Solid `TEXTBOX_FILL` color
-    /// inside the rect, alpha=0 outside.
+    /// Render the textbox interior — hard-edged pill (rectangle with semicircular ends), no AA.
+    /// **Step 2 of incremental rebuild**: rounded ends + state-based fill colour:
+    ///   - focused (active):  `theme::TEXTBOX_ACTIVE`
+    ///   - hovered (not focused):  `theme::TEXTBOX_HOVER`
+    ///   - default:           `theme::TEXTBOX_FILL`
     ///
-    /// Populates `self.mask` as 255 inside the rect, 0 outside (used downstream by glow + selection
-    /// once those come back).
+    /// No anti-aliasing — hairlines cover the binary pixel edge when they go on top in step 3.
+    /// Populates `self.mask` (255 inside pill, 0 outside) for downstream glow + selection use.
     ///
     /// `(offset_x, offset_y)` is the buffer's top-left in viewport coords.
     pub fn render_content_into(
@@ -334,8 +338,8 @@ impl Textbox {
         _clip: Option<Clip>,
         _mask: Option<&paint::AlphaMask>,
     ) {
-        let bw = self.width as usize;
-        let bh = self.height as usize;
+        let bw = self.width as isize;
+        let bh = self.height as isize;
         let pill_x_l = (self.center_x - self.width * 0.5 - offset_x) as isize;
         let pill_y_l = (self.center_y - self.height * 0.5 - offset_y) as isize;
 
@@ -348,17 +352,48 @@ impl Textbox {
             self.mask.fill(0);
         }
 
-        // Hard-edged rectangle fill — solid TEXTBOX_FILL, no AA.
-        paint::fill_rect_solid(pixels, buf_w, buf_h, pill_x_l, pill_y_l, bw as isize, bh as isize, theme::TEXTBOX_FILL, None);
+        // State-based fill colour.
+        let fill = if self.focused {
+            theme::TEXTBOX_ACTIVE
+        } else if self.hovered {
+            theme::TEXTBOX_HOVER
+        } else {
+            theme::TEXTBOX_FILL
+        };
 
-        // Mask: 255 inside the rect, 0 outside.
+        // Hard-edged pill: rectangular middle + two semicircular ends. Each pixel is binary
+        // (in/out), no AA. Radius = box_height / 2 (so the ends are perfect circles of that
+        // diameter); semicircle centers at (pill_x + r, pill_y + r) and (pill_x + w - r, pill_y + r).
+        let r = bh / 2;
+        let r_sq = r * r;
+        let cy = pill_y_l + r;
+        let mid_x_start = pill_x_l + r;        // first column of the rectangular middle
+        let mid_x_end   = pill_x_l + bw - r;   // first column past the rectangular middle (= right semicircle center)
+
         let x0 = pill_x_l.max(0) as usize;
         let y0 = pill_y_l.max(0) as usize;
-        let x1 = (pill_x_l + bw as isize).min(buf_w as isize).max(0) as usize;
-        let y1 = (pill_y_l + bh as isize).min(buf_h as isize).max(0) as usize;
+        let x1 = (pill_x_l + bw).min(buf_w as isize).max(0) as usize;
+        let y1 = (pill_y_l + bh).min(buf_h as isize).max(0) as usize;
+
         for row in y0..y1 {
+            let dy = row as isize - cy;
+            let dy_sq = dy * dy;
+            let row_base = row * buf_w;
             for col in x0..x1 {
-                self.mask[row * buf_w + col] = 255;
+                let inside = if (col as isize) >= mid_x_start && (col as isize) < mid_x_end {
+                    true   // rectangular middle
+                } else if (col as isize) < mid_x_start {
+                    let dx = col as isize - mid_x_start;
+                    dx * dx + dy_sq <= r_sq
+                } else {
+                    let dx = col as isize - mid_x_end;
+                    dx * dx + dy_sq <= r_sq
+                };
+                if inside {
+                    let idx = row_base + col;
+                    pixels[idx] = fill;
+                    self.mask[idx] = 255;
+                }
             }
         }
     }
