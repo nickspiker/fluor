@@ -300,7 +300,8 @@ impl DesktopApp {
                 let buf = &mut tg.rpn.layers[0].pixels;
                 buf.fill(0);
                 if let Some(t) = text.as_mut() {
-                    tb.render(buf, tw, th, bbox.x, bbox.y, t, None, None);
+                    // Legacy single-layer path — content only, no glow (legacy desktop::run is slated for deletion in Phase E; the trait-based run_app in app.rs has the correct two-layer glow setup).
+                    tb.render_content_into(buf, tw, th, bbox.x, bbox.y, t, None, None);
                 }
             }
         }

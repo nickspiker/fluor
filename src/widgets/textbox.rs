@@ -314,8 +314,10 @@ impl Textbox {
 
     // --- Rendering ---
 
-    /// Render pill + mask + text + selection (NOT the blinkey — that's a separate path so it can live in its own bbox-sized group). `(offset_x, offset_y)` is the buffer's top-left in viewport coords; pass `(0, 0)` for a full-viewport buffer or `(bbox.x, bbox.y)` for a sub-viewport buffer sized to the textbox's [`bbox`](Self::bbox).
-    pub fn render(
+    /// Render pill + mask + text + selection into a buffer. Populates `self.mask` as a side effect — call this BEFORE [`render_glow_into`](Self::render_glow_into) on a given frame, since the glow path reads the mask.
+    ///
+    /// `(offset_x, offset_y)` is the buffer's top-left in viewport coords; pass `(0, 0)` for a full-viewport buffer or `(bbox.x, bbox.y)` for a sub-viewport buffer sized to the textbox's [`bbox`](Self::bbox). NOT the blinkey — that lives in its own [`render_blinkey_into`](Self::render_blinkey_into) call.
+    pub fn render_content_into(
         &mut self,
         pixels: &mut [u32],
         buf_w: usize,
@@ -328,7 +330,6 @@ impl Textbox {
     ) {
         let bw = self.width as usize;
         let bh = self.height as usize;
-        // Local (buffer-relative) center.
         let cx_l = (self.center_x - offset_x) as usize;
         let cy_l = (self.center_y - offset_y) as isize;
         let center_y_l = self.center_y - offset_y;
@@ -345,12 +346,7 @@ impl Textbox {
         // 1. Pill shape + mask (buffer-local).
         paint::draw_textbox_pill(pixels, &mut self.mask, buf_w, buf_h, cx_l, cy_l, bw, bh);
 
-        // 2. Glow (if focused). Fluor's Group model fully re-rasterizes the layer each dirty cycle, so we always paint the glow when focused — no `glow_applied` latch needed (that was a photon incremental-update relic; here it caused the glow to render exactly once then vanish on the next redraw).
-        if self.focused {
-            paint::apply_textbox_glow(pixels, &self.mask, buf_w, buf_h, cy_l, bw, bh, theme::GLOW_DEFAULT);
-        }
-
-        // 3. Text — buffer-local positions: subtract offset from every viewport coord.
+        // 2. Text — buffer-local positions: subtract offset from every viewport coord.
         let s: String = self.chars.iter().collect();
         if !s.is_empty() {
             let text_x_v = self.text_start_x();
@@ -377,7 +373,7 @@ impl Textbox {
             }
         }
 
-        // 4. Selection highlight (XOR inversion within textbox mask) — buffer-local.
+        // 3. Selection highlight (XOR inversion within textbox mask) — buffer-local.
         if let Some((sel_start, sel_end)) = self.selection_range() {
             let start_px = (self.text_start_x() + self.widths[..sel_start].iter().sum::<Coord>()) - offset_x;
             let end_px = (self.text_start_x() + self.widths[..sel_end].iter().sum::<Coord>()) - offset_x;
@@ -396,6 +392,17 @@ impl Textbox {
                 }
             }
         }
+    }
+
+    /// Paint the focus glow into a buffer using the pill silhouette captured in `self.mask` by the last [`render_content_into`](Self::render_content_into) call. The glow goes into its OWN layer so AlphaOver in the textbox_group's Stack program produces the correct `glow_color × (1 - mask) + pill × mask` blend at AA edges — saturating-adding glow into the content layer would stain the pill's AA pixels with full glow_color.
+    pub fn render_glow_into(&self, pixels: &mut [u32], buf_w: usize, buf_h: usize, offset_x: Coord, offset_y: Coord) {
+        if !self.focused { return; }
+        let bw = self.width as usize;
+        let bh = self.height as usize;
+        let cy_l = (self.center_y - offset_y) as isize;
+        paint::apply_textbox_glow(pixels, &self.mask, buf_w, buf_h, cy_l, bw, bh, theme::GLOW_DEFAULT);
+        // `offset_x` reserved for future use; the glow currently centers on the same x-axis as the pill so no x-offset math is required here.
+        let _ = offset_x;
     }
 
     /// Render only the blinkey wave cursor into a buffer (typically a sub-viewport `cursor_group` buffer). `(offset_x, offset_y)` is the buffer's top-left in viewport coords. The buffer should be zeroed before calling — blinkey writes non-zero pixels for additive composition.
