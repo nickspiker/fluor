@@ -209,8 +209,7 @@ pub fn blend(bg: u32, fg: u32) -> u32 {
 /// Each variant is a branchless kernel that runs over the entire layer buffer. The blend mode is per-layer, not per-pixel, so there's no branching in the inner loop. Alpha participation varies by mode — see each variant's doc comment for the exact channel math.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlendMode {
-    /// Overwrite destination with source where source alpha > 0. Background layers use this.
-    /// `if src != 0 { dst = src }`
+    /// Unconditionally overwrite destination with source. `dst = src`. Bottom-most layers use this — anything beneath is irrelevant. Critical for silhouette-based corner knockout: a `Mul`-zeroed composite at the squircle corners must reach the present buffer as `0x00000000` so PostMultiplied alpha sees them as transparent. (The earlier "skip on src=0" semantic kept stale back-buffer content visible at the corners.)
     Replace,
     /// Standard Porter-Duff alpha-over. Source alpha controls blending.
     /// `dst = src * α + dst * (1 - α)` per channel, using SWAR /256 approximation.
@@ -247,9 +246,7 @@ impl BlendMode {
 }
 
 fn flatten_replace(dst: &mut [u32], src: &[u32]) {
-    for i in 0..dst.len() {
-        if src[i] != 0 { dst[i] = src[i]; }
-    }
+    dst.copy_from_slice(src);
 }
 
 fn flatten_alpha_over(dst: &mut [u32], src: &[u32]) {

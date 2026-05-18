@@ -47,9 +47,6 @@ pub struct Textbox {
     mask_w: usize,
     mask_h: usize,
 
-    // --- Glow state ---
-    /// Whether the glow is currently applied (so we can remove it on defocus).
-    glow_applied: bool,
 }
 
 impl Textbox {
@@ -72,7 +69,6 @@ impl Textbox {
             mask: Vec::new(),
             mask_w: 0,
             mask_h: 0,
-            glow_applied: false,
         }
     }
 
@@ -349,13 +345,9 @@ impl Textbox {
         // 1. Pill shape + mask (buffer-local).
         paint::draw_textbox_pill(pixels, &mut self.mask, buf_w, buf_h, cx_l, cy_l, bw, bh);
 
-        // 2. Glow (if focused).
-        if self.focused && !self.glow_applied {
+        // 2. Glow (if focused). Fluor's Group model fully re-rasterizes the layer each dirty cycle, so we always paint the glow when focused — no `glow_applied` latch needed (that was a photon incremental-update relic; here it caused the glow to render exactly once then vanish on the next redraw).
+        if self.focused {
             paint::apply_textbox_glow(pixels, &self.mask, buf_w, buf_h, cy_l, bw, bh, true, theme::GLOW_DEFAULT);
-            self.glow_applied = true;
-        } else if !self.focused && self.glow_applied {
-            paint::apply_textbox_glow(pixels, &self.mask, buf_w, buf_h, cy_l, bw, bh, false, theme::GLOW_DEFAULT);
-            self.glow_applied = false;
         }
 
         // 3. Text — buffer-local positions: subtract offset from every viewport coord.
@@ -414,7 +406,7 @@ impl Textbox {
         let blinkey_x = (blinkey_x_v - offset_x as isize) as usize;
         let blinkey_y = ((self.center_y - self.font_size * 0.5) - offset_y) as usize;
         let blinkey_h = self.font_size as usize;
-        if blinkey_x >= 7 && blinkey_x + 7 < buf_w && blinkey_y + blinkey_h < buf_h {
+        if blinkey_x >= 7 && blinkey_x + 7 < buf_w && blinkey_y + blinkey_h <= buf_h {
             paint::draw_blinkey(pixels, buf_w, blinkey_x, blinkey_y, blinkey_h, self.blinkey_wave_top, true);
         }
     }
