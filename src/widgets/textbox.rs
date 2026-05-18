@@ -314,9 +314,15 @@ impl Textbox {
 
     // --- Rendering ---
 
-    /// Render pill + mask + text + selection into a buffer. Populates `self.mask` as a side effect — call this BEFORE [`render_glow_into`](Self::render_glow_into) on a given frame, since the glow path reads the mask.
+    /// Render the textbox interior (hard-edged rectangle fill) into a buffer. **Step 1 of an
+    /// incremental rebuild** — no AA on the edges (hairlines will cover the transition when added
+    /// later), no rounded pill ends, no text, no selection, no glow. Solid `TEXTBOX_FILL` color
+    /// inside the rect, alpha=0 outside.
     ///
-    /// `(offset_x, offset_y)` is the buffer's top-left in viewport coords; pass `(0, 0)` for a full-viewport buffer or `(bbox.x, bbox.y)` for a sub-viewport buffer sized to the textbox's [`bbox`](Self::bbox). NOT the blinkey — that lives in its own [`render_blinkey_into`](Self::render_blinkey_into) call.
+    /// Populates `self.mask` as 255 inside the rect, 0 outside (used downstream by glow + selection
+    /// once those come back).
+    ///
+    /// `(offset_x, offset_y)` is the buffer's top-left in viewport coords.
     pub fn render_content_into(
         &mut self,
         pixels: &mut [u32],
@@ -324,15 +330,14 @@ impl Textbox {
         buf_h: usize,
         offset_x: Coord,
         offset_y: Coord,
-        text: &mut TextRenderer,
+        _text: &mut TextRenderer,
         _clip: Option<Clip>,
         _mask: Option<&paint::AlphaMask>,
     ) {
         let bw = self.width as usize;
         let bh = self.height as usize;
-        let cx_l = (self.center_x - offset_x) as usize;
-        let cy_l = (self.center_y - offset_y) as isize;
-        let center_y_l = self.center_y - offset_y;
+        let pill_x_l = (self.center_x - self.width * 0.5 - offset_x) as isize;
+        let pill_y_l = (self.center_y - self.height * 0.5 - offset_y) as isize;
 
         let needed = buf_w * buf_h;
         if self.mask.len() != needed {
@@ -343,53 +348,17 @@ impl Textbox {
             self.mask.fill(0);
         }
 
-        // 1. Pill shape + mask (buffer-local).
-        paint::draw_textbox_pill(pixels, &mut self.mask, buf_w, buf_h, cx_l, cy_l, bw, bh);
+        // Hard-edged rectangle fill — solid TEXTBOX_FILL, no AA.
+        paint::fill_rect_solid(pixels, buf_w, buf_h, pill_x_l, pill_y_l, bw as isize, bh as isize, theme::TEXTBOX_FILL, None);
 
-        // 2. Text — buffer-local positions: subtract offset from every viewport coord.
-        let s: String = self.chars.iter().collect();
-        if !s.is_empty() {
-            let text_x_v = self.text_start_x();
-            let tb_left_v = self.center_x - self.width * 0.5;
-            let tb_right_v = self.center_x + self.width * 0.5;
-            let mut x_off = text_x_v;
-            let mut char_buf = [0u8; 4];
-            for (i, &ch) in self.chars.iter().enumerate() {
-                let cw = self.widths[i];
-                let char_right = x_off + cw;
-                if char_right >= tb_left_v && x_off <= tb_right_v {
-                    let cs = ch.encode_utf8(&mut char_buf);
-                    let _ = text.draw_text_left_u32(
-                        pixels, buf_w, buf_h,
-                        cs,
-                        x_off - offset_x, center_y_l,
-                        self.font_size, 400,
-                        theme::TEXT_COLOUR,
-                        self.font,
-                        None, None, None,
-                    );
-                }
-                x_off += cw;
-            }
-        }
-
-        // 3. Selection highlight (XOR inversion within textbox mask) — buffer-local.
-        if let Some((sel_start, sel_end)) = self.selection_range() {
-            let start_px = (self.text_start_x() + self.widths[..sel_start].iter().sum::<Coord>()) - offset_x;
-            let end_px = (self.text_start_x() + self.widths[..sel_end].iter().sum::<Coord>()) - offset_x;
-            let sel_top = (center_y_l - self.font_size * 0.5) as isize;
-            let sel_bot = (center_y_l + self.font_size * 0.5) as isize;
-            let tb_left = ((self.center_x - self.width * 0.5) - offset_x) as isize;
-            let tb_right = ((self.center_x + self.width * 0.5) - offset_x) as isize;
-            for sy in sel_top.max(0)..sel_bot.min(buf_h as isize) {
-                for sx in (start_px as isize).max(tb_left)..(end_px as isize).min(tb_right) {
-                    if sx >= 0 && (sx as usize) < buf_w {
-                        let idx = sy as usize * buf_w + sx as usize;
-                        if self.mask[idx] > 0 {
-                            pixels[idx] ^= 0x00FFFFFF;
-                        }
-                    }
-                }
+        // Mask: 255 inside the rect, 0 outside.
+        let x0 = pill_x_l.max(0) as usize;
+        let y0 = pill_y_l.max(0) as usize;
+        let x1 = (pill_x_l + bw as isize).min(buf_w as isize).max(0) as usize;
+        let y1 = (pill_y_l + bh as isize).min(buf_h as isize).max(0) as usize;
+        for row in y0..y1 {
+            for col in x0..x1 {
+                self.mask[row * buf_w + col] = 255;
             }
         }
     }
