@@ -16,7 +16,7 @@ pub struct Textbox {
     /// Insertion point in `[0, chars.len()]`.
     pub cursor: usize,
     pub focused: bool,
-    /// Cursor is currently hovering over the textbox rect. Drives the hover fill colour.
+    /// Cursor is hovering over the textbox bbox. Drives the hover fill colour.
     pub hovered: bool,
     /// Pixel rect (center-anchored).
     pub center_x: Coord,
@@ -317,16 +317,18 @@ impl Textbox {
 
     // --- Rendering ---
 
-    /// Render the textbox interior — hard-edged pill (rectangle with semicircular ends), no AA.
-    /// **Step 2 of incremental rebuild**: rounded ends + state-based fill colour:
-    ///   - focused (active):  `theme::TEXTBOX_ACTIVE`
-    ///   - hovered (not focused):  `theme::TEXTBOX_HOVER`
+    /// Render the textbox interior — hard-edged pill with photon's squircle ends (squirdleyness=3,
+    /// matching `paint::draw_textbox_pill`'s shape but skipping the per-pixel AA). State-based
+    /// fill colour:
+    ///   - focused (active):  `theme::TEXTBOX_ACTIVE`  (black)
+    ///   - hovered only:      `theme::TEXTBOX_HOVER`   (lightened)
     ///   - default:           `theme::TEXTBOX_FILL`
     ///
-    /// No anti-aliasing — hairlines cover the binary pixel edge when they go on top in step 3.
-    /// Populates `self.mask` (255 inside pill, 0 outside) for downstream glow + selection use.
+    /// Each row's left/right edge column is computed from the squircle formula
+    /// `x = r·(1 - (y/r)³)^(1/3)`; the row is filled hard from `pill_x + inset` to
+    /// `pill_x + bw - 1 - inset`. No AA — hairlines will go on top in a later step.
     ///
-    /// `(offset_x, offset_y)` is the buffer's top-left in viewport coords.
+    /// Populates `self.mask` (255 inside, 0 outside) for downstream glow + selection.
     pub fn render_content_into(
         &mut self,
         pixels: &mut [u32],
@@ -361,39 +363,30 @@ impl Textbox {
             theme::TEXTBOX_FILL
         };
 
-        // Hard-edged pill: rectangular middle + two semicircular ends. Each pixel is binary
-        // (in/out), no AA. Radius = box_height / 2 (so the ends are perfect circles of that
-        // diameter); semicircle centers at (pill_x + r, pill_y + r) and (pill_x + w - r, pill_y + r).
-        let r = bh / 2;
-        let r_sq = r * r;
-        let cy = pill_y_l + r;
-        let mid_x_start = pill_x_l + r;        // first column of the rectangular middle
-        let mid_x_end   = pill_x_l + bw - r;   // first column past the rectangular middle (= right semicircle center)
+        // Squircle end radius = half height. Photon's squirdleyness=3.
+        let r_f = self.height as f32 * 0.5;
+        let cy = pill_y_l + (bh / 2);
 
-        let x0 = pill_x_l.max(0) as usize;
         let y0 = pill_y_l.max(0) as usize;
-        let x1 = (pill_x_l + bw).min(buf_w as isize).max(0) as usize;
         let y1 = (pill_y_l + bh).min(buf_h as isize).max(0) as usize;
 
         for row in y0..y1 {
-            let dy = row as isize - cy;
-            let dy_sq = dy * dy;
-            let row_base = row * buf_w;
-            for col in x0..x1 {
-                let inside = if (col as isize) >= mid_x_start && (col as isize) < mid_x_end {
-                    true   // rectangular middle
-                } else if (col as isize) < mid_x_start {
-                    let dx = col as isize - mid_x_start;
-                    dx * dx + dy_sq <= r_sq
-                } else {
-                    let dx = col as isize - mid_x_end;
-                    dx * dx + dy_sq <= r_sq
-                };
-                if inside {
-                    let idx = row_base + col;
-                    pixels[idx] = fill;
-                    self.mask[idx] = 255;
-                }
+            // Per-row squircle inset: how far inward from the pill's vertical edge to the leftmost
+            // (or rightmost) inside pixel for this row.
+            let dy = (row as isize - cy).abs() as f32;
+            let y_norm = (dy / r_f).min(1.0);
+            let x_norm = crate::math::powf(1.0 - crate::math::powi(y_norm, 3), 1.0 / 3.0);
+            let inset = (r_f - x_norm * r_f).floor() as isize;
+
+            let col_left_v  = pill_x_l + inset;
+            let col_right_v = pill_x_l + bw - inset;   // exclusive
+            if col_right_v <= col_left_v { continue; }
+            let col_left  = col_left_v.max(0) as usize;
+            let col_right = col_right_v.min(buf_w as isize) as usize;
+            let row_base  = row * buf_w;
+            for col in col_left..col_right {
+                pixels[row_base + col] = fill;
+                self.mask[row_base + col] = 255;
             }
         }
     }

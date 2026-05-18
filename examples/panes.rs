@@ -143,8 +143,10 @@ impl FluorApp for PanesDemo {
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
                 }
-                let new_hit = self.chrome.hit_at(ctx.cursor_x, ctx.cursor_y);
-                let chrome_changed = self.chrome.set_hover(new_hit);
+                let chrome_changed = {
+                    let new_hit = self.chrome.hit_at(ctx.cursor_x, ctx.cursor_y);
+                    self.chrome.set_hover(new_hit)
+                };
                 let new_textbox_hover = self.textbox.contains(ctx.cursor_x, ctx.cursor_y);
                 let textbox_changed = self.textbox.hovered != new_textbox_hover;
                 if textbox_changed {
