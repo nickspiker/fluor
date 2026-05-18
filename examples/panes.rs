@@ -329,15 +329,16 @@ impl FluorApp for PanesDemo {
             let (tw, th) = self.textbox_group.dims();
             let bbox = self.textbox.bbox();
 
-            // Layer 0 = content (created first), layer 1 = glow. Content rasterizes first so its
-            // pill paint populates `self.textbox.mask`, which the glow path reads.
+            // Step 1 of incremental rebuild: content layer holds just the hard-edged interior fill,
+            // glow layer stays zeroed (skipped). Internal AlphaOver of (glow=0 over content) is a
+            // no-op so the textbox shows the bare rectangle.
             let content = &mut self.textbox_group.rpn.layers[0].pixels;
             content.fill(0);
             self.textbox.render_content_into(content, tw, th, bbox.x, bbox.y, ctx.text, None, None);
 
             let glow = &mut self.textbox_group.rpn.layers[1].pixels;
             glow.fill(0);
-            self.textbox.render_glow_into(glow, tw, th, bbox.x, bbox.y);
+            // self.textbox.render_glow_into(glow, tw, th, bbox.x, bbox.y);  // disabled — re-enable in a later step.
         }
         self.textbox_group.flatten_into(target, buf_w, buf_h);
 
