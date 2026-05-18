@@ -144,13 +144,26 @@ impl FluorApp for PanesDemo {
                     return EventResponse::Handled;
                 }
                 let new_hit = self.chrome.hit_at(ctx.cursor_x, ctx.cursor_y);
-                if self.chrome.set_hover(new_hit) {
+                let chrome_changed = self.chrome.set_hover(new_hit);
+                let new_textbox_hover = self.textbox.contains(ctx.cursor_x, ctx.cursor_y);
+                let textbox_changed = self.textbox.hovered != new_textbox_hover;
+                if textbox_changed {
+                    self.textbox.hovered = new_textbox_hover;
+                    self.textbox_group.invalidate();
+                }
+                if chrome_changed || textbox_changed {
                     ctx.window.request_redraw();
                 }
                 EventResponse::Pass
             }
             WindowEvent::CursorLeft { .. } => {
-                if self.chrome.set_hover(HIT_NONE) {
+                let chrome_changed = self.chrome.set_hover(HIT_NONE);
+                let textbox_changed = self.textbox.hovered;
+                if textbox_changed {
+                    self.textbox.hovered = false;
+                    self.textbox_group.invalidate();
+                }
+                if chrome_changed || textbox_changed {
                     ctx.window.request_redraw();
                 }
                 EventResponse::Pass
