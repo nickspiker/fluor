@@ -525,6 +525,18 @@ pub fn blend_rgb_only(bg_colour: u32, fg_colour: u32, weight_bg: u8, weight_fg: 
     blended as u32
 }
 
+/// Photon's squircle inset formula — single row, parameterized by `squirdleyness`. Returns the curve's inset (distance from the bbox edge to the leftmost / rightmost inside pixel) for a row at `y_from_center` rows above or below the squircle's vertical center.
+///
+/// `squirdleyness = 2` → circle. `squirdleyness = 3` → photon's textbox pill default (slightly flatter than a circle). Higher = more rectangular. Both `draw_textbox_pill` (AA path) and the textbox widget's hard-pixel renderer route through this so any tweak to the curve math flows through both code paths.
+///
+/// Identical to the per-iteration formula at photon's [`compositing.rs:4567-4570`](/mnt/Octopus/Code/photon/src/ui/compositing.rs).
+#[inline]
+pub fn squircle_inset(y_from_center: f32, radius: f32, squirdleyness: i32) -> f32 {
+    let y_norm = (y_from_center / radius).min(1.0);
+    let x_norm = crate::math::powf(1.0 - crate::math::powi(y_norm, squirdleyness), 1.0 / squirdleyness as f32);
+    radius - x_norm * radius
+}
+
 /// Draw a pill-shaped textbox (semicircular ends, squirdleyness=3) with two-tone AA edges and generate an alpha mask. Ported from photon's `draw_textbox` in compositing.rs.
 ///
 /// Writes into `pixels` (fill + AA edges) and `mask` (0 outside, 255 interior, AA values on edges). The mask is used downstream by the glow effect, text clipping, and blinkey. `center_x`/`center_y` are pixel coordinates; `box_width`/`box_height` in pixels.
