@@ -376,7 +376,7 @@ impl Textbox {
             let dy = (row as isize - cy).abs() as f32;
             let y_norm = (dy / r_f).min(1.0);
             let x_norm = crate::math::powf(1.0 - crate::math::powi(y_norm, 3), 1.0 / 3.0);
-            let inset = (r_f - x_norm * r_f).floor() as isize;
+            let inset = (r_f - x_norm * r_f) as isize;   // matches photon's `inset as u16` — implicit truncation toward zero, which equals floor for positive values
 
             let col_left_v  = pill_x_l + inset;
             let col_right_v = pill_x_l + bw - inset;   // exclusive
