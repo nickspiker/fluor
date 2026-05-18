@@ -58,11 +58,13 @@ impl PanesDemo {
         let chrome = DefaultChrome::new(viewport, title.clone());
 
         // Placeholder textbox + groups — actual geometry computed in `init`/`on_resize`.
+        // textbox_group has two layers: glow (under) + content (on top), composed via AlphaOver inside the group so the pill's AA edge blends correctly with the glow halo instead of saturating to glow color.
         let textbox = Textbox::new(0.0, 0.0, 1.0, 1.0, 12.0);
         let placeholder_region = Region::new(0.0, 0.0, 1.0, 1.0);
         let mut textbox_group = Group::new(placeholder_region, BlendMode::AlphaOver);
-        let l = textbox_group.new_layer();
-        textbox_group.set_program(vec![Op::Push(l)]);
+        let glow_layer = textbox_group.new_layer();
+        let content_layer = textbox_group.new_layer();
+        textbox_group.set_program(vec![Op::Push(glow_layer), Op::Push(content_layer), Op::AlphaOver]);
         let mut cursor_group = Group::new(placeholder_region, BlendMode::Add);
         let l = cursor_group.new_layer();
         cursor_group.set_program(vec![Op::Push(l)]);
@@ -315,13 +317,22 @@ impl FluorApp for PanesDemo {
         }
         self.rotation_group.flatten_into(target, buf_w, buf_h);
 
-        // Textbox group.
-        if self.textbox_group.rpn.layers[0].dirty {
+        // Textbox group. Layer order: 0 = glow (under), 1 = content (on top). Rasterize content
+        // FIRST because it populates `self.textbox.mask` (the pill silhouette), which the glow
+        // path reads. The group's internal Stack (Push glow, Push content, AlphaOver) then
+        // produces the correct AA-edge blend before flattening onto chrome.
+        let layers_dirty = self.textbox_group.rpn.layers[0].dirty || self.textbox_group.rpn.layers[1].dirty;
+        if layers_dirty {
             let (tw, th) = self.textbox_group.dims();
             let bbox = self.textbox.bbox();
-            let buf = &mut self.textbox_group.rpn.layers[0].pixels;
-            buf.fill(0);
-            self.textbox.render(buf, tw, th, bbox.x, bbox.y, ctx.text, None, None);
+
+            let content = &mut self.textbox_group.rpn.layers[1].pixels;
+            content.fill(0);
+            self.textbox.render_content_into(content, tw, th, bbox.x, bbox.y, ctx.text, None, None);
+
+            let glow = &mut self.textbox_group.rpn.layers[0].pixels;
+            glow.fill(0);
+            self.textbox.render_glow_into(glow, tw, th, bbox.x, bbox.y);
         }
         self.textbox_group.flatten_into(target, buf_w, buf_h);
 
