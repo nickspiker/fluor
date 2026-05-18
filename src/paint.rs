@@ -858,10 +858,11 @@ pub fn draw_blinkey(
 
 /// Paint a 4-directional blur glow around a textbox pill silhouette.
 ///
-/// Loop structure + adder/intensity math are ported verbatim from photon's `apply_textbox_glow` (`compositing.rs:4479`). The pixel-write step diverges in two ways for fluor's layered model:
+/// Loop structure + adder/intensity math are ported verbatim from photon's `apply_textbox_glow` (`compositing.rs:4479`). The pixel-write step diverges in three ways for fluor's layered model:
 ///
 /// 1. **Constant glow_colour RGB + per-pass alpha** (instead of photon's intensity-scaled RGB additive blend onto opaque bg). Each pass writes `(intensity << 24) | (glow_colour & 0x00FFFFFF)` and saturating-adds onto the current pixel. The downstream textbox_group's `AlphaOver` flatten then produces `glow_colour × α/256 + chrome × (1 - α/256)` — exactly equivalent to photon's perceived appearance on opaque backgrounds, but also correct on bright or transparent ones (the layered-model equivalent of photon's additive paint).
 /// 2. **Saturating per-byte add** instead of wrapping `+=` — the textbox_group's layer starts at zero, so multi-direction accumulation would byte-wrap and produce dark stripes where the glow should be brightest. Each byte caps at 0xFF.
+/// 3. **Gated on `intensity > 0`** — photon's `pixels[idx] += 0 = no-op` was implicit; here we'd otherwise saturating-add `glow_rgb` (with alpha=0) into the pill interior every pass, staining it with the glow color. Explicit skip preserves photon's behaviour.
 ///
 /// The `add: bool` / "remove glow" path photon used is dropped — fluor's Group model fully re-rasterizes the layer each dirty cycle, so there's nothing to remove.
 pub fn apply_textbox_glow(
@@ -927,7 +928,9 @@ pub fn apply_textbox_glow(
             if bx > 0 && mask[idx] < mask[idx - 1] { adder += (mask[idx - 1] - mask[idx]) as u32; }
             adder = (adder * 15 >> 4).min(71);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
-            pixels[idx] = sat_byte_add(pixels[idx], (intensity << 24) | glow_rgb);
+            if intensity > 0 {
+                pixels[idx] = sat_byte_add(pixels[idx], (intensity << 24) | glow_rgb);
+            }
         }
     }
     // Left blur.
@@ -939,7 +942,9 @@ pub fn apply_textbox_glow(
             if bx + 1 < buf_w && mask[idx] < mask[idx + 1] { adder += (mask[idx + 1] - mask[idx]) as u32; }
             adder = (adder * 15 >> 4).min(71);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
-            pixels[idx] = sat_byte_add(pixels[idx], (intensity << 24) | glow_rgb);
+            if intensity > 0 {
+                pixels[idx] = sat_byte_add(pixels[idx], (intensity << 24) | glow_rgb);
+            }
         }
     }
     // Down blur.
@@ -952,7 +957,9 @@ pub fn apply_textbox_glow(
             if by > 0 { let ia = (by - 1) * buf_w + bx; if mask[idx] < mask[ia] { adder += (mask[ia] - mask[idx]) as u32; } }
             adder = (adder * 3 >> 2).min(70);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
-            pixels[idx] = sat_byte_add(pixels[idx], (intensity << 24) | glow_rgb);
+            if intensity > 0 {
+                pixels[idx] = sat_byte_add(pixels[idx], (intensity << 24) | glow_rgb);
+            }
         }
     }
     // Up blur.
@@ -966,7 +973,9 @@ pub fn apply_textbox_glow(
             if by + 1 < buf_h { let ib = (by + 1) * buf_w + bx; if mask[idx] < mask[ib] { adder += (mask[ib] - mask[idx]) as u32; } }
             adder = (adder * 3 >> 2).min(70);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
-            pixels[idx] = sat_byte_add(pixels[idx], (intensity << 24) | glow_rgb);
+            if intensity > 0 {
+                pixels[idx] = sat_byte_add(pixels[idx], (intensity << 24) | glow_rgb);
+            }
         }
     }
 }
