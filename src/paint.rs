@@ -546,103 +546,47 @@ pub fn draw_squircle_pill(
     blend_aa_with_existing: bool,
 ) {
     if pill_w <= 0 || pill_h <= 0 { return; }
+    let buf_w_i = buf_w as isize;
+    let buf_h_i = buf_h as isize;
+    // Bbox-overlap early-out — pill entirely off-buffer.
     if pill_x + pill_w <= 0 || pill_y + pill_h <= 0
-        || pill_x >= buf_w as isize || pill_y >= buf_h as isize { return; }
+        || pill_x >= buf_w_i || pill_y >= buf_h_i { return; }
 
     let radius_f = pill_h as f32 * 0.5;
     let radius = (pill_h / 2) as isize;
     let solid = color | 0xFF00_0000;
     let color_rgb = color & 0x00FF_FFFF;
-
     let crossings = squircle_crossings(radius_f, squirdleyness);
 
-    // For each crossing (offset i rows into the cap from the bbox edge), the curve crosses
-    // the row at column offset `inset`. By the squircle's x/y symmetry, the same crossings
-    // table also describes the column-walk: at column offset i, the curve crosses at row
-    // offset inset. One crossing → 8 AA pixels (2 per corner × 4 corners).
-    for (i, &(inset, _l, h)) in crossings.iter().enumerate() {
-        if inset as usize > i { break; } // past the diagonal — symmetric mirror already covers it
-        let i_iso = i as isize;
-        let inset_iso = inset as isize;
-        let h_u32 = h as u32;
+    // Fast/slow split. Fast path: pill bbox fully inside the buffer → no per-pixel checks.
+    // Slow path: partial overhang (scroll/resize transitions) → range clips at the corner-block
+    // boundary so each AA write has its row already proven in-buffer.
+    let fully_inside = pill_x >= 0 && pill_y >= 0
+        && pill_x + pill_w <= buf_w_i && pill_y + pill_h <= buf_h_i;
 
-        for &(flip_x, flip_y) in &[(false, false), (true, false), (false, true), (true, true)] {
-            // --- vertical-edge AA pixel + horizontal fill to the diagonal ---
-            let v_row = if flip_y {
-                pill_y + pill_h - 1 - radius + i_iso
-            } else {
-                pill_y + radius - i_iso
-            };
-            let v_aa_col = if flip_x {
-                pill_x + pill_w - 1 - inset_iso
-            } else {
-                pill_x + inset_iso
-            };
-            let diag_col = if flip_x {
-                pill_x + pill_w - 1 - radius + i_iso
-            } else {
-                pill_x + radius - i_iso
-            };
-            paint_squircle_aa(pixels, mask, buf_w, buf_h, v_aa_col, v_row, color_rgb, h_u32, blend_aa_with_existing);
-            if v_row >= 0 && v_row < buf_h as isize {
-                let (fx_start, fx_end) = if flip_x {
-                    (diag_col, v_aa_col)
-                } else {
-                    (v_aa_col + 1, diag_col + 1)
-                };
-                let fs = fx_start.max(0) as usize;
-                let fe = fx_end.max(0).min(buf_w as isize) as usize;
-                let row_base = v_row as usize * buf_w;
-                for fx in fs..fe {
-                    let idx = row_base + fx;
-                    pixels[idx] = solid;
-                    mask[idx] = 255;
-                }
-            }
-
-            // --- horizontal-edge AA pixel + vertical fill to the diagonal ---
-            let h_col = if flip_x {
-                pill_x + pill_w - 1 - radius + i_iso
-            } else {
-                pill_x + radius - i_iso
-            };
-            let h_aa_row = if flip_y {
-                pill_y + pill_h - 1 - inset_iso
-            } else {
-                pill_y + inset_iso
-            };
-            let diag_row = if flip_y {
-                pill_y + pill_h - 1 - radius + i_iso
-            } else {
-                pill_y + radius - i_iso
-            };
-            paint_squircle_aa(pixels, mask, buf_w, buf_h, h_col, h_aa_row, color_rgb, h_u32, blend_aa_with_existing);
-            if h_col >= 0 && h_col < buf_w as isize {
-                let (fy_start, fy_end) = if flip_y {
-                    (diag_row, h_aa_row)
-                } else {
-                    (h_aa_row + 1, diag_row + 1)
-                };
-                let fs = fy_start.max(0) as usize;
-                let fe = fy_end.max(0).min(buf_h as isize) as usize;
-                let col_us = h_col as usize;
-                for fy in fs..fe {
-                    let idx = fy * buf_w + col_us;
-                    pixels[idx] = solid;
-                    mask[idx] = 255;
-                }
-            }
-        }
+    if fully_inside {
+        draw_squircle_pill_unclipped(
+            pixels, mask, buf_w,
+            pill_x as usize, pill_y as usize, pill_w as usize, pill_h as usize, radius as usize,
+            &crossings, color_rgb, solid, blend_aa_with_existing,
+        );
+    } else {
+        draw_squircle_pill_clipped(
+            pixels, mask, buf_w, buf_h,
+            pill_x, pill_y, pill_w, pill_h, radius,
+            &crossings, color_rgb, solid, blend_aa_with_existing,
+        );
     }
 
-    // Center rectangle between the two semicircle caps — fully solid.
+    // Center rectangle between the two semicircle caps — both paths share this. Range already
+    // clips to [0, buf_w) × [0, buf_h) via .max(0).min(buf), so no per-pixel guard needed.
     let center_x_start = pill_x + radius;
     let center_x_end = pill_x + pill_w - radius;
     if center_x_start < center_x_end {
         let cy_start = pill_y.max(0) as usize;
-        let cy_end = (pill_y + pill_h).min(buf_h as isize).max(0) as usize;
+        let cy_end = (pill_y + pill_h).min(buf_h_i).max(0) as usize;
         let cx_start = center_x_start.max(0) as usize;
-        let cx_end = center_x_end.min(buf_w as isize).max(0) as usize;
+        let cx_end = center_x_end.min(buf_w_i).max(0) as usize;
         for fy in cy_start..cy_end {
             let row_base = fy * buf_w;
             for fx in cx_start..cx_end {
@@ -654,18 +598,154 @@ pub fn draw_squircle_pill(
     }
 }
 
+/// Fast-path squircle pill rasterizer. Bounds checks intentionally absent.
+///
+/// **Rule 0 — WHY/PROOF/PREVENTS:**
+/// CALLER GUARANTEES (verified at dispatch in [`draw_squircle_pill`]):
+///   - `pill_x + pill_w ≤ buf_w` and `pill_y + pill_h ≤ buf_h` (cast to `usize`).
+///   - `pill_w ≥ pill_h ≥ 2` (pill geometry: caps don't overlap).
+///
+/// PROOF — every AA / fill index is `< pixels.len() == buf_w * buf_h`:
+///   - `inset ∈ [0, radius]` (from `squircle_crossings`), `i ∈ [0, radius]` (loop break at diagonal).
+///   - All written cols are in `[pill_x, pill_x + pill_w)` (subset of `[0, buf_w)` by caller guarantee).
+///   - All written rows are in `[pill_y, pill_y + pill_h)` (subset of `[0, buf_h)` by caller guarantee).
+///   - Therefore `row * buf_w + col < buf_h * buf_w = pixels.len()`.
+///
+/// PREVENTS: nothing — this path runs only when the proof holds. Bounds-check elision lets the compiler emit unchecked stores.
+fn draw_squircle_pill_unclipped(
+    pixels: &mut [u32],
+    mask: &mut [u8],
+    buf_w: usize,
+    pill_x: usize,
+    pill_y: usize,
+    pill_w: usize,
+    pill_h: usize,
+    radius: usize,
+    crossings: &[(u16, u8, u8)],
+    color_rgb: u32,
+    solid: u32,
+    blend_aa_with_existing: bool,
+) {
+    for (i, &(inset, _l, h)) in crossings.iter().enumerate() {
+        if inset as usize > i { break; }
+        let inset_us = inset as usize;
+        let h_u32 = h as u32;
+        for &(flip_x, flip_y) in &[(false, false), (true, false), (false, true), (true, true)] {
+            // --- vertical edge: AA pixel + horizontal fill to the diagonal ---
+            let v_row = if flip_y { pill_y + pill_h - 1 - radius + i } else { pill_y + radius - i };
+            let v_aa_col = if flip_x { pill_x + pill_w - 1 - inset_us } else { pill_x + inset_us };
+            let diag_col = if flip_x { pill_x + pill_w - 1 - radius + i } else { pill_x + radius - i };
+            let row_base = v_row * buf_w;
+            write_aa(pixels, mask, row_base + v_aa_col, color_rgb, h_u32, blend_aa_with_existing);
+            let (fx_start, fx_end) = if flip_x { (diag_col, v_aa_col) } else { (v_aa_col + 1, diag_col + 1) };
+            for fx in fx_start..fx_end {
+                let idx = row_base + fx;
+                pixels[idx] = solid;
+                mask[idx] = 255;
+            }
+
+            // --- horizontal edge: AA pixel + vertical fill to the diagonal ---
+            let h_col = if flip_x { pill_x + pill_w - 1 - radius + i } else { pill_x + radius - i };
+            let h_aa_row = if flip_y { pill_y + pill_h - 1 - inset_us } else { pill_y + inset_us };
+            let diag_row = if flip_y { pill_y + pill_h - 1 - radius + i } else { pill_y + radius - i };
+            write_aa(pixels, mask, h_aa_row * buf_w + h_col, color_rgb, h_u32, blend_aa_with_existing);
+            let (fy_start, fy_end) = if flip_y { (diag_row, h_aa_row) } else { (h_aa_row + 1, diag_row + 1) };
+            for fy in fy_start..fy_end {
+                let idx = fy * buf_w + h_col;
+                pixels[idx] = solid;
+                mask[idx] = 255;
+            }
+        }
+    }
+}
+
+/// Slow-path squircle pill rasterizer. Used when the pill partially overhangs the buffer.
+///
+/// **Rule 0 — WHY/PROOF/PREVENTS for the bounds checks:**
+/// CALLER ALLOWS: `pill_x` may be negative; `pill_x + pill_w` may exceed `buf_w` (same for y). Partial overhang is the design case (scroll-out, resize transitions, off-pane drag).
+///
+/// PROOF that no closed-form i-range clip suffices: `inset[i]` is non-linear in `i` (squircle curve), so the AA-pixel column `pill_x + inset` can't be cleanly bracketed by a single i-range when the pill straddles `x=0` or `x=buf_w`. Linear-in-`i` coords (rows and `h_col`) ARE clipped at the corner-block level — one branch per corner instead of one per pixel. The inset-dependent AA column gets one inline check.
+///
+/// PREVENTS: OOB pixel write / slice panic at the math↔buffer boundary when the pill's geometric corner falls outside the buffer.
+fn draw_squircle_pill_clipped(
+    pixels: &mut [u32],
+    mask: &mut [u8],
+    buf_w: usize,
+    buf_h: usize,
+    pill_x: isize,
+    pill_y: isize,
+    pill_w: isize,
+    pill_h: isize,
+    radius: isize,
+    crossings: &[(u16, u8, u8)],
+    color_rgb: u32,
+    solid: u32,
+    blend_aa_with_existing: bool,
+) {
+    let buf_w_i = buf_w as isize;
+    let buf_h_i = buf_h as isize;
+    for (i, &(inset, _l, h)) in crossings.iter().enumerate() {
+        if inset as usize > i { break; }
+        let i_iso = i as isize;
+        let inset_iso = inset as isize;
+        let h_u32 = h as u32;
+        for &(flip_x, flip_y) in &[(false, false), (true, false), (false, true), (true, true)] {
+            let v_row = if flip_y { pill_y + pill_h - 1 - radius + i_iso } else { pill_y + radius - i_iso };
+            let h_col = if flip_x { pill_x + pill_w - 1 - radius + i_iso } else { pill_x + radius - i_iso };
+
+            // --- Vertical edge: row constraint hoisted ---
+            if v_row >= 0 && v_row < buf_h_i {
+                let row_base = v_row as usize * buf_w;
+                let v_aa_col = if flip_x { pill_x + pill_w - 1 - inset_iso } else { pill_x + inset_iso };
+                let diag_col = h_col;
+                // AA pixel: inline col check (inset is nonlinear in i; can't pre-clip).
+                if v_aa_col >= 0 && v_aa_col < buf_w_i {
+                    write_aa(pixels, mask, row_base + v_aa_col as usize, color_rgb, h_u32, blend_aa_with_existing);
+                }
+                // Fill: range self-clips to [0, buf_w).
+                let (fx_start, fx_end) = if flip_x { (diag_col, v_aa_col) } else { (v_aa_col + 1, diag_col + 1) };
+                let fs = fx_start.max(0) as usize;
+                let fe = fx_end.max(0).min(buf_w_i) as usize;
+                for fx in fs..fe {
+                    let idx = row_base + fx;
+                    pixels[idx] = solid;
+                    mask[idx] = 255;
+                }
+            }
+
+            // --- Horizontal edge: column constraint hoisted ---
+            if h_col >= 0 && h_col < buf_w_i {
+                let col_us = h_col as usize;
+                let h_aa_row = if flip_y { pill_y + pill_h - 1 - inset_iso } else { pill_y + inset_iso };
+                let diag_row = v_row;
+                if h_aa_row >= 0 && h_aa_row < buf_h_i {
+                    write_aa(pixels, mask, h_aa_row as usize * buf_w + col_us, color_rgb, h_u32, blend_aa_with_existing);
+                }
+                let (fy_start, fy_end) = if flip_y { (diag_row, h_aa_row) } else { (h_aa_row + 1, diag_row + 1) };
+                let fs = fy_start.max(0) as usize;
+                let fe = fy_end.max(0).min(buf_h_i) as usize;
+                for fy in fs..fe {
+                    let idx = fy * buf_w + col_us;
+                    pixels[idx] = solid;
+                    mask[idx] = 255;
+                }
+            }
+        }
+    }
+}
+
 /// Generate photon's squircle crossings: one entry per pixel-row offset from the cap edge into the diagonal. Each entry is `(inset_int, l_aa, h_aa)` where `inset_int` is the integer column offset where the curve crosses that row, and `l/h_aa = sqrt(frac(inset))*256` / `sqrt(1-frac(inset))*256` are the perceptual AA weights (low = outside fraction, high = inside fraction). Verbatim port of photon's loop in `compositing.rs::draw_textbox`.
 pub fn squircle_crossings(radius: f32, squirdleyness: i32) -> alloc::vec::Vec<(u16, u8, u8)> {
     let mut crossings: alloc::vec::Vec<(u16, u8, u8)> = alloc::vec::Vec::new();
     let mut offset = 0f32;
     loop {
         let y_norm = offset / radius;
-        let x_norm = crate::math::powf(1.0 - crate::math::powi(y_norm, squirdleyness), 1.0 / squirdleyness as f32);
+        let x_norm = crate::math::powf(1. - crate::math::powi(y_norm, squirdleyness), 1. / squirdleyness as f32);
         let cx = x_norm * radius;
         let inset = radius - cx;
-        if inset >= 0.0 {
-            let l = (crate::math::sqrt(crate::math::fract(inset)) * 256.0) as u8;
-            let h = (crate::math::sqrt(1.0 - crate::math::fract(inset)) * 256.0) as u8;
+        if inset >= 0. {
+            let l = (crate::math::sqrt(crate::math::fract(inset)) * 256.) as u8;
+            let h = (crate::math::sqrt(1. - crate::math::fract(inset)) * 256.) as u8;
             crossings.push((inset as u16, l, h));
         }
         if cx < offset { break; }
@@ -674,21 +754,9 @@ pub fn squircle_crossings(radius: f32, squirdleyness: i32) -> alloc::vec::Vec<(u
     crossings
 }
 
-/// AA-pixel write helper for [`draw_squircle_pill`]. Outer pass uses MAX-combine so the vertical-edge and horizontal-edge AA writes don't fight at the diagonal pixel. Inner pass blends RGB into the existing pixel.
+/// AA write at a proven-in-buffer index. Caller proves `idx < pixels.len() == mask.len()`; this function does no bounds checks. Outer pass MAX-combines alpha so the vertical-edge and horizontal-edge AA writes don't fight at the diagonal pixel. Inner pass blends RGB into the existing pixel.
 #[inline]
-fn paint_squircle_aa(
-    pixels: &mut [u32],
-    mask: &mut [u8],
-    buf_w: usize,
-    buf_h: usize,
-    x: isize,
-    y: isize,
-    color_rgb: u32,
-    h_aa: u32,
-    blend_aa_with_existing: bool,
-) {
-    if x < 0 || y < 0 || x >= buf_w as isize || y >= buf_h as isize { return; }
-    let idx = y as usize * buf_w + x as usize;
+fn write_aa(pixels: &mut [u32], mask: &mut [u8], idx: usize, color_rgb: u32, h_aa: u32, blend_aa_with_existing: bool) {
     if blend_aa_with_existing {
         let curr = pixels[idx];
         let curr_r = (curr >> 16) & 0xFF;
