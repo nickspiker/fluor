@@ -69,13 +69,15 @@ impl Renderer {
 
         let caps = surface.get_capabilities(&adapter);
 
+        // Lock the format. fluor's pixel convention is `0xAARRGGBB` u32 → LE bytes [B,G,R,A] = Bgra8Unorm. If the surface doesn't offer it, fail loud — we'd otherwise silently swap R↔B and produce wrong colors. The host upload boundary is the only legal place to convert; this surface does direct memcpy so it must match.
         let surface_format = caps.formats.iter().copied()
             .find(|f| *f == wgpu::TextureFormat::Bgra8Unorm)
-            .unwrap_or(caps.formats[0]);
+            .expect("wgpu: surface does not support Bgra8Unorm — fluor's pixel convention requires it for zero-conversion upload");
 
+        // Lock the alpha mode. PostMultiplied means the OS compositor performs the premultiply at present time, so we can hand it our straight-alpha pixels directly. Without it, we'd need to premultiply at upload — and we currently don't.
         let alpha_mode = caps.alpha_modes.iter().copied()
             .find(|m| *m == wgpu::CompositeAlphaMode::PostMultiplied)
-            .unwrap_or(caps.alpha_modes[0]);
+            .expect("wgpu: surface does not support PostMultiplied alpha — fluor's convention requires it (straight-alpha internal pixels)");
 
         let config = wgpu::SurfaceConfiguration {
             usage:   wgpu::TextureUsages::COPY_DST,

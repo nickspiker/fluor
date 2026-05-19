@@ -1,6 +1,12 @@
 //! Pixel format types with per-channel arithmetic.
 //!
-//! `Argb8` wraps a packed `u32` (`0xAARRGGBB`) and provides channel ops via SWAR (SIMD Within A Register) — four u8 channels processed in parallel via u64 widening. The `>> 8` normalization (divide by 256, not 255) is the canonical fast-blend approximation; per-channel error is below 1/256 and imperceptible.
+//! # Convention — locked
+//!
+//! **Internal pixel format**: `0xAARRGGBB` packed in a `u32`. Little-endian byte layout `[B, G, R, A]` ≡ `Bgra8Unorm`. Every paint primitive, every layer buffer, every Group composite uses this. No exceptions, no host conversion needed at present time.
+//!
+//! **Alpha semantics: STRAIGHT (non-premultiplied).** RGB stores the intrinsic color you'd see if the pixel were fully opaque; α is opacity. AA edges keep their straight RGB (a half-opacity red pixel is `(α=128, R=255, G=0, B=0)`, not `(α=128, R=128, G=0, B=0)`).
+//!
+//! **Chained composites stay correct via binary clipping masks, not via premultiplication.** When two layers can both contribute to a pixel (glow + content at the pill's AA edge), the design enforces mutual exclusivity with a binary silhouette layer multiplied via `Op::Mul` — one layer goes to `α=0` where the other has any coverage. With at most one contributor per pixel, `alpha_over` with the `dst_α=0 → return src` shortcut keeps RGB straight through every step.
 //!
 //! `#[repr(transparent)]` guarantees `Argb8` has the same layout as `u32`, so `&[Argb8]` and `&[u32]` are safely transmutable for zero-cost interop with paint primitives and GPU upload.
 
@@ -78,14 +84,23 @@ impl Argb8 {
         Argb8(a.0 ^ b.0)
     }
 
-    /// Porter-Duff source-over: `src * α + dst * (1 - α)` where α = src's alpha channel. SWAR with `>> 8` normalization (divide by 256, not 255).
+    /// Porter-Duff source-over for STRAIGHT alpha (per the module convention).
     ///
-    /// **Branchless and uniform across all α values.** α = 0 gives exact `dst` from the math (`bg * 256 + 0 = 256 * bg`, then `>> 8 = bg`). α = 255 gives `0.996·src + 0.004·dst` — *not* exact src, by design: the `>> 8` shortcut produces ≤1 LSB error per channel across the whole α range, and special-casing 255 to return src exactly would create a discontinuity at exactly one α value while leaving the rest noisy. Same trade-off `mul` makes. Callers that need a "fully transparent → skip work" optimization should short-circuit at the kernel level (see `paint::flatten_alpha_over`) where it composes with the per-pixel test for free.
+    /// Three shortcuts handle the cases where the result is exactly representable in straight form, no math needed:
+    /// - `src_α == 0` (src fully transparent): return `dst` exactly. Handled implicitly via the `bg * 256 + 0 = bg` SWAR math.
+    /// - `src_α == 255` (src fully opaque): return `src` exactly — src covers dst entirely.
+    /// - `dst_α == 0` (dst fully transparent): return `src` exactly. Without this shortcut, the SWAR math would produce premult RGB (`src_rgb · src_α / 256`); with it, straight stays straight when src lands on transparent dst.
+    ///
+    /// Middle path (both layers partially transparent): RGB via SWAR `dst · (1 − src_α) + src · src_α`. α via correct Porter-Duff `src_α + dst_α · (1 − src_α)`. The middle case only arises when the design fails to enforce mutual exclusivity via clipping masks — for those rare pixels, the result is approximately straight with ≤1 LSB error.
     #[inline]
     pub fn alpha_over(dst: Argb8, src: Argb8) -> Argb8 {
-        let alpha = ((src.0 >> 24) & 0xFF) as u64;
-        let inv = 256 - alpha;
+        let src_alpha = ((src.0 >> 24) & 0xFF) as u64;
+        if src_alpha == 255 { return src; }
+        let dst_alpha = ((dst.0 >> 24) & 0xFF) as u64;
+        if dst_alpha == 0 { return src; }
+        let inv = 256 - src_alpha;
 
+        // SWAR for the 3 RGB slots; α slot patched below.
         let mut bg = dst.0 as u64;
         bg = (bg | (bg << 16)) & 0x0000_FFFF_0000_FFFF;
         bg = (bg | (bg << 8)) & 0x00FF_00FF_00FF_00FF;
@@ -94,11 +109,15 @@ impl Argb8 {
         fg = (fg | (fg << 16)) & 0x0000_FFFF_0000_FFFF;
         fg = (fg | (fg << 8)) & 0x00FF_00FF_00FF_00FF;
 
-        let mut r = bg * inv + fg * alpha;
+        let mut r = bg * inv + fg * src_alpha;
         r = (r >> 8) & 0x00FF_00FF_00FF_00FF;
         r = (r | (r >> 8)) & 0x0000_FFFF_0000_FFFF;
         r = r | (r >> 16);
-        Argb8(r as u32)
+        let rgb_only = (r as u32) & 0x00FF_FFFF;
+
+        // Correct Porter-Duff over alpha — preserves opaque dst across all src_α.
+        let result_alpha = (src_alpha + ((dst_alpha * inv) >> 8)).min(255) as u32;
+        Argb8(rgb_only | (result_alpha << 24))
     }
 
     /// Screen: `MAX - (MAX - a) * (MAX - b) >> 8` per channel.
@@ -190,10 +209,32 @@ mod tests {
 
     #[test]
     fn alpha_over_transparent_preserves_dst_exact() {
-        // α = 0: math gives `bg·256 + fg·0`, then `>>8 = bg`. Exact, no LSB error.
+        // src_α = 0 → return dst exactly via the inv=256 SWAR math.
         let dst = Argb8(0xFF_11_22_33);
         let src = Argb8(0x00_AA_BB_CC);
         assert_eq!(Argb8::alpha_over(dst, src), dst);
+    }
+
+    #[test]
+    fn alpha_over_transparent_dst_returns_src() {
+        // dst_α = 0 → return src exactly (the shortcut that keeps straight RGB straight at
+        // pill AA pixels where the clipping mask has zeroed glow's α).
+        let dst = Argb8(0x00_00_00_00);
+        let src = Argb8(0x80_FF_00_00);  // 50% opacity red, straight RGB
+        assert_eq!(Argb8::alpha_over(dst, src), src);
+    }
+
+    #[test]
+    fn alpha_over_opaque_dst_stays_opaque() {
+        // Opaque dst stays opaque (≥254 under >>8) for ANY src_α. The halo doesn't punch a
+        // transparency hole through the chrome.
+        let dst = Argb8(0xFF_11_22_33);
+        for src_alpha in [0u32, 1, 50, 100, 128, 200, 254, 255] {
+            let src = Argb8((src_alpha << 24) | 0x00_AA_BB_CC);
+            let result = Argb8::alpha_over(dst, src);
+            let result_alpha = (result.0 >> 24) & 0xFF;
+            assert!(result_alpha >= 254, "src_α={src_alpha} dropped dst_α to {result_alpha}");
+        }
     }
 
     #[test]

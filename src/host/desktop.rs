@@ -318,6 +318,14 @@ impl DesktopApp {
         }
 
         // --- Flatten groups onto the present buffer ---
+        // Pixel-convention boundary. Internal pixels are STRAIGHT-alpha `0xAARRGGBB` u32.
+        // Conversion to platform-native layout lives HERE (and only here):
+        //   - PREMULTIPLY (`RGB · α/255`) for backends with PreMultiplied alpha mode.
+        //   - R↔B SWAP for backends expecting Rgba8Unorm instead of Bgra8Unorm.
+        //   - Both conditional per `cfg(target_os = …)` / per backend choice.
+        // Current backends need neither: macOS wgpu = Bgra8Unorm + PostMultiplied (LE bytes match,
+        // compositor multiplies α at present); softbuffer = same LE layout, α typically ignored.
+        // Both: direct memcpy.
         #[cfg(target_os = "macos")]
         {
             let Some(renderer) = self.renderer.as_mut() else { return; };

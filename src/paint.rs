@@ -250,23 +250,36 @@ fn flatten_replace(dst: &mut [u32], src: &[u32]) {
 }
 
 fn flatten_alpha_over(dst: &mut [u32], src: &[u32]) {
+    // Per-pixel Porter-Duff source-over for STRAIGHT alpha (per the pixel.rs convention).
+    // Shortcuts keep straight inputs producing straight outputs:
+    //   s==0          → dst stays (src contributes nothing).
+    //   src_α==255    → src replaces dst (src covers fully).
+    //   dst_α==0      → src replaces dst (prevents premult RGB when src lands on transparent dst).
+    // Middle path: RGB via SWAR + α slot with correct Porter-Duff.
     for i in 0..dst.len() {
         let s = src[i];
         if s == 0 { continue; }
-        let alpha = ((s >> 24) & 0xFF) as u64;
-        if alpha == 255 { dst[i] = s; continue; }
-        let inv = 256 - alpha;
-        let mut bg = dst[i] as u64;
+        let src_alpha = ((s >> 24) & 0xFF) as u64;
+        if src_alpha == 255 { dst[i] = s; continue; }
+        let d = dst[i];
+        let dst_alpha = ((d >> 24) & 0xFF) as u64;
+        if dst_alpha == 0 { dst[i] = s; continue; }
+        let inv = 256 - src_alpha;
+
+        let mut bg = d as u64;
         bg = (bg | (bg << 16)) & 0x0000_FFFF_0000_FFFF;
         bg = (bg | (bg << 8)) & 0x00FF_00FF_00FF_00FF;
         let mut fg = s as u64;
         fg = (fg | (fg << 16)) & 0x0000_FFFF_0000_FFFF;
         fg = (fg | (fg << 8)) & 0x00FF_00FF_00FF_00FF;
-        let mut blended = bg * inv + fg * alpha;
+        let mut blended = bg * inv + fg * src_alpha;
         blended = (blended >> 8) & 0x00FF_00FF_00FF_00FF;
         blended = (blended | (blended >> 8)) & 0x0000_FFFF_0000_FFFF;
         blended = blended | (blended >> 16);
-        dst[i] = blended as u32;
+        let rgb_only = (blended as u32) & 0x00FF_FFFF;
+
+        let result_alpha = (src_alpha + ((dst_alpha * inv) >> 8)).min(255) as u32;
+        dst[i] = rgb_only | (result_alpha << 24);
     }
 }
 
@@ -489,10 +502,7 @@ fn background_row(row_pixels: &mut [u32], width: usize, logical_row: isize, heig
     }
 }
 
-/// Photon's `PREMULTIPLIED` cfg flag: when true (Linux/Windows/macOS targets) the framebuffer expects premultiplied alpha; transparent edge pixels need their RGB scaled by alpha. False elsewhere (Android, etc.) — straight ARGB.
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-pub const PREMULTIPLIED: bool = true;
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+/// fluor's pixel convention is STRAIGHT alpha internally (see [`crate::pixel`] module docs). This constant is `false` everywhere; chrome paint primitives use the straight write `(colour & 0x00FFFFFF) | ((h as u32) << 24)` instead of `scale_alpha`. Future backends needing premultiplied output (e.g., wgpu PreMultiplied mode) do that conversion at the present boundary, not at primitive write time.
 pub const PREMULTIPLIED: bool = false;
 
 /// Photon's `scale_alpha` helper. Verbatim port from [compositing.rs:5809](/mnt/Octopus/Code/photon/src/ui/compositing.rs#L5809). Multiplies all four channels of `colour` by `alpha/256` using SWAR — premultiplies RGB so a fully transparent pixel reads as `0x00000000`.
