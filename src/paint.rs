@@ -550,8 +550,12 @@ pub fn draw_squircle_pill(
     squirdleyness: i32,
     blend_aa_with_existing: bool,     // false = outer pass (write fresh AA, max-combine on conflict); true = inner pass (blend RGB with current pixel, alpha stays 255)
 ) {
-    let cy = pill_y + pill_h / 2;
-    let r_int = pill_h / 2;
+    // FLOAT pixel-center math throughout. Integer `dy = row - cy` was asymmetric for even pill_h
+    // (geometric center sits at a half-pixel boundary), causing off-by-one AA placement.
+    // Pixel center for row R is at y = R + 0.5; comparing that against float pill_cy gives
+    // symmetric distances both above and below center.
+    let pill_cx_f = pill_x as f32 + pill_w as f32 * 0.5;
+    let pill_cy_f = pill_y as f32 + pill_h as f32 * 0.5;
     let radius = pill_h as f32 * 0.5;
     let color_rgb = color & 0x00FF_FFFF;
     let solid = color | 0xFF00_0000;
@@ -560,52 +564,70 @@ pub fn draw_squircle_pill(
     let y0 = pill_y.max(0) as usize;
     let y1 = (pill_y + pill_h).min(buf_h as isize).max(0) as usize;
     for row in y0..y1 {
-        let dy = (row as isize - cy).abs() as f32;
+        let row_center = row as f32 + 0.5;
+        let dy = (row_center - pill_cy_f).abs();
         let inset_f = squircle_inset(dy, radius, squirdleyness);
-        let inset_int = inset_f as isize;
-        let frac = inset_f - inset_int as f32;
-        let h_aa = (crate::math::sqrt(1.0 - frac) * 256.0).min(255.0) as u32;
+
+        // Left/right curve x positions (floats). Pixel containing the curve is floor(curve_x);
+        // coverage of that pixel = curve_x - floor(curve_x) for the left curve (inside-curve is
+        // to the right of the curve) and = ceil(curve_x) - curve_x for the right curve (inside is
+        // to the left). Use the same h_aa formula photon does — sqrt(1 - frac).
+        let left_curve_x  = pill_cx_f - (pill_w as f32 * 0.5 - inset_f);
+        let right_curve_x = pill_cx_f + (pill_w as f32 * 0.5 - inset_f);
+        let left_edge_col  = left_curve_x.floor()  as isize;   // pixel containing curve
+        let right_edge_col = (right_curve_x - 1.0).floor() as isize;   // pixel just inside curve on right
+        let left_frac  = left_curve_x  - left_edge_col as f32;          // 0..1, how far across pixel curve sits
+        let right_frac = right_curve_x - (right_edge_col + 1) as f32;   // same convention (curve is past pixel right edge by this much)
+        let left_h_aa  = (crate::math::sqrt(1.0 - left_frac).max(0.0) * 256.0).min(255.0) as u32;
+        let right_h_aa = (crate::math::sqrt(right_frac.max(0.0)) * 256.0).min(255.0) as u32;
 
         let row_base = row * buf_w;
 
-        // Solid interior — cols [inset+1, w-inset-1).
-        let solid_l = (pill_x + inset_int + 1).max(0) as usize;
-        let solid_r = ((pill_x + pill_w - inset_int - 1).min(buf_w as isize)).max(0) as usize;
+        // Solid interior — strictly between the AA pixels.
+        let solid_l = (left_edge_col + 1).max(0) as usize;
+        let solid_r = right_edge_col.max(0).min(buf_w as isize) as usize;
         for col in solid_l..solid_r {
             let idx = row_base + col;
             pixels[idx] = solid;
             mask[idx] = 255;
         }
 
-        // AA pixels at left + right outer edges of this row.
-        let edge_cols = [pill_x + inset_int, pill_x + pill_w - 1 - inset_int];
-        for &edge in &edge_cols {
-            if edge < 0 || edge as usize >= buf_w { continue; }
-            let idx = row_base + edge as usize;
-            paint_squircle_aa(pixels, mask, idx, color_rgb, h_aa, blend_aa_with_existing);
+        // AA pixels at left + right curve edges.
+        if left_edge_col >= 0 && (left_edge_col as usize) < buf_w {
+            paint_squircle_aa(pixels, mask, row_base + left_edge_col as usize, color_rgb, left_h_aa, blend_aa_with_existing);
+        }
+        if right_edge_col >= 0 && (right_edge_col as usize) < buf_w && right_edge_col > left_edge_col {
+            paint_squircle_aa(pixels, mask, row_base + right_edge_col as usize, color_rgb, right_h_aa, blend_aa_with_existing);
         }
     }
 
     // --- PER-COL WALK (cap regions only): AA at top/bottom of cap curves ---
-    let cap_x_left  = pill_x + r_int;                  // left-cap center column
-    let cap_x_right = pill_x + pill_w - r_int;         // right-cap center column
-    for &cap_x in &[cap_x_left, cap_x_right] {
-        let x_start = (cap_x - r_int).max(0) as usize;
-        let x_end   = (cap_x + r_int).min(buf_w as isize).max(0) as usize;
+    let cap_x_left_f  = pill_x as f32 + radius;                       // float cap center
+    let cap_x_right_f = pill_x as f32 + pill_w as f32 - radius;
+    for &cap_x_f in &[cap_x_left_f, cap_x_right_f] {
+        let x_start = (cap_x_f - radius).floor().max(0.0) as usize;
+        let x_end   = (cap_x_f + radius).ceil().min(buf_w as f32).max(0.0) as usize;
         for col in x_start..x_end {
-            let dx = ((col as isize) - cap_x).abs() as f32;
+            let col_center = col as f32 + 0.5;
+            let dx = (col_center - cap_x_f).abs();
+            if dx > radius { continue; }
             let inset_y_f = squircle_inset(dx, radius, squirdleyness);
-            let inset_y_int = inset_y_f as isize;
-            let frac = inset_y_f - inset_y_int as f32;
-            if frac == 0.0 { continue; }   // curve exactly on integer row → no AA needed
-            let h_aa = (crate::math::sqrt(1.0 - frac) * 256.0).min(255.0) as u32;
 
-            let top_row = cy - r_int + inset_y_int;
-            let bot_row = cy + r_int - inset_y_int - 1;
-            for &row in &[top_row, bot_row] {
-                if row < 0 || row as usize >= buf_h { continue; }
-                let idx = row as usize * buf_w + col;
-                paint_squircle_aa(pixels, mask, idx, color_rgb, h_aa, blend_aa_with_existing);
+            // Curve top/bottom y positions (floats).
+            let top_curve_y = pill_cy_f - (radius - inset_y_f);
+            let bot_curve_y = pill_cy_f + (radius - inset_y_f);
+            let top_edge_row = top_curve_y.floor() as isize;
+            let bot_edge_row = (bot_curve_y - 1.0).floor() as isize;
+            let top_frac = top_curve_y - top_edge_row as f32;
+            let bot_frac = bot_curve_y - (bot_edge_row + 1) as f32;
+            let top_h_aa = (crate::math::sqrt(1.0 - top_frac).max(0.0) * 256.0).min(255.0) as u32;
+            let bot_h_aa = (crate::math::sqrt(bot_frac.max(0.0)) * 256.0).min(255.0) as u32;
+
+            if top_edge_row >= 0 && (top_edge_row as usize) < buf_h && top_h_aa > 0 {
+                paint_squircle_aa(pixels, mask, top_edge_row as usize * buf_w + col, color_rgb, top_h_aa, blend_aa_with_existing);
+            }
+            if bot_edge_row >= 0 && (bot_edge_row as usize) < buf_h && bot_h_aa > 0 && bot_edge_row > top_edge_row {
+                paint_squircle_aa(pixels, mask, bot_edge_row as usize * buf_w + col, color_rgb, bot_h_aa, blend_aa_with_existing);
             }
         }
     }
