@@ -18,7 +18,8 @@ pub struct Textbox {
     pub focused: bool,
     /// Cursor is hovering over the textbox bbox. Drives the hover fill colour.
     pub hovered: bool,
-    /// Border/stroke thickness in RU (multiplied by `font_size` to get pixels). `0.0` → 1px minimum via the photon `+ 1` idiom — there's always a stroke. The stroke eats inward from the outer pill silhouette, so the textbox's outer bbox stays fixed and the inner usable area shrinks by `2 × stroke_px` in each dimension.
+    /// Stroke thickness in RU (multiplied by `font_size`). `0.0` → 1px minimum via the photon `+ 1`
+    /// idiom in `render_content_into`. Stroke eats inward from the outer pill silhouette.
     pub stroke_ru: f32,
     /// Pixel rect (center-anchored).
     pub center_x: Coord,
@@ -60,7 +61,7 @@ impl Textbox {
             cursor: 0,
             focused: false,
             hovered: false,
-            stroke_ru: 0.0,   // → 1 px minimum via the +1 idiom in render_content_into
+            stroke_ru: 0.0,   // → 1 px minimum stroke via the +1 idiom in render_content_into
             center_x,
             center_y,
             width,
@@ -320,25 +321,27 @@ impl Textbox {
 
     // --- Rendering ---
 
-    /// Render the textbox interior — hard-edged squircle pill with a stroke ring around it.
+    /// Render the textbox interior — two squircle pills stacked (photon avatar-ring pattern, but
+    /// using AA edges instead of a separate stroke line).
     ///
-    /// Photon's avatar-ring approach: compute TWO squircle silhouettes via [`paint::squircle_inset`].
-    /// The OUTER silhouette is the full pill at `radius = height/2`. The INNER silhouette is the
-    /// same squircle inset by `stroke_px` on every side (`radius - stroke_px`, bbox shrunk by
-    /// `2·stroke_px` in each dimension). Pixels between outer and inner = stroke colour
-    /// (`theme::TEXTBOX_LIGHT_EDGE`); pixels inside inner = state-based fill:
+    /// Outer pill: full size, painted in stroke colour with AA at the curve. Outer-pass AA writes
+    /// `(alpha = h_aa, RGB = stroke)` so the layer's outer composite (AlphaOver onto chrome)
+    /// blends stroke into bg for a smooth pill silhouette.
+    ///
+    /// Inner pill: inset by `stroke_px` on every side, painted in state-based fill colour. Inner-
+    /// pass AA blends fill_RGB with the underlying outer-stroke RGB at the inner curve, keeping
+    /// alpha = 255 — producing the proper `fill·h + stroke·(1-h)` transition.
+    ///
+    /// `stroke_px = (stroke_ru × font_size + 1.0) as isize` — photon's "+1" idiom for 1-px
+    /// minimum stroke when `stroke_ru == 0`.
+    ///
+    /// Fill colour by state:
     ///   - focused (active):  `theme::TEXTBOX_ACTIVE`
     ///   - hovered only:      `theme::TEXTBOX_HOVER`
     ///   - default:           `theme::TEXTBOX_FILL`
     ///
-    /// Stroke thickness: `stroke_px = (stroke_ru × font_size + 1.0) as isize`. The `+ 1` enforces a
-    /// 1-px minimum when `stroke_ru == 0` (photon's "add one for minimum" idiom). Stroke eats
-    /// inward — outer pill bbox stays fixed, inner usable area shrinks.
-    ///
-    /// No AA on either silhouette — each pixel is binary in/out, decided per row by comparing
-    /// the column against the squircle inset for that row. Squirdleyness = 3 for both rings.
-    ///
-    /// Populates `self.mask` (255 inside outer pill, 0 outside) for downstream glow + selection.
+    /// Squirdleyness = 3 (photon default; adjustable per [`paint::squircle_inset`]). Populates
+    /// `self.mask` (255 inside outer silhouette, AA values on outer curve) for downstream glow.
     pub fn render_content_into(
         &mut self,
         pixels: &mut [u32],
@@ -350,10 +353,10 @@ impl Textbox {
         _clip: Option<Clip>,
         _mask: Option<&paint::AlphaMask>,
     ) {
-        let bw = self.width as isize;
-        let bh = self.height as isize;
-        let pill_x_l = (self.center_x - self.width * 0.5 - offset_x) as isize;
-        let pill_y_l = (self.center_y - self.height * 0.5 - offset_y) as isize;
+        let pill_x = (self.center_x - self.width  * 0.5 - offset_x) as isize;
+        let pill_y = (self.center_y - self.height * 0.5 - offset_y) as isize;
+        let pill_w = self.width  as isize;
+        let pill_h = self.height as isize;
 
         let needed = buf_w * buf_h;
         if self.mask.len() != needed {
@@ -374,43 +377,24 @@ impl Textbox {
         let stroke_color = theme::TEXTBOX_LIGHT_EDGE;
 
         let stroke_px = (self.stroke_ru * self.font_size + 1.0) as isize;
-        let outer_radius = self.height as f32 * 0.5;
-        let inner_radius = (outer_radius - stroke_px as f32).max(0.0);
         let squirdleyness = 3i32;
 
-        let cy = pill_y_l + (bh / 2);
-        let y0 = pill_y_l.max(0) as usize;
-        let y1 = (pill_y_l + bh).min(buf_h as isize).max(0) as usize;
+        // Outer pill — stroke colour, AA writes alpha=h so the layer composite blends to bg.
+        paint::draw_squircle_pill(
+            pixels, &mut self.mask, buf_w, buf_h,
+            pill_x, pill_y, pill_w, pill_h,
+            stroke_color, squirdleyness, false,
+        );
 
-        for row in y0..y1 {
-            let dy = (row as isize - cy).abs() as f32;
-
-            // Outer silhouette inset for this row.
-            let outer_inset = paint::squircle_inset(dy, outer_radius, squirdleyness) as isize;
-            let outer_left_v  = pill_x_l + outer_inset;
-            let outer_right_v = pill_x_l + bw - outer_inset;
-            if outer_right_v <= outer_left_v { continue; }
-            let outer_left  = outer_left_v.max(0) as usize;
-            let outer_right = outer_right_v.min(buf_w as isize) as usize;
-
-            // Inner silhouette (the stroke-inset squircle). Only present when this row is within
-            // the inner pill's y range AND the inner radius is positive.
-            let has_inner = inner_radius > 0.0 && dy <= inner_radius;
-            let (inner_left, inner_right) = if has_inner {
-                let inner_inset = paint::squircle_inset(dy, inner_radius, squirdleyness) as isize;
-                let l = (pill_x_l + stroke_px + inner_inset).max(0) as usize;
-                let r = ((pill_x_l + bw - stroke_px - inner_inset).min(buf_w as isize)).max(0) as usize;
-                (l, r)
-            } else {
-                (outer_left, outer_left)   // empty inner range — entire outer row is stroke
-            };
-
-            let row_base = row * buf_w;
-            for col in outer_left..outer_right {
-                let inside_inner = col >= inner_left && col < inner_right;
-                pixels[row_base + col] = if inside_inner { fill } else { stroke_color };
-                self.mask[row_base + col] = 255;
-            }
+        // Inner pill — fill colour, AA blends RGB with the outer-pass stroke at the inner curve.
+        let inner_w = pill_w - 2 * stroke_px;
+        let inner_h = pill_h - 2 * stroke_px;
+        if inner_w > 0 && inner_h > 0 {
+            paint::draw_squircle_pill(
+                pixels, &mut self.mask, buf_w, buf_h,
+                pill_x + stroke_px, pill_y + stroke_px, inner_w, inner_h,
+                fill, squirdleyness, true,
+            );
         }
     }
 
