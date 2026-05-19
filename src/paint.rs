@@ -527,16 +527,11 @@ pub fn blend_rgb_only(bg_colour: u32, fg_colour: u32, weight_bg: u8, weight_fg: 
 
 /// Hard-pixel squircle pill with AA on both the X-axis curve (sides) and Y-axis curve (cap tops/bottoms). Photon's avatar-ring strategy in one call — render twice with different sizes/colors to get a stroke ring.
 ///
-/// Two AA walks for proper 2D coverage at the cap curves:
+/// Photon-faithful: precompute squircle crossings once (`(inset_px, l_aa, h_aa)` per pixel-row offset into the cap), then walk pure integer indices per corner. Each crossing produces BOTH a vertical-edge AA pixel and a horizontal-edge AA pixel via the squircle's diagonal symmetry — no separate per-col walk needed. Photon's `compositing.rs` `draw_textbox` is the reference; this is the single-color silhouette adaptation (`draw_textbox_pill` keeps the two-tone hairline version photon uses for textboxes).
 ///
-/// - **Per-row walk**: paints the solid interior + AA at the LEFT/RIGHT edge of the curve for each row. Handles the "vertical-ish" portions of the squircle where the curve traverses x faster than y.
-/// - **Per-col walk** (inside cap regions): paints AA at the TOP/BOTTOM of the curve for each column in the cap area. Handles the "horizontal-ish" portions near the top/bottom of each end cap, where the per-row walk produces only a single AA pixel per row and the rows-without-AA above stair-step visibly.
+/// `blend_aa_with_existing = false` (outer pass): AA pixels write `(alpha = h_aa, RGB = color)`. Conflicting writes at the diagonal pixel pick MAX h_aa.
 ///
-/// `blend_aa_with_existing = false` (outer pass): AA pixels write `(alpha = h_aa, RGB = color)` — the partial alpha blends into the layer's outer composite. Conflicting writes at the corner-corner pixel pick MAX h_aa (whichever axis covers more).
-///
-/// `blend_aa_with_existing = true` (inner pass): AA pixels blend `color_rgb` into the current pixel's RGB by `h_aa`, keeping alpha=255 — produces the proper `fill·h + stroke·(1-h)` transition across the inner curve when painted on top of an outer-pass result.
-///
-/// Squircle math routes through [`squircle_inset`]; `squirdleyness=3` = photon's textbox pill default. `h_aa = sqrt(1 - fract(inset)) × 256` matches photon's "high" AA weight (`compositing.rs:4573`).
+/// `blend_aa_with_existing = true` (inner pass): AA pixels blend `color_rgb` into the current pixel's RGB by `h_aa`, keeping alpha=255 — produces the proper `fill·h + outside·(1-h)` transition when painted on top of an outer-pass stroke result.
 pub fn draw_squircle_pill(
     pixels: &mut [u32],
     mask: &mut [u8],
@@ -546,96 +541,154 @@ pub fn draw_squircle_pill(
     pill_y: isize,
     pill_w: isize,
     pill_h: isize,
-    color: u32,                       // ARGB; alpha byte forced to 0xFF for solid pixels
+    color: u32,
     squirdleyness: i32,
-    blend_aa_with_existing: bool,     // false = outer pass (write fresh AA, max-combine on conflict); true = inner pass (blend RGB with current pixel, alpha stays 255)
+    blend_aa_with_existing: bool,
 ) {
-    // FLOAT pixel-center math throughout. Integer `dy = row - cy` was asymmetric for even pill_h
-    // (geometric center sits at a half-pixel boundary), causing off-by-one AA placement.
-    // Pixel center for row R is at y = R + 0.5; comparing that against float pill_cy gives
-    // symmetric distances both above and below center.
-    let pill_cx_f = pill_x as f32 + pill_w as f32 * 0.5;
-    let pill_cy_f = pill_y as f32 + pill_h as f32 * 0.5;
-    let radius = pill_h as f32 * 0.5;
-    let color_rgb = color & 0x00FF_FFFF;
+    if pill_w <= 0 || pill_h <= 0 { return; }
+    if pill_x + pill_w <= 0 || pill_y + pill_h <= 0
+        || pill_x >= buf_w as isize || pill_y >= buf_h as isize { return; }
+
+    let radius_f = pill_h as f32 * 0.5;
+    let radius = (pill_h / 2) as isize;
     let solid = color | 0xFF00_0000;
+    let color_rgb = color & 0x00FF_FFFF;
 
-    // --- PER-ROW WALK: solid interior + per-row AA at X-boundary ---
-    let y0 = pill_y.max(0) as usize;
-    let y1 = (pill_y + pill_h).min(buf_h as isize).max(0) as usize;
-    for row in y0..y1 {
-        let row_center = row as f32 + 0.5;
-        let dy = (row_center - pill_cy_f).abs();
-        let inset_f = squircle_inset(dy, radius, squirdleyness);
+    let crossings = squircle_crossings(radius_f, squirdleyness);
 
-        // Left/right curve x positions (floats). Pixel containing the curve is floor(curve_x);
-        // coverage of that pixel = curve_x - floor(curve_x) for the left curve (inside-curve is
-        // to the right of the curve) and = ceil(curve_x) - curve_x for the right curve (inside is
-        // to the left). Use the same h_aa formula photon does — sqrt(1 - frac).
-        let left_curve_x  = pill_cx_f - (pill_w as f32 * 0.5 - inset_f);
-        let right_curve_x = pill_cx_f + (pill_w as f32 * 0.5 - inset_f);
-        let left_edge_col  = left_curve_x.floor()  as isize;   // pixel containing curve
-        let right_edge_col = (right_curve_x - 1.0).floor() as isize;   // pixel just inside curve on right
-        let left_frac  = left_curve_x  - left_edge_col as f32;          // 0..1, how far across pixel curve sits
-        let right_frac = right_curve_x - (right_edge_col + 1) as f32;   // same convention (curve is past pixel right edge by this much)
-        let left_h_aa  = (crate::math::sqrt(1.0 - left_frac).max(0.0) * 256.0).min(255.0) as u32;
-        let right_h_aa = (crate::math::sqrt(right_frac.max(0.0)) * 256.0).min(255.0) as u32;
+    // For each crossing (offset i rows into the cap from the bbox edge), the curve crosses
+    // the row at column offset `inset`. By the squircle's x/y symmetry, the same crossings
+    // table also describes the column-walk: at column offset i, the curve crosses at row
+    // offset inset. One crossing → 8 AA pixels (2 per corner × 4 corners).
+    for (i, &(inset, _l, h)) in crossings.iter().enumerate() {
+        if inset as usize > i { break; } // past the diagonal — symmetric mirror already covers it
+        let i_iso = i as isize;
+        let inset_iso = inset as isize;
+        let h_u32 = h as u32;
 
-        let row_base = row * buf_w;
+        for &(flip_x, flip_y) in &[(false, false), (true, false), (false, true), (true, true)] {
+            // --- vertical-edge AA pixel + horizontal fill to the diagonal ---
+            let v_row = if flip_y {
+                pill_y + pill_h - 1 - radius + i_iso
+            } else {
+                pill_y + radius - i_iso
+            };
+            let v_aa_col = if flip_x {
+                pill_x + pill_w - 1 - inset_iso
+            } else {
+                pill_x + inset_iso
+            };
+            let diag_col = if flip_x {
+                pill_x + pill_w - 1 - radius + i_iso
+            } else {
+                pill_x + radius - i_iso
+            };
+            paint_squircle_aa(pixels, mask, buf_w, buf_h, v_aa_col, v_row, color_rgb, h_u32, blend_aa_with_existing);
+            if v_row >= 0 && v_row < buf_h as isize {
+                let (fx_start, fx_end) = if flip_x {
+                    (diag_col, v_aa_col)
+                } else {
+                    (v_aa_col + 1, diag_col + 1)
+                };
+                let fs = fx_start.max(0) as usize;
+                let fe = fx_end.max(0).min(buf_w as isize) as usize;
+                let row_base = v_row as usize * buf_w;
+                for fx in fs..fe {
+                    let idx = row_base + fx;
+                    pixels[idx] = solid;
+                    mask[idx] = 255;
+                }
+            }
 
-        // Solid interior — strictly between the AA pixels.
-        let solid_l = (left_edge_col + 1).max(0) as usize;
-        let solid_r = right_edge_col.max(0).min(buf_w as isize) as usize;
-        for col in solid_l..solid_r {
-            let idx = row_base + col;
-            pixels[idx] = solid;
-            mask[idx] = 255;
-        }
-
-        // AA pixels at left + right curve edges.
-        if left_edge_col >= 0 && (left_edge_col as usize) < buf_w {
-            paint_squircle_aa(pixels, mask, row_base + left_edge_col as usize, color_rgb, left_h_aa, blend_aa_with_existing);
-        }
-        if right_edge_col >= 0 && (right_edge_col as usize) < buf_w && right_edge_col > left_edge_col {
-            paint_squircle_aa(pixels, mask, row_base + right_edge_col as usize, color_rgb, right_h_aa, blend_aa_with_existing);
+            // --- horizontal-edge AA pixel + vertical fill to the diagonal ---
+            let h_col = if flip_x {
+                pill_x + pill_w - 1 - radius + i_iso
+            } else {
+                pill_x + radius - i_iso
+            };
+            let h_aa_row = if flip_y {
+                pill_y + pill_h - 1 - inset_iso
+            } else {
+                pill_y + inset_iso
+            };
+            let diag_row = if flip_y {
+                pill_y + pill_h - 1 - radius + i_iso
+            } else {
+                pill_y + radius - i_iso
+            };
+            paint_squircle_aa(pixels, mask, buf_w, buf_h, h_col, h_aa_row, color_rgb, h_u32, blend_aa_with_existing);
+            if h_col >= 0 && h_col < buf_w as isize {
+                let (fy_start, fy_end) = if flip_y {
+                    (diag_row, h_aa_row)
+                } else {
+                    (h_aa_row + 1, diag_row + 1)
+                };
+                let fs = fy_start.max(0) as usize;
+                let fe = fy_end.max(0).min(buf_h as isize) as usize;
+                let col_us = h_col as usize;
+                for fy in fs..fe {
+                    let idx = fy * buf_w + col_us;
+                    pixels[idx] = solid;
+                    mask[idx] = 255;
+                }
+            }
         }
     }
 
-    // --- PER-COL WALK (cap regions only): AA at top/bottom of cap curves ---
-    let cap_x_left_f  = pill_x as f32 + radius;                       // float cap center
-    let cap_x_right_f = pill_x as f32 + pill_w as f32 - radius;
-    for &cap_x_f in &[cap_x_left_f, cap_x_right_f] {
-        let x_start = (cap_x_f - radius).floor().max(0.0) as usize;
-        let x_end   = (cap_x_f + radius).ceil().min(buf_w as f32).max(0.0) as usize;
-        for col in x_start..x_end {
-            let col_center = col as f32 + 0.5;
-            let dx = (col_center - cap_x_f).abs();
-            if dx > radius { continue; }
-            let inset_y_f = squircle_inset(dx, radius, squirdleyness);
-
-            // Curve top/bottom y positions (floats).
-            let top_curve_y = pill_cy_f - (radius - inset_y_f);
-            let bot_curve_y = pill_cy_f + (radius - inset_y_f);
-            let top_edge_row = top_curve_y.floor() as isize;
-            let bot_edge_row = (bot_curve_y - 1.0).floor() as isize;
-            let top_frac = top_curve_y - top_edge_row as f32;
-            let bot_frac = bot_curve_y - (bot_edge_row + 1) as f32;
-            let top_h_aa = (crate::math::sqrt(1.0 - top_frac).max(0.0) * 256.0).min(255.0) as u32;
-            let bot_h_aa = (crate::math::sqrt(bot_frac.max(0.0)) * 256.0).min(255.0) as u32;
-
-            if top_edge_row >= 0 && (top_edge_row as usize) < buf_h && top_h_aa > 0 {
-                paint_squircle_aa(pixels, mask, top_edge_row as usize * buf_w + col, color_rgb, top_h_aa, blend_aa_with_existing);
-            }
-            if bot_edge_row >= 0 && (bot_edge_row as usize) < buf_h && bot_h_aa > 0 && bot_edge_row > top_edge_row {
-                paint_squircle_aa(pixels, mask, bot_edge_row as usize * buf_w + col, color_rgb, bot_h_aa, blend_aa_with_existing);
+    // Center rectangle between the two semicircle caps — fully solid.
+    let center_x_start = pill_x + radius;
+    let center_x_end = pill_x + pill_w - radius;
+    if center_x_start < center_x_end {
+        let cy_start = pill_y.max(0) as usize;
+        let cy_end = (pill_y + pill_h).min(buf_h as isize).max(0) as usize;
+        let cx_start = center_x_start.max(0) as usize;
+        let cx_end = center_x_end.min(buf_w as isize).max(0) as usize;
+        for fy in cy_start..cy_end {
+            let row_base = fy * buf_w;
+            for fx in cx_start..cx_end {
+                let idx = row_base + fx;
+                pixels[idx] = solid;
+                mask[idx] = 255;
             }
         }
     }
 }
 
-/// AA-pixel write helper for [`draw_squircle_pill`]. Outer pass uses MAX-combine so per-row + per-col walks don't fight at corner pixels. Inner pass blends RGB into existing.
+/// Generate photon's squircle crossings: one entry per pixel-row offset from the cap edge into the diagonal. Each entry is `(inset_int, l_aa, h_aa)` where `inset_int` is the integer column offset where the curve crosses that row, and `l/h_aa = sqrt(frac(inset))*256` / `sqrt(1-frac(inset))*256` are the perceptual AA weights (low = outside fraction, high = inside fraction). Verbatim port of photon's loop in `compositing.rs::draw_textbox`.
+pub fn squircle_crossings(radius: f32, squirdleyness: i32) -> alloc::vec::Vec<(u16, u8, u8)> {
+    let mut crossings: alloc::vec::Vec<(u16, u8, u8)> = alloc::vec::Vec::new();
+    let mut offset = 0f32;
+    loop {
+        let y_norm = offset / radius;
+        let x_norm = crate::math::powf(1.0 - crate::math::powi(y_norm, squirdleyness), 1.0 / squirdleyness as f32);
+        let cx = x_norm * radius;
+        let inset = radius - cx;
+        if inset >= 0.0 {
+            let l = (crate::math::sqrt(crate::math::fract(inset)) * 256.0) as u8;
+            let h = (crate::math::sqrt(1.0 - crate::math::fract(inset)) * 256.0) as u8;
+            crossings.push((inset as u16, l, h));
+        }
+        if cx < offset { break; }
+        offset += 1.0;
+    }
+    crossings
+}
+
+/// AA-pixel write helper for [`draw_squircle_pill`]. Outer pass uses MAX-combine so the vertical-edge and horizontal-edge AA writes don't fight at the diagonal pixel. Inner pass blends RGB into the existing pixel.
 #[inline]
-fn paint_squircle_aa(pixels: &mut [u32], mask: &mut [u8], idx: usize, color_rgb: u32, h_aa: u32, blend_aa_with_existing: bool) {
+fn paint_squircle_aa(
+    pixels: &mut [u32],
+    mask: &mut [u8],
+    buf_w: usize,
+    buf_h: usize,
+    x: isize,
+    y: isize,
+    color_rgb: u32,
+    h_aa: u32,
+    blend_aa_with_existing: bool,
+) {
+    if x < 0 || y < 0 || x >= buf_w as isize || y >= buf_h as isize { return; }
+    let idx = y as usize * buf_w + x as usize;
     if blend_aa_with_existing {
         let curr = pixels[idx];
         let curr_r = (curr >> 16) & 0xFF;
@@ -651,7 +704,6 @@ fn paint_squircle_aa(pixels: &mut [u32], mask: &mut [u8], idx: usize, color_rgb:
         pixels[idx] = (curr & 0xFF00_0000) | (br << 16) | (bg << 8) | bb;
         mask[idx] = 255;
     } else {
-        // Outer pass: max-combine alpha so per-row + per-col walks at corner pixels keep the largest coverage value.
         let existing_alpha = (pixels[idx] >> 24) & 0xFF;
         if h_aa > existing_alpha {
             pixels[idx] = (h_aa << 24) | color_rgb;
