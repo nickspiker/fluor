@@ -525,6 +525,81 @@ pub fn blend_rgb_only(bg_colour: u32, fg_colour: u32, weight_bg: u8, weight_fg: 
     blended as u32
 }
 
+/// Hard-pixel squircle pill with AA on the outer curve. Photon's avatar-ring strategy in one call: render twice with different sizes/colors to get a stroke ring. The outer call writes AA pixels as `(alpha=h_aa, RGB=color)` so the partial alpha blends into whatever's beneath via the layer's outer composite. The inner call sets `blend_aa_with_existing = true` so its AA edge pixels blend their RGB with the already-painted outer-stroke RGB (keeping alpha=255) — producing the proper `fill·h + stroke·(1-h)` transition across the inner curve.
+///
+/// Squircle math routes through [`squircle_inset`]; `squirdleyness=3` matches photon's textbox pill. `h_aa` = `sqrt(1 - fract(inset)) × 256`, matching photon's "high" AA weight (`compositing.rs:4573`).
+pub fn draw_squircle_pill(
+    pixels: &mut [u32],
+    mask: &mut [u8],
+    buf_w: usize,
+    buf_h: usize,
+    pill_x: isize,
+    pill_y: isize,
+    pill_w: isize,
+    pill_h: isize,
+    color: u32,                       // ARGB; alpha byte forced to 0xFF for solid pixels
+    squirdleyness: i32,
+    blend_aa_with_existing: bool,     // false = outer pass (write fresh AA); true = inner pass (blend RGB with current pixel, alpha stays 255)
+) {
+    let cy = pill_y + pill_h / 2;
+    let radius = pill_h as f32 * 0.5;
+    let color_rgb = color & 0x00FF_FFFF;
+    let solid = color | 0xFF00_0000;
+
+    let y0 = pill_y.max(0) as usize;
+    let y1 = (pill_y + pill_h).min(buf_h as isize).max(0) as usize;
+
+    for row in y0..y1 {
+        let dy = (row as isize - cy).abs() as f32;
+        let y_norm = (dy / radius).min(1.0);
+        let x_norm = crate::math::powf(1.0 - crate::math::powi(y_norm, squirdleyness), 1.0 / squirdleyness as f32);
+        let inset_f = radius - x_norm * radius;
+        let inset_int = inset_f as isize;
+        let frac = inset_f - inset_int as f32;
+        let h_aa = (crate::math::sqrt(1.0 - frac) * 256.0).min(255.0) as u32;
+
+        let row_base = row * buf_w;
+
+        // Solid interior — cols [inset+1, w-inset-1).
+        let solid_l = (pill_x + inset_int + 1).max(0) as usize;
+        let solid_r = ((pill_x + pill_w - inset_int - 1).min(buf_w as isize)).max(0) as usize;
+        for col in solid_l..solid_r {
+            let idx = row_base + col;
+            pixels[idx] = solid;
+            mask[idx] = 255;
+        }
+
+        // AA edge pixels: outer-left + outer-right (1 pixel each side per row).
+        let edge_cols = [pill_x + inset_int, pill_x + pill_w - 1 - inset_int];
+        for &edge in &edge_cols {
+            if edge < 0 || edge as usize >= buf_w { continue; }
+            let idx = row_base + edge as usize;
+            if blend_aa_with_existing {
+                // Blend `color_rgb` into the current pixel's RGB (which is the outer-pass solid stroke).
+                // alpha stays at whatever the current pixel had — typically 255 since outer painted solid here.
+                let curr = pixels[idx];
+                let curr_r = (curr >> 16) & 0xFF;
+                let curr_g = (curr >>  8) & 0xFF;
+                let curr_b =  curr        & 0xFF;
+                let new_r  = (color_rgb >> 16) & 0xFF;
+                let new_g  = (color_rgb >>  8) & 0xFF;
+                let new_b  =  color_rgb        & 0xFF;
+                let inv = 256 - h_aa;
+                let br = (curr_r * inv + new_r * h_aa) >> 8;
+                let bg = (curr_g * inv + new_g * h_aa) >> 8;
+                let bb = (curr_b * inv + new_b * h_aa) >> 8;
+                pixels[idx] = (curr & 0xFF00_0000) | (br << 16) | (bg << 8) | bb;
+                // Mask: edge is fully inside the outer silhouette → 255.
+                mask[idx] = 255;
+            } else {
+                // Outer pass — write fresh AA pixel. `alpha = h_aa` so the layer's outer composite blends stroke into bg.
+                pixels[idx] = (h_aa << 24) | color_rgb;
+                mask[idx] = h_aa as u8;
+            }
+        }
+    }
+}
+
 /// Photon's squircle inset formula — single row, parameterized by `squirdleyness`. Returns the curve's inset (distance from the bbox edge to the leftmost / rightmost inside pixel) for a row at `y_from_center` rows above or below the squircle's vertical center.
 ///
 /// `squirdleyness = 2` → circle. `squirdleyness = 3` → photon's textbox pill default (slightly flatter than a circle). Higher = more rectangular. Both `draw_textbox_pill` (AA path) and the textbox widget's hard-pixel renderer route through this so any tweak to the curve math flows through both code paths.
