@@ -62,7 +62,8 @@ impl PanesDemo {
         // Stack: Push content, Push glow, AlphaOver. Inside the pill: glow's intensity=0 leaves
         // pill pure. At AA edge: glow's small alpha lightly tints the pill's AA without staining
         // the body. Outside pill: glow alone over bg below.
-        let textbox = Textbox::new(0.0, 0.0, 1.0, 1.0, 12.0);
+        let mut textbox = Textbox::new(0.0, 0.0, 1.0, 1.0, 12.0);
+        textbox.stroke_ru = 0.15;   // a smidge of an RU so the inner/outer pills are visibly distinct for AA troubleshooting
         let placeholder_region = Region::new(0.0, 0.0, 1.0, 1.0);
         let mut textbox_group = Group::new(placeholder_region, BlendMode::AlphaOver);
         let content_layer = textbox_group.new_layer();
