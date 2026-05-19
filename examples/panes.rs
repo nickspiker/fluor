@@ -63,7 +63,7 @@ impl PanesDemo {
         // pill pure. At AA edge: glow's small alpha lightly tints the pill's AA without staining
         // the body. Outside pill: glow alone over bg below.
         let mut textbox = Textbox::new(0.0, 0.0, 1.0, 1.0, 12.0);
-        textbox.stroke_ru = 0.15;   // a smidge of an RU so the inner/outer pills are visibly distinct for AA troubleshooting
+        textbox.stroke_ru = 0.15;   // a smidge of an RU so the inner/outer pills are visibly distinct
         let placeholder_region = Region::new(0.0, 0.0, 1.0, 1.0);
         let mut textbox_group = Group::new(placeholder_region, BlendMode::AlphaOver);
         let content_layer = textbox_group.new_layer();
@@ -97,7 +97,9 @@ impl PanesDemo {
         let vp = ctx.viewport;
         let span = 2.0 * vp.width_px as Coord * vp.height_px as Coord / (vp.width_px as Coord + vp.height_px as Coord);
         let bw = chrome::MIN_BUTTON_HEIGHT_PX as Coord + (span / 32.0).ceil();
-        let center_x = vp.width_px as Coord * 0.5;
+        // Aspect-driven horizontal shift: square window centers the textbox; wider pushes it right, taller pushes it left. Magnitude scales with span so the shift is visible but bounded.
+        let aspect = vp.width_px as Coord / vp.height_px as Coord;
+        let center_x = vp.width_px as Coord * 0.5 + (aspect - 1.0) * span * 0.25;
         let center_y = bw * 7.0;
         let width = (vp.width_px as Coord * 0.5).max(bw * 8.0);
         let height = bw * 1.6;
@@ -354,7 +356,7 @@ impl FluorApp for PanesDemo {
 
             let glow = &mut self.textbox_group.rpn.layers[1].pixels;
             glow.fill(0);
-            // self.textbox.render_glow_into(glow, tw, th, bbox.x, bbox.y);  // disabled — re-enable in a later step.
+            self.textbox.render_glow_into(glow, tw, th, bbox.x, bbox.y);
         }
         self.textbox_group.flatten_into(target, buf_w, buf_h);
 
