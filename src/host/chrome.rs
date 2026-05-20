@@ -332,28 +332,28 @@ pub fn draw_window_edges_and_mask(
     for row in 0..start {
         for col in 0..start {
             let idx = row * width as usize + col;
-            pixels[idx] = 0;
+            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
             hit_test_map[idx] = HIT_NONE;
         }
     }
     for row in 0..start {
         for col in (width as usize - start)..width as usize {
             let idx = row * width as usize + col;
-            pixels[idx] = 0;
+            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
             hit_test_map[idx] = HIT_NONE;
         }
     }
     for row in (height as usize - start)..height as usize {
         for col in 0..start {
             let idx = row * width as usize + col;
-            pixels[idx] = 0;
+            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
             hit_test_map[idx] = HIT_NONE;
         }
     }
     for row in (height as usize - start)..height as usize {
         for col in (width as usize - start)..width as usize {
             let idx = row * width as usize + col;
-            pixels[idx] = 0;
+            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
             hit_test_map[idx] = HIT_NONE;
         }
     }
@@ -364,7 +364,7 @@ pub fn draw_window_edges_and_mask(
         let (inset, l, h) = crossings[crossing];
         // Left edge fill
         for idx in y_top * width as usize..y_top * width as usize + inset as usize {
-            pixels[idx] = 0;
+            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
             hit_test_map[idx] = HIT_NONE;
         }
 
@@ -395,7 +395,7 @@ pub fn draw_window_edges_and_mask(
         for idx in (y_top * width as usize + width as usize - inset as usize)
             ..((y_top + 1) * width as usize)
         {
-            pixels[idx] = 0;
+            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
             hit_test_map[idx] = HIT_NONE;
         }
         y_top += 1;
@@ -408,7 +408,7 @@ pub fn draw_window_edges_and_mask(
 
         // Left edge fill
         for idx in y_bottom * width as usize..y_bottom * width as usize + inset as usize {
-            pixels[idx] = 0;
+            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
             hit_test_map[idx] = HIT_NONE;
         }
 
@@ -439,7 +439,7 @@ pub fn draw_window_edges_and_mask(
         for idx in (y_bottom * width as usize + width as usize - inset as usize)
             ..((y_bottom + 1) * width as usize)
         {
-            pixels[idx] = 0;
+            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
             hit_test_map[idx] = HIT_NONE;
         }
 
@@ -454,7 +454,7 @@ pub fn draw_window_edges_and_mask(
         // Top edge fill
         for row in 0..inset as usize {
             let idx = row * width as usize + x_left;
-            pixels[idx] = 0;
+            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
             hit_test_map[idx] = HIT_NONE;
         }
 
@@ -484,7 +484,7 @@ pub fn draw_window_edges_and_mask(
         // Bottom edge fill
         for row in (height as usize - inset as usize)..height as usize {
             let idx = row * width as usize + x_left;
-            pixels[idx] = 0;
+            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
             hit_test_map[idx] = HIT_NONE;
         }
 
@@ -499,7 +499,7 @@ pub fn draw_window_edges_and_mask(
         // Top edge fill
         for row in 0..inset as usize {
             let idx = row * width as usize + x_right;
-            pixels[idx] = 0;
+            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
             hit_test_map[idx] = HIT_NONE;
         }
 
@@ -529,7 +529,7 @@ pub fn draw_window_edges_and_mask(
         // Bottom edge fill
         for row in (height as usize - inset as usize)..height as usize {
             let idx = row * width as usize + x_right;
-            pixels[idx] = 0;
+            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
             hit_test_map[idx] = HIT_NONE;
         }
 
