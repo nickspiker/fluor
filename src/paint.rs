@@ -667,22 +667,23 @@ fn background_row(
 /// Debug toggle that lets the chord `Ctrl/Cmd+Shift+D+P` skip the boundary premultiply at runtime — A/B the Linux fix without recompiling. Stays `false` by default.
 pub static DEBUG_SKIP_PREMULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Boundary conversion for Linux X11/Wayland — flips t→α on the top byte AND premultiplies RGB by α in one pass. fluor's internal pixels are t-convention straight RGB; KWin/Mutter want α-convention premultiplied. NEVER called from inside paint primitives or Group composites; only at the present boundary.
-///
-/// SWAR — R and B live in non-adjacent byte slots (bits 16-23 and 0-7), so `(R<<16 | B) * α` can multiply both at once without carries between them. Green is one slot off, handled in a second multiply. Two multiplies total instead of three.
+/// Flip every pixel's top byte from internal t-convention to host-facing α-convention. `α = 255 − t`, equivalently `top_byte ^= 0xFF` (since u8 XOR with 0xFF inverts). Boundary step needed on every host — wgpu PostMultiplied and softbuffer both want α-convention. ALWAYS called at the present boundary, never inside paint primitives or Group composites.
+#[inline]
+pub fn flip_t_to_alpha(pixels: &mut [u32]) {
+    for p in pixels.iter_mut() {
+        *p ^= 0xFF000000;
+    }
+}
+
+/// Premultiply RGB by α for each pixel in place — `R' = (R · α) >> 8` per channel. The Linux X11/Wayland boundary step (KWin/Mutter blend transparent windows using premultiplied alpha). Run AFTER [`flip_t_to_alpha`]: this function reads the top byte as α (opacity), not as t. α=0 zeros the pixel; α=255 leaves RGB unchanged; otherwise SWAR-multiplies R+B in one mul, G in another.
 pub fn premultiply_buffer(pixels: &mut [u32]) {
     for p in pixels.iter_mut() {
-        // Convert internal t to α: α = 255 - t. Then premultiply RGB by α.
-        let t = (*p >> 24) & 0xFF;
-        let alpha = 255 - t;
+        let alpha = (*p >> 24) & 0xFF;
         if alpha == 0 {
-            // Fully transparent — zero out everything so the OS compositor sees pure transparent.
             *p = 0;
             continue;
         }
         if alpha == 255 {
-            // Fully opaque — α=255, RGB unchanged. Top byte goes from t=0 to α=255.
-            *p = 0xFF000000 | (*p & 0x00FFFFFF);
             continue;
         }
         let rb = *p & 0x00FF_00FF;
