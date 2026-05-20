@@ -502,7 +502,8 @@ pub fn fill_rect_blend(
         assert_mask_matches_buffer(m, buf_w, buf_h);
     }
     let (x_min, y_min, x_max, y_max) = clip_rect(clip, x, y, rect_w, rect_h);
-    let colour_a = (colour >> 24) & 0xFF;
+    // Convert colour's t-byte to opacity for internal coverage math; convert back at write site.
+    let colour_opacity = 255 - ((colour >> 24) & 0xFF);
     let colour_rgb = colour & 0x00FF_FFFF;
     match mask {
         None => {
@@ -520,8 +521,8 @@ pub fn fill_rect_blend(
                 for col in x_min..x_max {
                     let idx = base + col;
                     let mask_a = m.pixels[idx] as u32;
-                    let effective_a = (colour_a * mask_a) >> 8;
-                    let masked = colour_rgb | (effective_a << 24);
+                    let effective_opacity = (colour_opacity * mask_a) >> 8;
+                    let masked = colour_rgb | ((255 - effective_opacity) << 24);
                     pixels[idx] = blend(pixels[idx], masked);
                 }
             }
@@ -708,7 +709,8 @@ pub fn blend_rgb_only(bg_colour: u32, fg_colour: u32, weight_bg: u8, weight_fg: 
     let mut blended = bg * weight_bg as u64 + fg * weight_fg as u64;
     blended = (blended >> 8) & 0x00FF00FF00FF00FF;
     blended = (blended | (blended >> 8)) & 0x0000FFFF0000FFFF;
-    blended = blended | (blended >> 16) | 0xFF000000;
+    // t-convention: force opaque by clearing the t-byte (top byte = 0).
+    blended = (blended | (blended >> 16)) & 0x00FFFFFF;
 
     blended as u32
 }
@@ -745,7 +747,8 @@ pub fn draw_squircle_pill(
 
     let radius_f = pill_h as f32 * 0.5;
     let radius = (pill_h / 2) as isize;
-    let solid = color | 0xFF00_0000;
+    // t-convention: force opaque (t=0) by clearing the top byte. RGB intact.
+    let solid = color & 0x00FF_FFFF;
     let color_rgb = color & 0x00FF_FFFF;
     let crossings = squircle_crossings(radius_f, squirdleyness);
 
@@ -1082,10 +1085,14 @@ fn write_aa(
         pixels[idx] = (curr & 0xFF00_0000) | (br << 16) | (bg << 8) | bb;
         mask[idx] = 255;
     } else {
-        let existing_alpha = (pixels[idx] >> 24) & 0xFF;
-        if h_aa > existing_alpha {
-            pixels[idx] = (h_aa << 24) | color_rgb;
-            mask[idx] = h_aa as u8;
+        // t-convention: top byte is transparency. We want the MORE OPAQUE write to win (lower t).
+        // h_aa is the AA coverage (0..255, higher = more covered); under t the equivalent
+        // transparency is 255 - h_aa.
+        let new_t = 255 - h_aa;
+        let existing_t = (pixels[idx] >> 24) & 0xFF;
+        if new_t < existing_t {
+            pixels[idx] = (new_t << 24) | color_rgb;
+            mask[idx] = h_aa as u8;  // mask stays in coverage form; flipped to t form in widget refactor
         }
     }
 }
@@ -1696,7 +1703,7 @@ pub mod glyph {
         let r_4 = r_2 * r_2;
         let r_3 = r_render * r_render * r_render;
 
-        let stroke_packed = stroke_colour | 0xFF00_0000;
+        let stroke_packed = stroke_colour & 0x00FF_FFFF;
 
         for h in -(r_render as isize)..=(r_render as isize) {
             for w in -(r as isize)..=(r as isize) {
@@ -1744,8 +1751,8 @@ pub mod glyph {
         let outer_edge_threshold = r_3 << 2;
         let inner_edge_threshold = r_inner_3 << 2;
 
-        let stroke_packed = stroke_colour | 0xFF00_0000;
-        let fill_packed = fill_colour | 0xFF00_0000;
+        let stroke_packed = stroke_colour & 0x00FF_FFFF;
+        let fill_packed = fill_colour & 0x00FF_FFFF;
 
         for h in -(r as isize)..=r as isize {
             for w in -(r as isize)..=r as isize {
@@ -1806,7 +1813,7 @@ pub mod glyph {
         let x2_end = cxf - end;
         let y2_end = cyf + end;
 
-        let stroke_packed = stroke_colour | 0xFF00_0000;
+        let stroke_packed = stroke_colour & 0x00FF_FFFF;
         let cxi = x as i32;
         let cyi = y as i32;
         let height = (pixels.len() / width) as i32;
@@ -1928,7 +1935,8 @@ pub fn circle_filled(
         2 * r_outer + 1,
     );
 
-    let fg_alpha = (colour >> 24) & 0xFF;
+    // Convert colour's t-byte to opacity for internal coverage math; convert back at write site.
+    let fg_opacity = 255 - ((colour >> 24) & 0xFF);
     let colour_rgb = colour & 0x00FF_FFFF;
 
     for py in y_min..y_max {
@@ -1946,13 +1954,13 @@ pub fn circle_filled(
             } else {
                 (((r_outer2 - dist2) << 8) / edge_range) as u32
             };
-            let scaled_alpha = (fg_alpha * coverage) >> 8;
+            let scaled_opacity = (fg_opacity * coverage) >> 8;
             let idx = base + px;
-            let final_alpha = match mask {
-                Some(m) => (scaled_alpha * m.pixels[idx] as u32) >> 8,
-                None => scaled_alpha,
+            let final_opacity = match mask {
+                Some(m) => (scaled_opacity * m.pixels[idx] as u32) >> 8,
+                None => scaled_opacity,
             };
-            let scaled_colour = colour_rgb | (final_alpha << 24);
+            let scaled_colour = colour_rgb | ((255 - final_opacity) << 24);
             pixels[idx] = blend(pixels[idx], scaled_colour);
         }
     }
