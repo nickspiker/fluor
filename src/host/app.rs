@@ -153,11 +153,17 @@ impl<A: FluorApp> DesktopShell<A> {
 
         let mut ctx = Context { viewport: self.viewport, text, window: &window, modifiers: self.modifiers, cursor_x: self.cursor_x, cursor_y: self.cursor_y };
 
+        // Pixel-convention boundary (see [`crate::pixel`] module docs). Internal pixels are
+        // t-convention `0xttRRGGBB`. Convert to α-convention HERE before submission:
+        //   1. `flip_t_to_alpha` always (XOR top byte; α = 255 − t).
+        //   2. `premultiply_buffer` on Linux only (KWin/Mutter want premultiplied α).
+        //      Toggleable at runtime via Ctrl+Shift+D+P for A/B testing.
         #[cfg(target_os = "macos")]
         {
             let Some(renderer) = self.renderer.as_mut() else { return; };
             let mut buffer = renderer.lock_buffer();
             self.app.render(&mut buffer, &mut ctx);
+            crate::paint::flip_t_to_alpha(&mut buffer);
             let _ = buffer.present();
         }
         #[cfg(not(target_os = "macos"))]
@@ -165,6 +171,11 @@ impl<A: FluorApp> DesktopShell<A> {
             let Some(surface) = self.surface.as_mut() else { return; };
             let mut buffer = surface.buffer_mut().expect("softbuffer buffer_mut");
             self.app.render(&mut buffer, &mut ctx);
+            crate::paint::flip_t_to_alpha(&mut buffer);
+            #[cfg(target_os = "linux")]
+            if !crate::paint::DEBUG_SKIP_PREMULT.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::paint::premultiply_buffer(&mut buffer);
+            }
             buffer.present().expect("softbuffer buffer.present");
         }
         // Drop `ctx` (releases &mut text borrow) and `buf_w`/`buf_h` shadow used for nothing — placeholder to avoid warnings if cfg drops both arms.
