@@ -386,7 +386,7 @@ impl FluorApp for PanesDemo {
         // Rotation demo text.
         if self.rotation_group.rpn.layers[0].dirty {
             let buf = &mut self.rotation_group.rpn.layers[0].pixels;
-            buf.fill(0);
+            buf.fill(0xFF000000);  // t-convention: transparent init — without this, full-viewport AlphaOver overwrites chrome with opaque black via the src_t==0 shortcut.
             let span = 2.0 * buf_w as Coord * buf_h as Coord / (buf_w as Coord + buf_h as Coord);
             let bw = chrome::MIN_BUTTON_HEIGHT_PX as Coord + (span / 32.0).ceil();
             let title_size = bw * 0.55;
