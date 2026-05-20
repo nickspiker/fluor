@@ -619,26 +619,29 @@ fn background_row(
     x_end: usize,
     speckle: usize,
 ) {
-    use crate::theme::{BG_ALPHA, BG_BASE, BG_MASK, BG_SPECKLE};
+    use crate::theme::{BG_BASE, BG_MASK, BG_SPECKLE};
+    // t-convention: opaque pixels have t=0 (top byte cleared). Mask = 0x00FFFFFF strips any carry
+    // into the t-byte from wrapping_add accumulation, keeping the noise pixels fully opaque.
+    const OPAQUE_MASK: u32 = 0x00FFFFFF;
     let mut rng: usize = (0xDEAD_BEEF_0123_4567)
         ^ ((logical_row as usize)
             .wrapping_sub(height / 2)
             .wrapping_mul(0x9E37_79B9_4517_B397));
     let ones = 0x0001_0101u32;
-    let mut colour = rng as u32 & BG_MASK | BG_ALPHA;
+    let mut colour = rng as u32 & BG_MASK;
 
     // Right half — left to right.
     for x in (width / 2)..x_end {
         rng ^= rng.rotate_left(13).wrapping_add(12_345_678_942);
         let adder = rng as u32 & ones;
         if rng.wrapping_add(speckle) < usize::MAX / 256 {
-            colour = (rng as u32 >> 8) & BG_SPECKLE | BG_ALPHA;
+            colour = (rng as u32 >> 8) & BG_SPECKLE;
         } else {
             colour = colour.wrapping_add(adder) & BG_MASK;
             let subtractor = (rng >> 5) as u32 & ones;
             colour = colour.wrapping_sub(subtractor) & BG_MASK;
         }
-        row_pixels[x] = colour.wrapping_add(BG_BASE) | BG_ALPHA;
+        row_pixels[x] = colour.wrapping_add(BG_BASE) & OPAQUE_MASK;
     }
 
     // Left half — right to left, same RNG seed (mirror).
@@ -646,18 +649,18 @@ fn background_row(
         ^ ((logical_row as usize)
             .wrapping_sub(height / 2)
             .wrapping_mul(0x9E37_79B9_4517_B397));
-    colour = rng as u32 & BG_MASK | BG_ALPHA;
+    colour = rng as u32 & BG_MASK;
     for x in (x_start..(width / 2)).rev() {
         rng ^= rng.rotate_left(13).wrapping_sub(12_345_678_942);
         let adder = rng as u32 & ones;
         if rng.wrapping_add(speckle) < usize::MAX / 256 {
-            colour = (rng as u32 >> 8) & BG_SPECKLE | BG_ALPHA;
+            colour = (rng as u32 >> 8) & BG_SPECKLE;
         } else {
             colour = colour.wrapping_add(adder) & BG_MASK;
             let subtractor = (rng >> 5) as u32 & ones;
             colour = colour.wrapping_sub(subtractor) & BG_MASK;
         }
-        row_pixels[x] = colour.wrapping_add(BG_BASE) | BG_ALPHA;
+        row_pixels[x] = colour.wrapping_add(BG_BASE) & OPAQUE_MASK;
     }
 }
 
