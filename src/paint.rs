@@ -661,39 +661,33 @@ fn background_row(
     }
 }
 
-/// fluor's pixel convention is STRAIGHT alpha internally (see [`crate::pixel`] module docs). This constant is `false` everywhere; chrome paint primitives use the straight write `(colour & 0x00FFFFFF) | ((h as u32) << 24)` instead of `scale_alpha`. Future backends needing premultiplied output (e.g., wgpu PreMultiplied mode) do that conversion at the present boundary, not at primitive write time.
-pub const PREMULTIPLIED: bool = false;
-
 /// Debug toggle that lets the chord `Ctrl/Cmd+Shift+D+P` skip the boundary premultiply at runtime — A/B the Linux fix without recompiling. Stays `false` by default.
 pub static DEBUG_SKIP_PREMULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Premultiply RGB by α for each pixel in place — `R' = (R · α) >> 8` per channel. The boundary conversion for platforms whose compositor expects premultiplied alpha (Linux X11/Wayland, where KWin/Mutter blend transparent windows with the desktop using premult math). Identity at α=0 (already 0,0,0,0) and α=255 (R·255/256 ≈ R within 1 LSB — accepted to keep this branchless except for the two endpoints). NEVER called from inside paint primitives or Group composites; only at the present boundary.
+/// Boundary conversion for Linux X11/Wayland — flips t→α on the top byte AND premultiplies RGB by α in one pass. fluor's internal pixels are t-convention straight RGB; KWin/Mutter want α-convention premultiplied. NEVER called from inside paint primitives or Group composites; only at the present boundary.
 ///
-/// SWAR — R and B live in non-adjacent byte slots (bits 16-23 and 0-7), so `(R<<16 | B) * α` can multiply both at once without carries between them. Green is one slot off, handled in a second multiply. Two multiplies total instead of three, no per-channel shift-extract-shift-or.
+/// SWAR — R and B live in non-adjacent byte slots (bits 16-23 and 0-7), so `(R<<16 | B) * α` can multiply both at once without carries between them. Green is one slot off, handled in a second multiply. Two multiplies total instead of three.
 pub fn premultiply_buffer(pixels: &mut [u32]) {
     for p in pixels.iter_mut() {
-        if *p < 0x01_00_00_00 || *p >= 0xFF_00_00_00 {
+        // Convert internal t to α: α = 255 - t. Then premultiply RGB by α.
+        let t = (*p >> 24) & 0xFF;
+        let alpha = 255 - t;
+        if alpha == 0 {
+            // Fully transparent — zero out everything so the OS compositor sees pure transparent.
+            *p = 0;
             continue;
         }
-        let alpha = *p >> 24;
+        if alpha == 255 {
+            // Fully opaque — α=255, RGB unchanged. Top byte goes from t=0 to α=255.
+            *p = 0xFF000000 | (*p & 0x00FFFFFF);
+            continue;
+        }
         let rb = *p & 0x00FF_00FF;
         let g = *p & 0x0000_FF00;
         let rb_premult = ((rb * alpha) >> 8) & 0x00FF_00FF;
         let g_premult = ((g * alpha) >> 8) & 0x0000_FF00;
         *p = (alpha << 24) | rb_premult | g_premult;
     }
-}
-
-/// Photon's `scale_alpha` helper. Verbatim port from [compositing.rs:5809](/mnt/Octopus/Code/photon/src/ui/compositing.rs#L5809). Multiplies all four channels of `colour` by `alpha/256` using SWAR — premultiplies RGB so a fully transparent pixel reads as `0x00000000`.
-pub fn scale_alpha(colour: u32, alpha: u8) -> u32 {
-    let mut c = colour as u64;
-    c = (c | (c << 16)) & 0x0000FFFF0000FFFF;
-    c = (c | (c << 8)) & 0x00FF00FF00FF00FF;
-    let mut scaled = c * alpha as u64;
-    scaled = (scaled >> 8) & 0x00FF00FF00FF00FF;
-    scaled = (scaled | (scaled >> 8)) & 0x0000FFFF0000FFFF;
-    scaled = scaled | (scaled >> 16);
-    scaled as u32
 }
 
 /// Photon's `blend_rgb_only` helper: weighted RGB blend of two colours with explicit per-pixel weights. Verbatim port from [compositing.rs:5821](/mnt/Octopus/Code/photon/src/ui/compositing.rs#L5821). Used by `draw_window_controls` for AA squircle edges.

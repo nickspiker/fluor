@@ -370,11 +370,8 @@ pub fn draw_window_edges_and_mask(
 
         // Left edge outer pixel
         let pixel_idx = y_top * width as usize + inset as usize;
-        if paint::PREMULTIPLIED {
-            pixels[pixel_idx] = paint::scale_alpha(light_colour, h);
-        } else {
-            pixels[pixel_idx] = (light_colour & 0x00FFFFFF) | ((h as u32) << 24);
-        }
+        // t-convention: top byte is transparency, h is coverage (0..255 high=opaque).
+        pixels[pixel_idx] = (light_colour & 0x00FFFFFF) | (((255 - h) as u32) << 24);
         if h < 255 {
             hit_test_map[pixel_idx] = HIT_NONE; // NEEDS FIXED!!!
         }
@@ -389,11 +386,7 @@ pub fn draw_window_edges_and_mask(
 
         // Right edge outer pixel
         let pixel_idx = pixel_idx + 1;
-        if paint::PREMULTIPLIED {
-            pixels[pixel_idx] = paint::scale_alpha(shadow_colour, h);
-        } else {
-            pixels[pixel_idx] = (shadow_colour & 0x00FFFFFF) | ((h as u32) << 24);
-        }
+        pixels[pixel_idx] = (shadow_colour & 0x00FFFFFF) | (((255 - h) as u32) << 24);
         if h < 255 {
             hit_test_map[pixel_idx] = HIT_NONE;
         }
@@ -421,11 +414,8 @@ pub fn draw_window_edges_and_mask(
 
         // Left outer edge pixel
         let pixel_idx = y_bottom * width as usize + inset as usize;
-        if paint::PREMULTIPLIED {
-            pixels[pixel_idx] = paint::scale_alpha(light_colour, h);
-        } else {
-            pixels[pixel_idx] = (light_colour & 0x00FFFFFF) | ((h as u32) << 24);
-        }
+        // t-convention: top byte is transparency, h is coverage (0..255 high=opaque).
+        pixels[pixel_idx] = (light_colour & 0x00FFFFFF) | (((255 - h) as u32) << 24);
         if h < 255 {
             hit_test_map[pixel_idx] = HIT_NONE;
         }
@@ -440,11 +430,7 @@ pub fn draw_window_edges_and_mask(
 
         // Right edge outer pixel
         let pixel_idx = pixel_idx + 1;
-        if paint::PREMULTIPLIED {
-            pixels[pixel_idx] = paint::scale_alpha(shadow_colour, h);
-        } else {
-            pixels[pixel_idx] = (shadow_colour & 0x00FFFFFF) | ((h as u32) << 24);
-        }
+        pixels[pixel_idx] = (shadow_colour & 0x00FFFFFF) | (((255 - h) as u32) << 24);
         if h < 255 {
             hit_test_map[pixel_idx] = HIT_NONE;
         }
@@ -474,11 +460,8 @@ pub fn draw_window_edges_and_mask(
 
         // Top outer edge pixel
         let pixel_idx = inset as usize * width as usize + x_left;
-        if paint::PREMULTIPLIED {
-            pixels[pixel_idx] = paint::scale_alpha(light_colour, h);
-        } else {
-            pixels[pixel_idx] = (light_colour & 0x00FFFFFF) | ((h as u32) << 24);
-        }
+        // t-convention: top byte is transparency, h is coverage (0..255 high=opaque).
+        pixels[pixel_idx] = (light_colour & 0x00FFFFFF) | (((255 - h) as u32) << 24);
         if h < 255 {
             hit_test_map[pixel_idx] = HIT_NONE;
         }
@@ -489,11 +472,7 @@ pub fn draw_window_edges_and_mask(
 
         // Bottom outer edge pixel
         let pixel_idx = (height as usize - 1 - inset as usize) * width as usize + x_left;
-        if paint::PREMULTIPLIED {
-            pixels[pixel_idx] = paint::scale_alpha(shadow_colour, h);
-        } else {
-            pixels[pixel_idx] = (shadow_colour & 0x00FFFFFF) | ((h as u32) << 24);
-        }
+        pixels[pixel_idx] = (shadow_colour & 0x00FFFFFF) | (((255 - h) as u32) << 24);
         if h < 255 {
             hit_test_map[pixel_idx] = HIT_NONE;
         }
@@ -526,11 +505,8 @@ pub fn draw_window_edges_and_mask(
 
         // Top outer edge pixel
         let pixel_idx = inset as usize * width as usize + x_right;
-        if paint::PREMULTIPLIED {
-            pixels[pixel_idx] = paint::scale_alpha(light_colour, h);
-        } else {
-            pixels[pixel_idx] = (light_colour & 0x00FFFFFF) | ((h as u32) << 24);
-        }
+        // t-convention: top byte is transparency, h is coverage (0..255 high=opaque).
+        pixels[pixel_idx] = (light_colour & 0x00FFFFFF) | (((255 - h) as u32) << 24);
         if h < 255 {
             hit_test_map[pixel_idx] = HIT_NONE;
         }
@@ -541,11 +517,7 @@ pub fn draw_window_edges_and_mask(
 
         // Bottom outer edge pixel
         let pixel_idx = (height as usize - 1 - inset as usize) * width as usize + x_right;
-        if paint::PREMULTIPLIED {
-            pixels[pixel_idx] = paint::scale_alpha(shadow_colour, h);
-        } else {
-            pixels[pixel_idx] = (shadow_colour & 0x00FFFFFF) | ((h as u32) << 24);
-        }
+        pixels[pixel_idx] = (shadow_colour & 0x00FFFFFF) | (((255 - h) as u32) << 24);
         if h < 255 {
             hit_test_map[pixel_idx] = HIT_NONE;
         }
