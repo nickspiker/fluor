@@ -364,18 +364,20 @@ fn flatten_alpha_over(dst: &mut [u32], src: &[u32]) {
 }
 
 fn flatten_add(dst: &mut [u32], src: &[u32]) {
+    // t-convention: fully-transparent src is 0xFF000000 (t=255, RGB=0). Skip those — Add of "no
+    // contribution" must not touch dst. Other pixels: per-channel wrapping add (caller knows the
+    // semantics; typically used for additive overlays where contributions stay within byte range).
     for i in 0..dst.len() {
-        if src[i] != 0 {
-            dst[i] = dst[i].wrapping_add(src[i]);
-        }
+        if src[i] == 0xFF000000 { continue; }
+        dst[i] = dst[i].wrapping_add(src[i]);
     }
 }
 
 fn flatten_xor(dst: &mut [u32], src: &[u32]) {
+    // t-convention: skip fully-transparent src. RGB-only XOR preserves dst's t.
     for i in 0..dst.len() {
-        if src[i] != 0 {
-            dst[i] ^= src[i] & 0x00FF_FFFF;
-        }
+        if src[i] == 0xFF000000 { continue; }
+        dst[i] ^= src[i] & 0x00FF_FFFF;
     }
 }
 

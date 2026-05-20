@@ -1,12 +1,14 @@
-//! Group — the unit of cached, hit-routable, text-clippable composite.
+//! Group — the unit of hit-routable, text-clippable composite.
 //!
-//! A `Group` wraps a [`Region`] (pixel-space bbox in target-buffer coordinates), an [`StackCompositor`] for internal RGB compositing, and optional side channels: a binary hit mask (`Option<Vec<u8>>`, one byte per pixel, 0 or 1) and a per-pixel text-clip alpha mask (`Option<Vec<u8>>`). All buffers are sized to the group's bbox — *not* the viewport — so memory scales with content area, not with viewport size.
+//! A `Group` wraps a [`Region`] (pixel-space bbox in target-buffer coordinates), a [`StackCompositor`] for internal RGB compositing, and optional side channels: a binary hit mask (`Option<Vec<u8>>`, one byte per pixel, 0 or 1) and a per-pixel text-clip alpha mask (`Option<Vec<u8>>`). All buffers are sized to the group's bbox — *not* the viewport — so memory scales with content area, not with viewport size.
 //!
 //! Groups are leaf-ish: there is no `children` field. The tree IS the consumer's code, exactly like [`Region`]'s "no parent pointers" doctrine. Consumers compose by holding a `Vec<Group>` (or any structure they prefer) and calling [`Group::flatten_into`] in order; hit testing iterates the same vec in reverse.
 //!
-//! Coordinate translation: paint primitives take buffer-relative pixel coordinates. When rasterizing into a group's Stack layer, the buffer is sized to `(region.w, region.h)`, so consumers must subtract `region.x, region.y` from any viewport-relative coordinate. There is deliberately no wrapper "GroupCanvas" type — per AGENT.md "no design for hypothetical futures," we add one only when a real consumer hurts.
+//! Coordinate translation: paint primitives take buffer-relative pixel coordinates. When rasterizing into a group's Stack layer, the buffer is sized to `(region.w, region.h)`, so consumers must subtract `region.x, region.y` from any viewport-relative coordinate.
 //!
-//! Damage tracking: [`mark_damage`](Group::mark_damage) coalesces overlapping rects on insert. [`is_dirty`](Group::is_dirty) lets consumers gate their rasterization. [`flatten_into`](Group::flatten_into) re-runs the whole Stack program when *anything* is dirty (per-pixel partial Stack re-evaluation is a future optimization). The savings come from gating consumer-side rasterization (text shaping, glyph rasterization, squircle math) — that's where the cycles live.
+//! Re-rasterization gate: per-layer `dirty: bool` flags inside [`StackCompositor`] gate expensive rasterization (text shaping, glyph rendering, squircle math). Consumers mark a layer dirty when its state changes; the layer re-rasterizes once, the Stack composite snapshot reuses across frames.
+//!
+//! "Where does this group contribute?" answer at flatten time: per-pixel `pixel >= 0xFF000000` (fully transparent) shortcut in the blend kernels skips contribution-less pixels for free. No sub-region damage tracking — the transparency map IS the dirty rect at per-pixel granularity. If a Group's bbox becomes too large for full-bbox flatten to be acceptable (chrome at 4K), the answer is to decompose into multiple smaller Groups (per-button, per-region), not to maintain a `Vec<Region>` damage list.
 
 use alloc::vec::Vec;
 use crate::coord::Coord;
@@ -23,8 +25,6 @@ pub struct Group {
     pub hitmask: Option<Vec<u8>>,
     /// Per-pixel alpha mask consumed by text rasterizers drawing into this group's RGB layers (group-local). `None` = no soft clip.
     pub text_clip: Option<Vec<u8>>,
-    /// Damage rects in group-local coordinates. Empty = clean. Coalesced on insert.
-    pub damage: Vec<Region>,
     /// How this group's flatten composites onto the target buffer.
     pub blend: BlendMode,
 }
@@ -39,7 +39,6 @@ impl Group {
             rpn: StackCompositor::new(w, h),
             hitmask: None,
             text_clip: None,
-            damage: Vec::new(),
             blend,
         }
     }
@@ -82,7 +81,7 @@ impl Group {
         self.text_clip.as_deref_mut()
     }
 
-    /// Resize bbox + reallocate internal buffers. All Stack layers are marked dirty (re-rasterization is the consumer's responsibility); hit + text-clip masks are zeroed; damage list is cleared.
+    /// Resize bbox + reallocate internal buffers. All Stack layers are marked dirty (re-rasterization is the consumer's responsibility); hit + text-clip masks are zeroed.
     pub fn resize(&mut self, region: Region) {
         let (w, h) = (region.w as usize, region.h as usize);
         self.region = region;
@@ -95,7 +94,6 @@ impl Group {
             m.resize(w * h, 0);
             m.fill(0);
         }
-        self.damage.clear();
     }
 
     /// Reposition (and optionally resize) the bbox. If dimensions are unchanged, only `region.x/y` update — buffers preserved, but every layer is marked dirty so the next `flatten_into` re-blits at the new target offset (the Stack cache is per-content; the *position on target* is a separate concern). If dimensions change, behaves like [`resize`](Self::resize).
@@ -119,29 +117,7 @@ impl Group {
         mask[ly * w + lx] != 0
     }
 
-    /// Coalescing damage insert. If `rect` overlaps any existing damage region, replace that region with their union; otherwise append. Degenerate rects (`w <= 0` or `h <= 0`) are dropped. O(N) per insert in the number of currently-tracked damage rects.
-    pub fn mark_damage(&mut self, rect: Region) {
-        if rect.w <= 0.0 || rect.h <= 0.0 { return; }
-        for existing in self.damage.iter_mut() {
-            if existing.intersects(&rect) {
-                *existing = existing.union(&rect);
-                return;
-            }
-        }
-        self.damage.push(rect);
-    }
-
-    /// True if any damage region intersects `rect` (group-local coordinates). Consumers gate their rasterization on this query.
-    pub fn is_dirty(&self, rect: &Region) -> bool {
-        self.damage.iter().any(|d| d.intersects(rect))
-    }
-
-    /// Read-only view of the current damage list.
-    pub fn dirty_rects(&self) -> &[Region] {
-        &self.damage
-    }
-
-    /// Mark every layer dirty (forces a full re-flatten on the next call). Use after viewport resize, target-buffer clear, or any time the contract "target unchanged since last flatten" no longer holds.
+    /// Mark every layer dirty (forces re-rasterization on the next render). Use after viewport resize, focus/hover state change, or any other state that affects what the layers should paint.
     pub fn invalidate(&mut self) {
         for layer in &mut self.rpn.layers {
             layer.dirty = true;
@@ -150,10 +126,12 @@ impl Group {
 
     /// Flatten the internal Stack onto `target` at `region.x, region.y` using `self.blend`. Always blits — the host's present buffer may be double-buffered, and downstream groups composited above this one may have overwritten our pixels last frame. The internal `StackCompositor::evaluate` cheaply returns a cached composite when no layer is dirty, so the per-frame cost when nothing changed is just the blit (one pass over the bbox area, not over the viewport).
     ///
+    /// Per-pixel transparent shortcut (`pixel >= 0xFF000000`) inside each blend kernel skips contribution-less pixels for free — no sub-region damage tracking needed at this layer.
+    ///
     /// Pixels that would land outside the target's bounds are clipped row-by-row before the per-row blend kernel runs; the blend kernel itself sees only in-bounds slices.
     pub fn flatten_into(&mut self, target: &mut [u32], target_w: usize, target_h: usize) {
         let composite = self.rpn.evaluate();
-        if composite.is_empty() { self.damage.clear(); return; }
+        if composite.is_empty() { return; }
 
         let (gw, gh) = (self.region.w as usize, self.region.h as usize);
         let gx = self.region.x as isize;
@@ -177,8 +155,6 @@ impl Group {
             let dst_slice = &mut target[dst_row_start + dst_x_start .. dst_row_start + dst_x_end];
             self.blend.flatten(dst_slice, src_slice);
         }
-
-        self.damage.clear();
     }
 }
 
@@ -194,7 +170,6 @@ mod tests {
         assert_eq!(g.dims(), (4, 3));
         assert!(g.hitmask.is_none());
         assert!(g.text_clip.is_none());
-        assert!(g.damage.is_empty());
     }
 
     #[test]
@@ -290,50 +265,4 @@ mod tests {
         assert!(!g.hit(3.0, 8.0));   // below bbox (exclusive)
     }
 
-    #[test]
-    fn mark_damage_coalesces_overlapping_rects() {
-        let mut g = Group::new(Region::new(0.0, 0.0, 100.0, 100.0), BlendMode::Replace);
-        g.mark_damage(Region::new(0.0, 0.0, 10.0, 10.0));
-        g.mark_damage(Region::new(5.0, 5.0, 10.0, 10.0));
-        assert_eq!(g.dirty_rects().len(), 1);
-        let r = g.dirty_rects()[0];
-        assert_eq!((r.x, r.y, r.w, r.h), (0.0, 0.0, 15.0, 15.0));
-    }
-
-    #[test]
-    fn mark_damage_appends_disjoint_rects() {
-        let mut g = Group::new(Region::new(0.0, 0.0, 100.0, 100.0), BlendMode::Replace);
-        g.mark_damage(Region::new(0.0, 0.0, 5.0, 5.0));
-        g.mark_damage(Region::new(50.0, 50.0, 5.0, 5.0));
-        assert_eq!(g.dirty_rects().len(), 2);
-    }
-
-    #[test]
-    fn mark_damage_drops_degenerate_rects() {
-        let mut g = Group::new(Region::new(0.0, 0.0, 100.0, 100.0), BlendMode::Replace);
-        g.mark_damage(Region::new(0.0, 0.0, 0.0, 5.0));
-        g.mark_damage(Region::new(0.0, 0.0, 5.0, 0.0));
-        assert!(g.dirty_rects().is_empty());
-    }
-
-    #[test]
-    fn is_dirty_finds_intersection() {
-        let mut g = Group::new(Region::new(0.0, 0.0, 100.0, 100.0), BlendMode::Replace);
-        g.mark_damage(Region::new(10.0, 10.0, 20.0, 20.0));
-        assert!(g.is_dirty(&Region::new(15.0, 15.0, 5.0, 5.0)));
-        assert!(g.is_dirty(&Region::new(25.0, 25.0, 20.0, 20.0)));
-        assert!(!g.is_dirty(&Region::new(50.0, 50.0, 5.0, 5.0)));
-    }
-
-    #[test]
-    fn flatten_clears_damage() {
-        let mut g = Group::new(Region::new(0.0, 0.0, 2.0, 1.0), BlendMode::Replace);
-        let l = g.new_layer();
-        g.rpn.layers[l].pixels = alloc::vec![opaque(0x112233); 2];
-        g.set_program(alloc::vec![Op::Push(l)]);
-        g.mark_damage(Region::new(0.0, 0.0, 1.0, 1.0));
-        let mut target = alloc::vec![0u32; 2];
-        g.flatten_into(&mut target, 2, 1);
-        assert!(g.dirty_rects().is_empty());
-    }
 }
