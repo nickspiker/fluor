@@ -19,12 +19,22 @@ pub struct Clip {
 
 impl Clip {
     pub const fn new(x_start: usize, y_start: usize, x_end: usize, y_end: usize) -> Self {
-        Self { x_start, y_start, x_end, y_end }
+        Self {
+            x_start,
+            y_start,
+            x_end,
+            y_end,
+        }
     }
 
     /// Full-buffer clip. Equivalent to passing `None` to a primitive.
     pub const fn buffer(buf_w: usize, buf_h: usize) -> Self {
-        Self { x_start: 0, y_start: 0, x_end: buf_w, y_end: buf_h }
+        Self {
+            x_start: 0,
+            y_start: 0,
+            x_end: buf_w,
+            y_end: buf_h,
+        }
     }
 
     /// Resolve an optional clip — `None` defaults to the full buffer. Used by every primitive at entry so the rest of the function reads from a single concrete `Clip`.
@@ -40,13 +50,23 @@ impl Clip {
 /// 2D affine transform — a 2×3 matrix laid out as `[a c tx; b d ty]`. Applied to a point `(x, y)` as `(a*x + c*y + tx, b*x + d*y + ty)`. Composes via [`then`](Self::then) (`a.then(b)` = "do `a` first, then `b`"). Used by the text path so glyph contours rotate / scale / skew *before* swash rasterizes them — proper hinting and AA on rotated glyphs, not a post-rotation pixel-shuffle.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Transform {
-    pub a: Coord, pub b: Coord,
-    pub c: Coord, pub d: Coord,
-    pub tx: Coord, pub ty: Coord,
+    pub a: Coord,
+    pub b: Coord,
+    pub c: Coord,
+    pub d: Coord,
+    pub tx: Coord,
+    pub ty: Coord,
 }
 
 impl Transform {
-    pub const IDENTITY: Transform = Transform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx: 0.0, ty: 0.0 };
+    pub const IDENTITY: Transform = Transform {
+        a: 1.0,
+        b: 0.0,
+        c: 0.0,
+        d: 1.0,
+        tx: 0.0,
+        ty: 0.0,
+    };
 
     #[inline]
     pub const fn new(a: Coord, b: Coord, c: Coord, d: Coord, tx: Coord, ty: Coord) -> Self {
@@ -56,22 +76,50 @@ impl Transform {
     #[inline]
     pub fn rotate(radians: Coord) -> Self {
         let (s, co) = crate::math::sin_cos(radians);
-        Self { a: co, b: s, c: -s, d: co, tx: 0.0, ty: 0.0 }
+        Self {
+            a: co,
+            b: s,
+            c: -s,
+            d: co,
+            tx: 0.0,
+            ty: 0.0,
+        }
     }
 
     #[inline]
     pub fn scale(sx: Coord, sy: Coord) -> Self {
-        Self { a: sx, b: 0.0, c: 0.0, d: sy, tx: 0.0, ty: 0.0 }
+        Self {
+            a: sx,
+            b: 0.0,
+            c: 0.0,
+            d: sy,
+            tx: 0.0,
+            ty: 0.0,
+        }
     }
 
     #[inline]
     pub fn skew(kx: Coord, ky: Coord) -> Self {
-        Self { a: 1.0, b: ky, c: kx, d: 1.0, tx: 0.0, ty: 0.0 }
+        Self {
+            a: 1.0,
+            b: ky,
+            c: kx,
+            d: 1.0,
+            tx: 0.0,
+            ty: 0.0,
+        }
     }
 
     #[inline]
     pub fn translate(tx: Coord, ty: Coord) -> Self {
-        Self { a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx, ty }
+        Self {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            tx,
+            ty,
+        }
     }
 
     /// Compose `self` then `other` (i.e. `other ∘ self` in math notation). The result transform applies `self` to the point first, then `other` to the result.
@@ -90,13 +138,21 @@ impl Transform {
     /// Apply to a point.
     #[inline]
     pub fn apply(self, x: Coord, y: Coord) -> (Coord, Coord) {
-        (self.a * x + self.c * y + self.tx, self.b * x + self.d * y + self.ty)
+        (
+            self.a * x + self.c * y + self.tx,
+            self.b * x + self.d * y + self.ty,
+        )
     }
 
     /// Bit-exact identity check. For "approximately identity" use a tolerance compare on the field deltas.
     #[inline]
     pub fn is_identity(self) -> bool {
-        self.a == 1.0 && self.b == 0.0 && self.c == 0.0 && self.d == 1.0 && self.tx == 0.0 && self.ty == 0.0
+        self.a == 1.0
+            && self.b == 0.0
+            && self.c == 0.0
+            && self.d == 1.0
+            && self.tx == 0.0
+            && self.ty == 0.0
     }
 
     /// Axis-aligned bounding box of the transformed rectangle `[0, w] × [0, h]`. Returns `(min_x, min_y, max_x, max_y)` in transformed coordinates. Used by text rasterizers to compute the clip-clamp range for a transformed glyph.
@@ -130,7 +186,9 @@ pub fn snap_rotation(radians: f32, font_size_px: f32, k: u32) -> f32 {
     let radius = font_size_px * 0.5;
     let raw_divs = crate::math::ceil(core::f32::consts::TAU * radius) as u32;
     let divs = ((raw_divs + k - 1) / k) * k;
-    if divs == 0 { return 0.0; }
+    if divs == 0 {
+        return 0.0;
+    }
     let step = core::f32::consts::TAU / divs as f32;
     let theta = crate::math::rem_euclid(radians, core::f32::consts::TAU);
     crate::math::floor(theta / step) * step
@@ -150,9 +208,16 @@ impl<'a> AlphaMask<'a> {
             pixels.len(),
             width * height,
             "AlphaMask: pixels.len() ({}) != width * height ({} * {} = {})",
-            pixels.len(), width, height, width * height,
+            pixels.len(),
+            width,
+            height,
+            width * height,
         );
-        Self { pixels, width, height }
+        Self {
+            pixels,
+            width,
+            height,
+        }
     }
 }
 
@@ -162,32 +227,40 @@ pub(crate) fn assert_mask_matches_buffer(mask: &AlphaMask, buf_w: usize, buf_h: 
     assert!(
         mask.width == buf_w && mask.height == buf_h,
         "AlphaMask dimensions {}×{} don't match buffer {}×{}",
-        mask.width, mask.height, buf_w, buf_h,
+        mask.width,
+        mask.height,
+        buf_w,
+        buf_h,
     );
 }
 
-/// Pack four 8-bit channels into a single 32-bit ARGB value (`0xAARRGGBB`).
+/// Pack four 8-bit channels into a fluor internal pixel (`0xttRRGGBB`). The public API keeps the opacity-convention signature — `a = 255` means fully opaque — so consumer code reads naturally. The flip to internal transparency convention (`t = 255 − a`) happens inside this function. This is the canonical external→internal boundary.
 #[inline]
 pub fn pack_argb(r: u8, g: u8, b: u8, a: u8) -> u32 {
-    ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+    let t = 255 - a;
+    ((t as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
-/// Unpack a 32-bit ARGB value into `(r, g, b, a)`.
+/// Unpack a fluor internal pixel into `(r, g, b, a)` with `a` in opacity convention — the inverse of [`pack_argb`]. Flips `t → 255 − t` so consumers always see opacity, never the internal transparency byte.
 #[inline]
 pub fn unpack_argb(packed: u32) -> (u8, u8, u8, u8) {
-    let a = (packed >> 24) as u8;
+    let t = (packed >> 24) as u8;
+    let a = 255 - t;
     let r = (packed >> 16) as u8;
     let g = (packed >> 8) as u8;
     let b = packed as u8;
     (r, g, b, a)
 }
 
-/// Straight-alpha lerp of `fg` onto `bg`. SWAR pattern: widen each 32-bit ARGB pixel to 64 bits with each 8-bit channel in its own 16-bit slot, do four channel multiplies in parallel via u64 arithmetic, narrow back. The `>>8` divisor is 256 (not 255) — the canonical fast-blend approximation; per-channel error is below 1/256 and imperceptible.
+/// Porter-Duff src-over for t-convention pixels (`0xttRRGGBB`). Free-function form of [`crate::pixel::Argb8::alpha_over`] — same math, same shortcut. RGB linearly blends with `fg` dominating as `fg_t → 0` (opaque); t-slot multiplies (combined transparency: opaque anywhere → result opaque).
 #[inline]
 pub fn blend(bg: u32, fg: u32) -> u32 {
-    let alpha = ((fg >> 24) & 0xFF) as u64;
-    let inv_alpha = 256 - alpha;
+    let fg_t = ((fg >> 24) & 0xFF) as u64;
+    if fg_t == 0 { return fg; }                          // opaque fg covers bg entirely
+    let bg_t = ((bg >> 24) & 0xFF) as u64;
+    let inv_fg_t = 256 - fg_t;
 
+    // SWAR for RGB; t slot patched below.
     let mut bg64 = bg as u64;
     bg64 = (bg64 | (bg64 << 16)) & 0x0000_FFFF_0000_FFFF;
     bg64 = (bg64 | (bg64 << 8)) & 0x00FF_00FF_00FF_00FF;
@@ -196,12 +269,14 @@ pub fn blend(bg: u32, fg: u32) -> u32 {
     fg64 = (fg64 | (fg64 << 16)) & 0x0000_FFFF_0000_FFFF;
     fg64 = (fg64 | (fg64 << 8)) & 0x00FF_00FF_00FF_00FF;
 
-    let mut blended = bg64 * inv_alpha + fg64 * alpha;
-
+    let mut blended = fg64 * inv_fg_t + bg64 * fg_t;
     blended = (blended >> 8) & 0x00FF_00FF_00FF_00FF;
     blended = (blended | (blended >> 8)) & 0x0000_FFFF_0000_FFFF;
     blended = blended | (blended >> 16);
-    blended as u32
+    let rgb_only = (blended as u32) & 0x00FF_FFFF;
+
+    let result_t = ((fg_t * bg_t) >> 8) as u32;
+    rgb_only | (result_t << 24)
 }
 
 /// Layer blend mode — selects which math op the flatten kernel applies when compositing a source layer onto the destination composite.
@@ -250,21 +325,26 @@ fn flatten_replace(dst: &mut [u32], src: &[u32]) {
 }
 
 fn flatten_alpha_over(dst: &mut [u32], src: &[u32]) {
-    // Per-pixel Porter-Duff source-over for STRAIGHT alpha (per the pixel.rs convention).
-    // Shortcuts keep straight inputs producing straight outputs:
-    //   s==0          → dst stays (src contributes nothing).
-    //   src_α==255    → src replaces dst (src covers fully).
-    //   dst_α==0      → src replaces dst (prevents premult RGB when src lands on transparent dst).
-    // Middle path: RGB via SWAR + α slot with correct Porter-Duff.
+    // Per-pixel Porter-Duff source-over for t-convention pixels (`0xttRRGGBB`).
+    // Shortcuts:
+    //   src_t==255 + RGB==0  (s==0xFF000000 — but stored as `s==0` early-out misses this; keep
+    //                         no-op test on `s == 0xFF000000` for clarity if needed)
+    //   src_t==0             → src replaces dst (src fully opaque).
+    // Middle path: RGB via SWAR `(fg·(256−src_t) + bg·src_t) >> 8`; t-slot is `(src_t·dst_t) >> 8`.
     for i in 0..dst.len() {
         let s = src[i];
-        if s == 0 { continue; }
-        let src_alpha = ((s >> 24) & 0xFF) as u64;
-        if src_alpha == 255 { dst[i] = s; continue; }
+        if s == 0xFF000000 {
+            // Fully transparent black — src contributes nothing visible. Skip.
+            continue;
+        }
+        let src_t = ((s >> 24) & 0xFF) as u64;
+        if src_t == 0 {
+            dst[i] = s;
+            continue;
+        }
         let d = dst[i];
-        let dst_alpha = ((d >> 24) & 0xFF) as u64;
-        if dst_alpha == 0 { dst[i] = s; continue; }
-        let inv = 256 - src_alpha;
+        let dst_t = ((d >> 24) & 0xFF) as u64;
+        let inv = 256 - src_t;
 
         let mut bg = d as u64;
         bg = (bg | (bg << 16)) & 0x0000_FFFF_0000_FFFF;
@@ -272,33 +352,39 @@ fn flatten_alpha_over(dst: &mut [u32], src: &[u32]) {
         let mut fg = s as u64;
         fg = (fg | (fg << 16)) & 0x0000_FFFF_0000_FFFF;
         fg = (fg | (fg << 8)) & 0x00FF_00FF_00FF_00FF;
-        let mut blended = bg * inv + fg * src_alpha;
+        let mut blended = fg * inv + bg * src_t;
         blended = (blended >> 8) & 0x00FF_00FF_00FF_00FF;
         blended = (blended | (blended >> 8)) & 0x0000_FFFF_0000_FFFF;
         blended = blended | (blended >> 16);
         let rgb_only = (blended as u32) & 0x00FF_FFFF;
 
-        let result_alpha = (src_alpha + ((dst_alpha * inv) >> 8)).min(255) as u32;
-        dst[i] = rgb_only | (result_alpha << 24);
+        let result_t = ((src_t * dst_t) >> 8) as u32;
+        dst[i] = rgb_only | (result_t << 24);
     }
 }
 
 fn flatten_add(dst: &mut [u32], src: &[u32]) {
     for i in 0..dst.len() {
-        if src[i] != 0 { dst[i] = dst[i].wrapping_add(src[i]); }
+        if src[i] != 0 {
+            dst[i] = dst[i].wrapping_add(src[i]);
+        }
     }
 }
 
 fn flatten_xor(dst: &mut [u32], src: &[u32]) {
     for i in 0..dst.len() {
-        if src[i] != 0 { dst[i] ^= src[i] & 0x00FF_FFFF; }
+        if src[i] != 0 {
+            dst[i] ^= src[i] & 0x00FF_FFFF;
+        }
     }
 }
 
 fn flatten_multiply(dst: &mut [u32], src: &[u32]) {
     for i in 0..dst.len() {
         let s = src[i];
-        if s == 0 { continue; }
+        if s == 0 {
+            continue;
+        }
         let alpha = ((s >> 24) & 0xFF) as u64;
         // Effective source = lerp(255, src_channel, alpha) = 255 + (src - 255) * alpha / 256
         // dst_channel = dst_channel * effective / 256
@@ -319,7 +405,9 @@ fn flatten_multiply(dst: &mut [u32], src: &[u32]) {
 fn flatten_screen(dst: &mut [u32], src: &[u32]) {
     for i in 0..dst.len() {
         let s = src[i];
-        if s == 0 { continue; }
+        if s == 0 {
+            continue;
+        }
         let alpha = ((s >> 24) & 0xFF) as u64;
         // Effective source = lerp(0, src_channel, alpha) = src * alpha / 256
         // Screen: dst = 255 - (255 - dst) * (255 - eff) / 256
@@ -341,21 +429,48 @@ fn flatten_screen(dst: &mut [u32], src: &[u32]) {
 ///
 /// **Rule 0 — WHY/PROOF/PREVENTS:** rect coords are external inputs (caller can pass a pane dragged off the window edge). WHY: compositor semantics demand "draw the intersection with the clip." PROOF without it: a negative `x as usize` wraps to a huge value, indexing past the pixel slice panics. PREVENTS: panic on partial-offscreen rects, which is a normal use case. The clip happens once per rect; inner loops trust the math.
 #[inline]
-fn clip_rect(clip: Clip, x: isize, y: isize, rect_w: isize, rect_h: isize) -> (usize, usize, usize, usize) {
+fn clip_rect(
+    clip: Clip,
+    x: isize,
+    y: isize,
+    rect_w: isize,
+    rect_h: isize,
+) -> (usize, usize, usize, usize) {
     // Negative isize → huge usize after cast; .min(clip.x_end) clamps it down. .max(clip.x_start) ensures we never index before the clip's left edge.
     let x_end = x + rect_w;
     let y_end = y + rect_h;
-    let x_min = if x < 0 { clip.x_start } else { (x as usize).clamp(clip.x_start, clip.x_end) };
-    let y_min = if y < 0 { clip.y_start } else { (y as usize).clamp(clip.y_start, clip.y_end) };
-    let x_max = if x_end < 0 { clip.x_start } else { (x_end as usize).clamp(clip.x_start, clip.x_end) };
-    let y_max = if y_end < 0 { clip.y_start } else { (y_end as usize).clamp(clip.y_start, clip.y_end) };
+    let x_min = if x < 0 {
+        clip.x_start
+    } else {
+        (x as usize).clamp(clip.x_start, clip.x_end)
+    };
+    let y_min = if y < 0 {
+        clip.y_start
+    } else {
+        (y as usize).clamp(clip.y_start, clip.y_end)
+    };
+    let x_max = if x_end < 0 {
+        clip.x_start
+    } else {
+        (x_end as usize).clamp(clip.x_start, clip.x_end)
+    };
+    let y_max = if y_end < 0 {
+        clip.y_start
+    } else {
+        (y_end as usize).clamp(clip.y_start, clip.y_end)
+    };
     (x_min, y_min, x_max, y_max)
 }
 
 /// Fill a rectangle with a solid (opaque-replace) ARGB colour. Solid means no alpha math — the source colour overwrites the destination directly. If you want alpha blending or alpha masking, use [`fill_rect_blend`].
 pub fn fill_rect_solid(
-    pixels: &mut [u32], buf_w: usize, buf_h: usize,
-    x: isize, y: isize, rect_w: isize, rect_h: isize,
+    pixels: &mut [u32],
+    buf_w: usize,
+    buf_h: usize,
+    x: isize,
+    y: isize,
+    rect_w: isize,
+    rect_h: isize,
     colour: u32,
     clip: Option<Clip>,
 ) {
@@ -371,14 +486,21 @@ pub fn fill_rect_solid(
 
 /// Fill a rectangle by alpha-blending `colour` over the existing buffer contents. With `mask = Some(&AlphaMask)`, the per-pixel mask alpha multiplies into `colour`'s alpha (soft clipping for shaped textboxes, scroll fades, etc.) — `effective_alpha = colour_alpha * mask_alpha / 256`.
 pub fn fill_rect_blend(
-    pixels: &mut [u32], buf_w: usize, buf_h: usize,
-    x: isize, y: isize, rect_w: isize, rect_h: isize,
+    pixels: &mut [u32],
+    buf_w: usize,
+    buf_h: usize,
+    x: isize,
+    y: isize,
+    rect_w: isize,
+    rect_h: isize,
     colour: u32,
     clip: Option<Clip>,
     mask: Option<&AlphaMask>,
 ) {
     let clip = Clip::resolve(clip, buf_w, buf_h);
-    if let Some(m) = mask { assert_mask_matches_buffer(m, buf_w, buf_h); }
+    if let Some(m) = mask {
+        assert_mask_matches_buffer(m, buf_w, buf_h);
+    }
     let (x_min, y_min, x_max, y_max) = clip_rect(clip, x, y, rect_w, rect_h);
     let colour_a = (colour >> 24) & 0xFF;
     let colour_rgb = colour & 0x00FF_FFFF;
@@ -409,20 +531,28 @@ pub fn fill_rect_blend(
 
 /// Stroke (outline) an axis-aligned rectangle. Draws four filled rect strips along the edges; corners are not joined separately because at 90° angles the strips meet cleanly. If `colour` is fully opaque (alpha = 0xFF) and `mask` is `None`, takes the fast `fill_rect_solid` path; otherwise routes each strip through `fill_rect_blend`.
 pub fn stroke_rect(
-    pixels: &mut [u32], buf_w: usize, buf_h: usize,
-    x: isize, y: isize, rect_w: isize, rect_h: isize,
-    stroke: isize, colour: u32,
+    pixels: &mut [u32],
+    buf_w: usize,
+    buf_h: usize,
+    x: isize,
+    y: isize,
+    rect_w: isize,
+    rect_h: isize,
+    stroke: isize,
+    colour: u32,
     clip: Option<Clip>,
     mask: Option<&AlphaMask>,
 ) {
-    if stroke <= 0 || rect_w <= 0 || rect_h <= 0 { return; }
+    if stroke <= 0 || rect_w <= 0 || rect_h <= 0 {
+        return;
+    }
     let solid = (colour >> 24) == 0xFF && mask.is_none();
     let inner_h = rect_h - 2 * stroke;
     let edges: [(isize, isize, isize, isize); 4] = [
-        (x, y, rect_w, stroke),                                       // top
-        (x, y + rect_h - stroke, rect_w, stroke),                     // bottom
-        (x, y + stroke, stroke, inner_h),                             // left
-        (x + rect_w - stroke, y + stroke, stroke, inner_h),           // right
+        (x, y, rect_w, stroke),                             // top
+        (x, y + rect_h - stroke, rect_w, stroke),           // bottom
+        (x, y + stroke, stroke, inner_h),                   // left
+        (x + rect_w - stroke, y + stroke, stroke, inner_h), // right
     ];
     for &(ex, ey, ew, eh) in &edges {
         if solid {
@@ -437,11 +567,17 @@ pub fn stroke_rect(
 ///
 /// Clip restricts the row range. Mask isn't supported here (background is bg — masking it would mean "draw nothing where mask is zero" which is the same as just clearing afterward; if you need that, do it explicitly).
 pub fn background_noise(
-    pixels: &mut [u32], buf_w: usize, buf_h: usize,
-    speckle: usize, fullscreen: bool, scroll_offset: isize,
+    pixels: &mut [u32],
+    buf_w: usize,
+    buf_h: usize,
+    speckle: usize,
+    fullscreen: bool,
+    scroll_offset: isize,
     clip: Option<Clip>,
 ) {
-    if buf_w < 2 || buf_h < 2 { return; }
+    if buf_w < 2 || buf_h < 2 {
+        return;
+    }
     let clip = Clip::resolve(clip, buf_w, buf_h);
     // Clip first, then `fullscreen` further insets by 1 px for the edge hairline.
     let (row_start, row_end, x_start, x_end) = if fullscreen {
@@ -454,19 +590,39 @@ pub fn background_noise(
             clip.x_end.saturating_sub(1).max(clip.x_start),
         )
     };
-    if row_start >= row_end || x_start >= x_end { return; }
+    if row_start >= row_end || x_start >= x_end {
+        return;
+    }
     for row_idx in row_start..row_end {
         let logical_row = row_idx as isize - scroll_offset;
         let row_pixels = &mut pixels[row_idx * buf_w..(row_idx + 1) * buf_w];
-        background_row(row_pixels, buf_w, logical_row, buf_h, x_start, x_end, speckle);
+        background_row(
+            row_pixels,
+            buf_w,
+            logical_row,
+            buf_h,
+            x_start,
+            x_end,
+            speckle,
+        );
     }
 }
 
 #[inline]
-fn background_row(row_pixels: &mut [u32], width: usize, logical_row: isize, height: usize, x_start: usize, x_end: usize, speckle: usize) {
+fn background_row(
+    row_pixels: &mut [u32],
+    width: usize,
+    logical_row: isize,
+    height: usize,
+    x_start: usize,
+    x_end: usize,
+    speckle: usize,
+) {
     use crate::theme::{BG_ALPHA, BG_BASE, BG_MASK, BG_SPECKLE};
     let mut rng: usize = (0xDEAD_BEEF_0123_4567)
-        ^ ((logical_row as usize).wrapping_sub(height / 2).wrapping_mul(0x9E37_79B9_4517_B397));
+        ^ ((logical_row as usize)
+            .wrapping_sub(height / 2)
+            .wrapping_mul(0x9E37_79B9_4517_B397));
     let ones = 0x0001_0101u32;
     let mut colour = rng as u32 & BG_MASK | BG_ALPHA;
 
@@ -486,7 +642,9 @@ fn background_row(row_pixels: &mut [u32], width: usize, logical_row: isize, heig
 
     // Left half — right to left, same RNG seed (mirror).
     rng = 0xDEAD_BEEF_0123_4567
-        ^ ((logical_row as usize).wrapping_sub(height / 2).wrapping_mul(0x9E37_79B9_4517_B397));
+        ^ ((logical_row as usize)
+            .wrapping_sub(height / 2)
+            .wrapping_mul(0x9E37_79B9_4517_B397));
     colour = rng as u32 & BG_MASK | BG_ALPHA;
     for x in (x_start..(width / 2)).rev() {
         rng ^= rng.rotate_left(13).wrapping_sub(12_345_678_942);
@@ -504,6 +662,26 @@ fn background_row(row_pixels: &mut [u32], width: usize, logical_row: isize, heig
 
 /// fluor's pixel convention is STRAIGHT alpha internally (see [`crate::pixel`] module docs). This constant is `false` everywhere; chrome paint primitives use the straight write `(colour & 0x00FFFFFF) | ((h as u32) << 24)` instead of `scale_alpha`. Future backends needing premultiplied output (e.g., wgpu PreMultiplied mode) do that conversion at the present boundary, not at primitive write time.
 pub const PREMULTIPLIED: bool = false;
+
+/// Debug toggle that lets the chord `Ctrl/Cmd+Shift+D+P` skip the boundary premultiply at runtime — A/B the Linux fix without recompiling. Stays `false` by default.
+pub static DEBUG_SKIP_PREMULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Premultiply RGB by α for each pixel in place — `R' = (R · α) >> 8` per channel. The boundary conversion for platforms whose compositor expects premultiplied alpha (Linux X11/Wayland, where KWin/Mutter blend transparent windows with the desktop using premult math). Identity at α=0 (already 0,0,0,0) and α=255 (R·255/256 ≈ R within 1 LSB — accepted to keep this branchless except for the two endpoints). NEVER called from inside paint primitives or Group composites; only at the present boundary.
+///
+/// SWAR — R and B live in non-adjacent byte slots (bits 16-23 and 0-7), so `(R<<16 | B) * α` can multiply both at once without carries between them. Green is one slot off, handled in a second multiply. Two multiplies total instead of three, no per-channel shift-extract-shift-or.
+pub fn premultiply_buffer(pixels: &mut [u32]) {
+    for p in pixels.iter_mut() {
+        if *p < 0x01_00_00_00 || *p >= 0xFF_00_00_00 {
+            continue;
+        }
+        let alpha = *p >> 24;
+        let rb = *p & 0x00FF_00FF;
+        let g = *p & 0x0000_FF00;
+        let rb_premult = ((rb * alpha) >> 8) & 0x00FF_00FF;
+        let g_premult = ((g * alpha) >> 8) & 0x0000_FF00;
+        *p = (alpha << 24) | rb_premult | g_premult;
+    }
+}
 
 /// Photon's `scale_alpha` helper. Verbatim port from [compositing.rs:5809](/mnt/Octopus/Code/photon/src/ui/compositing.rs#L5809). Multiplies all four channels of `colour` by `alpha/256` using SWAR — premultiplies RGB so a fully transparent pixel reads as `0x00000000`.
 pub fn scale_alpha(colour: u32, alpha: u8) -> u32 {
@@ -555,12 +733,15 @@ pub fn draw_squircle_pill(
     squirdleyness: i32,
     blend_aa_with_existing: bool,
 ) {
-    if pill_w <= 0 || pill_h <= 0 { return; }
+    if pill_w <= 0 || pill_h <= 0 {
+        return;
+    }
     let buf_w_i = buf_w as isize;
     let buf_h_i = buf_h as isize;
     // Bbox-overlap early-out — pill entirely off-buffer.
-    if pill_x + pill_w <= 0 || pill_y + pill_h <= 0
-        || pill_x >= buf_w_i || pill_y >= buf_h_i { return; }
+    if pill_x + pill_w <= 0 || pill_y + pill_h <= 0 || pill_x >= buf_w_i || pill_y >= buf_h_i {
+        return;
+    }
 
     let radius_f = pill_h as f32 * 0.5;
     let radius = (pill_h / 2) as isize;
@@ -571,20 +752,39 @@ pub fn draw_squircle_pill(
     // Fast/slow split. Fast path: pill bbox fully inside the buffer → no per-pixel checks.
     // Slow path: partial overhang (scroll/resize transitions) → range clips at the corner-block
     // boundary so each AA write has its row already proven in-buffer.
-    let fully_inside = pill_x >= 0 && pill_y >= 0
-        && pill_x + pill_w <= buf_w_i && pill_y + pill_h <= buf_h_i;
+    let fully_inside =
+        pill_x >= 0 && pill_y >= 0 && pill_x + pill_w <= buf_w_i && pill_y + pill_h <= buf_h_i;
 
     if fully_inside {
         draw_squircle_pill_unclipped(
-            pixels, mask, buf_w,
-            pill_x as usize, pill_y as usize, pill_w as usize, pill_h as usize, radius as usize,
-            &crossings, color_rgb, solid, blend_aa_with_existing,
+            pixels,
+            mask,
+            buf_w,
+            pill_x as usize,
+            pill_y as usize,
+            pill_w as usize,
+            pill_h as usize,
+            radius as usize,
+            &crossings,
+            color_rgb,
+            solid,
+            blend_aa_with_existing,
         );
     } else {
         draw_squircle_pill_clipped(
-            pixels, mask, buf_w, buf_h,
-            pill_x, pill_y, pill_w, pill_h, radius,
-            &crossings, color_rgb, solid, blend_aa_with_existing,
+            pixels,
+            mask,
+            buf_w,
+            buf_h,
+            pill_x,
+            pill_y,
+            pill_w,
+            pill_h,
+            radius,
+            &crossings,
+            color_rgb,
+            solid,
+            blend_aa_with_existing,
         );
     }
 
@@ -637,17 +837,42 @@ fn draw_squircle_pill_unclipped(
     blend_aa_with_existing: bool,
 ) {
     for (i, &(inset, _l, h)) in crossings.iter().enumerate() {
-        if inset as usize > i { break; }
+        if inset as usize > i {
+            break;
+        }
         let inset_us = inset as usize;
         let h_u32 = h as u32;
         for &(flip_x, flip_y) in &[(false, false), (true, false), (false, true), (true, true)] {
             // --- vertical edge: AA pixel + horizontal fill to the diagonal ---
-            let v_row = if flip_y { pill_y + pill_h - 1 - radius + i } else { pill_y + radius - i };
-            let v_aa_col = if flip_x { pill_x + pill_w - 1 - inset_us } else { pill_x + inset_us };
-            let diag_col = if flip_x { pill_x + pill_w - 1 - radius + i } else { pill_x + radius - i };
+            let v_row = if flip_y {
+                pill_y + pill_h - 1 - radius + i
+            } else {
+                pill_y + radius - i
+            };
+            let v_aa_col = if flip_x {
+                pill_x + pill_w - 1 - inset_us
+            } else {
+                pill_x + inset_us
+            };
+            let diag_col = if flip_x {
+                pill_x + pill_w - 1 - radius + i
+            } else {
+                pill_x + radius - i
+            };
             let row_base = v_row * buf_w;
-            write_aa(pixels, mask, row_base + v_aa_col, color_rgb, h_u32, blend_aa_with_existing);
-            let (fx_start, fx_end) = if flip_x { (diag_col, v_aa_col) } else { (v_aa_col + 1, diag_col + 1) };
+            write_aa(
+                pixels,
+                mask,
+                row_base + v_aa_col,
+                color_rgb,
+                h_u32,
+                blend_aa_with_existing,
+            );
+            let (fx_start, fx_end) = if flip_x {
+                (diag_col, v_aa_col)
+            } else {
+                (v_aa_col + 1, diag_col + 1)
+            };
             for fx in fx_start..fx_end {
                 let idx = row_base + fx;
                 pixels[idx] = solid;
@@ -655,11 +880,34 @@ fn draw_squircle_pill_unclipped(
             }
 
             // --- horizontal edge: AA pixel + vertical fill to the diagonal ---
-            let h_col = if flip_x { pill_x + pill_w - 1 - radius + i } else { pill_x + radius - i };
-            let h_aa_row = if flip_y { pill_y + pill_h - 1 - inset_us } else { pill_y + inset_us };
-            let diag_row = if flip_y { pill_y + pill_h - 1 - radius + i } else { pill_y + radius - i };
-            write_aa(pixels, mask, h_aa_row * buf_w + h_col, color_rgb, h_u32, blend_aa_with_existing);
-            let (fy_start, fy_end) = if flip_y { (diag_row, h_aa_row) } else { (h_aa_row + 1, diag_row + 1) };
+            let h_col = if flip_x {
+                pill_x + pill_w - 1 - radius + i
+            } else {
+                pill_x + radius - i
+            };
+            let h_aa_row = if flip_y {
+                pill_y + pill_h - 1 - inset_us
+            } else {
+                pill_y + inset_us
+            };
+            let diag_row = if flip_y {
+                pill_y + pill_h - 1 - radius + i
+            } else {
+                pill_y + radius - i
+            };
+            write_aa(
+                pixels,
+                mask,
+                h_aa_row * buf_w + h_col,
+                color_rgb,
+                h_u32,
+                blend_aa_with_existing,
+            );
+            let (fy_start, fy_end) = if flip_y {
+                (diag_row, h_aa_row)
+            } else {
+                (h_aa_row + 1, diag_row + 1)
+            };
             for fy in fy_start..fy_end {
                 let idx = fy * buf_w + h_col;
                 pixels[idx] = solid;
@@ -695,25 +943,50 @@ fn draw_squircle_pill_clipped(
     let buf_w_i = buf_w as isize;
     let buf_h_i = buf_h as isize;
     for (i, &(inset, _l, h)) in crossings.iter().enumerate() {
-        if inset as usize > i { break; }
+        if inset as usize > i {
+            break;
+        }
         let i_iso = i as isize;
         let inset_iso = inset as isize;
         let h_u32 = h as u32;
         for &(flip_x, flip_y) in &[(false, false), (true, false), (false, true), (true, true)] {
-            let v_row = if flip_y { pill_y + pill_h - 1 - radius + i_iso } else { pill_y + radius - i_iso };
-            let h_col = if flip_x { pill_x + pill_w - 1 - radius + i_iso } else { pill_x + radius - i_iso };
+            let v_row = if flip_y {
+                pill_y + pill_h - 1 - radius + i_iso
+            } else {
+                pill_y + radius - i_iso
+            };
+            let h_col = if flip_x {
+                pill_x + pill_w - 1 - radius + i_iso
+            } else {
+                pill_x + radius - i_iso
+            };
 
             // --- Vertical edge: row constraint hoisted ---
             if v_row >= 0 && v_row < buf_h_i {
                 let row_base = v_row as usize * buf_w;
-                let v_aa_col = if flip_x { pill_x + pill_w - 1 - inset_iso } else { pill_x + inset_iso };
+                let v_aa_col = if flip_x {
+                    pill_x + pill_w - 1 - inset_iso
+                } else {
+                    pill_x + inset_iso
+                };
                 let diag_col = h_col;
                 // AA pixel: inline col check (inset is nonlinear in i; can't pre-clip).
                 if v_aa_col >= 0 && v_aa_col < buf_w_i {
-                    write_aa(pixels, mask, row_base + v_aa_col as usize, color_rgb, h_u32, blend_aa_with_existing);
+                    write_aa(
+                        pixels,
+                        mask,
+                        row_base + v_aa_col as usize,
+                        color_rgb,
+                        h_u32,
+                        blend_aa_with_existing,
+                    );
                 }
                 // Fill: range self-clips to [0, buf_w).
-                let (fx_start, fx_end) = if flip_x { (diag_col, v_aa_col) } else { (v_aa_col + 1, diag_col + 1) };
+                let (fx_start, fx_end) = if flip_x {
+                    (diag_col, v_aa_col)
+                } else {
+                    (v_aa_col + 1, diag_col + 1)
+                };
                 let fs = fx_start.max(0) as usize;
                 let fe = fx_end.max(0).min(buf_w_i) as usize;
                 for fx in fs..fe {
@@ -726,12 +999,27 @@ fn draw_squircle_pill_clipped(
             // --- Horizontal edge: column constraint hoisted ---
             if h_col >= 0 && h_col < buf_w_i {
                 let col_us = h_col as usize;
-                let h_aa_row = if flip_y { pill_y + pill_h - 1 - inset_iso } else { pill_y + inset_iso };
+                let h_aa_row = if flip_y {
+                    pill_y + pill_h - 1 - inset_iso
+                } else {
+                    pill_y + inset_iso
+                };
                 let diag_row = v_row;
                 if h_aa_row >= 0 && h_aa_row < buf_h_i {
-                    write_aa(pixels, mask, h_aa_row as usize * buf_w + col_us, color_rgb, h_u32, blend_aa_with_existing);
+                    write_aa(
+                        pixels,
+                        mask,
+                        h_aa_row as usize * buf_w + col_us,
+                        color_rgb,
+                        h_u32,
+                        blend_aa_with_existing,
+                    );
                 }
-                let (fy_start, fy_end) = if flip_y { (diag_row, h_aa_row) } else { (h_aa_row + 1, diag_row + 1) };
+                let (fy_start, fy_end) = if flip_y {
+                    (diag_row, h_aa_row)
+                } else {
+                    (h_aa_row + 1, diag_row + 1)
+                };
                 let fs = fy_start.max(0) as usize;
                 let fe = fy_end.max(0).min(buf_h_i) as usize;
                 for fy in fs..fe {
@@ -750,7 +1038,10 @@ pub fn squircle_crossings(radius: f32, squirdleyness: i32) -> alloc::vec::Vec<(u
     let mut offset = 0f32;
     loop {
         let y_norm = offset / radius;
-        let x_norm = crate::math::powf(1. - crate::math::powi(y_norm, squirdleyness), 1. / squirdleyness as f32);
+        let x_norm = crate::math::powf(
+            1. - crate::math::powi(y_norm, squirdleyness),
+            1. / squirdleyness as f32,
+        );
         let cx = x_norm * radius;
         let inset = radius - cx;
         if inset >= 0. {
@@ -758,7 +1049,9 @@ pub fn squircle_crossings(radius: f32, squirdleyness: i32) -> alloc::vec::Vec<(u
             let h = (crate::math::sqrt(1. - crate::math::fract(inset)) * 256.) as u8;
             crossings.push((inset as u16, l, h));
         }
-        if cx < offset { break; }
+        if cx < offset {
+            break;
+        }
         offset += 1.0;
     }
     crossings
@@ -766,15 +1059,22 @@ pub fn squircle_crossings(radius: f32, squirdleyness: i32) -> alloc::vec::Vec<(u
 
 /// AA write at a proven-in-buffer index. Caller proves `idx < pixels.len() == mask.len()`; this function does no bounds checks. Outer pass MAX-combines alpha so the vertical-edge and horizontal-edge AA writes don't fight at the diagonal pixel. Inner pass blends RGB into the existing pixel.
 #[inline]
-fn write_aa(pixels: &mut [u32], mask: &mut [u8], idx: usize, color_rgb: u32, h_aa: u32, blend_aa_with_existing: bool) {
+fn write_aa(
+    pixels: &mut [u32],
+    mask: &mut [u8],
+    idx: usize,
+    color_rgb: u32,
+    h_aa: u32,
+    blend_aa_with_existing: bool,
+) {
     if blend_aa_with_existing {
         let curr = pixels[idx];
         let curr_r = (curr >> 16) & 0xFF;
-        let curr_g = (curr >>  8) & 0xFF;
-        let curr_b =  curr        & 0xFF;
-        let new_r  = (color_rgb >> 16) & 0xFF;
-        let new_g  = (color_rgb >>  8) & 0xFF;
-        let new_b  =  color_rgb        & 0xFF;
+        let curr_g = (curr >> 8) & 0xFF;
+        let curr_b = curr & 0xFF;
+        let new_r = (color_rgb >> 16) & 0xFF;
+        let new_g = (color_rgb >> 8) & 0xFF;
+        let new_b = color_rgb & 0xFF;
         let inv = 256 - h_aa;
         let br = (curr_r * inv + new_r * h_aa) >> 8;
         let bg = (curr_g * inv + new_g * h_aa) >> 8;
@@ -798,7 +1098,10 @@ fn write_aa(pixels: &mut [u32], mask: &mut [u8], idx: usize, color_rgb: u32, h_a
 #[inline]
 pub fn squircle_inset(y_from_center: f32, radius: f32, squirdleyness: i32) -> f32 {
     let y_norm = (y_from_center / radius).min(1.0);
-    let x_norm = crate::math::powf(1.0 - crate::math::powi(y_norm, squirdleyness), 1.0 / squirdleyness as f32);
+    let x_norm = crate::math::powf(
+        1.0 - crate::math::powi(y_norm, squirdleyness),
+        1.0 / squirdleyness as f32,
+    );
     radius - x_norm * radius
 }
 
@@ -824,12 +1127,18 @@ pub fn draw_textbox_pill(
 
     let x = center_x.wrapping_sub(box_width / 2);
     let y_signed = center_y - (box_height as isize / 2);
-    let y = if y_signed >= 0 { y_signed as usize } else { 0usize.wrapping_sub((-y_signed) as usize) };
+    let y = if y_signed >= 0 {
+        y_signed as usize
+    } else {
+        0usize.wrapping_sub((-y_signed) as usize)
+    };
 
     // Early out if entirely off-screen.
     let box_top = y_signed;
     let box_bottom = y_signed + box_height as isize;
-    if box_bottom <= 0 || box_top >= height_signed { return; }
+    if box_bottom <= 0 || box_top >= height_signed {
+        return;
+    }
 
     let light = theme::TEXTBOX_LIGHT_EDGE;
     let shadow = theme::TEXTBOX_SHADOW_EDGE;
@@ -842,7 +1151,10 @@ pub fn draw_textbox_pill(
     let mut offset = 0f32;
     loop {
         let y_norm = offset / radius;
-        let x_norm = crate::math::powf(1.0 - crate::math::powi(y_norm, squirdleyness), 1.0 / squirdleyness as f32);
+        let x_norm = crate::math::powf(
+            1.0 - crate::math::powi(y_norm, squirdleyness),
+            1.0 / squirdleyness as f32,
+        );
         let cx = x_norm * radius;
         let inset = radius - cx;
         if inset >= 0.0 {
@@ -850,7 +1162,9 @@ pub fn draw_textbox_pill(
             let h = (crate::math::sqrt(1.0 - crate::math::fract(inset)) * 256.0) as u8;
             crossings.push((inset as u16, l, h));
         }
-        if cx < offset { break; }
+        if cx < offset {
+            break;
+        }
         offset += 1.0;
     }
 
@@ -858,7 +1172,9 @@ pub fn draw_textbox_pill(
     // flip_x: false=left, true=right. flip_y: false=top, true=bottom.
     // Each crossing generates: vertical edge pixel, horizontal edge pixel, diagonal fill between them.
     for (i, &(inset, l, h)) in crossings.iter().enumerate() {
-        if inset as usize > i { break; }
+        if inset as usize > i {
+            break;
+        }
 
         // --- Top-left corner ---
         {
@@ -877,7 +1193,9 @@ pub fn draw_textbox_pill(
             if py < height {
                 let diag_x = x.wrapping_add(radius as usize).wrapping_sub(i).min(buf_w);
                 for fill_x in px.wrapping_add(2)..=diag_x {
-                    if fill_x >= buf_w { continue; }
+                    if fill_x >= buf_w {
+                        continue;
+                    }
                     let idx = py * buf_w + fill_x;
                     pixels[idx] = fill;
                     mask[idx] = 255;
@@ -900,14 +1218,21 @@ pub fn draw_textbox_pill(
             let fs = (hy_s + 2).max(0).min(height_signed) as usize;
             let fe = diag_y_s.max(0).min(height_signed) as usize;
             if hx < buf_w && fs < fe {
-                for fy in fs..fe { let idx = fy * buf_w + hx; pixels[idx] = fill; mask[idx] = 255; }
+                for fy in fs..fe {
+                    let idx = fy * buf_w + hx;
+                    pixels[idx] = fill;
+                    mask[idx] = 255;
+                }
             }
         }
 
         // --- Top-right corner ---
         {
             let py = y.wrapping_add(radius as usize).wrapping_sub(i);
-            let px = x.wrapping_add(box_width).wrapping_sub(1).wrapping_sub(inset as usize);
+            let px = x
+                .wrapping_add(box_width)
+                .wrapping_sub(1)
+                .wrapping_sub(inset as usize);
             if py < height && px < buf_w {
                 let idx = py * buf_w + px;
                 pixels[idx] = blend_rgb_only(pixels[idx], shadow, l, h);
@@ -919,15 +1244,25 @@ pub fn draw_textbox_pill(
                 mask[idx] = h;
             }
             if py < height {
-                let diag_x = x.wrapping_add(box_width).wrapping_sub(1).wrapping_sub(radius as usize).wrapping_add(i);
+                let diag_x = x
+                    .wrapping_add(box_width)
+                    .wrapping_sub(1)
+                    .wrapping_sub(radius as usize)
+                    .wrapping_add(i);
                 for fill_x in diag_x..px.wrapping_sub(1) {
-                    if fill_x >= buf_w { continue; }
+                    if fill_x >= buf_w {
+                        continue;
+                    }
                     let idx = py * buf_w + fill_x;
                     pixels[idx] = fill;
                     mask[idx] = 255;
                 }
             }
-            let hx = x.wrapping_add(box_width).wrapping_sub(1).wrapping_sub(radius as usize).wrapping_add(i);
+            let hx = x
+                .wrapping_add(box_width)
+                .wrapping_sub(1)
+                .wrapping_sub(radius as usize)
+                .wrapping_add(i);
             let hy = y.wrapping_add(inset as usize);
             if hy < height && hx < buf_w {
                 let idx = hy * buf_w + hx;
@@ -944,13 +1279,20 @@ pub fn draw_textbox_pill(
             let fs = (hy_s + 2).max(0).min(height_signed) as usize;
             let fe = diag_y_s.max(0).min(height_signed) as usize;
             if hx < buf_w && fs < fe {
-                for fy in fs..fe { let idx = fy * buf_w + hx; pixels[idx] = fill; mask[idx] = 255; }
+                for fy in fs..fe {
+                    let idx = fy * buf_w + hx;
+                    pixels[idx] = fill;
+                    mask[idx] = 255;
+                }
             }
         }
 
         // --- Bottom-left corner ---
         {
-            let py = y.wrapping_add(box_height).wrapping_sub(radius as usize).wrapping_add(i);
+            let py = y
+                .wrapping_add(box_height)
+                .wrapping_sub(radius as usize)
+                .wrapping_add(i);
             let px = x.wrapping_add(inset as usize);
             if py < height && px < buf_w {
                 let idx = py * buf_w + px;
@@ -965,7 +1307,9 @@ pub fn draw_textbox_pill(
             if py < height {
                 let diag_x = x.wrapping_add(radius as usize).wrapping_sub(i).min(buf_w);
                 for fill_x in px.wrapping_add(2)..=diag_x {
-                    if fill_x >= buf_w { continue; }
+                    if fill_x >= buf_w {
+                        continue;
+                    }
                     let idx = py * buf_w + fill_x;
                     pixels[idx] = fill;
                     mask[idx] = 255;
@@ -988,14 +1332,24 @@ pub fn draw_textbox_pill(
             let fs = (diag_y_s + 1).max(0).min(height_signed) as usize;
             let fe = (hy_s - 1).max(0).min(height_signed) as usize;
             if hx < buf_w && fs < fe {
-                for fy in fs..fe { let idx = fy * buf_w + hx; pixels[idx] = fill; mask[idx] = 255; }
+                for fy in fs..fe {
+                    let idx = fy * buf_w + hx;
+                    pixels[idx] = fill;
+                    mask[idx] = 255;
+                }
             }
         }
 
         // --- Bottom-right corner ---
         {
-            let py = y.wrapping_add(box_height).wrapping_sub(radius as usize).wrapping_add(i);
-            let px = x.wrapping_add(box_width).wrapping_sub(1).wrapping_sub(inset as usize);
+            let py = y
+                .wrapping_add(box_height)
+                .wrapping_sub(radius as usize)
+                .wrapping_add(i);
+            let px = x
+                .wrapping_add(box_width)
+                .wrapping_sub(1)
+                .wrapping_sub(inset as usize);
             if py < height && px < buf_w {
                 let idx = py * buf_w + px;
                 pixels[idx] = blend_rgb_only(pixels[idx], shadow, l, h);
@@ -1007,15 +1361,25 @@ pub fn draw_textbox_pill(
                 mask[idx] = h;
             }
             if py < height {
-                let diag_x = x.wrapping_add(box_width).wrapping_sub(1).wrapping_sub(radius as usize).wrapping_add(i);
+                let diag_x = x
+                    .wrapping_add(box_width)
+                    .wrapping_sub(1)
+                    .wrapping_sub(radius as usize)
+                    .wrapping_add(i);
                 for fill_x in diag_x..px.wrapping_sub(1) {
-                    if fill_x >= buf_w { continue; }
+                    if fill_x >= buf_w {
+                        continue;
+                    }
                     let idx = py * buf_w + fill_x;
                     pixels[idx] = fill;
                     mask[idx] = 255;
                 }
             }
-            let hx = x.wrapping_add(box_width).wrapping_sub(1).wrapping_sub(radius as usize).wrapping_add(i);
+            let hx = x
+                .wrapping_add(box_width)
+                .wrapping_sub(1)
+                .wrapping_sub(radius as usize)
+                .wrapping_add(i);
             let hy = y.wrapping_add(box_height).wrapping_sub(inset as usize);
             if hy < height && hx < buf_w {
                 let idx = hy * buf_w + hx;
@@ -1032,7 +1396,11 @@ pub fn draw_textbox_pill(
             let fs = (diag_y_s + 1).max(0).min(height_signed) as usize;
             let fe = (hy_s - 1).max(0).min(height_signed) as usize;
             if hx < buf_w && fs < fe {
-                for fy in fs..fe { let idx = fy * buf_w + hx; pixels[idx] = fill; mask[idx] = 255; }
+                for fy in fs..fe {
+                    let idx = fy * buf_w + hx;
+                    pixels[idx] = fill;
+                    mask[idx] = 255;
+                }
             }
         }
     }
@@ -1047,7 +1415,9 @@ pub fn draw_textbox_pill(
         if y_signed >= 0 && y_signed < height_signed {
             let top_y = y_signed as usize;
             for px in left_edge..right_edge {
-                if px >= buf_w { continue; }
+                if px >= buf_w {
+                    continue;
+                }
                 pixels[top_y * buf_w + px] = light;
             }
         }
@@ -1056,7 +1426,9 @@ pub fn draw_textbox_pill(
         if bot_y_s >= 0 && bot_y_s < height_signed {
             let bot_y = bot_y_s as usize;
             for px in left_edge..right_edge {
-                if px >= buf_w { continue; }
+                if px >= buf_w {
+                    continue;
+                }
                 pixels[bot_y * buf_w + px] = shadow;
             }
         }
@@ -1065,7 +1437,9 @@ pub fn draw_textbox_pill(
         let fill_bot = (y_signed + box_height as isize).max(0).min(height_signed) as usize;
         for py in fill_top..fill_bot {
             for px in left_edge..right_edge {
-                if px >= buf_w { continue; }
+                if px >= buf_w {
+                    continue;
+                }
                 let idx = py * buf_w + px;
                 pixels[idx] = fill;
                 mask[idx] = 255;
@@ -1074,17 +1448,25 @@ pub fn draw_textbox_pill(
     } else {
         // Skinny box: left/right straight edges + center fill.
         let top_edge = (y_signed + radius_int).max(0).min(height_signed) as usize;
-        let bot_edge = (y_signed + box_height as isize - radius_int).max(0).min(height_signed) as usize;
+        let bot_edge = (y_signed + box_height as isize - radius_int)
+            .max(0)
+            .min(height_signed) as usize;
         if x < buf_w {
-            for py in top_edge..bot_edge { pixels[py * buf_w + x] = light; }
+            for py in top_edge..bot_edge {
+                pixels[py * buf_w + x] = light;
+            }
         }
         let right_x = x.wrapping_add(box_width);
         if right_x < buf_w {
-            for py in top_edge..bot_edge { pixels[py * buf_w + right_x] = shadow; }
+            for py in top_edge..bot_edge {
+                pixels[py * buf_w + right_x] = shadow;
+            }
         }
         for py in top_edge..bot_edge {
             for px in x.wrapping_add(1)..x.wrapping_add(box_width).wrapping_sub(1) {
-                if px >= buf_w { continue; }
+                if px >= buf_w {
+                    continue;
+                }
                 let idx = py * buf_w + px;
                 pixels[idx] = fill;
                 mask[idx] = 255;
@@ -1156,7 +1538,9 @@ pub fn apply_textbox_glow(
     let blur_v = 16usize;
 
     let half_h = (box_height / 2) as isize;
-    if (center_y - half_h) as usize >= buf_h || (center_y + half_h) as usize >= buf_h { return; }
+    if (center_y - half_h) as usize >= buf_h || (center_y + half_h) as usize >= buf_h {
+        return;
+    }
     let cy = center_y as usize;
 
     let y_top = cy - box_height / 2;
@@ -1168,10 +1552,18 @@ pub fn apply_textbox_glow(
     let mut x_right = center_x;
     let scan = cy * buf_w;
     for lx in (0..center_x).rev() {
-        if mask[scan + lx] > 0 { x_left = lx; } else { break; }
+        if mask[scan + lx] > 0 {
+            x_left = lx;
+        } else {
+            break;
+        }
     }
     for rx in center_x..buf_w {
-        if mask[scan + rx] > 0 { x_right = rx; } else { break; }
+        if mask[scan + rx] > 0 {
+            x_right = rx;
+        } else {
+            break;
+        }
     }
 
     let corner_r = 2 * box_width * box_height / (box_width + box_height);
@@ -1198,11 +1590,17 @@ pub fn apply_textbox_glow(
     // Right blur.
     for y in y_top..y_bot {
         let mut adder = 0u32;
-        let start = x_right - (yhs as isize - y as isize).max(0) as usize - (y as isize - yhe as isize).max(0) as usize;
+        let start = x_right
+            - (yhs as isize - y as isize).max(0) as usize
+            - (y as isize - yhe as isize).max(0) as usize;
         for bx in start..x_right + blur_h {
-            if bx >= buf_w { break; }
+            if bx >= buf_w {
+                break;
+            }
             let idx = y * buf_w + bx;
-            if bx > 0 && mask[idx] < mask[idx - 1] { adder += (mask[idx - 1] - mask[idx]) as u32; }
+            if bx > 0 && mask[idx] < mask[idx - 1] {
+                adder += (mask[idx - 1] - mask[idx]) as u32;
+            }
             adder = (adder * 15 >> 4).min(71);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
             if intensity > 0 {
@@ -1213,10 +1611,14 @@ pub fn apply_textbox_glow(
     // Left blur.
     for y in y_top..y_bot {
         let mut adder = 0u32;
-        let end = x_left + (yhs as isize - y as isize).max(0) as usize + (y as isize - yhe as isize).max(0) as usize;
+        let end = x_left
+            + (yhs as isize - y as isize).max(0) as usize
+            + (y as isize - yhe as isize).max(0) as usize;
         for bx in (x_left.saturating_sub(blur_h)..=end).rev() {
             let idx = y * buf_w + bx;
-            if bx + 1 < buf_w && mask[idx] < mask[idx + 1] { adder += (mask[idx + 1] - mask[idx]) as u32; }
+            if bx + 1 < buf_w && mask[idx] < mask[idx + 1] {
+                adder += (mask[idx + 1] - mask[idx]) as u32;
+            }
             adder = (adder * 15 >> 4).min(71);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
             if intensity > 0 {
@@ -1227,11 +1629,20 @@ pub fn apply_textbox_glow(
     // Down blur.
     for bx in x_left..x_right {
         let mut adder = 0u32;
-        let start = y_bot - (xvs as isize - bx as isize).max(0) as usize - (bx as isize - xve as isize).max(0) as usize;
+        let start = y_bot
+            - (xvs as isize - bx as isize).max(0) as usize
+            - (bx as isize - xve as isize).max(0) as usize;
         for by in start..y_bot + blur_v {
-            if by >= buf_h { break; }
+            if by >= buf_h {
+                break;
+            }
             let idx = by * buf_w + bx;
-            if by > 0 { let ia = (by - 1) * buf_w + bx; if mask[idx] < mask[ia] { adder += (mask[ia] - mask[idx]) as u32; } }
+            if by > 0 {
+                let ia = (by - 1) * buf_w + bx;
+                if mask[idx] < mask[ia] {
+                    adder += (mask[ia] - mask[idx]) as u32;
+                }
+            }
             adder = (adder * 3 >> 2).min(70);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
             if intensity > 0 {
@@ -1242,12 +1653,23 @@ pub fn apply_textbox_glow(
     // Up blur.
     for bx in x_left..x_right {
         let mut adder = 0u32;
-        let end = y_top + (xvs as isize - bx as isize).max(0) as usize + (bx as isize - xve as isize).max(0) as usize;
+        let end = y_top
+            + (xvs as isize - bx as isize).max(0) as usize
+            + (bx as isize - xve as isize).max(0) as usize;
         for by in (0..=end).rev() {
-            if by + blur_v < y_top { break; }
-            if by >= buf_h { continue; }
+            if by + blur_v < y_top {
+                break;
+            }
+            if by >= buf_h {
+                continue;
+            }
             let idx = by * buf_w + bx;
-            if by + 1 < buf_h { let ib = (by + 1) * buf_w + bx; if mask[idx] < mask[ib] { adder += (mask[ib] - mask[idx]) as u32; } }
+            if by + 1 < buf_h {
+                let ib = (by + 1) * buf_w + bx;
+                if mask[idx] < mask[ib] {
+                    adder += (mask[ib] - mask[idx]) as u32;
+                }
+            }
             adder = (adder * 3 >> 2).min(70);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
             if intensity > 0 {
@@ -1260,7 +1682,14 @@ pub fn apply_textbox_glow(
 /// Glyph rasterizers for window controls. Ported verbatim from photon's [compositing.rs](/mnt/Octopus/Code/photon/src/ui/compositing.rs) — the squircle minus / squircle ring / capsule X — so chrome looks identical to photon.
 pub mod glyph {
     /// Draw a horizontal squircle "minus" stroke centered at `(x, y)` inside a button of pixel radius `r`. Uses a 4-power squircle with widened axis to make a flat horizontal pill.
-    pub fn minimize_symbol(pixels: &mut [u32], width: usize, x: usize, y: usize, r: usize, stroke_colour: u32) {
+    pub fn minimize_symbol(
+        pixels: &mut [u32],
+        width: usize,
+        x: usize,
+        y: usize,
+        r: usize,
+        stroke_colour: u32,
+    ) {
         let r = r + 1;
         let r_render = r / 4 + 1;
         let r_2 = r_render * r_render;
@@ -1293,7 +1722,15 @@ pub mod glyph {
     }
 
     /// Draw a square "maximize" symbol — squircle ring with stroke + interior fill — centered at `(x, y)` with pixel radius `r`.
-    pub fn maximize_symbol(pixels: &mut [u32], width: usize, x: usize, y: usize, r: usize, stroke_colour: u32, fill_colour: u32) {
+    pub fn maximize_symbol(
+        pixels: &mut [u32],
+        width: usize,
+        x: usize,
+        y: usize,
+        r: usize,
+        stroke_colour: u32,
+        fill_colour: u32,
+    ) {
         let r = r + 1;
         let mut r_4 = r * r;
         r_4 *= r_4;
@@ -1317,7 +1754,9 @@ pub mod glyph {
                 let w2 = w * w;
                 let w4 = w2 * w2;
                 let dist_4 = (h4 + w4) as usize;
-                if dist_4 > r_4 { continue; }
+                if dist_4 > r_4 {
+                    continue;
+                }
                 let px = (x as isize + w) as usize;
                 let py = (y as isize + h) as usize;
                 let idx = py * width + px;
@@ -1342,7 +1781,14 @@ pub mod glyph {
     }
 
     /// Draw an antialiased "X" close symbol — two crossed capsule lines — centered at `(x, y)` with pixel radius `r`.
-    pub fn close_symbol(pixels: &mut [u32], width: usize, x: usize, y: usize, r: usize, stroke_colour: u32) {
+    pub fn close_symbol(
+        pixels: &mut [u32],
+        width: usize,
+        x: usize,
+        y: usize,
+        r: usize,
+        stroke_colour: u32,
+    ) {
         let r = r + 1;
         let thickness = (r / 3).max(1) as f32;
         let radius = thickness / 2.0;
@@ -1351,10 +1797,14 @@ pub mod glyph {
         let cyf = y as f32;
         let end = size / 3.0;
 
-        let x1_start = cxf - end; let y1_start = cyf - end;
-        let x1_end   = cxf + end; let y1_end   = cyf + end;
-        let x2_start = cxf + end; let y2_start = cyf - end;
-        let x2_end   = cxf - end; let y2_end   = cyf + end;
+        let x1_start = cxf - end;
+        let y1_start = cyf - end;
+        let x1_end = cxf + end;
+        let y1_end = cyf + end;
+        let x2_start = cxf + end;
+        let y2_start = cyf - end;
+        let x2_end = cxf - end;
+        let y2_end = cyf + end;
 
         let stroke_packed = stroke_colour | 0xFF00_0000;
         let cxi = x as i32;
@@ -1367,19 +1817,30 @@ pub mod glyph {
 
         // Each quadrant samples one of the two diagonals (whichever passes through it).
         let quadrants: [(i32, i32, i32, i32, f32, f32, f32, f32); 4] = [
-            (min_x, cxi, min_y, cyi, x1_start, y1_start, x1_end, y1_end),  // top-left, diag1
-            (cxi,   max_x, min_y, cyi, x2_start, y2_start, x2_end, y2_end),// top-right, diag2
-            (min_x, cxi, cyi,   max_y, x2_start, y2_start, x2_end, y2_end),// bottom-left, diag2
-            (cxi,   max_x, cyi, max_y, x1_start, y1_start, x1_end, y1_end),// bottom-right, diag1
+            (min_x, cxi, min_y, cyi, x1_start, y1_start, x1_end, y1_end), // top-left, diag1
+            (cxi, max_x, min_y, cyi, x2_start, y2_start, x2_end, y2_end), // top-right, diag2
+            (min_x, cxi, cyi, max_y, x2_start, y2_start, x2_end, y2_end), // bottom-left, diag2
+            (cxi, max_x, cyi, max_y, x1_start, y1_start, x1_end, y1_end), // bottom-right, diag1
         ];
         for (qx0, qx1, qy0, qy1, x0, y0, x1, y1) in quadrants {
             for py in qy0..qy1 {
                 for px in qx0..qx1 {
                     let dist = distance_to_capsule(
-                        px as f32 + 0.5, py as f32 + 0.5,
-                        x0, y0, x1, y1, radius,
+                        px as f32 + 0.5,
+                        py as f32 + 0.5,
+                        x0,
+                        y0,
+                        x1,
+                        y1,
+                        radius,
                     );
-                    let alpha_f = if dist < -0.5 { 1.0 } else if dist < 0.5 { 0.5 - dist } else { 0.0 };
+                    let alpha_f = if dist < -0.5 {
+                        1.0
+                    } else if dist < 0.5 {
+                        0.5 - dist
+                    } else {
+                        0.0
+                    };
                     if alpha_f > 0.0 {
                         let idx = py as usize * width + px as usize;
                         let alpha = (alpha_f * 256.0) as u64;
@@ -1392,7 +1853,15 @@ pub mod glyph {
 
     /// Distance from a point to a capsule (line segment + radius). Negative inside the capsule, positive outside, used as an SDF for AA.
     #[inline]
-    fn distance_to_capsule(px: f32, py: f32, x1: f32, y1: f32, x2: f32, y2: f32, radius: f32) -> f32 {
+    fn distance_to_capsule(
+        px: f32,
+        py: f32,
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        radius: f32,
+    ) -> f32 {
         let dx = x2 - x1;
         let dy = y2 - y1;
         let len_sq = dx * dx + dy * dy;
@@ -1427,15 +1896,23 @@ pub mod glyph {
 ///
 /// AA via gradient-magnitude (no sqrt): for a pixel at squared distance `d²`, coverage is `(r_outer² - d²) / (r_outer² - r_inner²)` where `r_outer = radius` and `r_inner = radius - 1`. Gives a smooth 0→1 ramp across one pixel of edge.
 pub fn circle_filled(
-    pixels: &mut [u32], buf_w: usize, buf_h: usize,
-    cx: isize, cy: isize, radius: isize,
+    pixels: &mut [u32],
+    buf_w: usize,
+    buf_h: usize,
+    cx: isize,
+    cy: isize,
+    radius: isize,
     colour: u32,
     clip: Option<Clip>,
     mask: Option<&AlphaMask>,
 ) {
-    if radius <= 0 { return; }
+    if radius <= 0 {
+        return;
+    }
     let clip = Clip::resolve(clip, buf_w, buf_h);
-    if let Some(m) = mask { assert_mask_matches_buffer(m, buf_w, buf_h); }
+    if let Some(m) = mask {
+        assert_mask_matches_buffer(m, buf_w, buf_h);
+    }
     let r_outer = radius;
     let r_outer2 = r_outer * r_outer;
     let r_inner = radius - 1;
@@ -1443,7 +1920,13 @@ pub fn circle_filled(
     let edge_range = r_outer2 - r_inner2;
 
     // Circle's bounding box, clipped. Side length is 2r + 1 (inclusive on both ends).
-    let (x_min, y_min, x_max, y_max) = clip_rect(clip, cx - r_outer, cy - r_outer, 2 * r_outer + 1, 2 * r_outer + 1);
+    let (x_min, y_min, x_max, y_max) = clip_rect(
+        clip,
+        cx - r_outer,
+        cy - r_outer,
+        2 * r_outer + 1,
+        2 * r_outer + 1,
+    );
 
     let fg_alpha = (colour >> 24) & 0xFF;
     let colour_rgb = colour & 0x00FF_FFFF;
@@ -1455,7 +1938,9 @@ pub fn circle_filled(
         for px in x_min..x_max {
             let dx = px as isize - cx;
             let dist2 = dx * dx + dy2;
-            if dist2 > r_outer2 { continue; }
+            if dist2 > r_outer2 {
+                continue;
+            }
             let coverage: u32 = if dist2 <= r_inner2 {
                 256
             } else {
@@ -1479,7 +1964,12 @@ mod tests {
 
     #[test]
     fn pack_unpack_round_trip() {
-        let cases = [(0, 0, 0, 0), (255, 255, 255, 255), (12, 34, 56, 78), (200, 100, 50, 200)];
+        let cases = [
+            (0, 0, 0, 0),
+            (255, 255, 255, 255),
+            (12, 34, 56, 78),
+            (200, 100, 50, 200),
+        ];
         for &(r, g, b, a) in &cases {
             let p = pack_argb(r, g, b, a);
             assert_eq!(unpack_argb(p), (r, g, b, a));
@@ -1487,36 +1977,52 @@ mod tests {
     }
 
     #[test]
-    fn pack_layout_is_argb() {
-        assert_eq!(pack_argb(0xAB, 0xCD, 0xEF, 0x12), 0x12AB_CDEF);
+    fn pack_layout_stores_t_in_top_byte() {
+        // pack_argb's public signature is opacity-flavored (a=0x12 = nearly-transparent), but
+        // internal storage is t-convention. Top byte stores t = 255 - a = 0xED.
+        assert_eq!(pack_argb(0xAB, 0xCD, 0xEF, 0x12), 0xEDAB_CDEF);
     }
 
     #[test]
-    fn blend_alpha_zero_preserves_bg() {
+    fn blend_transparent_fg_preserves_bg_within_one_lsb() {
+        // fg with opacity=0 (a=0) becomes internal t=255 (almost transparent). Result ≈ bg with
+        // ≤1 LSB per-channel drift (the >>8 shortcut at the transparent endpoint).
         let bg = pack_argb(100, 150, 200, 255);
         let fg = pack_argb(255, 0, 0, 0);
         let result = blend(bg, fg);
         let (r, g, b, _) = unpack_argb(result);
-        assert_eq!((r, g, b), (100, 150, 200));
+        assert!((r as i32 - 100).abs() <= 1, "r got {}", r);
+        assert!((g as i32 - 150).abs() <= 1, "g got {}", g);
+        assert!((b as i32 - 200).abs() <= 1, "b got {}", b);
     }
 
     #[test]
-    fn blend_alpha_full_replaces_rgb() {
+    fn blend_opaque_fg_replaces_bg() {
+        // fg with opacity=255 (a=255) becomes internal t=0 (opaque). Shortcut returns fg exactly.
         let bg = pack_argb(100, 150, 200, 255);
         let fg = pack_argb(50, 80, 110, 255);
         let result = blend(bg, fg);
+        assert_eq!(result, fg);
         let (r, g, b, _) = unpack_argb(result);
-        // alpha=255, inv_alpha=1: result.r = (100*1 + 50*255) / 256 = (100 + 12750)/256 ≈ 50
-        // Off by at most 1 from fg per channel.
-        assert!((r as i32 - 50).abs() <= 1, "r got {}", r);
-        assert!((g as i32 - 80).abs() <= 1, "g got {}", g);
-        assert!((b as i32 - 110).abs() <= 1, "b got {}", b);
+        assert_eq!((r, g, b), (50, 80, 110));
     }
 
     #[test]
     fn stroke_rect_only_touches_edges() {
         let mut buf = vec![0u32; 10 * 10];
-        stroke_rect(&mut buf, 10, 10, 2, 2, 6, 6, 1, pack_argb(255, 0, 0, 255), None, None);
+        stroke_rect(
+            &mut buf,
+            10,
+            10,
+            2,
+            2,
+            6,
+            6,
+            1,
+            pack_argb(255, 0, 0, 255),
+            None,
+            None,
+        );
         assert_eq!(buf[5 * 10 + 5], 0);
         let (r, _, _, _) = unpack_argb(buf[2 * 10 + 2]);
         assert!(r > 240, "top-left stroke pixel r={}", r);
@@ -1526,16 +2032,42 @@ mod tests {
     #[test]
     fn circle_filled_center_is_colour() {
         let mut buf = vec![0u32; 16 * 16];
-        circle_filled(&mut buf, 16, 16, 8, 8, 5, pack_argb(255, 0, 0, 255), None, None);
+        circle_filled(
+            &mut buf,
+            16,
+            16,
+            8,
+            8,
+            5,
+            pack_argb(255, 0, 0, 255),
+            None,
+            None,
+        );
         let (r, g, b, _) = unpack_argb(buf[8 * 16 + 8]);
-        assert!(r > 240 && g < 16 && b < 16, "center = ({}, {}, {})", r, g, b);
+        assert!(
+            r > 240 && g < 16 && b < 16,
+            "center = ({}, {}, {})",
+            r,
+            g,
+            b
+        );
         assert_eq!(buf[0], 0);
     }
 
     #[test]
     fn circle_filled_clips_partial_offscreen() {
         let mut buf = vec![0u32; 8 * 8];
-        circle_filled(&mut buf, 8, 8, -2, -2, 4, pack_argb(255, 255, 255, 255), None, None);
+        circle_filled(
+            &mut buf,
+            8,
+            8,
+            -2,
+            -2,
+            4,
+            pack_argb(255, 255, 255, 255),
+            None,
+            None,
+        );
         let (r, _, _, _) = unpack_argb(buf[0]);
         assert!(r > 200, "buf[0] r={}", r);
     }
@@ -1564,10 +2096,7 @@ mod tests {
         let mut buf = vec![0u32; 4 * 4];
         fill_rect_solid(&mut buf, 4, 4, 1, 1, 2, 2, 0xFFAABBCC, None);
         let expected: [u32; 16] = [
-            0, 0, 0, 0,
-            0, 0xFFAABBCC, 0xFFAABBCC, 0,
-            0, 0xFFAABBCC, 0xFFAABBCC, 0,
-            0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0xFFAABBCC, 0xFFAABBCC, 0, 0, 0xFFAABBCC, 0xFFAABBCC, 0, 0, 0, 0, 0,
         ];
         assert_eq!(buf.as_slice(), &expected);
     }
@@ -1578,10 +2107,7 @@ mod tests {
         // Rect from (-2, -2) of size 4x4: only (0,0)..(2,2) intersects the buffer.
         fill_rect_solid(&mut buf, 4, 4, -2, -2, 4, 4, 0xFF000001, None);
         let expected: [u32; 16] = [
-            0xFF000001, 0xFF000001, 0, 0,
-            0xFF000001, 0xFF000001, 0, 0,
-            0,          0,          0, 0,
-            0,          0,          0, 0,
+            0xFF000001, 0xFF000001, 0, 0, 0xFF000001, 0xFF000001, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
         assert_eq!(buf.as_slice(), &expected);
     }
@@ -1598,17 +2124,41 @@ mod tests {
     #[test]
     fn fill_rect_blend_alpha_zero_no_change() {
         let mut buf = vec![pack_argb(50, 60, 70, 255); 4 * 4];
-        fill_rect_blend(&mut buf, 4, 4, 0, 0, 4, 4, pack_argb(255, 0, 0, 0), None, None);
+        fill_rect_blend(
+            &mut buf,
+            4,
+            4,
+            0,
+            0,
+            4,
+            4,
+            pack_argb(255, 0, 0, 0),
+            None,
+            None,
+        );
+        // Under t-convention, opacity=0 stores t=255 (almost transparent). The blend math then
+        // gives bg with ≤1 LSB drift per channel (bg·255/256 ≈ bg).
         assert!(buf.iter().all(|&p| {
             let (r, g, b, _) = unpack_argb(p);
-            (r, g, b) == (50, 60, 70)
+            (r as i32 - 50).abs() <= 1 && (g as i32 - 60).abs() <= 1 && (b as i32 - 70).abs() <= 1
         }));
     }
 
     #[test]
     fn fill_rect_blend_clips_partial() {
         let mut buf = vec![pack_argb(0, 0, 0, 255); 4 * 4];
-        fill_rect_blend(&mut buf, 4, 4, 2, 2, 10, 10, pack_argb(200, 200, 200, 128), None, None);
+        fill_rect_blend(
+            &mut buf,
+            4,
+            4,
+            2,
+            2,
+            10,
+            10,
+            pack_argb(200, 200, 200, 128),
+            None,
+            None,
+        );
         // Pixels at (2,2), (3,2), (2,3), (3,3) should be ~(100, 100, 100); rest unchanged.
         for y in 0..4usize {
             for x in 0..4usize {
@@ -1645,7 +2195,8 @@ mod tests {
     #[test]
     fn transform_compose_translate_then_rotate() {
         // translate(1,0) then rotate(90°): point (0,0) → (1,0) → (0,1).
-        let t = Transform::translate(1.0, 0.0).then(Transform::rotate(core::f32::consts::FRAC_PI_2));
+        let t =
+            Transform::translate(1.0, 0.0).then(Transform::rotate(core::f32::consts::FRAC_PI_2));
         let (x, y) = t.apply(0.0, 0.0);
         assert!(x.abs() < 1e-6 && (y - 1.0).abs() < 1e-6);
     }
@@ -1674,7 +2225,10 @@ mod tests {
         // Wrap-around: 2π == 0.
         assert_eq!(quantize_rotation(core::f32::consts::TAU, 10.0, 8), 0);
         // Negative angles wrap correctly via rem_euclid.
-        assert_eq!(quantize_rotation(-core::f32::consts::FRAC_PI_2, 10.0, 8), n - 8);
+        assert_eq!(
+            quantize_rotation(-core::f32::consts::FRAC_PI_2, 10.0, 8),
+            n - 8
+        );
     }
 
     #[test]
