@@ -88,6 +88,12 @@ impl Argb8 {
         Argb8(a.0 ^ b.0)
     }
 
+    /// Per-channel bitwise OR. Under t-convention this is how a binary silhouette layer knocks corner pixels to transparent without disturbing RGB: silhouette pixels of `0xFF_00_00_00` (t=255 transparent, RGB=0) OR'd onto opaque bg leave RGB intact and force t to 255 at the cutouts. No SWAR widening needed — bitwise OR has no carries between channels.
+    #[inline]
+    pub fn or(a: Argb8, b: Argb8) -> Argb8 {
+        Argb8(a.0 | b.0)
+    }
+
     /// Porter-Duff source-over under fluor's t-convention (top byte = transparency).
     ///
     /// Formulas:
