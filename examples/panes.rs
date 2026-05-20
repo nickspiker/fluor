@@ -273,7 +273,8 @@ impl FluorApp for PanesDemo {
                                     let g = (s >> 16) & 0xFF;
                                     s ^= s << 13; s ^= s >> 17; s ^= s << 5;
                                     let b = (s >> 16) & 0xFF;
-                                    self.debug_hit_colours.push(0xFF_00_00_00 | (r << 16) | (g << 8) | b);
+                                    // t-convention: t=0 (top byte = 0) means opaque.
+                                    self.debug_hit_colours.push((r << 16) | (g << 8) | b);
                                 }
                             }
                         } else if c == "p" || c == "P" {
@@ -421,11 +422,11 @@ impl FluorApp for PanesDemo {
             // glow layer stays zeroed (skipped). Internal AlphaOver of (glow=0 over content) is a
             // no-op so the textbox shows the bare rectangle.
             let content = &mut self.textbox_group.rpn.layers[0].pixels;
-            content.fill(0);
+            content.fill(0xFF000000);  // t-convention: transparent init so areas outside the pill don't overwrite the chrome below.
             self.textbox.render_content_into(content, tw, th, bbox.x, bbox.y, ctx.text, None, None);
 
             let glow = &mut self.textbox_group.rpn.layers[1].pixels;
-            glow.fill(0);
+            glow.fill(0xFF000000);  // t-convention: transparent init (t=255, RGB=0).
             self.textbox.render_glow_into(glow, tw, th, bbox.x, bbox.y);
         }
         self.textbox_group.flatten_into(target, buf_w, buf_h);
@@ -435,7 +436,7 @@ impl FluorApp for PanesDemo {
             let (cw, ch) = self.cursor_group.dims();
             let cbox = self.textbox.cursor_bbox();
             let buf = &mut self.cursor_group.rpn.layers[0].pixels;
-            buf.fill(0);
+            buf.fill(0xFF000000);  // t-convention: transparent init.
             self.textbox.render_blinkey_into(buf, cw, ch, cbox.x, cbox.y);
         }
         self.cursor_group.flatten_into(target, buf_w, buf_h);

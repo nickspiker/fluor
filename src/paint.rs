@@ -1578,17 +1578,20 @@ pub fn apply_textbox_glow(
 
     let glow_rgb = glow_colour & 0x00FF_FFFF;
 
-    /// Saturating per-byte add. The 4-direction passes SUM into alpha — corner pixels (touched by multiple directions) get extra brightness, matching photon's effect where corners look slightly brighter than straight-edge regions. Saturating prevents byte-wrap producing dark stripes at the over-saturation points.
+    /// Glow accumulation under fluor's t-convention. The 4-direction passes accumulate opacity into a pixel that starts at "transparent" (t=255). Top byte: saturating-subtract intensity (drives t toward 0/opaque). RGB: saturating-add per channel (corner pixels touched by multiple directions get extra brightness, matching photon's effect where corners look slightly brighter than straight-edge regions). Caller must initialize the pixel buffer to `0xFF000000` (t=255, RGB=0) before invoking.
     #[inline]
-    fn sat_byte_add(dst: u32, add: u32) -> u32 {
-        let mut result = 0u32;
-        for shift in [0u32, 8, 16, 24] {
-            let d = (dst >> shift) & 0xFF;
-            let a = (add >> shift) & 0xFF;
-            let sum = (d + a).min(0xFF);
-            result |= sum << shift;
-        }
-        result
+    fn glow_accumulate(dst: u32, intensity: u32, glow_rgb: u32) -> u32 {
+        let t = ((dst >> 24) & 0xFF).saturating_sub(intensity);
+        let dr = (dst >> 16) & 0xFF;
+        let dg = (dst >>  8) & 0xFF;
+        let db =  dst        & 0xFF;
+        let sr = (glow_rgb >> 16) & 0xFF;
+        let sg = (glow_rgb >>  8) & 0xFF;
+        let sb =  glow_rgb        & 0xFF;
+        let nr = (dr + sr).min(0xFF);
+        let ng = (dg + sg).min(0xFF);
+        let nb = (db + sb).min(0xFF);
+        (t << 24) | (nr << 16) | (ng << 8) | nb
     }
 
     // Right blur.
@@ -1608,7 +1611,7 @@ pub fn apply_textbox_glow(
             adder = (adder * 15 >> 4).min(71);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
             if intensity > 0 {
-                pixels[idx] = sat_byte_add(pixels[idx], (intensity << 24) | glow_rgb);
+                pixels[idx] = glow_accumulate(pixels[idx], intensity, glow_rgb);
             }
         }
     }
@@ -1626,7 +1629,7 @@ pub fn apply_textbox_glow(
             adder = (adder * 15 >> 4).min(71);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
             if intensity > 0 {
-                pixels[idx] = sat_byte_add(pixels[idx], (intensity << 24) | glow_rgb);
+                pixels[idx] = glow_accumulate(pixels[idx], intensity, glow_rgb);
             }
         }
     }
@@ -1650,7 +1653,7 @@ pub fn apply_textbox_glow(
             adder = (adder * 3 >> 2).min(70);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
             if intensity > 0 {
-                pixels[idx] = sat_byte_add(pixels[idx], (intensity << 24) | glow_rgb);
+                pixels[idx] = glow_accumulate(pixels[idx], intensity, glow_rgb);
             }
         }
     }
@@ -1677,7 +1680,7 @@ pub fn apply_textbox_glow(
             adder = (adder * 3 >> 2).min(70);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
             if intensity > 0 {
-                pixels[idx] = sat_byte_add(pixels[idx], (intensity << 24) | glow_rgb);
+                pixels[idx] = glow_accumulate(pixels[idx], intensity, glow_rgb);
             }
         }
     }
