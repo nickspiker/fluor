@@ -33,6 +33,12 @@ struct PanesDemo {
     blink: BlinkTimer,
     is_dragging_select: bool,
     selection_scroll_time: Option<Instant>,
+    /// True while D is physically held as part of the debug chord (was pressed with primary+shift modifiers). Cleared on D release. Pure event-driven, no timeout.
+    d_chord_held: bool,
+    /// Toggle for the H chord action — paints the chrome's hit_test_map as an opaque tinted overlay.
+    show_hitmask: bool,
+    /// 256-entry random colour table indexed by hit_test_map byte; regenerated each time H toggles on so distinct IDs get visibly-distinct colours. Photon's debug-hit pattern.
+    debug_hit_colours: Vec<u32>,
 }
 
 impl PanesDemo {
@@ -89,6 +95,9 @@ impl PanesDemo {
             blink: BlinkTimer::new(),
             is_dragging_select: false,
             selection_scroll_time: None,
+            d_chord_held: false,
+            show_hitmask: false,
+            debug_hit_colours: Vec::new(),
         }
     }
 
@@ -222,10 +231,71 @@ impl FluorApp for PanesDemo {
                 EventResponse::Pass
             }
             WindowEvent::KeyboardInput { event: kev, .. } => {
-                if kev.state != ElementState::Pressed { return EventResponse::Pass; }
-                if !self.textbox.focused { return EventResponse::Pass; }
                 let shift = ctx.modifiers.shift_key();
                 let ctrl = ctx.modifiers.super_key() || ctx.modifiers.control_key();
+
+                // --- Debug chord: Ctrl/Cmd + Shift + D held, then action key.
+                // Track D held state event-driven. D press with modifiers enters chord (swallowed
+                // as not-text); D release clears state. Other keys pressed while D is held with
+                // modifiers fire the matching action. No timer, no arming.
+                if let Key::Character(c) = &kev.logical_key {
+                    if c == "d" || c == "D" {
+                        if kev.state == ElementState::Pressed && ctrl && shift {
+                            self.d_chord_held = true;
+                            return EventResponse::Handled;
+                        }
+                        if kev.state == ElementState::Released && self.d_chord_held {
+                            self.d_chord_held = false;
+                            return EventResponse::Handled;
+                        }
+                    }
+                }
+                if self.d_chord_held && ctrl && shift && kev.state == ElementState::Pressed {
+                    if let Key::Character(c) = &kev.logical_key {
+                        let mut acted = true;
+                        if c == "h" || c == "H" {
+                            self.show_hitmask = !self.show_hitmask;
+                            if self.show_hitmask {
+                                // Fill the 256-entry colour table with distinct random RGBs each
+                                // toggle. xorshift32 seeded from process nanos — debug-quality, no
+                                // crypto needed. Each call to toggle = fresh palette.
+                                let seed = (std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.subsec_nanos())
+                                    .unwrap_or(1)) | 1;
+                                let mut s = seed;
+                                self.debug_hit_colours.clear();
+                                self.debug_hit_colours.reserve(256);
+                                for _ in 0..256 {
+                                    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+                                    let r = (s >> 16) & 0xFF;
+                                    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+                                    let g = (s >> 16) & 0xFF;
+                                    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+                                    let b = (s >> 16) & 0xFF;
+                                    self.debug_hit_colours.push(0xFF_00_00_00 | (r << 16) | (g << 8) | b);
+                                }
+                            }
+                        } else if c == "p" || c == "P" {
+                            let cur = paint::DEBUG_SKIP_PREMULT.load(std::sync::atomic::Ordering::Relaxed);
+                            paint::DEBUG_SKIP_PREMULT.store(!cur, std::sync::atomic::Ordering::Relaxed);
+                        } else if c == "r" || c == "R" {
+                            self.chrome.group.invalidate();
+                            self.textbox_group.invalidate();
+                            self.cursor_group.invalidate();
+                            self.rotation_group.invalidate();
+                        } else {
+                            acted = false;
+                        }
+                        if acted {
+                            ctx.window.request_redraw();
+                            return EventResponse::Handled;
+                        }
+                    }
+                }
+
+                if kev.state != ElementState::Pressed { return EventResponse::Pass; }
+                if !self.textbox.focused { return EventResponse::Pass; }
                 let mut changed = false;
                 match &kev.logical_key {
                     Key::Named(NamedKey::Backspace) => { self.textbox.backspace(ctx.text); changed = true; }
@@ -369,6 +439,18 @@ impl FluorApp for PanesDemo {
             self.textbox.render_blinkey_into(buf, cw, ch, cbox.x, cbox.y);
         }
         self.cursor_group.flatten_into(target, buf_w, buf_h);
+
+        // Debug overlay (photon-style): for every pixel, look up the hit_test_map's ID and paint
+        // its opaque random colour from `debug_hit_colours`. Fully replaces the underlying image —
+        // distinct hit zones are visually unmistakable. Drawn last over everything (including
+        // textbox + cursor) since hit testing is per-final-pixel anyway.
+        if self.show_hitmask && !self.debug_hit_colours.is_empty() {
+            let map = &self.chrome.hit_test_map;
+            let n = map.len().min(target.len());
+            for i in 0..n {
+                target[i] = self.debug_hit_colours[map[i] as usize];
+            }
+        }
     }
 
     fn cursor_for(&self, x: Coord, y: Coord, ctx: &Context) -> CursorIcon {
