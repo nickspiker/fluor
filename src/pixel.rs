@@ -2,11 +2,15 @@
 //!
 //! # Convention — locked
 //!
-//! **Internal pixel format**: `0xAARRGGBB` packed in a `u32`. Little-endian byte layout `[B, G, R, A]` ≡ `Bgra8Unorm`. Every paint primitive, every layer buffer, every Group composite uses this. No exceptions, no host conversion needed at present time.
+//! **Internal pixel format**: `0xttRRGGBB` packed in a `u32` — top byte is **transparency**, not alpha. LE byte layout `[B, G, R, t]`. Every paint primitive, every layer buffer, every Group composite uses this. The type is still named `Argb8` for stability across the codebase; the byte layout hasn't changed, only the top byte's interpretation.
 //!
-//! **Alpha semantics: STRAIGHT (non-premultiplied).** RGB stores the intrinsic color you'd see if the pixel were fully opaque; α is opacity. AA edges keep their straight RGB (a half-opacity red pixel is `(α=128, R=255, G=0, B=0)`, not `(α=128, R=128, G=0, B=0)`).
+//! **Transparency semantics**: `t = 0` = fully opaque, `t = 255` = (almost) fully transparent. Variables in code are named `t` / `transparency` — never `alpha` or `a` — so the convention is unambiguous at every read site. RGB channels store the straight (non-premultiplied) intrinsic color.
 //!
-//! **Chained composites stay correct via binary clipping masks, not via premultiplication.** When two layers can both contribute to a pixel (glow + content at the pill's AA edge), the design enforces mutual exclusivity with a binary silhouette layer multiplied via `Op::Mul` — one layer goes to `α=0` where the other has any coverage. With at most one contributor per pixel, `alpha_over` with the `dst_α=0 → return src` shortcut keeps RGB straight through every step.
+//! **Why t-convention** (mirroring the README): the hot-loop early-out fires precisely when a fully-opaque layer is hit, because `remaining = (remaining * t) >> 8 = 0` exactly when `t = 0`. Single u32 compare against an immediate detects opacity classes without any shift or mask: `if pixel <= 0x00FFFFFF` is "this pixel is fully opaque" in one CMP. Sort order primary-sorts by transparency for free.
+//!
+//! **The 256-vs-255 gap**: fully-transparent layers never enter the blend pass — they're culled at the caller level (you don't draw an invisible layer). Per-pixel `t = 255` within a partial-transparency layer contributes exact 0 to RGB (because `255 - 255 = 0`) and attenuates `remaining` by `255/256`; the 1-LSB drift is invisible at expected stacking depths. We never need to represent `t = 256` and the missing slot is a happy coincidence.
+//!
+//! **Boundary**: paint primitives write `t` directly. The host present pass flips `t → α` (XOR top byte with `0xFF`) right before submitting to wgpu / softbuffer — folded into the existing `premultiply_buffer` step on Linux. External inputs (cosmic-text glyph coverage, `pack_argb`) flip once at the import boundary, never per-frame.
 //!
 //! `#[repr(transparent)]` guarantees `Argb8` has the same layout as `u32`, so `&[Argb8]` and `&[u32]` are safely transmutable for zero-cost interop with paint primitives and GPU upload.
 
@@ -78,29 +82,27 @@ impl Argb8 {
         Argb8(0xFFFF_FFFF - a.0)
     }
 
-    /// Per-channel XOR across all four channels (uniform with `add` / `sub` / `mul` / `div` / `inv`). For "invert RGB but preserve destination alpha" semantics — the selection-highlight idiom — use `BlendMode::Xor` (kernel-level) which handles the alpha preservation; or XOR explicitly against `0x00FFFFFF`.
+    /// Per-channel XOR across all four channels (uniform with `add` / `sub` / `mul` / `div` / `inv`). For "invert RGB but preserve destination transparency" semantics — the selection-highlight idiom — use `BlendMode::Xor` (kernel-level) which handles the t-channel preservation; or XOR explicitly against `0x00FFFFFF`.
     #[inline]
     pub fn xor(a: Argb8, b: Argb8) -> Argb8 {
         Argb8(a.0 ^ b.0)
     }
 
-    /// Porter-Duff source-over for STRAIGHT alpha (per the module convention).
+    /// Porter-Duff source-over under fluor's t-convention (top byte = transparency).
     ///
-    /// Three shortcuts handle the cases where the result is exactly representable in straight form, no math needed:
-    /// - `src_α == 0` (src fully transparent): return `dst` exactly. Handled implicitly via the `bg * 256 + 0 = bg` SWAR math.
-    /// - `src_α == 255` (src fully opaque): return `src` exactly — src covers dst entirely.
-    /// - `dst_α == 0` (dst fully transparent): return `src` exactly. Without this shortcut, the SWAR math would produce premult RGB (`src_rgb · src_α / 256`); with it, straight stays straight when src lands on transparent dst.
+    /// Formulas:
+    /// - `result_rgb = (src_rgb · (256 − src_t) + dst_rgb · src_t) >> 8`. Linear blend; src dominates as `src_t → 0`, dst dominates as `src_t → 255`. The `(256 − src_t)` multiplier sums with `src_t` to exactly 256, making the `>> 8` normalization exact at `src_t = 0` (full src) — same trick the α-convention version used.
+    /// - `result_t = (src_t · dst_t) >> 8`. Result is opaque (`t = 0`) iff either input is opaque, which is the right "src over dst" semantic.
     ///
-    /// Middle path (both layers partially transparent): RGB via SWAR `dst · (1 − src_α) + src · src_α`. α via correct Porter-Duff `src_α + dst_α · (1 − src_α)`. The middle case only arises when the design fails to enforce mutual exclusivity via clipping masks — for those rare pixels, the result is approximately straight with ≤1 LSB error.
+    /// Single shortcut: `src_t == 0` (opaque src) → return src exactly. The transparent endpoint `src_t = 255` has no shortcut — it's just a normal value that the SWAR math handles with the standard 1-LSB drift (`dst * 255 / 256 ≈ dst`).
     #[inline]
     pub fn alpha_over(dst: Argb8, src: Argb8) -> Argb8 {
-        let src_alpha = ((src.0 >> 24) & 0xFF) as u64;
-        if src_alpha == 255 { return src; }
-        let dst_alpha = ((dst.0 >> 24) & 0xFF) as u64;
-        if dst_alpha == 0 { return src; }
-        let inv = 256 - src_alpha;
+        let src_t = ((src.0 >> 24) & 0xFF) as u64;
+        if src_t == 0 { return src; }                       // opaque src covers dst entirely
+        let dst_t = ((dst.0 >> 24) & 0xFF) as u64;
+        let inv_src_t = 256 - src_t;
 
-        // SWAR for the 3 RGB slots; α slot patched below.
+        // SWAR for the 3 RGB slots; t slot patched below.
         let mut bg = dst.0 as u64;
         bg = (bg | (bg << 16)) & 0x0000_FFFF_0000_FFFF;
         bg = (bg | (bg << 8)) & 0x00FF_00FF_00FF_00FF;
@@ -109,15 +111,16 @@ impl Argb8 {
         fg = (fg | (fg << 16)) & 0x0000_FFFF_0000_FFFF;
         fg = (fg | (fg << 8)) & 0x00FF_00FF_00FF_00FF;
 
-        let mut r = bg * inv + fg * src_alpha;
+        // fg · (256-src_t) + bg · src_t — slot max = 255*256 = 65280, fits in 16 bits per slot.
+        let mut r = fg * inv_src_t + bg * src_t;
         r = (r >> 8) & 0x00FF_00FF_00FF_00FF;
         r = (r | (r >> 8)) & 0x0000_FFFF_0000_FFFF;
         r = r | (r >> 16);
         let rgb_only = (r as u32) & 0x00FF_FFFF;
 
-        // Correct Porter-Duff over alpha — preserves opaque dst across all src_α.
-        let result_alpha = (src_alpha + ((dst_alpha * inv) >> 8)).min(255) as u32;
-        Argb8(rgb_only | (result_alpha << 24))
+        // t slot: (src_t · dst_t) >> 8 — separately, because the SWAR formula above produces a different value in the t-slot than we want.
+        let result_t = ((src_t * dst_t) >> 8) as u32;
+        Argb8(rgb_only | (result_t << 24))
     }
 
     /// Screen: `MAX - (MAX - a) * (MAX - b) >> 8` per channel.
@@ -195,46 +198,50 @@ mod tests {
     }
 
     #[test]
-    fn alpha_over_opaque_within_one_lsb_of_src() {
-        // α = 255 gives `0.996·src + 0.004·dst` under >>8 — each channel within 1 LSB of src.
-        let dst = Argb8(0xFF_11_22_33);
-        let src = Argb8(0xFF_AA_BB_CC);
-        let result = Argb8::alpha_over(dst, src);
-        for shift in [24, 16, 8, 0] {
-            let s = ((src.0 >> shift) & 0xFF) as i32;
-            let r = ((result.0 >> shift) & 0xFF) as i32;
-            assert!((s - r).abs() <= 1, "channel at shift {} > 1 LSB off: src={:#x} got={:#x}", shift, s, r);
-        }
-    }
-
-    #[test]
-    fn alpha_over_transparent_preserves_dst_exact() {
-        // src_α = 0 → return dst exactly via the inv=256 SWAR math.
-        let dst = Argb8(0xFF_11_22_33);
+    fn alpha_over_opaque_src_returns_src_exact() {
+        // src_t = 0 (opaque) → shortcut returns src exactly. No SWAR math runs.
+        let dst = Argb8(0x00_11_22_33);
         let src = Argb8(0x00_AA_BB_CC);
-        assert_eq!(Argb8::alpha_over(dst, src), dst);
-    }
-
-    #[test]
-    fn alpha_over_transparent_dst_returns_src() {
-        // dst_α = 0 → return src exactly (the shortcut that keeps straight RGB straight at
-        // pill AA pixels where the clipping mask has zeroed glow's α).
-        let dst = Argb8(0x00_00_00_00);
-        let src = Argb8(0x80_FF_00_00);  // 50% opacity red, straight RGB
         assert_eq!(Argb8::alpha_over(dst, src), src);
     }
 
     #[test]
-    fn alpha_over_opaque_dst_stays_opaque() {
-        // Opaque dst stays opaque (≥254 under >>8) for ANY src_α. The halo doesn't punch a
-        // transparency hole through the chrome.
-        let dst = Argb8(0xFF_11_22_33);
-        for src_alpha in [0u32, 1, 50, 100, 128, 200, 254, 255] {
-            let src = Argb8((src_alpha << 24) | 0x00_AA_BB_CC);
-            let result = Argb8::alpha_over(dst, src);
-            let result_alpha = (result.0 >> 24) & 0xFF;
-            assert!(result_alpha >= 254, "src_α={src_alpha} dropped dst_α to {result_alpha}");
+    fn alpha_over_almost_transparent_src_within_one_lsb_of_dst() {
+        // src_t = 255 (almost transparent) → src contributes 0 to RGB exactly (since 256-255=1
+        // gives 1-LSB src contribution), so result ≈ dst with ≤ 1 LSB per-channel drift.
+        let dst = Argb8(0x00_11_22_33);
+        let src = Argb8(0xFF_AA_BB_CC);
+        let result = Argb8::alpha_over(dst, src);
+        for shift in [24u32, 16, 8, 0] {
+            let d = ((dst.0 >> shift) & 0xFF) as i32;
+            let r = ((result.0 >> shift) & 0xFF) as i32;
+            assert!((d - r).abs() <= 1, "channel at shift {shift} > 1 LSB off: dst={:#x} got={:#x}", d, r);
         }
+    }
+
+    #[test]
+    fn alpha_over_opaque_dst_stays_opaque_exact() {
+        // dst_t = 0 (opaque) → result_t = (src_t · 0) >> 8 = 0 exactly. EXACT, no drift, for any
+        // src_t. The chrome can never lose its opacity under a transparent overlay.
+        let dst = Argb8(0x00_11_22_33);
+        for src_t in [0u32, 1, 50, 100, 128, 200, 254, 255] {
+            let src = Argb8((src_t << 24) | 0x00_AA_BB_CC);
+            let result = Argb8::alpha_over(dst, src);
+            let result_t = (result.0 >> 24) & 0xFF;
+            assert_eq!(result_t, 0, "src_t={src_t} produced result_t={result_t}");
+        }
+    }
+
+    #[test]
+    fn alpha_over_combined_transparency() {
+        // result_t = (src_t · dst_t) >> 8. Two half-transparent layers stacked = ~25% opacity
+        // (transparent · transparent → more transparent).
+        let dst = Argb8(0x80_00_00_00);
+        let src = Argb8(0x80_00_00_00);
+        let result = Argb8::alpha_over(dst, src);
+        let result_t = (result.0 >> 24) & 0xFF;
+        // 0x80 * 0x80 >> 8 = 0x40
+        assert_eq!(result_t, 0x40, "expected result_t=0x40, got {:#x}", result_t);
     }
 
     #[test]
