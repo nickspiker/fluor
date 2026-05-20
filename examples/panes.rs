@@ -151,7 +151,6 @@ impl FluorApp for PanesDemo {
                     }
                     self.textbox.cursor = self.textbox.cursor_index_from_x(clamped_x);
                     self.textbox_group.invalidate();
-                    self.cursor_group.invalidate();
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
                 }
@@ -205,7 +204,6 @@ impl FluorApp for PanesDemo {
                     self.is_dragging_select = true;
                     self.selection_scroll_time = None;
                     self.textbox_group.invalidate();
-                    self.cursor_group.invalidate();
                     self.blink.start(Instant::now());
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
@@ -213,7 +211,6 @@ impl FluorApp for PanesDemo {
                     self.blink.stop();
                     self.is_dragging_select = false;
                     self.textbox_group.invalidate();
-                    self.cursor_group.invalidate();
                     ctx.window.request_redraw();
                 }
                 EventResponse::StartWindowDrag
@@ -357,7 +354,6 @@ impl FluorApp for PanesDemo {
                 }
                 if changed {
                     self.textbox_group.invalidate();
-                    self.cursor_group.invalidate();
                     self.blink.start(Instant::now());
                     ctx.window.request_redraw();
                 }
@@ -431,14 +427,16 @@ impl FluorApp for PanesDemo {
         }
         self.textbox_group.flatten_into(target, buf_w, buf_h);
 
-        // Cursor group.
-        if self.cursor_group.rpn.layers[0].dirty {
-            let (cw, ch) = self.cursor_group.dims();
-            let cbox = self.textbox.cursor_bbox();
-            let buf = &mut self.cursor_group.rpn.layers[0].pixels;
-            buf.fill(0xFF000000);  // t-convention: transparent init.
-            self.textbox.render_blinkey_into(buf, cw, ch, cbox.x, cbox.y);
-        }
+        // Cursor group — always re-render every frame. The buffer is ~500 pixels (16 × font_size),
+        // so the dirty-gate overhead would dwarf the render. Transparency map drives compositing
+        // per-pixel: when blinkey_visible is false, render_blinkey_into is a no-op and the
+        // transparent-init buffer flattens as zero contribution via the per-pixel shortcut.
+        let (cw, ch) = self.cursor_group.dims();
+        let cbox = self.textbox.cursor_bbox();
+        let buf = &mut self.cursor_group.rpn.layers[0].pixels;
+        buf.fill(0xFF000000);
+        self.textbox.render_blinkey_into(buf, cw, ch, cbox.x, cbox.y);
+        self.cursor_group.rpn.layers[0].dirty = true;  // force StackCompositor::evaluate to re-snapshot
         self.cursor_group.flatten_into(target, buf_w, buf_h);
 
         // Debug overlay (photon-style): for every pixel, look up the hit_test_map's ID and paint
@@ -497,17 +495,16 @@ impl FluorApp for PanesDemo {
                 let clamped_x = ctx.cursor_x.clamp(tl, tr);
                 self.textbox.cursor = self.textbox.cursor_index_from_x(clamped_x);
                 self.textbox_group.invalidate();
-                self.cursor_group.invalidate();
                 needs_redraw = true;
             } else {
                 self.selection_scroll_time = None;
             }
         }
 
-        // Blink timer.
+        // Blink timer. State flip needs a frame so the cursor's new transparency reaches the
+        // present buffer; the cursor itself re-renders unconditionally in `render()`.
         if self.blink.poll(Instant::now()) {
             if self.textbox.flip_blinkey() {
-                self.cursor_group.invalidate();
                 needs_redraw = true;
             }
         }
