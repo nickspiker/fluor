@@ -88,7 +88,10 @@ impl DefaultChrome {
         let (w, h) = self.dims();
         let layer = &mut self.group.rpn.layers[self.layer_bg];
         if !layer.dirty { return; }
-        layer.pixels.fill(0);
+        // t-convention: transparent init so any pixels the closure doesn't paint don't end up
+        // as opaque black (t=0). The closure is expected to fully cover the bg, but defaulting
+        // to transparent is the safe failure mode.
+        layer.pixels.fill(0xFF000000);
         paint(&mut layer.pixels, w, h);
     }
 
@@ -107,7 +110,10 @@ impl DefaultChrome {
 
         // Stage 1: paint chrome strip + capture `start` / `crossings` from the controls pass.
         let chrome_buf = &mut self.group.rpn.layers[self.layer_chrome].pixels;
-        chrome_buf.fill(0);
+        // t-convention: transparent init. Untouched chrome pixels stay transparent so the bg
+        // beneath shows through via AlphaOver (instead of being overwritten with opaque black,
+        // which was what fill(0) did under the old α-convention's "transparent = 0" mapping).
+        chrome_buf.fill(0xFF000000);
         let (start, crossings, button_x_start, button_height) = chrome::draw_window_controls(
             chrome_buf, &mut self.hit_test_map, vp_w, vp_h, 1.0,
         );
