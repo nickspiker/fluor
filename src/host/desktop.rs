@@ -342,6 +342,13 @@ impl DesktopApp {
             if let Some(g) = self.chrome_group.as_mut() { g.flatten_into(&mut buffer, buf_w, buf_h); }
             if let Some(g) = self.textbox_group.as_mut() { g.flatten_into(&mut buffer, buf_w, buf_h); }
             if let Some(g) = self.cursor_group.as_mut() { g.flatten_into(&mut buffer, buf_w, buf_h); }
+            // Linux X11/Wayland compositors blend transparent windows using premultiplied alpha.
+            // Convert here at the boundary, never inside the compositor. Debug chord `Ctrl+Shift+D+P`
+            // toggles this off at runtime for A/B comparison via `paint::DEBUG_SKIP_PREMULT`.
+            #[cfg(target_os = "linux")]
+            if !paint::DEBUG_SKIP_PREMULT.load(std::sync::atomic::Ordering::Relaxed) {
+                paint::premultiply_buffer(&mut buffer);
+            }
             buffer.present().expect("softbuffer buffer.present");
         }
     }
