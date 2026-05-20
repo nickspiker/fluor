@@ -364,12 +364,25 @@ fn flatten_alpha_over(dst: &mut [u32], src: &[u32]) {
 }
 
 fn flatten_add(dst: &mut [u32], src: &[u32]) {
-    // t-convention: fully-transparent src is 0xFF000000 (t=255, RGB=0). Skip those — Add of "no
-    // contribution" must not touch dst. Other pixels: per-channel wrapping add (caller knows the
-    // semantics; typically used for additive overlays where contributions stay within byte range).
+    // Per-byte saturating add for RGB only; dst's t-byte is preserved unchanged. "Additive light"
+    // semantic — the source contributes brightness to the destination without changing its
+    // opacity. Skipping fully-transparent src (`0xFF000000`) is the fast path; for everything
+    // else, explicit per-channel add prevents RGB carries from leaking into the t-byte
+    // (`wrapping_add` on the whole u32 lets a saturated R overflow into t and eat the opacity).
     for i in 0..dst.len() {
-        if src[i] == 0xFF000000 { continue; }
-        dst[i] = dst[i].wrapping_add(src[i]);
+        let s = src[i];
+        if s == 0xFF000000 { continue; }
+        let d = dst[i];
+        let dr = (d >> 16) & 0xFF;
+        let dg = (d >>  8) & 0xFF;
+        let db =  d        & 0xFF;
+        let sr = (s >> 16) & 0xFF;
+        let sg = (s >>  8) & 0xFF;
+        let sb =  s        & 0xFF;
+        let nr = (dr + sr).min(0xFF);
+        let ng = (dg + sg).min(0xFF);
+        let nb = (db + sb).min(0xFF);
+        dst[i] = (d & 0xFF000000) | (nr << 16) | (ng << 8) | nb;
     }
 }
 
