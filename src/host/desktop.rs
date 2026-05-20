@@ -318,14 +318,12 @@ impl DesktopApp {
         }
 
         // --- Flatten groups onto the present buffer ---
-        // Pixel-convention boundary. Internal pixels are STRAIGHT-alpha `0xAARRGGBB` u32.
-        // Conversion to platform-native layout lives HERE (and only here):
-        //   - PREMULTIPLY (`RGB · α/255`) for backends with PreMultiplied alpha mode.
-        //   - R↔B SWAP for backends expecting Rgba8Unorm instead of Bgra8Unorm.
-        //   - Both conditional per `cfg(target_os = …)` / per backend choice.
-        // Current backends need neither: macOS wgpu = Bgra8Unorm + PostMultiplied (LE bytes match,
-        // compositor multiplies α at present); softbuffer = same LE layout, α typically ignored.
-        // Both: direct memcpy.
+        // Pixel-convention boundary. Internal pixels are t-convention `0xttRRGGBB` u32 (t=0
+        // opaque, t=255 transparent). Convert to α-convention here — and ONLY here:
+        //   1. `flip_t_to_alpha` always — every host wants α in the top byte (α = 255 - t).
+        //   2. `premultiply_buffer` on Linux only — KWin/Mutter blend with premultiplied α.
+        //      Toggleable at runtime via Ctrl+Shift+D+P for A/B testing.
+        // macOS wgpu PostMultiplied + softbuffer α-byte → both want straight-α; flip is enough.
         #[cfg(target_os = "macos")]
         {
             let Some(renderer) = self.renderer.as_mut() else { return; };
@@ -333,6 +331,7 @@ impl DesktopApp {
             if let Some(g) = self.chrome_group.as_mut() { g.flatten_into(&mut buffer, buf_w, buf_h); }
             if let Some(g) = self.textbox_group.as_mut() { g.flatten_into(&mut buffer, buf_w, buf_h); }
             if let Some(g) = self.cursor_group.as_mut() { g.flatten_into(&mut buffer, buf_w, buf_h); }
+            paint::flip_t_to_alpha(&mut buffer);
             let _ = buffer.present();
         }
         #[cfg(not(target_os = "macos"))]
@@ -342,9 +341,7 @@ impl DesktopApp {
             if let Some(g) = self.chrome_group.as_mut() { g.flatten_into(&mut buffer, buf_w, buf_h); }
             if let Some(g) = self.textbox_group.as_mut() { g.flatten_into(&mut buffer, buf_w, buf_h); }
             if let Some(g) = self.cursor_group.as_mut() { g.flatten_into(&mut buffer, buf_w, buf_h); }
-            // Linux X11/Wayland compositors blend transparent windows using premultiplied alpha.
-            // Convert here at the boundary, never inside the compositor. Debug chord `Ctrl+Shift+D+P`
-            // toggles this off at runtime for A/B comparison via `paint::DEBUG_SKIP_PREMULT`.
+            paint::flip_t_to_alpha(&mut buffer);
             #[cfg(target_os = "linux")]
             if !paint::DEBUG_SKIP_PREMULT.load(std::sync::atomic::Ordering::Relaxed) {
                 paint::premultiply_buffer(&mut buffer);
