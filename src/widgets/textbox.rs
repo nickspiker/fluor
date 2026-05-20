@@ -418,7 +418,7 @@ impl Textbox {
         let blinkey_y = ((self.center_y - self.font_size * 0.5) - offset_y) as usize;
         let blinkey_h = self.font_size as usize;
         if blinkey_x >= 7 && blinkey_x + 7 < buf_w && blinkey_y + blinkey_h <= buf_h {
-            paint::draw_blinkey(pixels, buf_w, blinkey_x, blinkey_y, blinkey_h, self.blinkey_wave_top, true);
+            paint::draw_blinkey(pixels, buf_w, blinkey_x, blinkey_y, blinkey_h, self.blinkey_wave_top);
         }
     }
 }

@@ -277,6 +277,9 @@ impl FluorApp for PanesDemo {
                         } else if c == "p" || c == "P" {
                             let cur = paint::DEBUG_SKIP_PREMULT.load(std::sync::atomic::Ordering::Relaxed);
                             paint::DEBUG_SKIP_PREMULT.store(!cur, std::sync::atomic::Ordering::Relaxed);
+                        } else if c == "m" || c == "M" {
+                            let cur = paint::DEBUG_SKIP_FLIP.load(std::sync::atomic::Ordering::Relaxed);
+                            paint::DEBUG_SKIP_FLIP.store(!cur, std::sync::atomic::Ordering::Relaxed);
                         } else if c == "r" || c == "R" {
                             self.chrome.group.invalidate();
                             self.textbox_group.invalidate();

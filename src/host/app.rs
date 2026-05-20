@@ -158,12 +158,13 @@ impl<A: FluorApp> DesktopShell<A> {
         //   1. `flip_t_to_alpha` always (XOR top byte; α = 255 − t).
         //   2. `premultiply_buffer` on Linux only (KWin/Mutter want premultiplied α).
         //      Toggleable at runtime via Ctrl+Shift+D+P for A/B testing.
+        let skip_flip = crate::paint::DEBUG_SKIP_FLIP.load(std::sync::atomic::Ordering::Relaxed);
         #[cfg(target_os = "macos")]
         {
             let Some(renderer) = self.renderer.as_mut() else { return; };
             let mut buffer = renderer.lock_buffer();
             self.app.render(&mut buffer, &mut ctx);
-            crate::paint::flip_t_to_alpha(&mut buffer);
+            if !skip_flip { crate::paint::flip_t_to_alpha(&mut buffer); }
             let _ = buffer.present();
         }
         #[cfg(not(target_os = "macos"))]
@@ -171,7 +172,7 @@ impl<A: FluorApp> DesktopShell<A> {
             let Some(surface) = self.surface.as_mut() else { return; };
             let mut buffer = surface.buffer_mut().expect("softbuffer buffer_mut");
             self.app.render(&mut buffer, &mut ctx);
-            crate::paint::flip_t_to_alpha(&mut buffer);
+            if !skip_flip { crate::paint::flip_t_to_alpha(&mut buffer); }
             #[cfg(target_os = "linux")]
             if !crate::paint::DEBUG_SKIP_PREMULT.load(std::sync::atomic::Ordering::Relaxed) {
                 crate::paint::premultiply_buffer(&mut buffer);
