@@ -679,8 +679,11 @@ fn background_row(
     }
 }
 
-/// Debug toggle that lets the chord `Ctrl/Cmd+Shift+D+P` skip the boundary premultiply at runtime — A/B the Linux fix without recompiling. Stays `false` by default.
+/// Debug toggle that lets the chord `Ctrl/Cmd+Shift+D+P` skip the boundary premultiply at runtime — A/B the Linux premult fix without recompiling. Stays `false` by default.
 pub static DEBUG_SKIP_PREMULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Debug toggle that lets the chord `Ctrl/Cmd+Shift+D+M` skip the boundary t→α flip at runtime — when set, internal t-convention pixels go to the OS unchanged. With `M` ON you see the raw t buffer as the OS interprets it (opaque areas appear transparent and vice versa) — useful for confirming what the compositor is actually getting. Stays `false` by default.
+pub static DEBUG_SKIP_FLIP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Flip every pixel's top byte from internal t-convention to host-facing α-convention. `α = 255 − t`, equivalently `top_byte ^= 0xFF` (since u8 XOR with 0xFF inverts). Boundary step needed on every host — wgpu PostMultiplied and softbuffer both want α-convention. ALWAYS called at the present boundary, never inside paint primitives or Group composites.
 #[inline]
@@ -1512,7 +1515,6 @@ pub fn draw_blinkey(
     by: usize,
     height: usize,
     top_bright: bool,
-    add: bool,
 ) {
     let half = height / 2;
     for y in by..by + height {
@@ -1526,11 +1528,7 @@ pub fn draw_blinkey(
         let w = wave as u32;
         for dx in -7i32..=7 {
             let pixel = 0x00010101u32 * (w >> dx.unsigned_abs());
-            if add {
-                pixels[(idx as isize + dx as isize) as usize] += pixel;
-            } else {
-                pixels[(idx as isize + dx as isize) as usize] -= pixel;
-            }
+            pixels[(idx as isize + dx as isize) as usize] += pixel;
         }
     }
 }
