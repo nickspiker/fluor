@@ -537,9 +537,9 @@ pub fn draw_window_edges_and_mask(
     }
 }
 
-/// Rasterize the window-silhouette mask: `0xFF_FF_FF_FF` inside the squircle (window interior + chrome strip), `0x00_00_00_00` outside (the four corner cutouts). Used as a layer in [`super::chrome_widget::DefaultChrome`]'s Stack program — `Push bg, Push silhouette, Mul, …` knocks out the bg's pixels at the corners so the final composite has alpha=0 there (transparent on macOS PostMultiplied; compositor-honored on Linux).
+/// Rasterize the window-silhouette mask under fluor's t-convention. Interior of the squircle = `0x00_00_00_00` (t=0 = no-op for OR — preserves bg). Four corner cutouts + AA pixels = `0xFF_00_00_00` (t=255 = transparent — OR forces the bg's t to 255 at those pixels). RGB=0 throughout so the OR doesn't touch bg's RGB.
 ///
-/// Same zeroing pattern as [`draw_window_edges_and_mask`] (corner squares + per-crossing fill + outer-AA pixel) — the silhouette is binary, so the AA edge counts as "outside" and the chrome layer's own perimeter pixels handle the visible squircle curve via AlphaOver.
+/// Used in [`super::chrome_widget::DefaultChrome`]'s Stack program — `Push bg, Push silhouette, Or, …` makes the bg's corners transparent. AA edge counts as "outside" (cutout); the chrome layer's own perimeter pixels handle the visible squircle curve via AlphaOver.
 pub fn rasterize_window_silhouette(
     silhouette: &mut [u32],
     width: u32,
@@ -547,30 +547,31 @@ pub fn rasterize_window_silhouette(
     start: usize,
     crossings: &[(u16, u8, u8)],
 ) {
-    // Default everything to opaque-white (binary "keep"). Buffers come in zeroed from `Group::resize`; the fill makes the function self-contained.
-    silhouette.fill(0xFF_FF_FF_FF);
+    // Default everything to "inside" = OR-identity (no bits set).
+    silhouette.fill(0);
 
     if width < 2 || height < 2 { return; }
     if start * 2 >= width as usize || start * 2 >= height as usize { return; }
 
     let w = width as usize;
     let h = height as usize;
+    const CUTOUT: u32 = 0xFF_00_00_00; // t=255 in top byte, RGB=0 (OR no-op for RGB).
 
     // Four corner squares (size `start × start`) — outside the squircle.
     for row in 0..start {
         for col in 0..start {
-            silhouette[row * w + col] = 0;
+            silhouette[row * w + col] = CUTOUT;
         }
         for col in (w - start)..w {
-            silhouette[row * w + col] = 0;
+            silhouette[row * w + col] = CUTOUT;
         }
     }
     for row in (h - start)..h {
         for col in 0..start {
-            silhouette[row * w + col] = 0;
+            silhouette[row * w + col] = CUTOUT;
         }
         for col in (w - start)..w {
-            silhouette[row * w + col] = 0;
+            silhouette[row * w + col] = CUTOUT;
         }
     }
 
@@ -578,14 +579,12 @@ pub fn rasterize_window_silhouette(
     let mut y_top = start;
     for &(inset, _l, _h) in crossings {
         let row_base = y_top * w;
-        // Left side: cols [0, inset] outside (including outer AA pixel).
         for col in 0..=(inset as usize).min(w - 1) {
-            silhouette[row_base + col] = 0;
+            silhouette[row_base + col] = CUTOUT;
         }
-        // Right side: cols [w - 1 - inset, w-1] outside.
         let right_start = w.saturating_sub(inset as usize + 1);
         for col in right_start..w {
-            silhouette[row_base + col] = 0;
+            silhouette[row_base + col] = CUTOUT;
         }
         y_top += 1;
     }
@@ -595,27 +594,25 @@ pub fn rasterize_window_silhouette(
     for &(inset, _l, _h) in crossings {
         let row_base = y_bottom * w;
         for col in 0..=(inset as usize).min(w - 1) {
-            silhouette[row_base + col] = 0;
+            silhouette[row_base + col] = CUTOUT;
         }
         let right_start = w.saturating_sub(inset as usize + 1);
         for col in right_start..w {
-            silhouette[row_base + col] = 0;
+            silhouette[row_base + col] = CUTOUT;
         }
         if y_bottom == 0 { break; }
         y_bottom -= 1;
     }
 
-    // Left/right squircle columns (the curve seen from the side — symmetric set).
+    // Left/right squircle columns.
     let mut x_left = start;
     for &(inset, _l, _h) in crossings {
-        // Top: rows [0, inset] in this column → outside.
         for row in 0..=(inset as usize).min(h - 1) {
-            silhouette[row * w + x_left] = 0;
+            silhouette[row * w + x_left] = CUTOUT;
         }
-        // Bottom: rows [h - 1 - inset, h - 1] → outside.
         let bottom_start = h.saturating_sub(inset as usize + 1);
         for row in bottom_start..h {
-            silhouette[row * w + x_left] = 0;
+            silhouette[row * w + x_left] = CUTOUT;
         }
         x_left += 1;
     }
@@ -623,11 +620,11 @@ pub fn rasterize_window_silhouette(
     let mut x_right = w - start - 1;
     for &(inset, _l, _h) in crossings {
         for row in 0..=(inset as usize).min(h - 1) {
-            silhouette[row * w + x_right] = 0;
+            silhouette[row * w + x_right] = CUTOUT;
         }
         let bottom_start = h.saturating_sub(inset as usize + 1);
         for row in bottom_start..h {
-            silhouette[row * w + x_right] = 0;
+            silhouette[row * w + x_right] = CUTOUT;
         }
         if x_right == 0 { break; }
         x_right -= 1;

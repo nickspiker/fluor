@@ -32,6 +32,8 @@ pub enum Op {
     Screen,
     /// Per-channel XOR across all four channels (its own inverse: `a ^ b ^ b = a`).
     Xor,
+    /// Per-channel bitwise OR. Under t-convention, OR with a "binary silhouette" pixel knocks the result's t-byte up to the silhouette's value (255 at corner cutouts, 0 inside the shape) without disturbing RGB when the silhouette's RGB is 0 — used by chrome to mark corner pixels as transparent.
+    Or,
 
     // --- Unary (pop 1, push 1) ---
     /// Per-channel invert: `255 - x`.
@@ -194,6 +196,7 @@ impl StackCompositor {
                 Op::AlphaOver => self.binary_op(Argb8::alpha_over),
                 Op::Screen => self.binary_op(Argb8::screen),
                 Op::Xor => self.binary_op(Argb8::xor),
+                Op::Or => self.binary_op(Argb8::or),
                 Op::Inv => self.unary_op(Argb8::inv),
             }
 

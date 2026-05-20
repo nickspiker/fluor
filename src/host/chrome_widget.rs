@@ -39,7 +39,7 @@ pub struct DefaultChrome {
 impl DefaultChrome {
     /// Allocate the chrome group + hit_test_map sized to `viewport`. Four layers (bg, silhouette, chrome, hover) all start dirty so the first frame paints from scratch.
     ///
-    /// Stack program: `Push bg, Push silhouette, Mul, Push chrome, AlphaOver, Push hover, Add`. The `Mul` step zeros the bg at the four squircle corner cutouts so the final composite has alpha=0 there (transparent on macOS PostMultiplied; compositor-honored on Linux).
+    /// Stack program: `Push bg, Push silhouette, Or, Push chrome, AlphaOver, Push hover, Add`. The `Or` step raises the bg's t-byte to 255 at the four squircle corner cutouts (silhouette = `0xFF_00_00_00` there, OR-identity = `0` inside) so the final composite has t=255 at the corners — transparent on macOS PostMultiplied; compositor-honored on Linux.
     pub fn new(viewport: Viewport, title: impl Into<String>) -> Self {
         let region = Region::new(0.0, 0.0, viewport.width_px as Coord, viewport.height_px as Coord);
         let mut group = Group::new(region, BlendMode::Replace);
@@ -50,7 +50,7 @@ impl DefaultChrome {
         group.set_program(alloc::vec![
             Op::Push(layer_bg),
             Op::Push(layer_silhouette),
-            Op::Mul,
+            Op::Or,
             Op::Push(layer_chrome),
             Op::AlphaOver,
             Op::Push(layer_hover),
