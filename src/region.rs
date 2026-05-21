@@ -52,23 +52,33 @@ impl Region {
 
     /// Right edge: `x + w`.
     #[inline]
-    pub fn right(&self) -> Coord { self.x + self.w }
+    pub fn right(&self) -> Coord {
+        self.x + self.w
+    }
 
     /// Bottom edge: `y + h`.
     #[inline]
-    pub fn bottom(&self) -> Coord { self.y + self.h }
+    pub fn bottom(&self) -> Coord {
+        self.y + self.h
+    }
 
     /// Center point in pixel coordinates.
     #[inline]
-    pub fn center(&self) -> (Coord, Coord) { (self.x + self.w * 0.5, self.y + self.h * 0.5) }
+    pub fn center(&self) -> (Coord, Coord) {
+        (self.x + self.w * 0.5, self.y + self.h * 0.5)
+    }
 
     /// Center x in pixel coordinates.
     #[inline]
-    pub fn center_x(&self) -> Coord { self.x + self.w * 0.5 }
+    pub fn center_x(&self) -> Coord {
+        self.x + self.w * 0.5
+    }
 
     /// Center y in pixel coordinates.
     #[inline]
-    pub fn center_y(&self) -> Coord { self.y + self.h * 0.5 }
+    pub fn center_y(&self) -> Coord {
+        self.y + self.h * 0.5
+    }
 
     // --- Hit testing ---
 
@@ -84,7 +94,9 @@ impl Region {
     /// Use for font sizes, margins, padding, border widths — anything that should
     /// scale with this region's dimensions.
     #[inline]
-    pub fn size(&self, divisor: Coord) -> Coord { self.span / divisor }
+    pub fn size(&self, divisor: Coord) -> Coord {
+        self.span / divisor
+    }
 
     // --- Subdivision ---
 
@@ -128,7 +140,10 @@ impl Region {
     /// True if this region's interior overlaps `other`'s interior. Edges-only contact returns false (consistent with `contains` being half-open on right/bottom).
     #[inline]
     pub fn intersects(&self, other: &Region) -> bool {
-        self.x < other.right() && other.x < self.right() && self.y < other.bottom() && other.y < self.bottom()
+        self.x < other.right()
+            && other.x < self.right()
+            && self.y < other.bottom()
+            && other.y < self.bottom()
     }
 
     /// Smallest region containing both `self` and `other`. Span is recomputed for the union dimensions, not interpolated.
@@ -217,7 +232,9 @@ mod tests {
 
     const EPSILON: f32 = 1e-4;
 
-    fn approx(a: f32, b: f32) -> bool { (a - b).abs() < EPSILON }
+    fn approx(a: f32, b: f32) -> bool {
+        (a - b).abs() < EPSILON
+    }
 
     #[test]
     fn from_viewport_produces_correct_region() {
@@ -420,7 +437,7 @@ mod tests {
         assert_eq!(clip.x_start, 10);
         assert_eq!(clip.y_start, 20);
         assert_eq!(clip.x_end, 110); // (10.5 + 100.3) as usize = 110
-        assert_eq!(clip.y_end, 71);  // (20.7 + 50.9) as usize = 71
+        assert_eq!(clip.y_end, 71); // (20.7 + 50.9) as usize = 71
     }
 
     #[test]

@@ -1,8 +1,8 @@
-//! Pixel-buffer paint primitives. ARGB layout is `0xAARRGGBB` (alpha high byte, blue low). All inputs are pixel-space, not RU — convert via [`Viewport::ru_to_px`](crate::Viewport::ru_to_px) before calling.
+//! Pixel-buffer paint primitives. Packed layout is `0xttRRGGBB` (t-byte high, blue low) — top byte is **transparency**, not alpha (`t = 0` opaque, `t = 255` transparent). See [`crate::pixel`] for the locked convention. All inputs are pixel-space, not RU — convert via [`Viewport::ru_to_px`](crate::Viewport::ru_to_px) before calling.
 //!
-//! Internal to fluor's render pipeline. Per `## API / Implementation Separation` in AGENT.md, these are not part of the consumer-facing API: future SIMD kernels (NEON, SSE2) will dispatch through the same entry points without changing call sites in `pane` or `Compositor`.
+//! Internal to fluor's render pipeline. Per `## API / Implementation Separation` in AGENT.md, these are not part of the consumer-facing API: future SIMD kernels (NEON, SSE2) will dispatch thru the same entry points without changing call sites in `pane` or `Compositor`.
 //!
-//! Blend model is straight (non-premultiplied) alpha lerp: `result = bg * (1 - α) + fg * α`. For an opaque target framebuffer (the common case — the host window's backbuffer) the alpha channel of the result is don't-care; for layered translucency a Porter-Duff over would be needed and is not provided here.
+//! Blend model is t-convention front-to-back: `dst` is the partial composite already accumulated above (its t-byte = remaining transparency budget), `src` is the new layer going behind. Per-pixel early-out fires when `dst < 0x0100_0000` (dst opaque — `t == 0`) via a single u32 compare. Math throughout is `>> 8` with the `(256 - t)` and `(contrib + 1)` tricks to keep the opaque endpoint exact — never `/ 255`, never floats in the inner loop. Multi-layer translucency composes by chained Under operations; the buffer carries the accumulator state across Group boundaries so the early-out chain survives between flatten passes.
 //!
 //! Every blending primitive accepts an optional [`Clip`] (defaults to full buffer when `None`) and an optional [`AlphaMask`] (full-frame, multiplies into per-pixel alpha for soft clipping — rounded textboxes, squircle pane corners, scroll fades). The clip is resolved once at entry into `(x_min, y_min, x_max, y_max)` loop bounds, so the inner loops carry **zero per-pixel bounds checks** — the math at the entry is the proof. AlphaMask dimensions must equal the buffer's `(buf_w, buf_h)`; mismatches panic per AGENT.md "fail loud."
 
@@ -252,191 +252,14 @@ pub fn unpack_argb(packed: u32) -> (u8, u8, u8, u8) {
     (r, g, b, a)
 }
 
-/// Porter-Duff src-over for t-convention pixels (`0xttRRGGBB`). Free-function form of [`crate::pixel::Argb8::alpha_over`] — same math, same shortcut. RGB linearly blends with `fg` dominating as `fg_t → 0` (opaque); t-slot multiplies (combined transparency: opaque anywhere → result opaque).
+use crate::pixel::Blend;
+pub use crate::pixel::BlendMode;
+
+/// Flatten `src` underneath `dst` across the whole slice, pixel-by-pixel, via [`Blend::under`]. `dst` is the partial composite already accumulated above (its t-byte = remaining transparency budget); `src` is the new layer going behind. Per-pixel early-out fires when `dst.t == 0`. Both slices must be the same length.
 #[inline]
-pub fn blend(bg: u32, fg: u32) -> u32 {
-    let fg_t = ((fg >> 24) & 0xFF) as u64;
-    if fg_t == 0 { return fg; }                          // opaque fg covers bg entirely
-    let bg_t = ((bg >> 24) & 0xFF) as u64;
-    let inv_fg_t = 256 - fg_t;
-
-    // SWAR for RGB; t slot patched below.
-    let mut bg64 = bg as u64;
-    bg64 = (bg64 | (bg64 << 16)) & 0x0000_FFFF_0000_FFFF;
-    bg64 = (bg64 | (bg64 << 8)) & 0x00FF_00FF_00FF_00FF;
-
-    let mut fg64 = fg as u64;
-    fg64 = (fg64 | (fg64 << 16)) & 0x0000_FFFF_0000_FFFF;
-    fg64 = (fg64 | (fg64 << 8)) & 0x00FF_00FF_00FF_00FF;
-
-    let mut blended = fg64 * inv_fg_t + bg64 * fg_t;
-    blended = (blended >> 8) & 0x00FF_00FF_00FF_00FF;
-    blended = (blended | (blended >> 8)) & 0x0000_FFFF_0000_FFFF;
-    blended = blended | (blended >> 16);
-    let rgb_only = (blended as u32) & 0x00FF_FFFF;
-
-    let result_t = ((fg_t * bg_t) >> 8) as u32;
-    rgb_only | (result_t << 24)
-}
-
-/// Layer blend mode — selects which math op the flatten kernel applies when compositing a source layer onto the destination composite.
-///
-/// Each variant is a branchless kernel that runs over the entire layer buffer. The blend mode is per-layer, not per-pixel, so there's no branching in the inner loop. Alpha participation varies by mode — see each variant's doc comment for the exact channel math.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BlendMode {
-    /// Unconditionally overwrite destination with source. `dst = src`. Bottom-most layers use this — anything beneath is irrelevant. Critical for silhouette-based corner knockout: a `Mul`-zeroed composite at the squircle corners must reach the present buffer as `0x00000000` so PostMultiplied alpha sees them as transparent. (The earlier "skip on src=0" semantic kept stale back-buffer content visible at the corners.)
-    Replace,
-    /// Standard Porter-Duff alpha-over. Source alpha controls blending.
-    /// `dst = src * α + dst * (1 - α)` per channel, using SWAR /256 approximation.
-    AlphaOver,
-    /// Additive blend. Source is added to destination directly (intensity baked into src pixels).
-    /// `dst = dst.wrapping_add(src)` — overflow wraps intentionally (packed channel isolation).
-    /// Used for glow, blinkey wave, any emissive effect.
-    Add,
-    /// XOR RGB channels, preserve destination alpha. Source alpha is ignored.
-    /// `dst.rgb ^= src.rgb` where `src != 0`.
-    /// Used for selection highlight inversion.
-    Xor,
-    /// Multiplicative darkening. Transparent source pixels don't darken (blend toward white at low alpha).
-    /// `dst = dst * lerp(255, src, α) >> 8` per channel.
-    Multiply,
-    /// Screen (inverse multiply). Transparent source pixels don't lighten.
-    /// `dst = 255 - ((255 - dst) * (255 - lerp(0, src, α)) >> 8)` per channel.
-    Screen,
-}
-
-impl BlendMode {
-    /// Run this blend mode's kernel over the entire buffer. `dst` is the composite being built; `src` is the layer being flattened onto it. Both must be the same length.
-    #[inline]
-    pub fn flatten(self, dst: &mut [u32], src: &[u32]) {
-        match self {
-            BlendMode::Replace => flatten_replace(dst, src),
-            BlendMode::AlphaOver => flatten_alpha_over(dst, src),
-            BlendMode::Add => flatten_add(dst, src),
-            BlendMode::Xor => flatten_xor(dst, src),
-            BlendMode::Multiply => flatten_multiply(dst, src),
-            BlendMode::Screen => flatten_screen(dst, src),
-        }
-    }
-}
-
-fn flatten_replace(dst: &mut [u32], src: &[u32]) {
-    dst.copy_from_slice(src);
-}
-
-fn flatten_alpha_over(dst: &mut [u32], src: &[u32]) {
-    // Per-pixel Porter-Duff source-over for t-convention pixels (`0xttRRGGBB`).
-    // Shortcuts:
-    //   src_t==255 + RGB==0  (s==0xFF000000 — but stored as `s==0` early-out misses this; keep
-    //                         no-op test on `s == 0xFF000000` for clarity if needed)
-    //   src_t==0             → src replaces dst (src fully opaque).
-    // Middle path: RGB via SWAR `(fg·(256−src_t) + bg·src_t) >> 8`; t-slot is `(src_t·dst_t) >> 8`.
+pub fn flatten(dst: &mut [u32], src: &[u32], mode: BlendMode) {
     for i in 0..dst.len() {
-        let s = src[i];
-        if s == 0xFF000000 {
-            // Fully transparent black — src contributes nothing visible. Skip.
-            continue;
-        }
-        let src_t = ((s >> 24) & 0xFF) as u64;
-        if src_t == 0 {
-            dst[i] = s;
-            continue;
-        }
-        let d = dst[i];
-        let dst_t = ((d >> 24) & 0xFF) as u64;
-        let inv = 256 - src_t;
-
-        let mut bg = d as u64;
-        bg = (bg | (bg << 16)) & 0x0000_FFFF_0000_FFFF;
-        bg = (bg | (bg << 8)) & 0x00FF_00FF_00FF_00FF;
-        let mut fg = s as u64;
-        fg = (fg | (fg << 16)) & 0x0000_FFFF_0000_FFFF;
-        fg = (fg | (fg << 8)) & 0x00FF_00FF_00FF_00FF;
-        let mut blended = fg * inv + bg * src_t;
-        blended = (blended >> 8) & 0x00FF_00FF_00FF_00FF;
-        blended = (blended | (blended >> 8)) & 0x0000_FFFF_0000_FFFF;
-        blended = blended | (blended >> 16);
-        let rgb_only = (blended as u32) & 0x00FF_FFFF;
-
-        let result_t = ((src_t * dst_t) >> 8) as u32;
-        dst[i] = rgb_only | (result_t << 24);
-    }
-}
-
-fn flatten_add(dst: &mut [u32], src: &[u32]) {
-    // Per-byte saturating add for RGB only; dst's t-byte is preserved unchanged. "Additive light"
-    // semantic — the source contributes brightness to the destination without changing its
-    // opacity. Skipping fully-transparent src (`0xFF000000`) is the fast path; for everything
-    // else, explicit per-channel add prevents RGB carries from leaking into the t-byte
-    // (`wrapping_add` on the whole u32 lets a saturated R overflow into t and eat the opacity).
-    for i in 0..dst.len() {
-        let s = src[i];
-        if s == 0xFF000000 { continue; }
-        let d = dst[i];
-        let dr = (d >> 16) & 0xFF;
-        let dg = (d >>  8) & 0xFF;
-        let db =  d        & 0xFF;
-        let sr = (s >> 16) & 0xFF;
-        let sg = (s >>  8) & 0xFF;
-        let sb =  s        & 0xFF;
-        let nr = (dr + sr).min(0xFF);
-        let ng = (dg + sg).min(0xFF);
-        let nb = (db + sb).min(0xFF);
-        dst[i] = (d & 0xFF000000) | (nr << 16) | (ng << 8) | nb;
-    }
-}
-
-fn flatten_xor(dst: &mut [u32], src: &[u32]) {
-    // t-convention: skip fully-transparent src. RGB-only XOR preserves dst's t.
-    for i in 0..dst.len() {
-        if src[i] == 0xFF000000 { continue; }
-        dst[i] ^= src[i] & 0x00FF_FFFF;
-    }
-}
-
-fn flatten_multiply(dst: &mut [u32], src: &[u32]) {
-    for i in 0..dst.len() {
-        let s = src[i];
-        if s == 0 {
-            continue;
-        }
-        let alpha = ((s >> 24) & 0xFF) as u64;
-        // Effective source = lerp(255, src_channel, alpha) = 255 + (src - 255) * alpha / 256
-        // dst_channel = dst_channel * effective / 256
-        let d = dst[i];
-        let dr = ((d >> 16) & 0xFF) as u64;
-        let dg = ((d >> 8) & 0xFF) as u64;
-        let db = (d & 0xFF) as u64;
-        let sr = 255 + ((((s >> 16) & 0xFF) as i64 - 255) * alpha as i64 >> 8) as u64;
-        let sg = 255 + ((((s >> 8) & 0xFF) as i64 - 255) * alpha as i64 >> 8) as u64;
-        let sb = 255 + (((s & 0xFF) as i64 - 255) * alpha as i64 >> 8) as u64;
-        let rr = (dr * sr) >> 8;
-        let rg = (dg * sg) >> 8;
-        let rb = (db * sb) >> 8;
-        dst[i] = (d & 0xFF00_0000) | ((rr as u32) << 16) | ((rg as u32) << 8) | (rb as u32);
-    }
-}
-
-fn flatten_screen(dst: &mut [u32], src: &[u32]) {
-    for i in 0..dst.len() {
-        let s = src[i];
-        if s == 0 {
-            continue;
-        }
-        let alpha = ((s >> 24) & 0xFF) as u64;
-        // Effective source = lerp(0, src_channel, alpha) = src * alpha / 256
-        // Screen: dst = 255 - (255 - dst) * (255 - eff) / 256
-        let d = dst[i];
-        let dr = ((d >> 16) & 0xFF) as u64;
-        let dg = ((d >> 8) & 0xFF) as u64;
-        let db = (d & 0xFF) as u64;
-        let sr = (((s >> 16) & 0xFF) as u64 * alpha) >> 8;
-        let sg = (((s >> 8) & 0xFF) as u64 * alpha) >> 8;
-        let sb = ((s & 0xFF) as u64 * alpha) >> 8;
-        let rr = 255 - ((255 - dr) * (255 - sr) >> 8);
-        let rg = 255 - ((255 - dg) * (255 - sg) >> 8);
-        let rb = 255 - ((255 - db) * (255 - sb) >> 8);
-        dst[i] = (d & 0xFF00_0000) | ((rr as u32) << 16) | ((rg as u32) << 8) | (rb as u32);
+        dst[i] = dst[i].under(src[i], mode);
     }
 }
 
@@ -477,30 +300,12 @@ fn clip_rect(
     (x_min, y_min, x_max, y_max)
 }
 
-/// Fill a rectangle with a solid (opaque-replace) ARGB colour. Solid means no alpha math — the source colour overwrites the destination directly. If you want alpha blending or alpha masking, use [`fill_rect_blend`].
-pub fn fill_rect_solid(
-    pixels: &mut [u32],
-    buf_w: usize,
-    buf_h: usize,
-    x: isize,
-    y: isize,
-    rect_w: isize,
-    rect_h: isize,
-    colour: u32,
-    clip: Option<Clip>,
-) {
-    let clip = Clip::resolve(clip, buf_w, buf_h);
-    let (x_min, y_min, x_max, y_max) = clip_rect(clip, x, y, rect_w, rect_h);
-    for row in y_min..y_max {
-        let base = row * buf_w;
-        for col in x_min..x_max {
-            pixels[base + col] = colour;
-        }
-    }
-}
-
-/// Fill a rectangle by alpha-blending `colour` over the existing buffer contents. With `mask = Some(&AlphaMask)`, the per-pixel mask alpha multiplies into `colour`'s alpha (soft clipping for shaped textboxes, scroll fades, etc.) — `effective_alpha = colour_alpha * mask_alpha / 256`.
-pub fn fill_rect_blend(
+/// Fill a rectangle by under-blending `colour` into the buffer — the single rect paint primitive.
+///
+/// Per-pixel: `pixels[idx] = pixels[idx].under(effective_colour, BlendMode::Normal)`. The dst-opaque early-out fires automatically where a topmost paint has already claimed the pixel (`dst.t == 0`), so the topmost-first doctrine is honored without callers having to think about z-order.
+///
+/// `mask: Some(&AlphaMask)` multiplies each pixel's mask alpha into `colour`'s opacity (`effective_opacity = colour_opacity * mask_alpha >> 8`) — used for shaped textbox interiors, scroll fades, etc. `mask: None` skips that math entirely.
+pub fn fill_rect(
     pixels: &mut [u32],
     buf_w: usize,
     buf_h: usize,
@@ -517,20 +322,19 @@ pub fn fill_rect_blend(
         assert_mask_matches_buffer(m, buf_w, buf_h);
     }
     let (x_min, y_min, x_max, y_max) = clip_rect(clip, x, y, rect_w, rect_h);
-    // Convert colour's t-byte to opacity for internal coverage math; convert back at write site.
-    let colour_opacity = 255 - ((colour >> 24) & 0xFF);
-    let colour_rgb = colour & 0x00FF_FFFF;
     match mask {
         None => {
             for row in y_min..y_max {
                 let base = row * buf_w;
                 for col in x_min..x_max {
                     let idx = base + col;
-                    pixels[idx] = blend(pixels[idx], colour);
+                    pixels[idx] = pixels[idx].under(colour, BlendMode::Normal);
                 }
             }
         }
         Some(m) => {
+            let colour_opacity = 255 - ((colour >> 24) & 0xFF);
+            let colour_rgb = colour & 0x00FF_FFFF;
             for row in y_min..y_max {
                 let base = row * buf_w;
                 for col in x_min..x_max {
@@ -538,14 +342,14 @@ pub fn fill_rect_blend(
                     let mask_a = m.pixels[idx] as u32;
                     let effective_opacity = (colour_opacity * mask_a) >> 8;
                     let masked = colour_rgb | ((255 - effective_opacity) << 24);
-                    pixels[idx] = blend(pixels[idx], masked);
+                    pixels[idx] = pixels[idx].under(masked, BlendMode::Normal);
                 }
             }
         }
     }
 }
 
-/// Stroke (outline) an axis-aligned rectangle. Draws four filled rect strips along the edges; corners are not joined separately because at 90° angles the strips meet cleanly. If `colour` is fully opaque (alpha = 0xFF) and `mask` is `None`, takes the fast `fill_rect_solid` path; otherwise routes each strip through `fill_rect_blend`.
+/// Stroke (outline) an axis-aligned rectangle. Draws four filled rect strips along the edges via [`fill_rect`]; corners are not joined separately because at 90° angles the strips meet cleanly.
 pub fn stroke_rect(
     pixels: &mut [u32],
     buf_w: usize,
@@ -562,7 +366,6 @@ pub fn stroke_rect(
     if stroke <= 0 || rect_w <= 0 || rect_h <= 0 {
         return;
     }
-    let solid = (colour >> 24) == 0xFF && mask.is_none();
     let inner_h = rect_h - 2 * stroke;
     let edges: [(isize, isize, isize, isize); 4] = [
         (x, y, rect_w, stroke),                             // top
@@ -571,11 +374,7 @@ pub fn stroke_rect(
         (x + rect_w - stroke, y + stroke, stroke, inner_h), // right
     ];
     for &(ex, ey, ew, eh) in &edges {
-        if solid {
-            fill_rect_solid(pixels, buf_w, buf_h, ex, ey, ew, eh, colour, clip);
-        } else {
-            fill_rect_blend(pixels, buf_w, buf_h, ex, ey, ew, eh, colour, clip, mask);
-        }
+        fill_rect(pixels, buf_w, buf_h, ex, ey, ew, eh, colour, clip, mask);
     }
 }
 
@@ -680,16 +479,86 @@ fn background_row(
 }
 
 /// Debug toggle that lets the chord `Ctrl/Cmd+Shift+D+P` skip the boundary premultiply at runtime — A/B the Linux premult fix without recompiling. Stays `false` by default.
-pub static DEBUG_SKIP_PREMULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static DEBUG_SKIP_PREMULT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Debug toggle that lets the chord `Ctrl/Cmd+Shift+D+M` skip the boundary t→α flip at runtime — when set, internal t-convention pixels go to the OS unchanged. With `M` ON you see the raw t buffer as the OS interprets it (opaque areas appear transparent and vice versa) — useful for confirming what the compositor is actually getting. Stays `false` by default.
-pub static DEBUG_SKIP_FLIP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static DEBUG_SKIP_FLIP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
-/// Flip every pixel's top byte from internal t-convention to host-facing α-convention. `α = 255 − t`, equivalently `top_byte ^= 0xFF` (since u8 XOR with 0xFF inverts). Boundary step needed on every host — wgpu PostMultiplied and softbuffer both want α-convention. ALWAYS called at the present boundary, never inside paint primitives or Group composites.
+/// Debug cycle bound to the `Ctrl/Cmd + Shift + D + A` chord. Three states (rotate each press): `0` = off (normal boundary conversion), `1` = α-as-grayscale (replace each pixel with `(final_α, final_α, final_α, 0xFF)` — inspect alpha distribution), `2` = force-opaque (force every pixel's α to 255 and pass the RGB through unmodified — inspect what the kernel produced BEFORE the clip mask + premultiply trimmed it).
+pub static DEBUG_SHOW_ALPHA: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+pub const DEBUG_SHOW_ALPHA_OFF: u8 = 0;
+pub const DEBUG_SHOW_ALPHA_GRAYSCALE: u8 = 1;
+pub const DEBUG_SHOW_ALPHA_FORCE_OPAQUE: u8 = 2;
+
+/// Debug toggle that suppresses chrome layer rasterization (perimeter hairline + future controls + title) so consumers can see the background / panes / textbox underneath without chrome on top. Bound to the `Ctrl/Cmd + Shift + D + C` chord. The clip_mask is still carved at the boundary, so the window-shape trim remains visible. Stays `false` by default.
+pub static DEBUG_SKIP_CHROME: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Boundary conversion from internal t-convention to host-facing α-convention. Two modes:
+/// * Normal (default while scaffolding): OR-mask `*p |= 0xFF000000` — force every pixel fully opaque (α=255), RGB passes through unblended. Lets us see the raw kernel/paint-primitive output without OS compositing. Swap the OR for XOR (`*p ^= 0xFF000000`) when partial-t AA needs to round-trip properly through the OS compositor (α = 255 − t).
+/// * `DEBUG_SHOW_ALPHA` (Ctrl+Shift+D+A chord): replace every pixel with `(α, α, α, 255)` — α value rendered as grayscale, alpha-byte forced opaque so the OS displays the grayscale. RGB is discarded for this view. Lets you visually inspect where partial-t pixels live without the RGB content distracting.
+///
+/// **Deprecated** — superseded by [`finalize_for_os`] which folds the t→α flip, the clip-mask multiply, the Linux premultiply, and the pack step into one pass. Kept around for hosts that haven't migrated yet.
 #[inline]
 pub fn flip_t_to_alpha(pixels: &mut [u32]) {
-    for p in pixels.iter_mut() {
-        *p ^= 0xFF000000;
+    let mode = DEBUG_SHOW_ALPHA.load(std::sync::atomic::Ordering::Relaxed);
+    if mode == DEBUG_SHOW_ALPHA_GRAYSCALE {
+        for p in pixels.iter_mut() {
+            let alpha = 255 - ((*p >> 24) & 0xFF);
+            *p = 0xFF000000 | (alpha << 16) | (alpha << 8) | alpha;
+        }
+    } else {
+        for p in pixels.iter_mut() {
+            *p |= 0xFF000000;
+        }
+    }
+}
+
+/// Boundary step that finalizes the present buffer for the OS in a **single pass** per pixel — folds the t→α flip, the window-shape clip-mask multiply, the Linux RGB premultiply, and the pack into one go. Walks `pixels` and `clip_mask` in lockstep; both slices must be the same length.
+///
+/// Per pixel:
+/// 1. `inner_α = 255 − t` (the buffer's current α after the implicit flip — what the under-chain accumulated).
+/// 2. `final_α = (inner_α × clip_mask_α) >> 8` (multiply with the window-shape clip — preserves any partial transparency the under-chain produced AND trims to the window's actual shape; not a swap).
+/// 3. **Linux only**: premultiply RGB by `final_α / 256`. macOS / other platforms get straight-α output and the OS does its own multiply at composite time.
+/// 4. Pack back into `0xααRRGGBB`.
+///
+/// Debug toggles:
+/// * `DEBUG_SHOW_ALPHA` (Ctrl+Shift+D+A): replace each pixel with `(final_α, final_α, final_α, 0xFF)` — grayscale α visualization, opaque so the OS shows it.
+/// * `DEBUG_SKIP_FLIP` (Ctrl+Shift+D+M): pass the raw t-byte through as if it were α (opaque areas appear transparent and vice versa).
+/// * `DEBUG_SKIP_PREMULT` (Ctrl+Shift+D+P): skip the Linux RGB×α step.
+pub fn finalize_for_os(pixels: &mut [u32], clip_mask: &[u8]) {
+    let alpha_mode = DEBUG_SHOW_ALPHA.load(std::sync::atomic::Ordering::Relaxed);
+    let skip_flip = DEBUG_SKIP_FLIP.load(std::sync::atomic::Ordering::Relaxed);
+    let n = pixels.len().min(clip_mask.len());
+    for i in 0..n {
+        let p = pixels[i];
+        let m = clip_mask[i] as u32;
+        let raw_t = (p >> 24) & 0xFF;
+        let inner_alpha = if skip_flip { raw_t } else { 255 - raw_t };
+        let final_alpha = (inner_alpha * m) >> 8;
+        if alpha_mode == DEBUG_SHOW_ALPHA_GRAYSCALE {
+            pixels[i] = 0xFF000000 | (final_alpha << 16) | (final_alpha << 8) | final_alpha;
+            continue;
+        }
+        if alpha_mode == DEBUG_SHOW_ALPHA_FORCE_OPAQUE {
+            // Force-opaque: keep the kernel's RGB exactly as written (no premultiply, no clip-mask trim), set α=255 so the OS displays it. Lets you see what landed in the buffer BEFORE the boundary trimmed/multiplied anything.
+            pixels[i] = 0xFF000000 | (p & 0x00FFFFFF);
+            continue;
+        }
+        #[cfg(target_os = "linux")]
+        let s = if DEBUG_SKIP_PREMULT.load(std::sync::atomic::Ordering::Relaxed) {
+            256u32
+        } else {
+            final_alpha
+        };
+        #[cfg(not(target_os = "linux"))]
+        let s = 256u32;
+        let r = (((p >> 16) & 0xFF) * s) >> 8;
+        let g = (((p >> 8) & 0xFF) * s) >> 8;
+        let b = ((p & 0xFF) * s) >> 8;
+        pixels[i] = (final_alpha << 24) | (r << 16) | (g << 8) | b;
     }
 }
 
@@ -1108,14 +977,14 @@ fn write_aa(
         let existing_t = (pixels[idx] >> 24) & 0xFF;
         if new_t < existing_t {
             pixels[idx] = (new_t << 24) | color_rgb;
-            mask[idx] = h_aa as u8;  // mask stays in coverage form; flipped to t form in widget refactor
+            mask[idx] = h_aa as u8; // mask stays in coverage form; flipped to t form in widget refactor
         }
     }
 }
 
 /// Photon's squircle inset formula — single row, parameterized by `squirdleyness`. Returns the curve's inset (distance from the bbox edge to the leftmost / rightmost inside pixel) for a row at `y_from_center` rows above or below the squircle's vertical center.
 ///
-/// `squirdleyness = 2` → circle. `squirdleyness = 3` → photon's textbox pill default (slightly flatter than a circle). Higher = more rectangular. Both `draw_textbox_pill` (AA path) and the textbox widget's hard-pixel renderer route through this so any tweak to the curve math flows through both code paths.
+/// `squirdleyness = 2` → circle. `squirdleyness = 3` → photon's textbox pill default (slightly flatter than a circle). Higher = more rectangular. Both `draw_textbox_pill` (AA path) and the textbox widget's hard-pixel renderer route thru this so any tweak to the curve math flows thru both code paths.
 ///
 /// Identical to the per-iteration formula at photon's [`compositing.rs:4567-4570`](/mnt/Octopus/Code/photon/src/ui/compositing.rs).
 #[inline]
@@ -1592,16 +1461,16 @@ pub fn apply_textbox_glow(
 
     let glow_rgb = glow_colour & 0x00FF_FFFF;
 
-    /// Glow accumulation under fluor's t-convention. The 4-direction passes accumulate opacity into a pixel that starts at "transparent" (t=255). Top byte: saturating-subtract intensity (drives t toward 0/opaque). RGB: saturating-add per channel (corner pixels touched by multiple directions get extra brightness, matching photon's effect where corners look slightly brighter than straight-edge regions). Caller must initialize the pixel buffer to `0xFF000000` (t=255, RGB=0) before invoking.
+    /// Glow accumulation under fluor's t-convention. The 4-direction passes accumulate opacity into a pixel that starts at "transparent" (t=255). Top byte: saturating-subtract intensity (drives t toward 0/opaque). RGB: saturating-add per channel (corner pixels touched by multiple directions get extra brightness, matching photon's effect where corners look slightly brighter than straight-edge regions). Caller must initialize the pixel buffer to the canonical empty value `0xFFFFFFFF` (t=255, RGB=255 — white invisible at full transparency, byte-uniform memset) before invoking.
     #[inline]
     fn glow_accumulate(dst: u32, intensity: u32, glow_rgb: u32) -> u32 {
         let t = ((dst >> 24) & 0xFF).saturating_sub(intensity);
         let dr = (dst >> 16) & 0xFF;
-        let dg = (dst >>  8) & 0xFF;
-        let db =  dst        & 0xFF;
+        let dg = (dst >> 8) & 0xFF;
+        let db = dst & 0xFF;
         let sr = (glow_rgb >> 16) & 0xFF;
-        let sg = (glow_rgb >>  8) & 0xFF;
-        let sb =  glow_rgb        & 0xFF;
+        let sg = (glow_rgb >> 8) & 0xFF;
+        let sb = glow_rgb & 0xFF;
         let nr = (dr + sr).min(0xFF);
         let ng = (dg + sg).min(0xFF);
         let nb = (db + sb).min(0xFF);
@@ -1836,7 +1705,7 @@ pub mod glyph {
         let min_y = ((y as i32) - (r as i32)).max(0);
         let max_y = ((y as i32) + (r as i32)).min(height);
 
-        // Each quadrant samples one of the two diagonals (whichever passes through it).
+        // Each quadrant samples one of the two diagonals (whichever passes thru it).
         let quadrants: [(i32, i32, i32, i32, f32, f32, f32, f32); 4] = [
             (min_x, cxi, min_y, cyi, x1_start, y1_start, x1_end, y1_end), // top-left, diag1
             (cxi, max_x, min_y, cyi, x2_start, y2_start, x2_end, y2_end), // top-right, diag2
@@ -1975,7 +1844,7 @@ pub fn circle_filled(
                 None => scaled_opacity,
             };
             let scaled_colour = colour_rgb | ((255 - final_opacity) << 24);
-            pixels[idx] = blend(pixels[idx], scaled_colour);
+            pixels[idx] = pixels[idx].under(scaled_colour, BlendMode::Normal);
         }
     }
 }
@@ -2006,12 +1875,12 @@ mod tests {
     }
 
     #[test]
-    fn blend_transparent_fg_preserves_bg_within_one_lsb() {
-        // fg with opacity=0 (a=0) becomes internal t=255 (almost transparent). Result ≈ bg with
-        // ≤1 LSB per-channel drift (the >>8 shortcut at the transparent endpoint).
-        let bg = pack_argb(100, 150, 200, 255);
-        let fg = pack_argb(255, 0, 0, 0);
-        let result = blend(bg, fg);
+    fn under_fully_transparent_top_yields_bottom_within_one_lsb() {
+        // top with t=255 (fully transparent) over opaque bottom → result ≈ bottom with ≤1 LSB drift
+        // from the >>8 shortcut at the transparent endpoint.
+        let top = pack_argb(255, 0, 0, 0); // t=255, RGB=0
+        let bottom = pack_argb(100, 150, 200, 255); // opaque, RGB=(100,150,200)
+        let result = top.under(bottom, BlendMode::Normal);
         let (r, g, b, _) = unpack_argb(result);
         assert!((r as i32 - 100).abs() <= 1, "r got {}", r);
         assert!((g as i32 - 150).abs() <= 1, "g got {}", g);
@@ -2019,19 +1888,20 @@ mod tests {
     }
 
     #[test]
-    fn blend_opaque_fg_replaces_bg() {
-        // fg with opacity=255 (a=255) becomes internal t=0 (opaque). Shortcut returns fg exactly.
-        let bg = pack_argb(100, 150, 200, 255);
-        let fg = pack_argb(50, 80, 110, 255);
-        let result = blend(bg, fg);
-        assert_eq!(result, fg);
+    fn under_opaque_top_returns_top_exact() {
+        // top with t=0 (opaque) — early-out returns top unchanged regardless of bottom.
+        let top = pack_argb(50, 80, 110, 255);
+        let bottom = pack_argb(100, 150, 200, 255);
+        let result = top.under(bottom, BlendMode::Normal);
+        assert_eq!(result, top);
         let (r, g, b, _) = unpack_argb(result);
         assert_eq!((r, g, b), (50, 80, 110));
     }
 
     #[test]
     fn stroke_rect_only_touches_edges() {
-        let mut buf = vec![0u32; 10 * 10];
+        // Buffer starts fully transparent (t=255) — the canonical empty state for under-blend painting.
+        let mut buf = vec![0xFFFFFFFFu32; 10 * 10];
         stroke_rect(
             &mut buf,
             10,
@@ -2045,15 +1915,17 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(buf[5 * 10 + 5], 0);
+        // Interior of the rect — never touched, stays transparent.
+        assert_eq!(buf[5 * 10 + 5], 0xFFFFFFFF);
         let (r, _, _, _) = unpack_argb(buf[2 * 10 + 2]);
         assert!(r > 240, "top-left stroke pixel r={}", r);
-        assert_eq!(buf[1 * 10 + 1], 0);
+        // Outside the rect — untouched, stays transparent.
+        assert_eq!(buf[1 * 10 + 1], 0xFFFFFFFF);
     }
 
     #[test]
     fn circle_filled_center_is_colour() {
-        let mut buf = vec![0u32; 16 * 16];
+        let mut buf = vec![0xFFFFFFFFu32; 16 * 16];
         circle_filled(
             &mut buf,
             16,
@@ -2073,12 +1945,13 @@ mod tests {
             g,
             b
         );
-        assert_eq!(buf[0], 0);
+        // Corner outside the circle — untouched, stays transparent.
+        assert_eq!(buf[0], 0xFFFFFFFF);
     }
 
     #[test]
     fn circle_filled_clips_partial_offscreen() {
-        let mut buf = vec![0u32; 8 * 8];
+        let mut buf = vec![0xFFFFFFFFu32; 8 * 8];
         circle_filled(
             &mut buf,
             8,
@@ -2095,58 +1968,89 @@ mod tests {
     }
 
     #[test]
-    fn blend_alpha_half_is_midpoint() {
-        let bg = pack_argb(0, 0, 0, 255);
-        let fg = pack_argb(200, 200, 200, 128);
-        let result = blend(bg, fg);
+    fn under_half_top_blends_with_opaque_bottom() {
+        // top is half-transparent (t=128, RGB=(200,200,200)) over opaque black bottom.
+        // top_opacity=128, contrib=(128*256)>>8=128. nr = (200*128 + 0*128) >> 8 = 100.
+        let top = pack_argb(200, 200, 200, 128);
+        let bottom = pack_argb(0, 0, 0, 255);
+        let result = top.under(bottom, BlendMode::Normal);
         let (r, g, b, _) = unpack_argb(result);
-        // (0 * 128 + 200 * 128) / 256 = 100
         assert!((r as i32 - 100).abs() <= 1, "r got {}", r);
         assert!((g as i32 - 100).abs() <= 1, "g got {}", g);
         assert!((b as i32 - 100).abs() <= 1, "b got {}", b);
     }
 
     #[test]
-    fn fill_rect_solid_full_buffer() {
-        let mut buf = vec![0u32; 4 * 4];
-        fill_rect_solid(&mut buf, 4, 4, 0, 0, 4, 4, 0xFF112233, None);
-        assert!(buf.iter().all(|&p| p == 0xFF112233));
+    fn fill_rect_full_buffer() {
+        // Buffer starts TRANSPARENT (t=255). Paint opaque (t=0) RGB(0x11,0x22,0x33) under it.
+        // Result: ~opaque colour (1-LSB drift per channel from the >>8 normalization).
+        let mut buf = vec![0xFFFFFFFFu32; 4 * 4];
+        fill_rect(&mut buf, 4, 4, 0, 0, 4, 4, 0x00_11_22_33, None, None);
+        for &p in &buf {
+            assert_eq!(p >> 24, 0, "pixel t should be 0 (opaque): {p:#x}");
+            assert!(((p >> 16) & 0xFF) >= 0x10);
+        }
     }
 
     #[test]
-    fn fill_rect_solid_partial() {
-        let mut buf = vec![0u32; 4 * 4];
-        fill_rect_solid(&mut buf, 4, 4, 1, 1, 2, 2, 0xFFAABBCC, None);
-        let expected: [u32; 16] = [
-            0, 0, 0, 0, 0, 0xFFAABBCC, 0xFFAABBCC, 0, 0, 0xFFAABBCC, 0xFFAABBCC, 0, 0, 0, 0, 0,
-        ];
-        assert_eq!(buf.as_slice(), &expected);
+    fn fill_rect_partial() {
+        let mut buf = vec![0xFFFFFFFFu32; 4 * 4];
+        fill_rect(&mut buf, 4, 4, 1, 1, 2, 2, 0x00_AA_BB_CC, None, None);
+        for y in 0..4usize {
+            for x in 0..4usize {
+                let p = buf[y * 4 + x];
+                let inside = x >= 1 && x < 3 && y >= 1 && y < 3;
+                if inside {
+                    assert_eq!(
+                        p >> 24,
+                        0,
+                        "inside pixel ({x},{y}) should be opaque: {p:#x}"
+                    );
+                } else {
+                    assert_eq!(
+                        p, 0xFFFFFFFF,
+                        "outside pixel ({x},{y}) untouched, got {p:#x}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
-    fn fill_rect_solid_clips_negative_origin() {
-        let mut buf = vec![0u32; 4 * 4];
-        // Rect from (-2, -2) of size 4x4: only (0,0)..(2,2) intersects the buffer.
-        fill_rect_solid(&mut buf, 4, 4, -2, -2, 4, 4, 0xFF000001, None);
-        let expected: [u32; 16] = [
-            0xFF000001, 0xFF000001, 0, 0, 0xFF000001, 0xFF000001, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
-        assert_eq!(buf.as_slice(), &expected);
+    fn fill_rect_clips_negative_origin() {
+        let mut buf = vec![0xFFFFFFFFu32; 4 * 4];
+        fill_rect(&mut buf, 4, 4, -2, -2, 4, 4, 0x00_00_00_01, None, None);
+        for y in 0..4usize {
+            for x in 0..4usize {
+                let p = buf[y * 4 + x];
+                let inside = x < 2 && y < 2;
+                if inside {
+                    assert_eq!(
+                        p >> 24,
+                        0,
+                        "inside pixel ({x},{y}) should be opaque: {p:#x}"
+                    );
+                } else {
+                    assert_eq!(p, 0xFFFFFFFF, "outside pixel ({x},{y}) untouched");
+                }
+            }
+        }
     }
 
     #[test]
-    fn fill_rect_solid_fully_offscreen_is_noop() {
-        let mut buf = vec![0u32; 4 * 4];
-        fill_rect_solid(&mut buf, 4, 4, 100, 100, 5, 5, 0xFFFFFFFF, None);
-        assert!(buf.iter().all(|&p| p == 0));
-        fill_rect_solid(&mut buf, 4, 4, -10, -10, 5, 5, 0xFFFFFFFF, None);
-        assert!(buf.iter().all(|&p| p == 0));
+    fn fill_rect_fully_offscreen_is_noop() {
+        let mut buf = vec![0xFFFFFFFFu32; 4 * 4];
+        fill_rect(&mut buf, 4, 4, 100, 100, 5, 5, 0x00_FF_FF_FF, None, None);
+        assert!(buf.iter().all(|&p| p == 0xFFFFFFFF));
+        fill_rect(&mut buf, 4, 4, -10, -10, 5, 5, 0x00_FF_FF_FF, None, None);
+        assert!(buf.iter().all(|&p| p == 0xFFFFFFFF));
     }
 
     #[test]
-    fn fill_rect_blend_alpha_zero_no_change() {
+    fn fill_rect_transparent_src_into_opaque_dst_is_noop() {
+        // Dst is opaque (t=0). Under doctrine: dst-opaque early-out fires for every pixel. Src never read.
         let mut buf = vec![pack_argb(50, 60, 70, 255); 4 * 4];
-        fill_rect_blend(
+        fill_rect(
             &mut buf,
             4,
             4,
@@ -2158,42 +2062,8 @@ mod tests {
             None,
             None,
         );
-        // Under t-convention, opacity=0 stores t=255 (almost transparent). The blend math then
-        // gives bg with ≤1 LSB drift per channel (bg·255/256 ≈ bg).
-        assert!(buf.iter().all(|&p| {
-            let (r, g, b, _) = unpack_argb(p);
-            (r as i32 - 50).abs() <= 1 && (g as i32 - 60).abs() <= 1 && (b as i32 - 70).abs() <= 1
-        }));
-    }
-
-    #[test]
-    fn fill_rect_blend_clips_partial() {
-        let mut buf = vec![pack_argb(0, 0, 0, 255); 4 * 4];
-        fill_rect_blend(
-            &mut buf,
-            4,
-            4,
-            2,
-            2,
-            10,
-            10,
-            pack_argb(200, 200, 200, 128),
-            None,
-            None,
-        );
-        // Pixels at (2,2), (3,2), (2,3), (3,3) should be ~(100, 100, 100); rest unchanged.
-        for y in 0..4usize {
-            for x in 0..4usize {
-                let (r, g, b, _) = unpack_argb(buf[y * 4 + x]);
-                if x >= 2 && y >= 2 {
-                    assert!((r as i32 - 100).abs() <= 1);
-                    assert!((g as i32 - 100).abs() <= 1);
-                    assert!((b as i32 - 100).abs() <= 1);
-                } else {
-                    assert_eq!((r, g, b), (0, 0, 0));
-                }
-            }
-        }
+        // Buffer unchanged — every pixel was opaque dst, every under call early-out'd.
+        assert!(buf.iter().all(|&p| p == pack_argb(50, 60, 70, 255)));
     }
 
     #[test]

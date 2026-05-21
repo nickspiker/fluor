@@ -15,7 +15,10 @@ pub struct BlinkTimer {
 impl BlinkTimer {
     /// New timer with a fixed-but-arbitrary seed (`0xDEAD_BEEF`). Stopped (no next tick).
     pub fn new() -> Self {
-        Self { rng: 0xDEAD_BEEF, next: None }
+        Self {
+            rng: 0xDEAD_BEEF,
+            next: None,
+        }
     }
 
     /// Start the timer: schedule the first tick at `now + random(0..=300ms)`.
@@ -56,7 +59,9 @@ impl BlinkTimer {
 }
 
 impl Default for BlinkTimer {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -115,7 +120,12 @@ mod tests {
         // xorshift32 should produce varied intervals across many advances.
         let mut t = BlinkTimer::new();
         let mut intervals = std::collections::HashSet::new();
-        for _ in 0..20 { intervals.insert(t.advance().as_millis()); }
-        assert!(intervals.len() > 5, "xorshift32 should produce >5 distinct values in 20 draws");
+        for _ in 0..20 {
+            intervals.insert(t.advance().as_millis());
+        }
+        assert!(
+            intervals.len() > 5,
+            "xorshift32 should produce >5 distinct values in 20 draws"
+        );
     }
 }

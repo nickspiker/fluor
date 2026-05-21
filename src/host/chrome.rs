@@ -1,25 +1,27 @@
-//! Window chrome — verbatim port of photon's window controls. **Do not "improve" or "simplify" the math here.** The function below is photon's [draw_window_controls](/mnt/Octopus/Code/photon/src/ui/compositing.rs) with `Self::` prefixes stripped to free-function calls. The squircle bottom-left corner, the per-pixel `hit_test_map` write, the symbol placement at `bw/4` offset — all unchanged.
+//! Window chrome — minimal top-down rasterization. Each pixel in the chrome layer is written by exactly one site. No painter's algorithm anywhere.
 //!
-//! Symbol rendering and `blend_rgb_only` live in [`crate::paint`]. Hit IDs are integers so the desktop host can index `hit_test_map[y * w + x]` directly on click.
+//! Currently scoped to **window perimeter hairline** with squircle corner AA. The chrome layer starts at the canonical empty value (`0xFFFFFFFF`); this function paints only the hairline pixels. Everywhere else in the chrome layer stays transparent so panes / bg can pass through the chrome group's Stack composition. Buttons, glyphs, title text, hover overlay — all deferred to subsequent scaffold steps; reintroduce them only when each can be added without overwriting earlier writes within this same layer.
 //!
-//! Chrome here = window controls strip + edges. Title-bar text, scroll bars, status bar, tooltips, context menus, per-pane chrome — all not yet built.
+//! Hit-test IDs and the `ResizeEdge` enum live here so the desktop host's mouse routing can reference them without depending on the (future, larger) controls implementation.
+//!
+//! The squircle crossings table is consumed but not computed here; the caller (chrome_widget) computes it once per resize and passes it in.
+//!
+//! All RGB values stored in the chrome layer are straight-α (the canonical buffer convention). The OS conversion layer at the present boundary handles platform-specific premultiplication.
 
-use alloc::vec::Vec;
 use crate::coord::Coord;
 use crate::math;
-use crate::paint;
 use crate::theme;
 
-/// Hit-test IDs written into the per-pixel map by [`draw_window_controls`]. Same numbering as photon.
+/// Hit-test IDs that the per-pixel hit_test_map can carry. `HIT_NONE` = clicks pass through. Button IDs are placeholders for the future controls scaffold step.
 pub const HIT_NONE: u8 = 0;
 pub const HIT_MINIMIZE_BUTTON: u8 = 1;
 pub const HIT_MAXIMIZE_BUTTON: u8 = 2;
 pub const HIT_CLOSE_BUTTON: u8 = 3;
 
-/// Pixel floor for the controls-strip button height. The actual height is `MIN_BUTTON_HEIGHT_PX + ceil(span/32)` so it always grows with viewport but never collapses to a degenerate size where: (a) the symbol rasterizers' integer math floors to zero (`maximize_symbol` divides by `r_inner³` where `r_inner = (r*4 + 4) / 5`), or (b) a 1-pixel feature can't be antialiased meaningfully. Pair with a window `min_inner_size` that guarantees the chrome strip can horizontally fit (`window_width >= 7 * MIN_BUTTON_HEIGHT_PX / 2 = 14`).
-pub const MIN_BUTTON_HEIGHT_PX: usize = 4;
+/// Minimum pixel height for a control button. The button-sizing formula in higher scaffold steps is `MIN_BUTTON_HEIGHT_PX + ceil(span/32 * ru)` — the floor guarantees controls remain visible (and that symbol-rasterizer integer math never floors to zero) at any window size the WM permits. Kept as a public const so the host can compute layout pre-rasterization.
+pub const MIN_BUTTON_HEIGHT_PX: u32 = 24;
 
-/// Resize edge classification, photon's enum verbatim.
+/// Resize-edge classification returned by [`get_resize_edge`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResizeEdge {
     None,
@@ -33,9 +35,10 @@ pub enum ResizeEdge {
     BottomRight,
 }
 
-/// Photon's `get_resize_edge`. Edge thickness derived from harmonic-mean span.
+/// Classify a cursor position as one of nine resize zones (or None for the window interior). Geometry only — no rasterization. Edge band thickness derived from harmonic-mean span so the hit zone scales with viewport size.
 pub fn get_resize_edge(window_width: u32, window_height: u32, x: Coord, y: Coord) -> ResizeEdge {
-    let span = 2.0 * window_width as Coord * window_height as Coord / (window_width as Coord + window_height as Coord);
+    let span = 2.0 * window_width as Coord * window_height as Coord
+        / (window_width as Coord + window_height as Coord);
     let resize_border = math::ceil(span / 32.0);
 
     let at_left = x < resize_border;
@@ -43,746 +46,202 @@ pub fn get_resize_edge(window_width: u32, window_height: u32, x: Coord, y: Coord
     let at_top = y < resize_border;
     let at_bottom = y > (window_height as Coord - resize_border);
 
-    if at_top && at_left { ResizeEdge::TopLeft }
-    else if at_top && at_right { ResizeEdge::TopRight }
-    else if at_bottom && at_left { ResizeEdge::BottomLeft }
-    else if at_bottom && at_right { ResizeEdge::BottomRight }
-    else if at_top { ResizeEdge::Top }
-    else if at_bottom { ResizeEdge::Bottom }
-    else if at_left { ResizeEdge::Left }
-    else if at_right { ResizeEdge::Right }
-    else { ResizeEdge::None }
+    if at_top && at_left {
+        ResizeEdge::TopLeft
+    } else if at_top && at_right {
+        ResizeEdge::TopRight
+    } else if at_bottom && at_left {
+        ResizeEdge::BottomLeft
+    } else if at_bottom && at_right {
+        ResizeEdge::BottomRight
+    } else if at_top {
+        ResizeEdge::Top
+    } else if at_bottom {
+        ResizeEdge::Bottom
+    } else if at_left {
+        ResizeEdge::Left
+    } else if at_right {
+        ResizeEdge::Right
+    } else {
+        ResizeEdge::None
+    }
 }
 
-/// Verbatim port of photon's `draw_window_controls`. Renders the top-right control strip — grey background, two-tone hairline edge, squircle bottom-left corner, plus three glyph buttons (minimize, maximize, close) — and writes per-pixel button IDs into `hit_test_map` for downstream click routing.
+/// Rasterize the window-perimeter hairline into `pixels` (the chrome layer) AND the per-pixel window-shape `clip_mask`. Two outputs, single pass per crossing — the chrome layer carries opaque RGB only (no partial-t), and ALL partial-α information lives in the clip mask. The boundary's [`crate::paint::finalize_for_os`] multiplies the clip mask into each pixel's α before the OS sees it.
 ///
-/// `ru` is the resolution-units multiplier (default `1.0`); button height = `ceil(span / 32 * ru)`.
-pub fn draw_window_controls(
-    pixels: &mut [u32],
-    hit_test_map: &mut [u8],
-    window_width: u32,
-    window_height: u32,
-    ru: Coord,
-) -> (usize, Vec<(u16, u8, u8)>, usize, usize) {
-    let window_width = window_width as usize;
-    let window_height = window_height as usize;
-
-    // Calculate button dimensions: a fixed minimum + harmonic-mean span scaled by ru. The minimum guarantees controls are always visible (and that the symbol rasterizers' integer math never floors to zero), and the +scaled term gives smooth growth with viewport size — same growth rate as photon's pure-scaled version, just with a floor.
-    let span = 2.0 * window_width as Coord * window_height as Coord
-        / (window_width as Coord + window_height as Coord);
-    let button_height = MIN_BUTTON_HEIGHT_PX + math::ceil(span / 32.0 * ru) as usize;
-    let button_width = button_height;
-    let total_width = button_width * 7 / 2;
-
-    // If the controls strip wouldn't fit horizontally or vertically, give up gracefully. With min_inner_size enforced at the host level the strip always fits at any non-degenerate window size, so this guards against pathological intermediate states only.
-    if total_width >= window_width || button_height >= window_height {
-        return (0, Vec::new(), 0, 0);
-    }
-
-    // Buttons extend to top-right corner of window
-    let mut x_start = window_width - total_width;
-    let y_start = 0;
-
-    // Build squircle crossings for bottom-left corner
-    let radius = span * ru / 4.0;
-    let squirdleyness = 24;
-
-    let mut crossings: Vec<(u16, u8, u8)> = Vec::new();
-    let mut y = 1f32;
-    loop {
-        let y_norm = y / radius;
-        let x_norm = math::powf(1.0 - math::powi(y_norm, squirdleyness), 1.0 / squirdleyness as Coord);
-        let x = x_norm * radius;
-        let inset = radius - x;
-        if inset > 0. {
-            crossings.push((
-                inset as u16,
-                (math::sqrt(math::fract(inset)) * 256.) as u8,
-                (math::sqrt(1. - math::fract(inset)) * 256.) as u8,
-            ));
-        }
-        if x < y {
-            break;
-        }
-        y += 1.;
-    }
-    let start = (radius - y) as usize;
-    let crossings: Vec<(u16, u8, u8)> = crossings.into_iter().rev().collect();
-
-    let edge_colour = theme::WINDOW_LIGHT_EDGE;
-    let bg_colour = theme::WINDOW_CONTROLS_BG;
-
-    // Left edge (vertical) - draw light hairline following squircle curve
-    let mut y_offset = start;
-    for (inset, l, h) in &crossings {
-        if y_offset >= button_height {
-            break;
-        }
-        let py = y_start + button_height - 1 - y_offset;
-
-        // Fill grey to the right of the curve and populate hit test map
-        let col_end = total_width.min(window_width - x_start);
-        for col in (*inset as usize + 2)..col_end - 1 {
-            let px = x_start + col;
-            let pixel_idx = py * window_width + px;
-
-            pixels[pixel_idx] = bg_colour;
-
-            // Determine which button this pixel belongs to. Buttons are drawn with a button_width / 4 offset.
-            let button_area_x_start = x_start + button_width / 4;
-            let button_id = if px < button_area_x_start {
-                HIT_MINIMIZE_BUTTON
-            } else {
-                let x_in_button_area = px - button_area_x_start;
-                if x_in_button_area < button_width {
-                    HIT_MINIMIZE_BUTTON
-                } else if x_in_button_area < button_width * 2 {
-                    HIT_MAXIMIZE_BUTTON
-                } else {
-                    HIT_CLOSE_BUTTON
-                }
-            };
-            hit_test_map[pixel_idx] = button_id;
-        }
-
-        let px = x_start + *inset as usize;
-        let pixel_idx = py * window_width + px;
-        pixels[pixel_idx] = paint::blend_rgb_only(pixels[pixel_idx], edge_colour, *l, *h);
-
-        let px = x_start + *inset as usize + 1;
-        let pixel_idx = py * window_width + px;
-        pixels[pixel_idx] = paint::blend_rgb_only(bg_colour, edge_colour, *h, *l);
-
-        let button_area_x_start = x_start + button_width / 4;
-        let button_id = if px < button_area_x_start {
-            HIT_MINIMIZE_BUTTON
-        } else {
-            let x_in_button_area = px - button_area_x_start;
-            if x_in_button_area < button_width {
-                HIT_MINIMIZE_BUTTON
-            } else if x_in_button_area < button_width * 2 {
-                HIT_MAXIMIZE_BUTTON
-            } else {
-                HIT_CLOSE_BUTTON
-            }
-        };
-        hit_test_map[pixel_idx] = button_id;
-
-        y_offset += 1;
-    }
-
-    // Bottom edge (horizontal)
-    let mut x_offset = start;
-    let crossing_limit = crossings.len().min(window_width - (x_start + start));
-    for &(inset, l, h) in &crossings[..crossing_limit] {
-        let i = inset as usize;
-        // Skip crossings whose inset extends past the strip's vertical height — `py = button_height - 1 - (i + 1)` would underflow usize. Crossings are sorted descending after reversal, so the early iterations may exceed button_height; subsequent ones are progressively smaller and become safe.
-        if i + 1 >= button_height {
-            x_offset += 1;
-            continue;
-        }
-        let px = x_start + x_offset;
-
-        let py = y_start + button_height - 1 - i;
-        let pixel_idx = py * window_width + px;
-        pixels[pixel_idx] = paint::blend_rgb_only(pixels[pixel_idx], edge_colour, l, h);
-
-        for row in (i + 2)..start {
-            let py = y_start + button_height - 1 - row;
-            let pixel_idx = py * window_width + px;
-
-            pixels[pixel_idx] = bg_colour;
-
-            let button_area_x_start = x_start + button_width / 4;
-            let button_id = if px < button_area_x_start {
-                HIT_MINIMIZE_BUTTON
-            } else {
-                let x_in_button_area = px - button_area_x_start;
-                if x_in_button_area < button_width {
-                    HIT_MINIMIZE_BUTTON
-                } else if x_in_button_area < button_width * 2 {
-                    HIT_MAXIMIZE_BUTTON
-                } else {
-                    HIT_CLOSE_BUTTON
-                }
-            };
-            hit_test_map[pixel_idx] = button_id;
-        }
-
-        let py = y_start + button_height - 1 - (i + 1);
-        let pixel_idx = py * window_width + px;
-        pixels[pixel_idx] = paint::blend_rgb_only(bg_colour, edge_colour, h, l);
-
-        let button_area_x_start = x_start + button_width / 4;
-        let button_id = if px < button_area_x_start {
-            HIT_MINIMIZE_BUTTON
-        } else {
-            let x_in_button_area = px - button_area_x_start;
-            if x_in_button_area < button_width {
-                HIT_MINIMIZE_BUTTON
-            } else if x_in_button_area < button_width * 2 {
-                HIT_MAXIMIZE_BUTTON
-            } else {
-                HIT_CLOSE_BUTTON
-            }
-        };
-        hit_test_map[pixel_idx] = button_id;
-
-        x_offset += 1;
-    }
-
-    // Continue bottom edge linearly from where squircle ends to window edge
-    let linear_start_x = x_start + start + crossings.len();
-    let edge_y = y_start + button_height - 1;
-
-    for px in linear_start_x..window_width {
-        let pixel_idx = edge_y * window_width + px;
-        pixels[pixel_idx] = edge_colour;
-
-        for row in 1..start {
-            let py = edge_y - row;
-            let pixel_idx = py * window_width + px;
-            pixels[pixel_idx] = bg_colour;
-
-            // All pixels past the squircle belong to close button
-            hit_test_map[pixel_idx] = HIT_CLOSE_BUTTON;
-        }
-    }
-
-    x_start += button_width / 4;
-
-    // Draw button symbols using glyph colours
-    paint::glyph::minimize_symbol(
-        pixels,
-        window_width,
-        x_start + button_width / 2,
-        y_start + button_width / 2,
-        button_width / 4,
-        theme::MINIMIZE_GLYPH,
-    );
-
-    paint::glyph::maximize_symbol(
-        pixels,
-        window_width,
-        x_start + button_width + button_width / 2,
-        y_start + button_width / 2,
-        button_width / 4,
-        theme::MAXIMIZE_GLYPH,
-        theme::MAXIMIZE_GLYPH_INTERIOR,
-    );
-
-    paint::glyph::close_symbol(
-        pixels,
-        window_width,
-        x_start + button_width * 2 + button_width / 2,
-        y_start + button_width / 2,
-        button_width / 4,
-        theme::CLOSE_GLYPH,
-    );
-    (start, crossings, x_start, button_height)
-}
-
-/// Verbatim port of photon's `draw_window_edges_and_mask`. Paints the two-tone window perimeter (light top/left, shadow bottom/right) and clips out squircle corners by zeroing pixels outside the squircle (those pixels become fully transparent under `with_transparent(true)`). Takes `start` and `crossings` from the matching call to [`draw_window_controls`].
+/// Pre-conditions: `pixels` already at the canonical empty value `0xFFFFFFFF`, `clip_mask` already at the host's default of `255` (fully visible window-interior assumption).
+///
+/// Topology: straight edges paint opaque RGB in non-corner ranges (`cap..(end-cap)`) and leave the clip mask alone (= 255, fully visible). Each crossing entry handles **one row** of the curve region for the four corners: zero out the cutout cols, write opaque hairline RGB at the curve's outer + inner pixel positions, and write `h_cov` / `l` into the clip mask at those same positions. Above-the-curve rows (`0..start`) and below-the-curve rows (`h-start..h`) are *entirely* cutout — the curve never enters them — so the full cap-width at those rows is zeroed in the clip mask.
+///
+/// Two-tone bevel (light from upper-left): top + left straight edges are light, bottom + right are shadow. TL and BR corners are uniform (both adjacent edges agree); TR and BL transition along the curve. The per-pixel colour test (`tr_color`, `bl_color`) is the same one we settled on previously — closer-to-light-edge wins.
+///
+/// `hit_test_map` is preserved as a parameter for forward compatibility with the controls scaffold step but is not modified here.
 pub fn draw_window_edges_and_mask(
     pixels: &mut [u32],
     hit_test_map: &mut [u8],
+    clip_mask: &mut [u8],
     width: u32,
     height: u32,
     start: usize,
     crossings: &[(u16, u8, u8)],
 ) {
-    // External-input guard: degenerate sizes underflow `(height - 1) * width` and the per-crossing index math. Same Rule 0 justification as draw_window_controls — WM can send tiny sizes during drag.
+    let _ = hit_test_map;
     if width < 2 || height < 2 {
         return;
     }
-    // If the squircle inset doesn't fit the window, the four-corner-square / per-row math underflows. Return without drawing edges; the chrome strip already short-circuited above too.
-    if start * 2 >= width as usize || start * 2 >= height as usize {
-        return;
-    }
-
-    let light_colour = theme::WINDOW_LIGHT_EDGE;
-    let shadow_colour = theme::WINDOW_SHADOW_EDGE;
-
-    // Fill all four edges with white before squircle clipping
-    // Top edge
-    for x in 0..width {
-        let idx = 0 * width + x;
-        pixels[idx as usize] = light_colour;
-    }
-
-    // Bottom edge
-    for x in 0..width {
-        let idx = (height - 1) * width + x;
-        pixels[idx as usize] = shadow_colour;
-    }
-
-    // Left edge
-    for y in 0..height {
-        let idx = y * width + 0;
-        pixels[idx as usize] = light_colour;
-    }
-
-    // Right edge
-    for y in 0..height {
-        let idx = y * width + (width - 1);
-        pixels[idx as usize] = shadow_colour;
-    }
-
-    // Fill four corner squares and clear hitmap
-    for row in 0..start {
-        for col in 0..start {
-            let idx = row * width as usize + col;
-            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
-            hit_test_map[idx] = HIT_NONE;
-        }
-    }
-    for row in 0..start {
-        for col in (width as usize - start)..width as usize {
-            let idx = row * width as usize + col;
-            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
-            hit_test_map[idx] = HIT_NONE;
-        }
-    }
-    for row in (height as usize - start)..height as usize {
-        for col in 0..start {
-            let idx = row * width as usize + col;
-            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
-            hit_test_map[idx] = HIT_NONE;
-        }
-    }
-    for row in (height as usize - start)..height as usize {
-        for col in (width as usize - start)..width as usize {
-            let idx = row * width as usize + col;
-            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
-            hit_test_map[idx] = HIT_NONE;
-        }
-    }
-
-    // Top left/right edges
-    let mut y_top = start;
-    for crossing in 0..crossings.len() {
-        let (inset, l, h) = crossings[crossing];
-        // Left edge fill
-        for idx in y_top * width as usize..y_top * width as usize + inset as usize {
-            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
-            hit_test_map[idx] = HIT_NONE;
-        }
-
-        // Left edge outer pixel
-        let pixel_idx = y_top * width as usize + inset as usize;
-        // t-convention: top byte is transparency, h is coverage (0..255 high=opaque).
-        pixels[pixel_idx] = (light_colour & 0x00FFFFFF) | (((255 - h) as u32) << 24);
-        if h < 255 {
-            hit_test_map[pixel_idx] = HIT_NONE; // NEEDS FIXED!!!
-        }
-
-        // Left edge inner pixel
-        let pixel_idx = pixel_idx + 1;
-        pixels[pixel_idx] = paint::blend_rgb_only(pixels[pixel_idx], light_colour, h, l);
-
-        // Right edge inner pixel
-        let pixel_idx = y_top * width as usize + width as usize - 2 - inset as usize;
-        pixels[pixel_idx] = paint::blend_rgb_only(pixels[pixel_idx], shadow_colour, h, l);
-
-        // Right edge outer pixel
-        let pixel_idx = pixel_idx + 1;
-        pixels[pixel_idx] = (shadow_colour & 0x00FFFFFF) | (((255 - h) as u32) << 24);
-        if h < 255 {
-            hit_test_map[pixel_idx] = HIT_NONE;
-        }
-
-        // Right edge fill
-        for idx in (y_top * width as usize + width as usize - inset as usize)
-            ..((y_top + 1) * width as usize)
-        {
-            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
-            hit_test_map[idx] = HIT_NONE;
-        }
-        y_top += 1;
-    }
-
-    // Bottom left/right edges
-    let mut y_bottom = height as usize - start - 1;
-    for crossing in 0..crossings.len() {
-        let (inset, l, h) = crossings[crossing];
-
-        // Left edge fill
-        for idx in y_bottom * width as usize..y_bottom * width as usize + inset as usize {
-            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
-            hit_test_map[idx] = HIT_NONE;
-        }
-
-        // Left outer edge pixel
-        let pixel_idx = y_bottom * width as usize + inset as usize;
-        // t-convention: top byte is transparency, h is coverage (0..255 high=opaque).
-        pixels[pixel_idx] = (light_colour & 0x00FFFFFF) | (((255 - h) as u32) << 24);
-        if h < 255 {
-            hit_test_map[pixel_idx] = HIT_NONE;
-        }
-
-        // Left inner edge pixel
-        let pixel_idx = pixel_idx + 1;
-        pixels[pixel_idx] = paint::blend_rgb_only(pixels[pixel_idx], light_colour, h, l);
-
-        // Right edge inner pixel
-        let pixel_idx = y_bottom * width as usize + width as usize - 2 - inset as usize;
-        pixels[pixel_idx] = paint::blend_rgb_only(pixels[pixel_idx], shadow_colour, h, l);
-
-        // Right edge outer pixel
-        let pixel_idx = pixel_idx + 1;
-        pixels[pixel_idx] = (shadow_colour & 0x00FFFFFF) | (((255 - h) as u32) << 24);
-        if h < 255 {
-            hit_test_map[pixel_idx] = HIT_NONE;
-        }
-
-        // Right edge fill
-        for idx in (y_bottom * width as usize + width as usize - inset as usize)
-            ..((y_bottom + 1) * width as usize)
-        {
-            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
-            hit_test_map[idx] = HIT_NONE;
-        }
-
-        y_bottom -= 1;
-    }
-
-    // Left side top/bottom edges
-    let mut x_left = start;
-    for crossing in 0..crossings.len() {
-        let (inset, l, h) = crossings[crossing];
-
-        // Top edge fill
-        for row in 0..inset as usize {
-            let idx = row * width as usize + x_left;
-            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
-            hit_test_map[idx] = HIT_NONE;
-        }
-
-        // Top outer edge pixel
-        let pixel_idx = inset as usize * width as usize + x_left;
-        // t-convention: top byte is transparency, h is coverage (0..255 high=opaque).
-        pixels[pixel_idx] = (light_colour & 0x00FFFFFF) | (((255 - h) as u32) << 24);
-        if h < 255 {
-            hit_test_map[pixel_idx] = HIT_NONE;
-        }
-
-        // Top inner edge pixel
-        let pixel_idx = (inset as usize + 1) * width as usize + x_left;
-        pixels[pixel_idx] = paint::blend_rgb_only(pixels[pixel_idx], light_colour, h, l);
-
-        // Bottom outer edge pixel
-        let pixel_idx = (height as usize - 1 - inset as usize) * width as usize + x_left;
-        pixels[pixel_idx] = (shadow_colour & 0x00FFFFFF) | (((255 - h) as u32) << 24);
-        if h < 255 {
-            hit_test_map[pixel_idx] = HIT_NONE;
-        }
-
-        // Bottom inner edge pixel
-        let pixel_idx = (height as usize - 2 - inset as usize) * width as usize + x_left;
-        pixels[pixel_idx] = paint::blend_rgb_only(pixels[pixel_idx], shadow_colour, h, l);
-
-        // Bottom edge fill
-        for row in (height as usize - inset as usize)..height as usize {
-            let idx = row * width as usize + x_left;
-            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
-            hit_test_map[idx] = HIT_NONE;
-        }
-
-        x_left += 1;
-    }
-
-    // Right side top/bottom edges
-    let mut x_right = width as usize - start - 1;
-    for crossing in 0..crossings.len() {
-        let (inset, l, h) = crossings[crossing];
-
-        // Top edge fill
-        for row in 0..inset as usize {
-            let idx = row * width as usize + x_right;
-            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
-            hit_test_map[idx] = HIT_NONE;
-        }
-
-        // Top outer edge pixel
-        let pixel_idx = inset as usize * width as usize + x_right;
-        // t-convention: top byte is transparency, h is coverage (0..255 high=opaque).
-        pixels[pixel_idx] = (light_colour & 0x00FFFFFF) | (((255 - h) as u32) << 24);
-        if h < 255 {
-            hit_test_map[pixel_idx] = HIT_NONE;
-        }
-
-        // Top inner edge pixel
-        let pixel_idx = (inset as usize + 1) * width as usize + x_right;
-        pixels[pixel_idx] = paint::blend_rgb_only(pixels[pixel_idx], light_colour, h, l);
-
-        // Bottom outer edge pixel
-        let pixel_idx = (height as usize - 1 - inset as usize) * width as usize + x_right;
-        pixels[pixel_idx] = (shadow_colour & 0x00FFFFFF) | (((255 - h) as u32) << 24);
-        if h < 255 {
-            hit_test_map[pixel_idx] = HIT_NONE;
-        }
-
-        // Bottom inner edge pixel
-        let pixel_idx = (height as usize - 2 - inset as usize) * width as usize + x_right;
-        pixels[pixel_idx] = paint::blend_rgb_only(pixels[pixel_idx], shadow_colour, h, l);
-
-        // Bottom edge fill
-        for row in (height as usize - inset as usize)..height as usize {
-            let idx = row * width as usize + x_right;
-            pixels[idx] = 0xFF000000;  // t-convention: transparent (t=255, RGB=0).
-            hit_test_map[idx] = HIT_NONE;
-        }
-
-        x_right -= 1;
-    }
-}
-
-/// Rasterize the window-silhouette mask under fluor's t-convention. Interior of the squircle = `0x00_00_00_00` (t=0 = no-op for OR — preserves bg). Four corner cutouts + AA pixels = `0xFF_00_00_00` (t=255 = transparent — OR forces the bg's t to 255 at those pixels). RGB=0 throughout so the OR doesn't touch bg's RGB.
-///
-/// Used in [`super::chrome_widget::DefaultChrome`]'s Stack program — `Push bg, Push silhouette, Or, …` makes the bg's corners transparent. AA edge counts as "outside" (cutout); the chrome layer's own perimeter pixels handle the visible squircle curve via AlphaOver.
-pub fn rasterize_window_silhouette(
-    silhouette: &mut [u32],
-    width: u32,
-    height: u32,
-    start: usize,
-    crossings: &[(u16, u8, u8)],
-) {
-    // Default everything to "inside" = OR-identity (no bits set).
-    silhouette.fill(0);
-
-    if width < 2 || height < 2 { return; }
-    if start * 2 >= width as usize || start * 2 >= height as usize { return; }
-
     let w = width as usize;
     let h = height as usize;
-    const CUTOUT: u32 = 0xFF_00_00_00; // t=255 in top byte, RGB=0 (OR no-op for RGB).
-
-    // Four corner squares (size `start × start`) — outside the squircle.
-    for row in 0..start {
-        for col in 0..start {
-            silhouette[row * w + col] = CUTOUT;
-        }
-        for col in (w - start)..w {
-            silhouette[row * w + col] = CUTOUT;
-        }
-    }
-    for row in (h - start)..h {
-        for col in 0..start {
-            silhouette[row * w + col] = CUTOUT;
-        }
-        for col in (w - start)..w {
-            silhouette[row * w + col] = CUTOUT;
-        }
-    }
-
-    // Top-left/right squircle rows.
-    let mut y_top = start;
-    for &(inset, _l, _h) in crossings {
-        let row_base = y_top * w;
-        for col in 0..=(inset as usize).min(w - 1) {
-            silhouette[row_base + col] = CUTOUT;
-        }
-        let right_start = w.saturating_sub(inset as usize + 1);
-        for col in right_start..w {
-            silhouette[row_base + col] = CUTOUT;
-        }
-        y_top += 1;
-    }
-
-    // Bottom-left/right squircle rows.
-    let mut y_bottom = h - start - 1;
-    for &(inset, _l, _h) in crossings {
-        let row_base = y_bottom * w;
-        for col in 0..=(inset as usize).min(w - 1) {
-            silhouette[row_base + col] = CUTOUT;
-        }
-        let right_start = w.saturating_sub(inset as usize + 1);
-        for col in right_start..w {
-            silhouette[row_base + col] = CUTOUT;
-        }
-        if y_bottom == 0 { break; }
-        y_bottom -= 1;
-    }
-
-    // Left/right squircle columns.
-    let mut x_left = start;
-    for &(inset, _l, _h) in crossings {
-        for row in 0..=(inset as usize).min(h - 1) {
-            silhouette[row * w + x_left] = CUTOUT;
-        }
-        let bottom_start = h.saturating_sub(inset as usize + 1);
-        for row in bottom_start..h {
-            silhouette[row * w + x_left] = CUTOUT;
-        }
-        x_left += 1;
-    }
-
-    let mut x_right = w - start - 1;
-    for &(inset, _l, _h) in crossings {
-        for row in 0..=(inset as usize).min(h - 1) {
-            silhouette[row * w + x_right] = CUTOUT;
-        }
-        let bottom_start = h.saturating_sub(inset as usize + 1);
-        for row in bottom_start..h {
-            silhouette[row * w + x_right] = CUTOUT;
-        }
-        if x_right == 0 { break; }
-        x_right -= 1;
-    }
-}
-
-/// Verbatim port of photon's `draw_button_hairlines`. Vertical 1-px hairlines between minimize/maximize and maximize/close, drawn from the strip's vertical center outward until they hit a pixel of a different colour (so they stop cleanly at the squircle edge above and the bottom edge below).
-pub fn draw_button_hairlines(
-    pixels: &mut [u32],
-    hit_test_map: &mut [u8],
-    window_width: u32,
-    _window_height: u32,
-    button_x_start: usize,
-    button_height: usize,
-    _start: usize,
-    _crossings: &[(u16, u8, u8)],
-) {
-    // No-op when chrome was skipped. button_height = 0 means draw_window_controls returned early.
-    if button_height == 0 || window_width == 0 {
+    if start * 2 >= w || start * 2 >= h {
         return;
     }
-    let width = window_width as usize;
-    let y_start = 0;
 
-    // button_width equals button_height (passed in, already scaled with span * ru)
-    let button_width = button_height;
-
-    // Two hairlines: at 1.0 and 2.0 button widths from button area start
-    let left_px = button_x_start + button_width;
-    let right_px = button_x_start + button_width * 2;
-
-    let center_y = y_start + button_height / 2;
-    let edge_colour = theme::WINDOW_CONTROLS_HAIRLINE;
-
-    // Left hairline — upward from center
-    let center_colour = pixels[center_y * width + left_px];
-    for py in (y_start..=center_y).rev() {
-        let idx = py * width + left_px;
-        let diff = pixels[idx] != center_colour;
-        pixels[idx] = edge_colour;
-        hit_test_map[idx] = HIT_NONE;
-        if diff {
-            break;
-        }
-    }
-    // Left hairline — downward from center+1
-    for py in (center_y + 1)..(y_start + button_height) {
-        let idx = py * width + left_px;
-        let diff = pixels[idx] != center_colour;
-        pixels[idx] = edge_colour;
-        hit_test_map[idx] = HIT_NONE;
-        if diff {
-            break;
-        }
+    let light = theme::WINDOW_LIGHT_EDGE;
+    let shadow = theme::WINDOW_SHADOW_EDGE;
+    let count = crossings.len();
+    let cap = start + count;
+    if cap * 2 >= w || cap * 2 >= h {
+        return;
     }
 
-    // Right hairline — upward from center
-    let center_colour_right = pixels[center_y * width + right_px];
-    for py in (y_start..=center_y).rev() {
-        let idx = py * width + right_px;
-        let diff = pixels[idx] != center_colour_right;
-        pixels[idx] = edge_colour;
-        hit_test_map[idx] = HIT_NONE;
-        if diff {
-            break;
+    // Straight edges — opaque RGB only. Clip mask along these edges stays at the host's 255 default (fully visible).
+    for x in cap..(w - cap) {
+        pixels[x] = light; // top row
+        pixels[(h - 1) * w + x] = shadow; // bottom row
+    }
+    for y in cap..(h - cap) {
+        pixels[y * w] = light; // left col
+        pixels[y * w + (w - 1)] = shadow; // right col
+    }
+
+    // Corner-of-corner cutout (start × start at each corner): the small outer square that the curve never reaches under any squircle parameter. The rest of the cap (the inner L-shape: rows 0..start × cols start..cap, and rows start..cap × cols 0..start) is handled per-pixel by the curve row-walks (zero c in 0..inset at row=start+i) and col-walks (zero r in 0..inset at col=start+i). Curve interior (rows start..cap × cols start..cap, inside the squircle) stays at the default 255.
+    for r in 0..start {
+        for c in 0..start {
+            clip_mask[r * w + c] = 0;
+        }
+        for c in (w - start)..w {
+            clip_mask[r * w + c] = 0;
         }
     }
-    // Right hairline — downward from center+1
-    for py in (center_y + 1)..(y_start + button_height) {
-        let idx = py * width + right_px;
-        let diff = pixels[idx] != center_colour_right;
-        pixels[idx] = edge_colour;
-        hit_test_map[idx] = HIT_NONE;
-        if diff {
-            break;
+    for r in (h - start)..h {
+        for c in 0..start {
+            clip_mask[r * w + c] = 0;
         }
+        for c in (w - start)..w {
+            clip_mask[r * w + c] = 0;
+        }
+    }
+
+    let tr_color =
+        |row: usize, col: usize| -> u32 { if row < (w - 1 - col) { light } else { shadow } };
+    let bl_color =
+        |row: usize, col: usize| -> u32 { if col < (h - 1 - row) { light } else { shadow } };
+
+    // Curve rows AND curve cols: the squircle is symmetric under x↔y swap, so the same crossings table walks both axes. The row-walk handles the corner's near-vertical segment (one row, two-pixel hairline at the curve crossing); the col-walk handles the near-horizontal segment (one col, two-pixel hairline). Both walks together fully cover the corner — without the col-walk, the near-horizontal portion of the corner (where the curve travels many cols per row) shows visible gaps.
+    for (i, &(inset_raw, l, h_cov)) in crossings.iter().enumerate() {
+        let inset = inset_raw as usize;
+        // Guard: in degenerate geometries the curve terminal can sit past the cap boundary. Skip those only. Letting `inset+1 == cap` through is required — that's the curve's natural last hairline pixel meeting the straight edge at the cap join.
+        if inset >= cap {
+            continue;
+        }
+
+        let row_top = start + i;
+        let row_bot = h - 1 - start - i;
+        let col_left = start + i;
+        let col_right = w - 1 - start - i;
+
+        // Two-sided AA convention. OUTER pixel = on the curve, partially outside the window: clip_mask = h_cov trims against the OS bg; chrome stays opaque (t=0) because the entire inside-window portion IS hairline. INNER pixel = one step inside the curve: clip_mask = 255 (fully inside the window shape); chrome's t-byte carries the hairline-vs-bg AA, set to `inner_t` so the Under blend mixes h_cov/256 of hairline color over (256-h_cov)/256 of window bg. The `l` slot in each crossing entry is the linear-coverage counterpart of h_cov, retained for the outer-pixel chrome-t AA when we move from a 2-pixel hairline to a 1-pixel-with-halo hairline.
+        let _ = l;
+        let inner_t = (h_cov as u32) << 24;
+        let light_inner = (light & 0x00FFFFFF) | inner_t;
+        let shadow_inner = (shadow & 0x00FFFFFF) | inner_t;
+
+        // TL row-walk
+        for c in 0..inset {
+            clip_mask[row_top * w + c] = 0;
+        }
+        pixels[row_top * w + inset] = light;
+        clip_mask[row_top * w + inset] = h_cov;
+        pixels[row_top * w + inset + 1] = light_inner;
+        clip_mask[row_top * w + inset + 1] = 255;
+
+        // TR row-walk
+        for c in (w - inset)..w {
+            clip_mask[row_top * w + c] = 0;
+        }
+        let tr_out_col = w - 1 - inset;
+        let tr_in_col = w - 2 - inset;
+        pixels[row_top * w + tr_out_col] = tr_color(row_top, tr_out_col);
+        clip_mask[row_top * w + tr_out_col] = h_cov;
+        pixels[row_top * w + tr_in_col] =
+            (tr_color(row_top, tr_in_col) & 0x00FFFFFF) | inner_t;
+        clip_mask[row_top * w + tr_in_col] = 255;
+
+        // BL row-walk
+        for c in 0..inset {
+            clip_mask[row_bot * w + c] = 0;
+        }
+        pixels[row_bot * w + inset] = bl_color(row_bot, inset);
+        clip_mask[row_bot * w + inset] = h_cov;
+        pixels[row_bot * w + inset + 1] =
+            (bl_color(row_bot, inset + 1) & 0x00FFFFFF) | inner_t;
+        clip_mask[row_bot * w + inset + 1] = 255;
+
+        // BR row-walk
+        for c in (w - inset)..w {
+            clip_mask[row_bot * w + c] = 0;
+        }
+        pixels[row_bot * w + (w - 1 - inset)] = shadow;
+        clip_mask[row_bot * w + (w - 1 - inset)] = h_cov;
+        pixels[row_bot * w + (w - 2 - inset)] = shadow_inner;
+        clip_mask[row_bot * w + (w - 2 - inset)] = 255;
+
+        // TL col-walk (near-horizontal portion of TL corner).
+        for r in 0..inset {
+            clip_mask[r * w + col_left] = 0;
+        }
+        pixels[inset * w + col_left] = light;
+        clip_mask[inset * w + col_left] = h_cov;
+        pixels[(inset + 1) * w + col_left] = light_inner;
+        clip_mask[(inset + 1) * w + col_left] = 255;
+
+        // TR col-walk.
+        for r in 0..inset {
+            clip_mask[r * w + col_right] = 0;
+        }
+        pixels[inset * w + col_right] = tr_color(inset, col_right);
+        clip_mask[inset * w + col_right] = h_cov;
+        pixels[(inset + 1) * w + col_right] =
+            (tr_color(inset + 1, col_right) & 0x00FFFFFF) | inner_t;
+        clip_mask[(inset + 1) * w + col_right] = 255;
+
+        // BL col-walk.
+        for r in (h - inset)..h {
+            clip_mask[r * w + col_left] = 0;
+        }
+        let bl_out_row = h - 1 - inset;
+        let bl_in_row = h - 2 - inset;
+        pixels[bl_out_row * w + col_left] = bl_color(bl_out_row, col_left);
+        clip_mask[bl_out_row * w + col_left] = h_cov;
+        pixels[bl_in_row * w + col_left] =
+            (bl_color(bl_in_row, col_left) & 0x00FFFFFF) | inner_t;
+        clip_mask[bl_in_row * w + col_left] = 255;
+
+        // BR col-walk.
+        for r in (h - inset)..h {
+            clip_mask[r * w + col_right] = 0;
+        }
+        pixels[(h - 1 - inset) * w + col_right] = shadow;
+        clip_mask[(h - 1 - inset) * w + col_right] = h_cov;
+        pixels[(h - 2 - inset) * w + col_right] = shadow_inner;
+        clip_mask[(h - 2 - inset) * w + col_right] = 255;
     }
 }
 
-/// Verbatim port of photon's `draw_button_hover_by_pixels`. Add or subtract a packed-u32 hover delta over a precomputed pixel list (deltas chosen so RGB wraps and alpha absorbs the carry).
-pub fn draw_button_hover_by_pixels(pixels: &mut [u32], pixel_list: &[usize], hover: bool, button_id: u8) {
-    let hover_delta = match button_id {
-        HIT_CLOSE_BUTTON => theme::CLOSE_HOVER,
-        HIT_MAXIMIZE_BUTTON => theme::MAXIMIZE_HOVER,
-        HIT_MINIMIZE_BUTTON => theme::MINIMIZE_HOVER,
-        _ => return,
-    };
-    for &hit_idx in pixel_list {
-        pixels[hit_idx] = if hover {
-            pixels[hit_idx].wrapping_add(hover_delta)
-        } else {
-            pixels[hit_idx].wrapping_sub(hover_delta)
-        };
-    }
-}
-
-/// Build a pixel-index list for `button_id` by scanning `hit_test_map`. Photon caches these lists across frames in its `Compositor`; for v0 we recompute on hover-state change (still O(width*height) but only once per hover event, not per frame).
-pub fn pixels_for_button(hit_test_map: &[u8], button_id: u8) -> Vec<usize> {
-    if button_id == HIT_NONE { return Vec::new(); }
-    let mut out = Vec::new();
-    for (i, &id) in hit_test_map.iter().enumerate() {
-        if id == button_id { out.push(i); }
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pixels_for_button_returns_matching_indices() {
-        let mut map = vec![HIT_NONE; 16];
-        map[3] = HIT_CLOSE_BUTTON;
-        map[7] = HIT_CLOSE_BUTTON;
-        map[10] = HIT_MAXIMIZE_BUTTON;
-        let close = pixels_for_button(&map, HIT_CLOSE_BUTTON);
-        assert_eq!(close, vec![3, 7]);
-        let max = pixels_for_button(&map, HIT_MAXIMIZE_BUTTON);
-        assert_eq!(max, vec![10]);
-    }
-
-    #[test]
-    fn hover_by_pixels_shifts_listed_pixels_only() {
-        let mut pixels = vec![0xFF20_2024u32; 8];
-        draw_button_hover_by_pixels(&mut pixels, &[2, 5], true, HIT_CLOSE_BUTTON);
-        assert_ne!(pixels[2], 0xFF20_2024);
-        assert_ne!(pixels[5], 0xFF20_2024);
-        assert_eq!(pixels[0], 0xFF20_2024);
-        assert_eq!(pixels[7], 0xFF20_2024);
-    }
-
-    #[test]
-    fn resize_edge_corners_win() {
-        assert_eq!(get_resize_edge(1920, 1080, 0.0, 0.0), ResizeEdge::TopLeft);
-        assert_eq!(get_resize_edge(1920, 1080, 1919.9, 0.0), ResizeEdge::TopRight);
-        assert_eq!(get_resize_edge(1920, 1080, 0.0, 1079.9), ResizeEdge::BottomLeft);
-        assert_eq!(get_resize_edge(1920, 1080, 1919.9, 1079.9), ResizeEdge::BottomRight);
-    }
-
-    #[test]
-    fn resize_edge_none_in_center() {
-        assert_eq!(get_resize_edge(1920, 1080, 960.0, 540.0), ResizeEdge::None);
-    }
-
-    #[test]
-    fn draw_window_controls_writes_hit_map() {
-        let w = 800u32;
-        let h = 600u32;
-        let mut pixels = vec![0u32; (w * h) as usize];
-        let mut hit_map = vec![HIT_NONE; (w * h) as usize];
-        let _ = draw_window_controls(&mut pixels, &mut hit_map, w, h, 1.0);
-        // Some pixels in the top-right strip should have button IDs.
-        let close_count = hit_map.iter().filter(|&&id| id == HIT_CLOSE_BUTTON).count();
-        let max_count = hit_map.iter().filter(|&&id| id == HIT_MAXIMIZE_BUTTON).count();
-        let min_count = hit_map.iter().filter(|&&id| id == HIT_MINIMIZE_BUTTON).count();
-        assert!(close_count > 0, "no close pixels");
-        assert!(max_count > 0, "no maximize pixels");
-        assert!(min_count > 0, "no minimize pixels");
-    }
-}
+// Removed in the "ONLY THE HAIRLINE" simplification (each was painter's-algorithm internally):
+//   - draw_window_controls         — button strip; opaque bg painted first, then read back by blend_rgb_only at AA crossings (classic painter's).
+//   - draw_button_hairlines        — walked vertically reading just-painted pixels to detect where to stop.
+//   - pixels_for_button            — consumer of the hit_test_map after the controls scaffold.
+//   - draw_button_hover_by_pixels  — additive overlay; depends on the controls scaffold.
+//   - rasterize_window_silhouette  — was for the deleted Op::Or knockout.
+//
+// Each will be re-added as a separate scaffold step, redesigned top-down (compute layout once, write each pixel from a single deterministic source) when the time comes.

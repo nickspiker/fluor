@@ -6,8 +6,7 @@
 //!
 //! Pattern: `chrome.rasterize_bg(|bg, w, h| { /* paint into bg */ });` → `chrome.rasterize_chrome(text);` → `chrome.rasterize_hover();` → `chrome.flatten_into(target, w, h);`. Each rasterize_* checks the layer's dirty bit internally and is a no-op on clean.
 
-use alloc::string::String;
-use alloc::vec::Vec;
+use super::chrome::{self, HIT_NONE, MIN_BUTTON_HEIGHT_PX};
 use crate::coord::Coord;
 use crate::geom::Viewport;
 use crate::group::Group;
@@ -16,11 +15,12 @@ use crate::region::Region;
 use crate::stack::Op;
 use crate::text::TextRenderer;
 use crate::theme;
-use super::chrome::{self, HIT_NONE, MIN_BUTTON_HEIGHT_PX};
+use alloc::string::String;
+use alloc::vec::Vec;
 
 /// Reusable window frame: controls, edges, hairlines, title, hover overlay.
 pub struct DefaultChrome {
-    /// Full-viewport Group with 3 layers (bg, chrome, hover) composed via Stack Notation: `Push bg, Push chrome, AlphaOver, Push hover, Add`. Blend onto target = `Replace`.
+    /// Full-viewport Group with 3 layers (bg, chrome, hover) composed via Stack Notation. Topmost-first: `Push chrome, Push bg, Under(Normal)` for the minimal scaffold; expand to include hover via `Push hover, Push chrome, Under(Add), Push bg, Under(Normal)` as the design grows.
     pub group: Group,
     /// Per-pixel button-id map. `0` = HIT_NONE; non-zero = a chrome button (`HIT_MINIMIZE_BUTTON` / `HIT_MAXIMIZE_BUTTON` / `HIT_CLOSE_BUTTON`). Sized to `width * height` pixels of the current viewport.
     pub hit_test_map: Vec<u8>,
@@ -31,30 +31,29 @@ pub struct DefaultChrome {
     /// Cached pixel index list for the currently hovered button — recomputed on hover-state change.
     pub hover_pixel_list: Vec<usize>,
     layer_bg: usize,
-    layer_silhouette: usize,
     layer_chrome: usize,
     layer_hover: usize,
 }
 
 impl DefaultChrome {
-    /// Allocate the chrome group + hit_test_map sized to `viewport`. Four layers (bg, silhouette, chrome, hover) all start dirty so the first frame paints from scratch.
+    /// Allocate the chrome group + hit_test_map sized to `viewport`. Three layers (bg, chrome, hover) all start dirty so the first frame paints from scratch.
     ///
-    /// Stack program: `Push bg, Push silhouette, Or, Push chrome, AlphaOver, Push hover, Add`. The `Or` step raises the bg's t-byte to 255 at the four squircle corner cutouts (silhouette = `0xFF_00_00_00` there, OR-identity = `0` inside) so the final composite has t=255 at the corners — transparent on macOS PostMultiplied; compositor-honored on Linux.
+    /// **Topmost-first scaffold:** the Stack program is the minimal front-to-back composite — `Push chrome, Push bg, Under(Normal)`. Chrome is the topmost layer (controls, edges, hairlines, title), bg is the layer behind it (background_noise + panes). Stack order matches the visual stack: first push lands on the bottom of the eval stack and is the topmost layer; second push goes underneath via `Under`. The hover layer still exists and is rasterized so the API surface is stable; it's omitted from the program until the hover overlay is wired back up via `Push hover, Under(Add)` as the topmost step. Corner knockout (formerly a separate silhouette layer + `Op::Or`) is handled at chrome rasterization time by writing `t=255` directly into the chrome layer's corner pixels — no separate Stack op under the unified Under model.
     pub fn new(viewport: Viewport, title: impl Into<String>) -> Self {
-        let region = Region::new(0.0, 0.0, viewport.width_px as Coord, viewport.height_px as Coord);
-        let mut group = Group::new(region, BlendMode::Replace);
+        let region = Region::new(
+            0.0,
+            0.0,
+            viewport.width_px as Coord,
+            viewport.height_px as Coord,
+        );
+        let mut group = Group::new(region, BlendMode::Normal);
         let layer_bg = group.new_layer();
-        let layer_silhouette = group.new_layer();
         let layer_chrome = group.new_layer();
         let layer_hover = group.new_layer();
         group.set_program(alloc::vec![
-            Op::Push(layer_bg),
-            Op::Push(layer_silhouette),
-            Op::Or,
             Op::Push(layer_chrome),
-            Op::AlphaOver,
-            Op::Push(layer_hover),
-            Op::Add,
+            Op::Push(layer_bg),
+            Op::Under(BlendMode::Normal),
         ]);
         let map_len = (viewport.width_px as usize).saturating_mul(viewport.height_px as usize);
         Self {
@@ -64,7 +63,6 @@ impl DefaultChrome {
             hover_state: HIT_NONE,
             hover_pixel_list: Vec::new(),
             layer_bg,
-            layer_silhouette,
             layer_chrome,
             layer_hover,
         }
@@ -72,7 +70,12 @@ impl DefaultChrome {
 
     /// Resize the chrome group + hit_test_map to a new viewport. All layers go dirty.
     pub fn resize(&mut self, viewport: Viewport) {
-        let region = Region::new(0.0, 0.0, viewport.width_px as Coord, viewport.height_px as Coord);
+        let region = Region::new(
+            0.0,
+            0.0,
+            viewport.width_px as Coord,
+            viewport.height_px as Coord,
+        );
         self.group.resize(region);
         let map_len = (viewport.width_px as usize).saturating_mul(viewport.height_px as usize);
         self.hit_test_map.resize(map_len, HIT_NONE);
@@ -87,87 +90,101 @@ impl DefaultChrome {
     pub fn rasterize_bg(&mut self, paint: impl FnOnce(&mut [u32], usize, usize)) {
         let (w, h) = self.dims();
         let layer = &mut self.group.rpn.layers[self.layer_bg];
-        if !layer.dirty { return; }
+        if !layer.dirty {
+            return;
+        }
         // t-convention: transparent init so any pixels the closure doesn't paint don't end up
         // as opaque black (t=0). The closure is expected to fully cover the bg, but defaulting
         // to transparent is the safe failure mode.
-        layer.pixels.fill(0xFF000000);
+        layer.pixels.fill(0xFFFFFFFF);
         paint(&mut layer.pixels, w, h);
     }
 
-    /// Paint controls + edges + hairlines + title text into the chrome layer AND the matching window silhouette into the silhouette layer if either is dirty. Clears + rewrites `hit_test_map` as a side effect (chrome buttons stamp their IDs there). Title is skipped silently when the computed title size falls below 6 px (tiny windows where text would be unreadable).
-    pub fn rasterize_chrome(&mut self, text: &mut TextRenderer) {
+    /// **Scaffold step 1 (top of stack: AA rounded hairline only):** paint the squircle-cornered window-perimeter hairline into the chrome layer via [`chrome::draw_window_edges_and_mask`]. Chrome layer carries OPAQUE RGB only at the hairline; partial-α window-shape coverage (corner curve AA + outside-curve cutout) is written into `clip_mask` so the OS boundary can fold it into the final alpha in one pass.
+    ///
+    /// The `text` parameter is accepted for forward-compat with the title text pass; currently unused.
+    pub fn rasterize_chrome(&mut self, _text: &mut TextRenderer, clip_mask: &mut [u8]) {
         let (buf_w, buf_h) = self.dims();
         let vp_w = buf_w as u32;
         let vp_h = buf_h as u32;
 
-        let chrome_dirty = self.group.rpn.layers[self.layer_chrome].dirty;
-        let silhouette_dirty = self.group.rpn.layers[self.layer_silhouette].dirty;
-        if !chrome_dirty && !silhouette_dirty { return; }
-
-        // Reset hit_test_map for the new chrome rasterization.
-        self.hit_test_map.fill(HIT_NONE);
-
-        // Stage 1: paint chrome strip + capture `start` / `crossings` from the controls pass.
-        let chrome_buf = &mut self.group.rpn.layers[self.layer_chrome].pixels;
-        // t-convention: transparent init. Untouched chrome pixels stay transparent so the bg
-        // beneath shows through via AlphaOver (instead of being overwritten with opaque black,
-        // which was what fill(0) did under the old α-convention's "transparent = 0" mapping).
-        chrome_buf.fill(0xFF000000);
-        let (start, crossings, button_x_start, button_height) = chrome::draw_window_controls(
-            chrome_buf, &mut self.hit_test_map, vp_w, vp_h, 1.0,
-        );
-        chrome::draw_window_edges_and_mask(
-            chrome_buf, &mut self.hit_test_map, vp_w, vp_h, start, &crossings,
-        );
-        chrome::draw_button_hairlines(
-            chrome_buf, &mut self.hit_test_map, vp_w, vp_h,
-            button_x_start, button_height, start, &crossings,
-        );
-
-        // Stage 2: title text.
-        let span = 2.0 * vp_w as Coord * vp_h as Coord / (vp_w as Coord + vp_h as Coord);
-        let bw = MIN_BUTTON_HEIGHT_PX as Coord + crate::math::ceil(span / 32.0);
-        let title_size = bw * 0.55;
-        if title_size >= 6.0 && !self.title.is_empty() {
-            let pad = bw * 0.5;
-            let baseline_y = bw * 0.5;
-            let _ = text.draw_text_left_u32(
-                chrome_buf, buf_w, buf_h, &self.title,
-                pad, baseline_y, title_size, 400,
-                theme::TEXT_COLOUR, "Open Sans", None, None, None,
-            );
+        if !self.group.rpn.layers[self.layer_chrome].dirty {
+            return;
         }
 
-        // Stage 3: silhouette mask (uses the same start/crossings — they define the squircle shape).
-        let silhouette_buf = &mut self.group.rpn.layers[self.layer_silhouette].pixels;
-        chrome::rasterize_window_silhouette(silhouette_buf, vp_w, vp_h, start, &crossings);
+        self.hit_test_map.fill(HIT_NONE);
+
+        let chrome_buf = &mut self.group.rpn.layers[self.layer_chrome].pixels;
+        // t-convention: transparent init so the bg shows through everywhere except the hairline + AA pixels.
+        chrome_buf.fill(0xFFFFFFFF);
+
+        if vp_w < 2 || vp_h < 2 {
+            return;
+        }
+
+        // Compute squircle start + crossings (lifted from `chrome::draw_window_controls`, button bits stripped).
+        let span = 2.0 * vp_w as Coord * vp_h as Coord / (vp_w as Coord + vp_h as Coord);
+        let radius = span / 4.0;
+        let squirdleyness = 24i32;
+        let mut crossings: Vec<(u16, u8, u8)> = Vec::new();
+        let mut y = 1f32;
+        loop {
+            let y_norm = y / radius;
+            let x_norm = crate::math::powf(
+                1.0 - crate::math::powi(y_norm, squirdleyness),
+                1.0 / squirdleyness as Coord,
+            );
+            let x = x_norm * radius;
+            let inset = radius - x;
+            if inset > 0.0 {
+                crossings.push((
+                    inset as u16,
+                    (crate::math::sqrt(crate::math::fract(inset)) * 256.0) as u8,
+                    (crate::math::sqrt(1.0 - crate::math::fract(inset)) * 256.0) as u8,
+                ));
+            }
+            if x < y {
+                break;
+            }
+            y += 1.0;
+        }
+        let start = (radius - y) as usize;
+        let crossings: Vec<(u16, u8, u8)> = crossings.into_iter().rev().collect();
+
+        if start == 0 || crossings.is_empty() {
+            return;
+        }
+
+        chrome::draw_window_edges_and_mask(
+            chrome_buf,
+            &mut self.hit_test_map,
+            clip_mask,
+            vp_w,
+            vp_h,
+            start,
+            &crossings,
+        );
+
+        // Ctrl+Shift+D+C: suppress chrome RGB so the layers underneath show through. Clip-mask carving (above) is preserved so the window-shape trim stays visible.
+        if crate::paint::DEBUG_SKIP_CHROME.load(std::sync::atomic::Ordering::Relaxed) {
+            chrome_buf.fill(0xFFFFFFFF);
+        }
     }
 
     /// Paint the hover-overlay delta if the hover layer is dirty. The delta is added (per-channel wrap) onto the chrome layer at the currently-hovered button's pixel positions; on hover_state == HIT_NONE the layer is just zeroed (Add of 0 = no-op).
+    /// Stub for the future hover-overlay scaffold step. Currently leaves the hover layer at the
+    /// canonical empty value (no-op). The button hover effect depends on the controls scaffold
+    /// (which builds the per-pixel hit_test_map of button regions); it returns alongside that.
     pub fn rasterize_hover(&mut self) {
         let layer = &mut self.group.rpn.layers[self.layer_hover];
-        if !layer.dirty { return; }
-
-        let buf = &mut layer.pixels;
-        buf.fill(0);
-
-        // Recompute pixel list for the current hover state.
-        self.hover_pixel_list = chrome::pixels_for_button(&self.hit_test_map, self.hover_state);
-        let hover_delta = match self.hover_state {
-            chrome::HIT_CLOSE_BUTTON => theme::CLOSE_HOVER,
-            chrome::HIT_MAXIMIZE_BUTTON => theme::MAXIMIZE_HOVER,
-            chrome::HIT_MINIMIZE_BUTTON => theme::MINIMIZE_HOVER,
-            _ => 0,
-        };
-        if hover_delta != 0 {
-            for &idx in &self.hover_pixel_list {
-                buf[idx] = hover_delta;
-            }
+        if !layer.dirty {
+            return;
         }
+        layer.pixels.fill(0xFFFFFFFF);
+        layer.dirty = false;
     }
 
-    /// Flatten the chrome group onto `target` at the chrome's bbox (full viewport).
+    /// Composite the chrome group (bg + chrome layers via internal Stack `Push chrome, Push bg, Under(Normal)`) and flatten under the present buffer. Front-to-back: chrome's composited result is blended `under` whatever's already in target, so chrome wins where opaque and bg shows through where chrome is transparent.
     pub fn flatten_into(&mut self, target: &mut [u32], target_w: usize, target_h: usize) {
         self.group.flatten_into(target, target_w, target_h);
     }
@@ -188,7 +205,9 @@ impl DefaultChrome {
 
     /// Update the hover state if `new_hit` differs from the current. Returns `true` iff the state changed (so the consumer knows to invalidate the hover layer + request_redraw).
     pub fn set_hover(&mut self, new_hit: u8) -> bool {
-        if new_hit == self.hover_state { return false; }
+        if new_hit == self.hover_state {
+            return false;
+        }
         self.hover_state = new_hit;
         self.group.rpn.layers[self.layer_hover].dirty = true;
         true
@@ -230,9 +249,9 @@ mod tests {
     #[test]
     fn set_hover_returns_true_on_change_only() {
         let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "");
-        assert!(chrome.set_hover(chrome::HIT_CLOSE_BUTTON));     // changed
-        assert!(!chrome.set_hover(chrome::HIT_CLOSE_BUTTON));    // same
-        assert!(chrome.set_hover(HIT_NONE));                     // changed back
+        assert!(chrome.set_hover(chrome::HIT_CLOSE_BUTTON)); // changed
+        assert!(!chrome.set_hover(chrome::HIT_CLOSE_BUTTON)); // same
+        assert!(chrome.set_hover(HIT_NONE)); // changed back
     }
 
     #[test]

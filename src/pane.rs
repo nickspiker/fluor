@@ -4,10 +4,10 @@
 //!
 //! `Compositor` owns the pane tree, the active `Viewport`, and the focus state. Per `## API / Implementation Separation` in AGENT.md, the renderer underneath is an implementation detail — `Compositor::render` currently calls into [`crate::paint`] directly, but a future enum-dispatched backend (CPU SIMD / GPU / Spirix-AA) plugs in here without changing the API.
 
-use alloc::vec::Vec;
 use crate::coord::RuVec2;
 use crate::geom::Viewport;
 use crate::paint;
+use alloc::vec::Vec;
 
 /// Stable handle to a pane. Returned from [`Compositor::insert`]; remains valid until the pane is removed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -24,8 +24,12 @@ pub struct Pane {
 }
 
 impl Pane {
-    pub fn id(&self) -> PaneId { self.id }
-    pub fn z(&self) -> u8 { self.z }
+    pub fn id(&self) -> PaneId {
+        self.id
+    }
+    pub fn z(&self) -> u8 {
+        self.z
+    }
 
     /// True if `p` lies inside the pane (inclusive on the edges).
     pub fn contains(&self, p: RuVec2) -> bool {
@@ -34,8 +38,12 @@ impl Pane {
         dx <= self.extent.x && dy <= self.extent.y
     }
 
-    pub fn min_corner(&self) -> RuVec2 { self.center - self.extent }
-    pub fn max_corner(&self) -> RuVec2 { self.center + self.extent }
+    pub fn min_corner(&self) -> RuVec2 {
+        self.center - self.extent
+    }
+    pub fn max_corner(&self) -> RuVec2 {
+        self.center + self.extent
+    }
 }
 
 /// The compositor — owner of the pane tree and the viewport. Public API surface that consumers program against.
@@ -49,10 +57,17 @@ pub struct Compositor {
 
 impl Compositor {
     pub fn new(viewport: Viewport) -> Self {
-        Self { panes: Vec::new(), next_id: 0, focused: None, viewport }
+        Self {
+            panes: Vec::new(),
+            next_id: 0,
+            focused: None,
+            viewport,
+        }
     }
 
-    pub fn viewport(&self) -> Viewport { self.viewport }
+    pub fn viewport(&self) -> Viewport {
+        self.viewport
+    }
 
     /// Resize the viewport. Recomputes `span` / `perimeter` / `diagonal_sq` from the new pixel dimensions; pane RU coordinates are unchanged so layout scales naturally.
     pub fn resize(&mut self, width_px: u32, height_px: u32) {
@@ -65,7 +80,13 @@ impl Compositor {
         let id = PaneId(self.next_id);
         self.next_id += 1;
         let z = self.panes.len() as u8;
-        self.panes.push(Pane { id, z, center, extent, background });
+        self.panes.push(Pane {
+            id,
+            z,
+            center,
+            extent,
+            background,
+        });
         id
     }
 
@@ -73,7 +94,9 @@ impl Compositor {
         if let Some(pos) = self.panes.iter().position(|p| p.id == id) {
             self.panes.remove(pos);
             self.renumber_z();
-            if self.focused == Some(id) { self.focused = None; }
+            if self.focused == Some(id) {
+                self.focused = None;
+            }
         }
     }
 
@@ -85,13 +108,23 @@ impl Compositor {
         self.panes.iter_mut().find(|p| p.id == id)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &Pane> { self.panes.iter() }
-    pub fn len(&self) -> usize { self.panes.len() }
-    pub fn is_empty(&self) -> bool { self.panes.is_empty() }
+    pub fn iter(&self) -> impl Iterator<Item = &Pane> {
+        self.panes.iter()
+    }
+    pub fn len(&self) -> usize {
+        self.panes.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.panes.is_empty()
+    }
 
     /// Find the topmost pane containing `p` (in RU). Returns `None` if no pane covers it.
     pub fn hit_test(&self, p: RuVec2) -> Option<PaneId> {
-        self.panes.iter().rev().find(|pane| pane.contains(p)).map(|pane| pane.id)
+        self.panes
+            .iter()
+            .rev()
+            .find(|pane| pane.contains(p))
+            .map(|pane| pane.id)
     }
 
     pub fn focus(&mut self, id: PaneId) {
@@ -100,7 +133,9 @@ impl Compositor {
         }
     }
 
-    pub fn focused(&self) -> Option<PaneId> { self.focused }
+    pub fn focused(&self) -> Option<PaneId> {
+        self.focused
+    }
 
     /// Move `id` to the top of the z-stack. No-op if `id` is unknown.
     pub fn bring_to_front(&mut self, id: PaneId) {
@@ -120,11 +155,9 @@ impl Compositor {
         }
     }
 
-    /// Render every pane, bottom-up, into the target ARGB buffer. Future versions will route through a renderer enum and call into the squircle rasterizer for rounded corners.
-    ///
-    /// Fully-opaque panes (alpha == 255) take the exact `fill_rect_solid` path; translucent panes go through `fill_rect_blend`. Reason: the SWAR blend divides by 256 (not 255) and produces a 1/256 channel error per blend — invisible by itself, but compounded over many opaque panes it would dim the buffer by a measurable amount over time. Solid is also faster.
+    /// Paint every pane into the `target` buffer, **topmost-first** (highest-z first). `fill_rect` uses `Blend::under` internally, so where a topmost pane has already painted opaque pixels, lower panes are skipped automatically via the dst-opaque early-out. The buffer must be pre-initialized to the canonical empty value `0xFFFFFFFF` (t=255, RGB=255 — invisible at full transparency, byte-uniform memset) by the caller so the under-chain has a clean starting accumulator state.
     pub fn render(&self, target: &mut [u32], buf_w: usize, buf_h: usize) {
-        for pane in &self.panes {
+        for pane in self.panes.iter().rev() {
             let (cx, cy) = self.viewport.ru_to_px(pane.center);
             let ex = self.viewport.ru_to_px_d(pane.extent.x);
             let ey = self.viewport.ru_to_px_d(pane.extent.y);
@@ -132,11 +165,18 @@ impl Compositor {
             let y = cy - ey;
             let w = ex + ex;
             let h = ey + ey;
-            if (pane.background >> 24) == 0xFF {
-                paint::fill_rect_solid(target, buf_w, buf_h, x, y, w, h, pane.background, None);
-            } else {
-                paint::fill_rect_blend(target, buf_w, buf_h, x, y, w, h, pane.background, None, None);
-            }
+            paint::fill_rect(
+                target,
+                buf_w,
+                buf_h,
+                x,
+                y,
+                w,
+                h,
+                pane.background,
+                None,
+                None,
+            );
         }
     }
 
@@ -235,15 +275,22 @@ mod tests {
     #[test]
     fn render_fills_pane_pixels() {
         let mut c = make_compositor(8, 8);
-        // Pane at center, half-extent 0.05 RU. With span = harmonic mean of 8x8 = 8, ru = 1.0,
-        // half-extent in pixels = 0.05 * 8 * 1 = 0.4 px → 0 after isize cast. Use larger extent.
-        c.insert(RuVec2::new(0.0, 0.0), RuVec2::splat(0.25), pack_argb(255, 0, 0, 255));
-        let mut buf = vec![0u32; 8 * 8];
+        c.insert(
+            RuVec2::new(0.0, 0.0),
+            RuVec2::splat(0.25),
+            pack_argb(255, 0, 0, 255),
+        );
+        // Buffer pre-initialized to canonical empty (0xFFFFFFFF) per the under-chain contract.
+        let mut buf = vec![0xFFFFFFFFu32; 8 * 8];
         c.render(&mut buf, 8, 8);
-        // Center pixel at (4, 4) should be opaque red.
+        // Center pixel at (4, 4): opaque red pane painted under transparent dst → ~opaque red (1-LSB drift).
         let center = buf[4 * 8 + 4];
         let (r, g, b, _) = unpack_argb(center);
-        assert_eq!((r, g, b), (255, 0, 0), "center pixel = {:#010x}", center);
+        assert!(
+            r >= 0xFE && g == 0 && b == 0,
+            "center pixel = {:#010x}",
+            center
+        );
     }
 
     #[test]
