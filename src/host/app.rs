@@ -6,10 +6,10 @@
 //!
 //! The current `desktop::run(compositor, title)` is a transitional shim that wraps the legacy demo into a `FluorApp`. New code should use [`run_app`] directly.
 
+use super::chrome::{self, ResizeEdge};
 use crate::coord::Coord;
 use crate::geom::Viewport;
 use crate::text::TextRenderer;
-use super::chrome::{self, ResizeEdge};
 use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
@@ -25,6 +25,8 @@ pub struct Context<'a> {
     pub viewport: Viewport,
     /// Shared font system + glyph caches. Initialized lazily by the host on first window creation; passed by mutable reference because cache insertion and font loading require mutation.
     pub text: &'a mut TextRenderer,
+    /// Window-shape clip mask, one byte per pixel, same dimensions as the present buffer. Default fill is `255` (fully visible — finalize_for_os multiplies by 255 ≈ no change). Consumers with a rounded window (e.g. `DefaultChrome`) carve the corner cutouts here once per resize; the boundary's [`crate::paint::finalize_for_os`] multiplies it into each pixel's α to trim the OS handoff. Decoupled from the present-buffer RGB so internal layer compositing stays opaque-or-empty and never deals with partial-α drift.
+    pub clip_mask: &'a mut [u8],
     /// The host's winit window handle. Use for `set_cursor`, `set_minimized`, `set_maximized`, `request_redraw`, `drag_window`, `set_title`, `outer_position`.
     pub window: &'a Window,
     /// Latest tracked modifier state (shift / ctrl / alt / super).
@@ -52,7 +54,9 @@ pub enum EventResponse {
 /// What a consumer implements to drive the desktop host.
 pub trait FluorApp {
     /// Initial window title. Default is empty; override or call `ctx.window.set_title(...)` from `init` if you want it set later.
-    fn title(&self) -> &str { "" }
+    fn title(&self) -> &str {
+        ""
+    }
 
     /// One-shot setup after the window exists. Allocate Groups, widgets, initial geometry. The viewport in `ctx` is the actual physical size the host opened.
     fn init(&mut self, ctx: &mut Context);
@@ -70,10 +74,15 @@ pub trait FluorApp {
     fn cursor_for(&self, x: Coord, y: Coord, ctx: &Context) -> CursorIcon;
 
     /// When to wake up next (animation timers, blinks). `None` = wait for input only. The host calls this once per `about_to_wait` cycle and feeds it into `ControlFlow::WaitUntil`.
-    fn wake_at(&self) -> Option<Instant> { None }
+    fn wake_at(&self) -> Option<Instant> {
+        None
+    }
 
     /// Called once per `about_to_wait` cycle (after the host's own platform polling). Drive time-based state here — blink timers, animation tweens, drag-scroll. Return `true` if state changed and a redraw is needed; the host will call `request_redraw` for you.
-    fn tick(&mut self, ctx: &mut Context) -> bool { let _ = ctx; false }
+    fn tick(&mut self, ctx: &mut Context) -> bool {
+        let _ = ctx;
+        false
+    }
 }
 
 /// Run the desktop host until the window closes.
@@ -97,6 +106,8 @@ struct DesktopShell<A: FluorApp> {
 
     // --- Shared resources ---
     text: Option<TextRenderer>,
+    /// Window-shape clip mask, one byte α per pixel. Same dimensions as the present buffer. Consumers write to it via `ctx.clip_mask` once per resize (e.g. `DefaultChrome` carves the rounded-corner cutouts); the boundary step multiplies it into each pixel's α before handing the buffer to the OS. Default `255` (fully visible) means a consumer that doesn't touch it gets a rectangular window with no clipping.
+    clip_mask: Vec<u8>,
     cursor_x: Coord,
     cursor_y: Coord,
     modifiers: ModifiersState,
@@ -127,6 +138,7 @@ impl<A: FluorApp> DesktopShell<A> {
             #[cfg(not(target_os = "macos"))]
             surface: None,
             text: None,
+            clip_mask: Vec::new(),
             cursor_x: 0.0,
             cursor_y: 0.0,
             modifiers: ModifiersState::empty(),
@@ -146,37 +158,53 @@ impl<A: FluorApp> DesktopShell<A> {
     }
 
     fn render_frame(&mut self) {
-        let Some(window) = self.window.as_ref().cloned() else { return; };
-        let Some(text) = self.text.as_mut() else { return; };
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
         let buf_w = self.viewport.width_px as usize;
         let buf_h = self.viewport.height_px as usize;
+        // Make sure the clip mask is sized to the current viewport. Default fill is 255 = fully visible (consumer is opting in to clip-shape carving).
+        let needed = buf_w * buf_h;
+        if self.clip_mask.len() != needed {
+            self.clip_mask.resize(needed, 255);
+        }
+        let Some(text) = self.text.as_mut() else {
+            return;
+        };
 
-        let mut ctx = Context { viewport: self.viewport, text, window: &window, modifiers: self.modifiers, cursor_x: self.cursor_x, cursor_y: self.cursor_y };
+        let mut ctx = Context {
+            viewport: self.viewport,
+            text,
+            clip_mask: &mut self.clip_mask,
+            window: &window,
+            modifiers: self.modifiers,
+            cursor_x: self.cursor_x,
+            cursor_y: self.cursor_y,
+        };
 
-        // Pixel-convention boundary (see [`crate::pixel`] module docs). Internal pixels are
-        // t-convention `0xttRRGGBB`. Convert to α-convention HERE before submission:
-        //   1. `flip_t_to_alpha` always (XOR top byte; α = 255 − t).
-        //   2. `premultiply_buffer` on Linux only (KWin/Mutter want premultiplied α).
-        //      Toggleable at runtime via Ctrl+Shift+D+P for A/B testing.
-        let skip_flip = crate::paint::DEBUG_SKIP_FLIP.load(std::sync::atomic::Ordering::Relaxed);
+        // Boundary: present buffer init to canonical empty (`0xFFFFFFFF` — byte-uniform memset, t=255 transparent), consumer renders into it (writing t-convention pixels + carving `ctx.clip_mask`), then `finalize_for_os` does the t→α flip + clip-mask multiply + Linux premult + pack in one pass. `ctx` drops first so we can re-borrow `self.clip_mask` immutably for the boundary call.
         #[cfg(target_os = "macos")]
         {
-            let Some(renderer) = self.renderer.as_mut() else { return; };
+            let Some(renderer) = self.renderer.as_mut() else {
+                return;
+            };
             let mut buffer = renderer.lock_buffer();
+            buffer.fill(0xFFFFFFFF);
             self.app.render(&mut buffer, &mut ctx);
-            if !skip_flip { crate::paint::flip_t_to_alpha(&mut buffer); }
+            drop(ctx);
+            crate::paint::finalize_for_os(&mut buffer, &self.clip_mask);
             let _ = buffer.present();
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let Some(surface) = self.surface.as_mut() else { return; };
+            let Some(surface) = self.surface.as_mut() else {
+                return;
+            };
             let mut buffer = surface.buffer_mut().expect("softbuffer buffer_mut");
+            buffer.fill(0xFFFFFFFF);
             self.app.render(&mut buffer, &mut ctx);
-            if !skip_flip { crate::paint::flip_t_to_alpha(&mut buffer); }
-            #[cfg(target_os = "linux")]
-            if !crate::paint::DEBUG_SKIP_PREMULT.load(std::sync::atomic::Ordering::Relaxed) {
-                crate::paint::premultiply_buffer(&mut buffer);
-            }
+            drop(ctx);
+            crate::paint::finalize_for_os(&mut buffer, &self.clip_mask);
             buffer.present().expect("softbuffer buffer.present");
         }
         // Drop `ctx` (releases &mut text borrow) and `buf_w`/`buf_h` shadow used for nothing — placeholder to avoid warnings if cfg drops both arms.
@@ -185,7 +213,9 @@ impl<A: FluorApp> DesktopShell<A> {
 
     /// Apply an [`EventResponse`] returned from `app.on_event`. Returns `true` if the response was `Close` (caller should terminate).
     fn apply_response(&mut self, response: EventResponse) -> bool {
-        let Some(window) = self.window.as_ref().cloned() else { return false; };
+        let Some(window) = self.window.as_ref().cloned() else {
+            return false;
+        };
         match response {
             EventResponse::Handled | EventResponse::Pass => false,
             EventResponse::StartWindowDrag => {
@@ -235,12 +265,17 @@ impl<A: FluorApp> DesktopShell<A> {
 
     #[cfg(target_os = "macos")]
     fn poll_macos_resize(&mut self) -> bool {
-        let Some(window) = self.window.as_ref() else { return false; };
+        let Some(window) = self.window.as_ref() else {
+            return false;
+        };
         use std::ffi::{c_char, c_void};
 
         #[repr(C)]
         #[derive(Clone, Copy)]
-        struct NSPoint { x: f64, y: f64 }
+        struct NSPoint {
+            x: f64,
+            y: f64,
+        }
 
         unsafe extern "C" {
             fn objc_msgSend(receiver: *const c_void, sel: *const c_void) -> usize;
@@ -282,8 +317,12 @@ impl<A: FluorApp> DesktopShell<A> {
 
     #[cfg(target_os = "macos")]
     fn apply_macos_resize(&self) {
-        let Some(window) = self.window.as_ref() else { return; };
-        let Ok(window_pos) = window.outer_position() else { return; };
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let Ok(window_pos) = window.outer_position() else {
+            return;
+        };
 
         let current_screen_x = window_pos.x as f64 + self.cursor_x as f64;
         let current_screen_y = window_pos.y as f64 + self.cursor_y as f64;
@@ -301,7 +340,13 @@ impl<A: FluorApp> DesktopShell<A> {
             ResizeEdge::Left => {
                 let w = (self.drag_start_size.0 as Coord - dx).max(min_size) as u32;
                 let width_change = self.drag_start_size.0 as i32 - w as i32;
-                (w, self.drag_start_size.1, true, self.drag_start_window_pos.0 + width_change, self.drag_start_window_pos.1)
+                (
+                    w,
+                    self.drag_start_size.1,
+                    true,
+                    self.drag_start_window_pos.0 + width_change,
+                    self.drag_start_window_pos.1,
+                )
             }
             ResizeEdge::Bottom => {
                 let h = (self.drag_start_size.1 as Coord + dy).max(min_size) as u32;
@@ -310,20 +355,38 @@ impl<A: FluorApp> DesktopShell<A> {
             ResizeEdge::Top => {
                 let h = (self.drag_start_size.1 as Coord - dy).max(min_size) as u32;
                 let height_change = self.drag_start_size.1 as i32 - h as i32;
-                (self.drag_start_size.0, h, true, self.drag_start_window_pos.0, self.drag_start_window_pos.1 + height_change)
+                (
+                    self.drag_start_size.0,
+                    h,
+                    true,
+                    self.drag_start_window_pos.0,
+                    self.drag_start_window_pos.1 + height_change,
+                )
             }
             ResizeEdge::TopRight => {
                 let w = (self.drag_start_size.0 as Coord + dx).max(min_size) as u32;
                 let h = (self.drag_start_size.1 as Coord - dy).max(min_size) as u32;
                 let height_change = self.drag_start_size.1 as i32 - h as i32;
-                (w, h, true, self.drag_start_window_pos.0, self.drag_start_window_pos.1 + height_change)
+                (
+                    w,
+                    h,
+                    true,
+                    self.drag_start_window_pos.0,
+                    self.drag_start_window_pos.1 + height_change,
+                )
             }
             ResizeEdge::TopLeft => {
                 let w = (self.drag_start_size.0 as Coord - dx).max(min_size) as u32;
                 let h = (self.drag_start_size.1 as Coord - dy).max(min_size) as u32;
                 let width_change = self.drag_start_size.0 as i32 - w as i32;
                 let height_change = self.drag_start_size.1 as i32 - h as i32;
-                (w, h, true, self.drag_start_window_pos.0 + width_change, self.drag_start_window_pos.1 + height_change)
+                (
+                    w,
+                    h,
+                    true,
+                    self.drag_start_window_pos.0 + width_change,
+                    self.drag_start_window_pos.1 + height_change,
+                )
             }
             ResizeEdge::BottomRight => {
                 let w = (self.drag_start_size.0 as Coord + dx).max(min_size) as u32;
@@ -334,7 +397,13 @@ impl<A: FluorApp> DesktopShell<A> {
                 let w = (self.drag_start_size.0 as Coord - dx).max(min_size) as u32;
                 let h = (self.drag_start_size.1 as Coord + dy).max(min_size) as u32;
                 let width_change = self.drag_start_size.0 as i32 - w as i32;
-                (w, h, true, self.drag_start_window_pos.0 + width_change, self.drag_start_window_pos.1)
+                (
+                    w,
+                    h,
+                    true,
+                    self.drag_start_window_pos.0 + width_change,
+                    self.drag_start_window_pos.1,
+                )
             }
             ResizeEdge::None => return,
         };
@@ -348,9 +417,12 @@ impl<A: FluorApp> DesktopShell<A> {
 
 impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() { return; }
+        if self.window.is_some() {
+            return;
+        }
 
-        let monitor = event_loop.primary_monitor()
+        let monitor = event_loop
+            .primary_monitor()
             .or_else(|| event_loop.available_monitors().next());
 
         let initial = if let Some(ref mon) = monitor {
@@ -387,13 +459,19 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
 
         #[cfg(target_os = "macos")]
         {
-            self.renderer = Some(super::renderer_wgpu::Renderer::new(&window, initial.width, initial.height));
+            self.renderer = Some(super::renderer_wgpu::Renderer::new(
+                &window,
+                initial.width,
+                initial.height,
+            ));
         }
         #[cfg(not(target_os = "macos"))]
         {
             use std::num::NonZeroU32;
-            let context = softbuffer::Context::new(window.clone()).expect("softbuffer Context::new");
-            let mut surface = softbuffer::Surface::new(&context, window.clone()).expect("softbuffer Surface::new");
+            let context =
+                softbuffer::Context::new(window.clone()).expect("softbuffer Context::new");
+            let mut surface = softbuffer::Surface::new(&context, window.clone())
+                .expect("softbuffer Surface::new");
             surface
                 .resize(
                     NonZeroU32::new(initial.width).expect("nonzero width"),
@@ -407,10 +485,24 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
             self.text = Some(TextRenderer::new());
         }
 
+        // Allocate the clip-mask buffer matched to the initial viewport (default 255 = fully visible — consumer carves shape via DefaultChrome or similar).
+        let needed = self.viewport.width_px as usize * self.viewport.height_px as usize;
+        if self.clip_mask.len() != needed {
+            self.clip_mask.resize(needed, 255);
+        }
+
         // Hand control to the consumer's init.
         {
             let text = self.text.as_mut().expect("text renderer initialized");
-            let mut ctx = Context { viewport: self.viewport, text, window: &window, modifiers: self.modifiers, cursor_x: self.cursor_x, cursor_y: self.cursor_y };
+            let mut ctx = Context {
+                viewport: self.viewport,
+                text,
+                clip_mask: &mut self.clip_mask,
+                window: &window,
+                modifiers: self.modifiers,
+                cursor_x: self.cursor_x,
+                cursor_y: self.cursor_y,
+            };
             self.app.init(&mut ctx);
         }
 
@@ -422,7 +514,9 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
         #[cfg(target_os = "macos")]
         if self.is_dragging_resize {
             if self.poll_macos_resize() {
-                if let Some(window) = self.window.as_ref() { window.request_redraw(); }
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
             }
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
                 std::time::Instant::now() + std::time::Duration::from_millis(16),
@@ -430,12 +524,26 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
             return;
         }
 
-        let needs_redraw = if let (Some(window), Some(text)) = (self.window.as_ref().cloned(), self.text.as_mut()) {
-            let mut ctx = Context { viewport: self.viewport, text, window: &window, modifiers: self.modifiers, cursor_x: self.cursor_x, cursor_y: self.cursor_y };
+        let needs_redraw = if let (Some(window), Some(text)) =
+            (self.window.as_ref().cloned(), self.text.as_mut())
+        {
+            let mut ctx = Context {
+                viewport: self.viewport,
+                text,
+                clip_mask: &mut self.clip_mask,
+                window: &window,
+                modifiers: self.modifiers,
+                cursor_x: self.cursor_x,
+                cursor_y: self.cursor_y,
+            };
             self.app.tick(&mut ctx)
-        } else { false };
+        } else {
+            false
+        };
         if needs_redraw {
-            if let Some(window) = self.window.as_ref() { window.request_redraw(); }
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
         }
 
         if let Some(when) = self.app.wake_at() {
@@ -452,7 +560,9 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 if size.width == self.viewport.width_px && size.height == self.viewport.height_px {
                     return;
                 }
-                if size.width == 0 || size.height == 0 { return; }
+                if size.width == 0 || size.height == 0 {
+                    return;
+                }
 
                 #[cfg(target_os = "macos")]
                 if let Some(renderer) = self.renderer.as_mut() {
@@ -461,15 +571,31 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 #[cfg(not(target_os = "macos"))]
                 if let Some(surface) = self.surface.as_mut() {
                     use std::num::NonZeroU32;
-                    if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
+                    if let (Some(w), Some(h)) =
+                        (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+                    {
                         surface.resize(w, h).expect("softbuffer Surface::resize");
                     }
                 }
 
                 self.viewport = Viewport::new(size.width, size.height);
+                let needed = size.width as usize * size.height as usize;
+                if self.clip_mask.len() != needed {
+                    self.clip_mask.resize(needed, 255);
+                }
 
-                if let (Some(window), Some(text)) = (self.window.as_ref().cloned(), self.text.as_mut()) {
-                    let mut ctx = Context { viewport: self.viewport, text, window: &window, modifiers: self.modifiers, cursor_x: self.cursor_x, cursor_y: self.cursor_y };
+                if let (Some(window), Some(text)) =
+                    (self.window.as_ref().cloned(), self.text.as_mut())
+                {
+                    let mut ctx = Context {
+                        viewport: self.viewport,
+                        text,
+                        clip_mask: &mut self.clip_mask,
+                        window: &window,
+                        modifiers: self.modifiers,
+                        cursor_x: self.cursor_x,
+                        cursor_y: self.cursor_y,
+                    };
                     self.app.on_resize(size.width, size.height, &mut ctx);
                     window.request_redraw();
                 }
@@ -478,8 +604,18 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 self.cursor_x = position.x as Coord;
                 self.cursor_y = position.y as Coord;
 
-                if let (Some(window), Some(text)) = (self.window.as_ref().cloned(), self.text.as_mut()) {
-                    let mut ctx = Context { viewport: self.viewport, text, window: &window, modifiers: self.modifiers, cursor_x: self.cursor_x, cursor_y: self.cursor_y };
+                if let (Some(window), Some(text)) =
+                    (self.window.as_ref().cloned(), self.text.as_mut())
+                {
+                    let mut ctx = Context {
+                        viewport: self.viewport,
+                        text,
+                        clip_mask: &mut self.clip_mask,
+                        window: &window,
+                        modifiers: self.modifiers,
+                        cursor_x: self.cursor_x,
+                        cursor_y: self.cursor_y,
+                    };
                     let response = self.app.on_event(&event, &mut ctx);
                     let icon = self.app.cursor_for(self.cursor_x, self.cursor_y, &ctx);
                     drop(ctx);
@@ -499,12 +635,18 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 }
                 self.dispatch_event(event);
             }
-            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
                 #[cfg(target_os = "macos")]
                 if self.is_dragging_resize {
                     self.is_dragging_resize = false;
                     self.resize_edge = ResizeEdge::None;
-                    if let Some(window) = self.window.as_ref() { window.request_redraw(); }
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
                 }
                 self.dispatch_event(event);
             }
@@ -522,7 +664,15 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
     /// Helper: dispatch a generic event to `app.on_event`, applying any returned [`EventResponse`].
     fn dispatch_event(&mut self, event: WindowEvent) {
         if let (Some(window), Some(text)) = (self.window.as_ref().cloned(), self.text.as_mut()) {
-            let mut ctx = Context { viewport: self.viewport, text, window: &window, modifiers: self.modifiers, cursor_x: self.cursor_x, cursor_y: self.cursor_y };
+            let mut ctx = Context {
+                viewport: self.viewport,
+                text,
+                clip_mask: &mut self.clip_mask,
+                window: &window,
+                modifiers: self.modifiers,
+                cursor_x: self.cursor_x,
+                cursor_y: self.cursor_y,
+            };
             let response = self.app.on_event(&event, &mut ctx);
             drop(ctx);
             self.apply_response(response);

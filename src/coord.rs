@@ -33,39 +33,73 @@ impl RuVec2 {
 impl Add for RuVec2 {
     type Output = Self;
     #[inline]
-    fn add(self, rhs: Self) -> Self { Self { x: self.x + rhs.x, y: self.y + rhs.y } }
+    fn add(self, rhs: Self) -> Self {
+        Self {
+            x: self.x + rhs.x,
+            y: self.y + rhs.y,
+        }
+    }
 }
 impl AddAssign for RuVec2 {
     #[inline]
-    fn add_assign(&mut self, rhs: Self) { self.x += rhs.x; self.y += rhs.y; }
+    fn add_assign(&mut self, rhs: Self) {
+        self.x += rhs.x;
+        self.y += rhs.y;
+    }
 }
 impl Sub for RuVec2 {
     type Output = Self;
     #[inline]
-    fn sub(self, rhs: Self) -> Self { Self { x: self.x - rhs.x, y: self.y - rhs.y } }
+    fn sub(self, rhs: Self) -> Self {
+        Self {
+            x: self.x - rhs.x,
+            y: self.y - rhs.y,
+        }
+    }
 }
 impl SubAssign for RuVec2 {
     #[inline]
-    fn sub_assign(&mut self, rhs: Self) { self.x -= rhs.x; self.y -= rhs.y; }
+    fn sub_assign(&mut self, rhs: Self) {
+        self.x -= rhs.x;
+        self.y -= rhs.y;
+    }
 }
 impl Neg for RuVec2 {
     type Output = Self;
     #[inline]
-    fn neg(self) -> Self { Self { x: -self.x, y: -self.y } }
+    fn neg(self) -> Self {
+        Self {
+            x: -self.x,
+            y: -self.y,
+        }
+    }
 }
 impl Mul<Coord> for RuVec2 {
     type Output = Self;
     #[inline]
-    fn mul(self, k: Coord) -> Self { Self { x: self.x * k, y: self.y * k } }
+    fn mul(self, k: Coord) -> Self {
+        Self {
+            x: self.x * k,
+            y: self.y * k,
+        }
+    }
 }
 impl MulAssign<Coord> for RuVec2 {
     #[inline]
-    fn mul_assign(&mut self, k: Coord) { self.x *= k; self.y *= k; }
+    fn mul_assign(&mut self, k: Coord) {
+        self.x *= k;
+        self.y *= k;
+    }
 }
 impl Div<Coord> for RuVec2 {
     type Output = Self;
     #[inline]
-    fn div(self, k: Coord) -> Self { Self { x: self.x / k, y: self.y / k } }
+    fn div(self, k: Coord) -> Self {
+        Self {
+            x: self.x / k,
+            y: self.y / k,
+        }
+    }
 }
 
 #[cfg(test)]

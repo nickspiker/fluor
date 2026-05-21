@@ -12,7 +12,9 @@ const fn fmt(trgb: u32) -> u32 {
 }
 
 #[cfg(not(target_os = "android"))]
-const fn fmt(trgb: u32) -> u32 { trgb }
+const fn fmt(trgb: u32) -> u32 {
+    trgb
+}
 
 // Background texture (organic noise, scrollable). All opaque (t=0).
 pub const BG_BASE: u32 = fmt(0x00_0C_14_0E);

@@ -2,9 +2,9 @@
 //!
 //! Photon's full version bundles Oxanium and Josefin Slab too; those are dropped here to keep the v0 crate small (~260 KB instead of ~2 MB). They'll be added back when a consumer needs them.
 
-use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
 use crate::paint::{AlphaMask, Clip, Transform};
-use swash::scale::{image::Image as SwashImage, Render, ScaleContext, Source};
+use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
+use swash::scale::{Render, ScaleContext, Source, image::Image as SwashImage};
 use swash::zeno::Transform as ZenoTransform;
 
 /// Cache key for rasterized transformed-glyph images. The full linear part (`a, b, c, d`) of the transform is included as bit-pattern equality so any unique linear transform — pure rotation, scale, skew, mirror, mix — gets its own cache entry. Translation is excluded because it doesn't affect the glyph bitmap, only where it gets composited. Callers that want cache hits across small angle changes should snap with [`crate::paint::snap_rotation`] before constructing the Transform.
@@ -13,7 +13,10 @@ struct TransformGlyphKey {
     font_id: cosmic_text::fontdb::ID,
     glyph_id: u16,
     size_bits: u32,
-    a_bits: u32, b_bits: u32, c_bits: u32, d_bits: u32,
+    a_bits: u32,
+    b_bits: u32,
+    c_bits: u32,
+    d_bits: u32,
 }
 
 /// Linear-scan + bump-to-front LRU cache for swash-rasterized transformed glyphs. Capacity-bounded; tail-evicts on overflow. No `HashMap` — the keyspace is small (visible glyphs at active rotations) and a Vec scan with cache-friendly contiguous layout beats hashing at the N we care about.
@@ -24,7 +27,10 @@ struct TransformGlyphCache {
 
 impl TransformGlyphCache {
     fn new(cap: usize) -> Self {
-        Self { entries: Vec::with_capacity(cap.min(64)), cap }
+        Self {
+            entries: Vec::with_capacity(cap.min(64)),
+            cap,
+        }
     }
 
     /// Look up a key. On hit, bumps the entry to the front (LRU). Returns the slice index of the (front) entry on hit, `None` on miss.
@@ -64,9 +70,7 @@ impl TextRenderer {
         db.load_font_data(
             include_bytes!("../assets/Open_Sans/static/OpenSans-Regular.ttf").to_vec(),
         );
-        db.load_font_data(
-            include_bytes!("../assets/Open_Sans/static/OpenSans-Bold.ttf").to_vec(),
-        );
+        db.load_font_data(include_bytes!("../assets/Open_Sans/static/OpenSans-Bold.ttf").to_vec());
 
         Self {
             font_system,
@@ -98,7 +102,9 @@ impl TextRenderer {
         mask: Option<&AlphaMask>,
         transform: Option<Transform>,
     ) -> f32 {
-        let attrs = Attrs::new().family(Family::Name(font)).weight(Weight(weight));
+        let attrs = Attrs::new()
+            .family(Family::Name(font))
+            .weight(Weight(weight));
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(&mut self.font_system, None, None);
@@ -115,7 +121,21 @@ impl TextRenderer {
             let text_width = max_x - min_x;
             let text_height = run.line_height;
 
-            self.render_buffer_u32(&mut buffer, pixels, buf_w, buf_h, x, y, text_width, text_height, colour, 0, clip, mask, transform);
+            self.render_buffer_u32(
+                &mut buffer,
+                pixels,
+                buf_w,
+                buf_h,
+                x,
+                y,
+                text_width,
+                text_height,
+                colour,
+                0,
+                clip,
+                mask,
+                transform,
+            );
             text_width
         } else {
             0.
@@ -138,7 +158,9 @@ impl TextRenderer {
         mask: Option<&AlphaMask>,
         transform: Option<Transform>,
     ) -> f32 {
-        let attrs = Attrs::new().family(Family::Name(font)).weight(Weight(weight));
+        let attrs = Attrs::new()
+            .family(Family::Name(font))
+            .weight(Weight(weight));
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(&mut self.font_system, None, None);
@@ -151,7 +173,21 @@ impl TextRenderer {
                 text_width = text_width.max(glyph.x + glyph.w);
             }
             let text_height = run.line_height;
-            self.render_buffer_u32(&mut buffer, pixels, buf_w, buf_h, x, y, text_width, text_height, colour, 1, clip, mask, transform);
+            self.render_buffer_u32(
+                &mut buffer,
+                pixels,
+                buf_w,
+                buf_h,
+                x,
+                y,
+                text_width,
+                text_height,
+                colour,
+                1,
+                clip,
+                mask,
+                transform,
+            );
             text_width
         } else {
             0.
@@ -174,7 +210,9 @@ impl TextRenderer {
         mask: Option<&AlphaMask>,
         transform: Option<Transform>,
     ) -> f32 {
-        let attrs = Attrs::new().family(Family::Name(font)).weight(Weight(weight));
+        let attrs = Attrs::new()
+            .family(Family::Name(font))
+            .weight(Weight(weight));
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(&mut self.font_system, None, None);
@@ -187,7 +225,21 @@ impl TextRenderer {
                 text_width = text_width.max(glyph.x + glyph.w);
             }
             let text_height = run.line_height;
-            self.render_buffer_u32(&mut buffer, pixels, buf_w, buf_h, x, y, text_width, text_height, colour, 2, clip, mask, transform);
+            self.render_buffer_u32(
+                &mut buffer,
+                pixels,
+                buf_w,
+                buf_h,
+                x,
+                y,
+                text_width,
+                text_height,
+                colour,
+                2,
+                clip,
+                mask,
+                transform,
+            );
             text_width
         } else {
             0.
@@ -378,7 +430,9 @@ impl TextRenderer {
         transform: Option<Transform>,
     ) {
         let clip = Clip::resolve(clip, buf_w, buf_h);
-        if let Some(m) = mask { crate::paint::assert_mask_matches_buffer(m, buf_w, buf_h); }
+        if let Some(m) = mask {
+            crate::paint::assert_mask_matches_buffer(m, buf_w, buf_h);
+        }
 
         let (offset_x, offset_y) = match alignment {
             0 => (anchor_x - text_width / 2., anchor_y - text_height / 2.),
@@ -411,56 +465,92 @@ impl TextRenderer {
                         let theta_snapped = crate::paint::snap_rotation(theta, glyph.font_size, 8);
                         let delta = theta_snapped - theta;
                         if delta == 0.0 {
-                            Some(Transform { a: t.a, b: t.b, c: t.c, d: t.d, tx: 0.0, ty: 0.0 })
+                            Some(Transform {
+                                a: t.a,
+                                b: t.b,
+                                c: t.c,
+                                d: t.d,
+                                tx: 0.0,
+                                ty: 0.0,
+                            })
                         } else {
-                            let linear_only = Transform { a: t.a, b: t.b, c: t.c, d: t.d, tx: 0.0, ty: 0.0 };
+                            let linear_only = Transform {
+                                a: t.a,
+                                b: t.b,
+                                c: t.c,
+                                d: t.d,
+                                tx: 0.0,
+                                ty: 0.0,
+                            };
                             Some(linear_only.then(Transform::rotate(delta)))
                         }
                     }
                     _ => None,
                 };
-                let zeno_transform = contour_transform.map(|t| ZenoTransform::new(t.a, t.c, t.b, t.d, 0.0, 0.0));
+                let zeno_transform =
+                    contour_transform.map(|t| ZenoTransform::new(t.a, t.c, t.b, t.d, 0.0, 0.0));
 
-                let (glyph_data, placement_left, placement_top, placement_w, placement_h) = match zeno_transform {
-                    None => {
-                        // Identity fast path: cosmic-text's SwashCache owns the rasterized-image cache for non-transformed glyphs.
-                        let Some(image) = self.swash_cache.get_image(&mut self.font_system, physical_glyph.cache_key) else { continue; };
-                        let p = image.placement;
-                        (&image.data[..], p.left, p.top, p.width, p.height)
-                    }
-                    Some(zt) => {
-                        // Transform path: check our own LRU cache first; on miss, rasterize via swash directly (contour transformed in font space → proper hinting + AA), then insert at front. Cache key uses the *snapped* linear part so consecutive frames in the same rotation bin hit.
-                        let t = contour_transform.expect("zeno_transform set implies contour_transform set");
-                        let key = TransformGlyphKey {
-                            font_id: glyph.font_id,
-                            glyph_id: glyph.glyph_id,
-                            size_bits: glyph.font_size.to_bits(),
-                            a_bits: t.a.to_bits(),
-                            b_bits: t.b.to_bits(),
-                            c_bits: t.c.to_bits(),
-                            d_bits: t.d.to_bits(),
-                        };
-                        if self.transform_cache.lookup(key).is_none() {
-                            let Some(font) = self.font_system.get_font(glyph.font_id) else { continue; };
-                            let image = {
-                                let swash_font = font.as_swash();
-                                let mut scaler = self.scale_context.builder(swash_font).size(glyph.font_size).build();
-                                let Some(img) = Render::new(&[Source::Outline]).transform(Some(zt)).render(&mut scaler, glyph.glyph_id) else { continue; };
-                                img
+                let (glyph_data, placement_left, placement_top, placement_w, placement_h) =
+                    match zeno_transform {
+                        None => {
+                            // Identity fast path: cosmic-text's SwashCache owns the rasterized-image cache for non-transformed glyphs.
+                            let Some(image) = self
+                                .swash_cache
+                                .get_image(&mut self.font_system, physical_glyph.cache_key)
+                            else {
+                                continue;
                             };
-                            self.transform_cache.insert(key, image);
+                            let p = image.placement;
+                            (&image.data[..], p.left, p.top, p.width, p.height)
                         }
-                        // Cache front entry is the one we just looked up or inserted.
-                        let entry = &self.transform_cache.entries[0];
-                        let p = entry.1.placement;
-                        (&entry.1.data[..], p.left, p.top, p.width, p.height)
-                    }
-                };
+                        Some(zt) => {
+                            // Transform path: check our own LRU cache first; on miss, rasterize via swash directly (contour transformed in font space → proper hinting + AA), then insert at front. Cache key uses the *snapped* linear part so consecutive frames in the same rotation bin hit.
+                            let t = contour_transform
+                                .expect("zeno_transform set implies contour_transform set");
+                            let key = TransformGlyphKey {
+                                font_id: glyph.font_id,
+                                glyph_id: glyph.glyph_id,
+                                size_bits: glyph.font_size.to_bits(),
+                                a_bits: t.a.to_bits(),
+                                b_bits: t.b.to_bits(),
+                                c_bits: t.c.to_bits(),
+                                d_bits: t.d.to_bits(),
+                            };
+                            if self.transform_cache.lookup(key).is_none() {
+                                let Some(font) = self.font_system.get_font(glyph.font_id) else {
+                                    continue;
+                                };
+                                let image = {
+                                    let swash_font = font.as_swash();
+                                    let mut scaler = self
+                                        .scale_context
+                                        .builder(swash_font)
+                                        .size(glyph.font_size)
+                                        .build();
+                                    let Some(img) = Render::new(&[Source::Outline])
+                                        .transform(Some(zt))
+                                        .render(&mut scaler, glyph.glyph_id)
+                                    else {
+                                        continue;
+                                    };
+                                    img
+                                };
+                                self.transform_cache.insert(key, image);
+                            }
+                            // Cache front entry is the one we just looked up or inserted.
+                            let entry = &self.transform_cache.entries[0];
+                            let p = entry.1.placement;
+                            (&entry.1.data[..], p.left, p.top, p.width, p.height)
+                        }
+                    };
 
                 // Glyph origin: cosmic-text gives integer (px, py) at the run-local position. Under transform we rotate that position too so the run reads as one rotated piece.
                 let (origin_x, origin_y) = match active_transform {
                     Some(t) => {
-                        let (rx, ry) = t.apply(physical_glyph.x as f32, (physical_glyph.y + baseline_offset as i32) as f32);
+                        let (rx, ry) = t.apply(
+                            physical_glyph.x as f32,
+                            (physical_glyph.y + baseline_offset as i32) as f32,
+                        );
                         (rx as i32, ry as i32)
                     }
                     None => (physical_glyph.x, physical_glyph.y + baseline_offset as i32),
@@ -475,7 +565,9 @@ impl TextRenderer {
                 let cy_min = (clip.y_start as i32 - glyph_y).max(0).min(gh) as usize;
                 let cx_max = (clip.x_end as i32 - glyph_x).max(0).min(gw) as usize;
                 let cy_max = (clip.y_end as i32 - glyph_y).max(0).min(gh) as usize;
-                if cx_min >= cx_max || cy_min >= cy_max { continue; }
+                if cx_min >= cx_max || cy_min >= cy_max {
+                    continue;
+                }
 
                 let gw_us = gw as usize;
                 for cy in cy_min..cy_max {
@@ -484,7 +576,9 @@ impl TextRenderer {
                     let row_offset_glyph = cy * gw_us;
                     for cx in cx_min..cx_max {
                         let alpha = glyph_data[row_offset_glyph + cx];
-                        if alpha == 0 { continue; }
+                        if alpha == 0 {
+                            continue;
+                        }
                         let final_x = (glyph_x + cx as i32) as usize;
                         let idx = row_offset_buf + final_x;
 
@@ -822,11 +916,7 @@ impl TextRenderer {
     ) {
         // Calculate text width for centering
         let text_width: f32 = buffer.layout_runs().fold(0.0, |max_width, run| {
-            let run_width = run
-                .glyphs
-                .iter()
-                .map(|g| g.w)
-                .sum::<f32>();
+            let run_width = run.glyphs.iter().map(|g| g.w).sum::<f32>();
             max_width.max(run_width)
         });
 
@@ -897,11 +987,7 @@ impl TextRenderer {
     ) {
         // Calculate text width for right-alignment
         let text_width: f32 = buffer.layout_runs().fold(0.0, |max_width, run| {
-            let run_width = run
-                .glyphs
-                .iter()
-                .map(|g| g.w)
-                .sum::<f32>();
+            let run_width = run.glyphs.iter().map(|g| g.w).sum::<f32>();
             max_width.max(run_width)
         });
 
@@ -1202,9 +1288,11 @@ impl TextRenderer {
                             // WHY: Glyph can be partially off-screen when textbox is scrolled
                             // PROOF: final_x/final_y are i32, can be negative or exceed bounds
                             // PREVENTS: Index out of bounds panic on wrapped negative values
-                            if final_x < 0 || final_y < 0
+                            if final_x < 0
+                                || final_y < 0
                                 || final_x as usize >= width
-                                || final_y as usize >= height {
+                                || final_y as usize >= height
+                            {
                                 continue;
                             }
                             let idx = final_y as usize * width + final_x as usize;

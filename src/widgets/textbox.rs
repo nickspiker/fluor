@@ -2,13 +2,13 @@
 //!
 //! Patterns lifted from photon's text_editing.rs + compositing.rs — `chars + widths + cursor` model, pill shape via squircle crossings, wave blinkey with alternating top/bottom brightness, symmetric scroll margins, 4-directional glow blur, XOR selection inversion.
 
-use alloc::string::String;
-use alloc::vec::Vec;
 use crate::coord::Coord;
 use crate::paint::{self, Clip};
 use crate::region::Region;
 use crate::text::TextRenderer;
 use crate::theme;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 pub struct Textbox {
     /// Text content as a `Vec<char>` — character-indexed cursor + width arrays.
@@ -51,17 +51,22 @@ pub struct Textbox {
     mask: Vec<u8>,
     mask_w: usize,
     mask_h: usize,
-
 }
 
 impl Textbox {
-    pub fn new(center_x: Coord, center_y: Coord, width: Coord, height: Coord, font_size: Coord) -> Self {
+    pub fn new(
+        center_x: Coord,
+        center_y: Coord,
+        width: Coord,
+        height: Coord,
+        font_size: Coord,
+    ) -> Self {
         Self {
             chars: Vec::new(),
             cursor: 0,
             focused: false,
             hovered: false,
-            stroke_ru: 0.0,   // → 1 px minimum stroke via the +1 idiom in render_content_into
+            stroke_ru: 0.0, // → 1 px minimum stroke via the +1 idiom in render_content_into
             center_x,
             center_y,
             width,
@@ -83,8 +88,10 @@ impl Textbox {
     pub fn contains(&self, x: Coord, y: Coord) -> bool {
         let half_w = self.width * 0.5;
         let half_h = self.height * 0.5;
-        x >= self.center_x - half_w && x < self.center_x + half_w
-            && y >= self.center_y - half_h && y < self.center_y + half_h
+        x >= self.center_x - half_w
+            && x < self.center_x + half_w
+            && y >= self.center_y - half_h
+            && y < self.center_y + half_h
     }
 
     pub fn set_rect(&mut self, center_x: Coord, center_y: Coord, width: Coord, height: Coord) {
@@ -136,7 +143,9 @@ impl Textbox {
     // --- Editing ---
 
     pub fn insert_char(&mut self, c: char, text: &mut TextRenderer) {
-        if c.is_control() { return; }
+        if c.is_control() {
+            return;
+        }
         self.delete_selection(text);
         self.chars.insert(self.cursor, c);
         self.cursor += 1;
@@ -145,8 +154,13 @@ impl Textbox {
     }
 
     pub fn backspace(&mut self, text: &mut TextRenderer) {
-        if self.has_selection() { self.delete_selection(text); return; }
-        if self.cursor == 0 { return; }
+        if self.has_selection() {
+            self.delete_selection(text);
+            return;
+        }
+        if self.cursor == 0 {
+            return;
+        }
         self.cursor -= 1;
         self.chars.remove(self.cursor);
         self.recalc_widths(text);
@@ -154,17 +168,38 @@ impl Textbox {
     }
 
     pub fn delete_forward(&mut self, text: &mut TextRenderer) {
-        if self.has_selection() { self.delete_selection(text); return; }
-        if self.cursor >= self.chars.len() { return; }
+        if self.has_selection() {
+            self.delete_selection(text);
+            return;
+        }
+        if self.cursor >= self.chars.len() {
+            return;
+        }
         self.chars.remove(self.cursor);
         self.recalc_widths(text);
         self.update_scroll();
     }
 
-    pub fn cursor_left(&mut self) { if self.cursor > 0 { self.cursor -= 1; self.update_scroll(); } }
-    pub fn cursor_right(&mut self) { if self.cursor < self.chars.len() { self.cursor += 1; self.update_scroll(); } }
-    pub fn cursor_home(&mut self) { self.cursor = 0; self.update_scroll(); }
-    pub fn cursor_end(&mut self) { self.cursor = self.chars.len(); self.update_scroll(); }
+    pub fn cursor_left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            self.update_scroll();
+        }
+    }
+    pub fn cursor_right(&mut self) {
+        if self.cursor < self.chars.len() {
+            self.cursor += 1;
+            self.update_scroll();
+        }
+    }
+    pub fn cursor_home(&mut self) {
+        self.cursor = 0;
+        self.update_scroll();
+    }
+    pub fn cursor_end(&mut self) {
+        self.cursor = self.chars.len();
+        self.update_scroll();
+    }
 
     // --- Selection ---
 
@@ -175,8 +210,11 @@ impl Textbox {
     /// Get sorted (start, end) of the selection range.
     pub fn selection_range(&self) -> Option<(usize, usize)> {
         self.selection_anchor.and_then(|a| {
-            if a == self.cursor { None }
-            else { Some((a.min(self.cursor), a.max(self.cursor))) }
+            if a == self.cursor {
+                None
+            } else {
+                Some((a.min(self.cursor), a.max(self.cursor)))
+            }
         })
     }
 
@@ -197,7 +235,8 @@ impl Textbox {
 
     /// Get selected text as a String.
     pub fn selected_text(&self) -> Option<String> {
-        self.selection_range().map(|(s, e)| self.chars[s..e].iter().collect())
+        self.selection_range()
+            .map(|(s, e)| self.chars[s..e].iter().collect())
     }
 
     /// Replace selection (or insert at cursor) with string.
@@ -245,11 +284,15 @@ impl Textbox {
 
     pub fn cursor_index_from_x(&self, click_x: Coord) -> usize {
         let text_start = self.text_start_x();
-        if click_x <= text_start { return 0; }
+        if click_x <= text_start {
+            return 0;
+        }
         let mut accum = text_start;
         for (i, &w) in self.widths.iter().enumerate() {
             let mid = accum + w * 0.5;
-            if click_x < mid { return i; }
+            if click_x < mid {
+                return i;
+            }
             accum += w;
         }
         self.chars.len()
@@ -273,7 +316,9 @@ impl Textbox {
 
     /// Flip the blinkey wave between top-bright and bottom-bright. Returns true if the blinkey is visible (caller should redraw).
     pub fn flip_blinkey(&mut self) -> bool {
-        if !self.focused { return false; }
+        if !self.focused {
+            return false;
+        }
         self.blinkey_wave_top = !self.blinkey_wave_top;
         self.blinkey_visible = true;
         true
@@ -312,9 +357,9 @@ impl Textbox {
     pub fn bbox(&self) -> Region {
         let glow_pad = self.font_size;
         Region::new(
-            self.center_x - self.width  * 0.5 - glow_pad,
+            self.center_x - self.width * 0.5 - glow_pad,
             self.center_y - self.height * 0.5 - glow_pad,
-            self.width  + 2.0 * glow_pad,
+            self.width + 2.0 * glow_pad,
             self.height + 2.0 * glow_pad,
         )
     }
@@ -353,9 +398,9 @@ impl Textbox {
         _clip: Option<Clip>,
         _mask: Option<&paint::AlphaMask>,
     ) {
-        let pill_x = (self.center_x - self.width  * 0.5 - offset_x) as isize;
+        let pill_x = (self.center_x - self.width * 0.5 - offset_x) as isize;
         let pill_y = (self.center_y - self.height * 0.5 - offset_y) as isize;
-        let pill_w = self.width  as isize;
+        let pill_w = self.width as isize;
         let pill_h = self.height as isize;
 
         let needed = buf_w * buf_h;
@@ -381,9 +426,17 @@ impl Textbox {
 
         // Outer pill — stroke colour, AA writes alpha=h so the layer composite blends to bg.
         paint::draw_squircle_pill(
-            pixels, &mut self.mask, buf_w, buf_h,
-            pill_x, pill_y, pill_w, pill_h,
-            stroke_color, squirdleyness, false,
+            pixels,
+            &mut self.mask,
+            buf_w,
+            buf_h,
+            pill_x,
+            pill_y,
+            pill_w,
+            pill_h,
+            stroke_color,
+            squirdleyness,
+            false,
         );
 
         // Inner pill — fill colour, AA blends RGB with the outer-pass stroke at the inner curve.
@@ -391,34 +444,76 @@ impl Textbox {
         let inner_h = pill_h - 2 * stroke_px;
         if inner_w > 0 && inner_h > 0 {
             paint::draw_squircle_pill(
-                pixels, &mut self.mask, buf_w, buf_h,
-                pill_x + stroke_px, pill_y + stroke_px, inner_w, inner_h,
-                fill, squirdleyness, true,
+                pixels,
+                &mut self.mask,
+                buf_w,
+                buf_h,
+                pill_x + stroke_px,
+                pill_y + stroke_px,
+                inner_w,
+                inner_h,
+                fill,
+                squirdleyness,
+                true,
             );
         }
     }
 
     /// Paint the focus glow into a buffer using the pill silhouette captured in `self.mask` by the last [`render_content_into`](Self::render_content_into) call. The glow goes into its OWN layer so AlphaOver in the textbox_group's Stack program produces the correct `glow_color × (1 - mask) + pill × mask` blend at AA edges — saturating-adding glow into the content layer would stain the pill's AA pixels with full glow_color.
-    pub fn render_glow_into(&self, pixels: &mut [u32], buf_w: usize, buf_h: usize, offset_x: Coord, offset_y: Coord) {
-        if !self.focused { return; }
+    pub fn render_glow_into(
+        &self,
+        pixels: &mut [u32],
+        buf_w: usize,
+        buf_h: usize,
+        offset_x: Coord,
+        offset_y: Coord,
+    ) {
+        if !self.focused {
+            return;
+        }
         let bw = self.width as usize;
         let bh = self.height as usize;
         let cy_l = (self.center_y - offset_y) as isize;
-        paint::apply_textbox_glow(pixels, &self.mask, buf_w, buf_h, cy_l, bw, bh, theme::GLOW_DEFAULT);
+        paint::apply_textbox_glow(
+            pixels,
+            &self.mask,
+            buf_w,
+            buf_h,
+            cy_l,
+            bw,
+            bh,
+            theme::GLOW_DEFAULT,
+        );
         // `offset_x` reserved for future use; the glow currently centers on the same x-axis as the pill so no x-offset math is required here.
         let _ = offset_x;
     }
 
     /// Render only the blinkey wave cursor into a buffer (typically a sub-viewport `cursor_group` buffer). `(offset_x, offset_y)` is the buffer's top-left in viewport coords. The buffer should be zeroed before calling — blinkey writes non-zero pixels for additive composition.
-    pub fn render_blinkey_into(&self, pixels: &mut [u32], buf_w: usize, buf_h: usize, offset_x: Coord, offset_y: Coord) {
-        if !self.focused || self.has_selection() || !self.blinkey_visible { return; }
+    pub fn render_blinkey_into(
+        &self,
+        pixels: &mut [u32],
+        buf_w: usize,
+        buf_h: usize,
+        offset_x: Coord,
+        offset_y: Coord,
+    ) {
+        if !self.focused || self.has_selection() || !self.blinkey_visible {
+            return;
+        }
         let cpx_v = self.cursor_pixel_x();
         let blinkey_x_v = cpx_v as isize;
         let blinkey_x = (blinkey_x_v - offset_x as isize) as usize;
         let blinkey_y = ((self.center_y - self.font_size * 0.5) - offset_y) as usize;
         let blinkey_h = self.font_size as usize;
         if blinkey_x >= 7 && blinkey_x + 7 < buf_w && blinkey_y + blinkey_h <= buf_h {
-            paint::draw_blinkey(pixels, buf_w, blinkey_x, blinkey_y, blinkey_h, self.blinkey_wave_top);
+            paint::draw_blinkey(
+                pixels,
+                buf_w,
+                blinkey_x,
+                blinkey_y,
+                blinkey_h,
+                self.blinkey_wave_top,
+            );
         }
     }
 }

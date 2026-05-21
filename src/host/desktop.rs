@@ -7,7 +7,10 @@
 //!
 //! macOS resize uses manual mouse tracking via direct NSEvent polling (photon's approach) because winit stops delivering CursorMoved events once the cursor leaves the window during a resize drag. Linux uses native `drag_resize_window`.
 
-use super::chrome::{self, ResizeEdge, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE};
+use super::chrome::{
+    self, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE, ResizeEdge,
+};
+use crate::Compositor;
 use crate::coord::Coord;
 use crate::group::Group;
 use crate::paint;
@@ -17,7 +20,6 @@ use crate::stack::Op;
 use crate::text::TextRenderer;
 use crate::theme;
 use crate::widgets::Textbox;
-use crate::Compositor;
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::error::EventLoopError;
@@ -73,6 +75,9 @@ struct DesktopApp {
     chrome_layer_chrome: usize,
     chrome_layer_hover: usize,
 
+    /// Window-shape clip mask, one byte α per pixel. Default 255 (fully visible). Carved by chrome's perimeter rasterizer once per resize; multiplied into final α at the boundary via [`crate::paint::finalize_for_os`].
+    clip_mask: Vec<u8>,
+
     // --- macOS manual resize tracking ---
     // winit stops delivering CursorMoved when the cursor leaves the window during a
     // resize drag on macOS. We poll NSEvent.mouseLocation directly via objc_msgSend
@@ -124,6 +129,7 @@ impl DesktopApp {
             chrome_layer_bg: 0,
             chrome_layer_chrome: 0,
             chrome_layer_hover: 0,
+            clip_mask: Vec::new(),
             #[cfg(target_os = "macos")]
             is_dragging_resize: false,
             #[cfg(target_os = "macos")]
@@ -156,14 +162,18 @@ impl DesktopApp {
     /// Reposition + resize the demo textbox to match the current viewport. Also resizes `textbox_group` + `cursor_group` if they exist (initial creation happens in `resumed`).
     fn update_textbox_layout(&mut self) {
         let vp = self.compositor.viewport();
-        let span = 2.0 * vp.width_px as Coord * vp.height_px as Coord / (vp.width_px as Coord + vp.height_px as Coord);
+        let span = 2.0 * vp.width_px as Coord * vp.height_px as Coord
+            / (vp.width_px as Coord + vp.height_px as Coord);
         let bw = chrome::MIN_BUTTON_HEIGHT_PX as Coord + crate::math::ceil(span / 32.0);
         let center_x = vp.width_px as Coord * 0.5;
         let center_y = bw * 7.0;
         let width = (vp.width_px as Coord * 0.5).max(bw * 8.0);
         let height = bw * 1.6;
         let font_size = bw * 0.55;
-        let text = match self.text.as_mut() { Some(t) => t, None => return };
+        let text = match self.text.as_mut() {
+            Some(t) => t,
+            None => return,
+        };
         if let Some(tb) = self.demo_textbox.as_mut() {
             tb.set_rect(center_x, center_y, width, height);
             tb.set_font_size(font_size, text);
@@ -176,8 +186,12 @@ impl DesktopApp {
         if let Some(tb) = self.demo_textbox.as_ref() {
             let bbox = tb.bbox();
             let cbox = tb.cursor_bbox();
-            if let Some(g) = self.textbox_group.as_mut() { g.resize(bbox); }
-            if let Some(g) = self.cursor_group.as_mut() { g.resize(cbox); }
+            if let Some(g) = self.textbox_group.as_mut() {
+                g.resize(bbox);
+            }
+            if let Some(g) = self.cursor_group.as_mut() {
+                g.resize(cbox);
+            }
         }
     }
 
@@ -192,6 +206,9 @@ impl DesktopApp {
             self.hit_test_map.resize(needed, HIT_NONE);
         } else {
             self.hit_test_map.fill(HIT_NONE);
+        }
+        if self.clip_mask.len() != needed {
+            self.clip_mask.resize(needed, 255);
         }
 
         // Sync cursor_group region with current cursor position (cursor may have moved since last frame).
@@ -214,6 +231,7 @@ impl DesktopApp {
             hover_pixel_list,
             text,
             demo_textbox,
+            clip_mask,
             ..
         } = self;
 
@@ -221,131 +239,137 @@ impl DesktopApp {
         if let Some(cg) = chrome_group.as_mut() {
             let layers = &mut cg.rpn.layers;
 
-            // Layer bg: background noise + panes.
+            // Layer bg: background noise + panes. Layer starts TRANSPARENT (t=255) so paint primitives can blend into a clean accumulator. Filling with 0 here would be opaque black and freeze the layer via the dst-opaque early-out.
             if layers[*chrome_layer_bg].dirty {
                 let bg = &mut layers[*chrome_layer_bg].pixels;
-                bg.fill(0);
-                paint::background_noise(bg, buf_w, buf_h, 0, true, 0, None);
+                bg.fill(0xFFFFFFFF);
+                paint::background_noise(bg, buf_w, buf_h, 0, false, 0, None); // fullscreen=false leaves a 1px transparent border so the chrome perimeter's partial-t outer edge passes through to the OS for soft AA against the desktop.
                 compositor.render(bg, buf_w, buf_h);
             }
 
-            // Layer chrome: controls + edges + hairlines + title text + rotation demo.
+            // Layer chrome: perimeter hairline only (ONLY THE HAIRLINE scaffold step). Compute squircle crossings inline, then call the perimeter rasterizer. Buttons + title text + hover are deferred to subsequent scaffold steps.
             if layers[*chrome_layer_chrome].dirty {
                 let chrome_buf = &mut layers[*chrome_layer_chrome].pixels;
-                chrome_buf.fill(0);
-                let (start, crossings, button_x_start, button_height) = chrome::draw_window_controls(
-                    chrome_buf, hit_test_map, vp_w, vp_h, 1.0,
-                );
-                chrome::draw_window_edges_and_mask(
-                    chrome_buf, hit_test_map, vp_w, vp_h, start, &crossings,
-                );
-                chrome::draw_button_hairlines(
-                    chrome_buf, hit_test_map, vp_w, vp_h,
-                    button_x_start, button_height, start, &crossings,
-                );
+                chrome_buf.fill(0xFFFFFFFF);
                 let span = 2.0 * vp_w as Coord * vp_h as Coord / (vp_w as Coord + vp_h as Coord);
-                let bw = chrome::MIN_BUTTON_HEIGHT_PX as Coord + crate::math::ceil(span / 32.0);
-                let title_size = bw * 0.55;
-                if title_size >= 6.0 {
-                    if let Some(t) = text.as_mut() {
-                        let pad = bw * 0.5;
-                        let baseline_y = bw * 0.5;
-                        let _ = t.draw_text_left_u32(
-                            chrome_buf, buf_w, buf_h, title,
-                            pad, baseline_y, title_size, 400,
-                            theme::TEXT_COLOUR, "Open Sans", None, None, None,
-                        );
-                        let aspect = vp_w as Coord / vp_h as Coord;
-                        let demo_size = title_size * 0.85;
-                        let theta = (aspect - 1.0) * core::f32::consts::PI;
-                        let demo_anchor_x = vp_w as Coord * 0.5;
-                        let demo_anchor_y = bw * 4.0;
-                        let demo_transform = Transform::translate(-demo_anchor_x, -demo_anchor_y)
-                            .then(Transform::rotate(theta))
-                            .then(Transform::translate(demo_anchor_x, demo_anchor_y));
-                        let _ = t.draw_text_center_u32(
-                            chrome_buf, buf_w, buf_h,
-                            "rotation tracks viewport aspect ratio (proper AA via swash::scale)",
-                            demo_anchor_x, demo_anchor_y, demo_size, 400,
-                            theme::TEXT_COLOUR, "Open Sans", None, None, Some(demo_transform),
-                        );
+                let radius = span / 4.0;
+                let squirdleyness = 24i32;
+                let mut crossings: Vec<(u16, u8, u8)> = Vec::new();
+                let mut y = 1f32;
+                loop {
+                    let y_norm = y / radius;
+                    let x_norm = crate::math::powf(
+                        1.0 - crate::math::powi(y_norm, squirdleyness),
+                        1.0 / squirdleyness as Coord,
+                    );
+                    let x = x_norm * radius;
+                    let inset = radius - x;
+                    if inset > 0.0 {
+                        crossings.push((
+                            inset as u16,
+                            (crate::math::sqrt(crate::math::fract(inset)) * 256.0) as u8,
+                            (crate::math::sqrt(1.0 - crate::math::fract(inset)) * 256.0) as u8,
+                        ));
                     }
+                    if x < y {
+                        break;
+                    }
+                    y += 1.0;
                 }
+                let start = (radius - y) as usize;
+                let crossings: Vec<(u16, u8, u8)> = crossings.into_iter().rev().collect();
+                if start > 0 && !crossings.is_empty() {
+                    clip_mask.fill(255);
+                    chrome::draw_window_edges_and_mask(
+                        chrome_buf,
+                        hit_test_map,
+                        clip_mask,
+                        vp_w,
+                        vp_h,
+                        start,
+                        &crossings,
+                    );
+                }
+                let _ = title; // title + text rendering deferred to the next scaffold step
             }
 
-            // Layer hover: additive delta on control buttons.
+            // Hover layer: cleared to transparent. Hover overlay returns with the controls scaffold step.
             if layers[*chrome_layer_hover].dirty {
-                let hov_buf = &mut layers[*chrome_layer_hover].pixels;
-                hov_buf.fill(0);
-                *hover_pixel_list = chrome::pixels_for_button(hit_test_map, *hover_state);
-                let hover_delta = match *hover_state {
-                    HIT_CLOSE_BUTTON => theme::CLOSE_HOVER,
-                    HIT_MAXIMIZE_BUTTON => theme::MAXIMIZE_HOVER,
-                    HIT_MINIMIZE_BUTTON => theme::MINIMIZE_HOVER,
-                    _ => 0,
-                };
-                if hover_delta != 0 {
-                    for &idx in hover_pixel_list.iter() {
-                        hov_buf[idx] = hover_delta;
-                    }
-                }
+                layers[*chrome_layer_hover].pixels.fill(0xFFFFFFFF);
+                let _ = (hover_state, hover_pixel_list);
             }
         }
 
-        // --- textbox_group: pill + glow + text + selection (bbox-sized, AlphaOver onto target) ---
+        // --- textbox_group: pill + glow + text + selection (bbox-sized, Under(Normal) onto target). Layer pre-cleared to TRANSPARENT before rasterization so painted content blends into a clean accumulator. ---
         if let (Some(tg), Some(tb)) = (textbox_group.as_mut(), demo_textbox.as_mut()) {
             if tg.rpn.layers[0].dirty {
                 let (tw, th) = tg.dims();
                 let bbox = tb.bbox();
                 let buf = &mut tg.rpn.layers[0].pixels;
-                buf.fill(0);
+                buf.fill(0xFFFFFFFF);
                 if let Some(t) = text.as_mut() {
-                    // Legacy single-layer path — content only, no glow (legacy desktop::run is slated for deletion in Phase E; the trait-based run_app in app.rs has the correct two-layer glow setup).
                     tb.render_content_into(buf, tw, th, bbox.x, bbox.y, t, None, None);
                 }
             }
         }
 
-        // --- cursor_group: blinkey wave (cursor-smear-bbox-sized, Add onto target) ---
+        // --- cursor_group: blinkey wave (cursor-smear-bbox-sized, Under(Add) onto target). Same TRANSPARENT-init contract. ---
         if let (Some(cg), Some(tb)) = (cursor_group.as_mut(), demo_textbox.as_ref()) {
             if cg.rpn.layers[0].dirty {
                 let (cw, ch) = cg.dims();
                 let cbox = tb.cursor_bbox();
                 let buf = &mut cg.rpn.layers[0].pixels;
-                buf.fill(0);
+                buf.fill(0xFFFFFFFF);
                 tb.render_blinkey_into(buf, cw, ch, cbox.x, cbox.y);
             }
         }
 
         // --- Flatten groups onto the present buffer ---
-        // Pixel-convention boundary. Internal pixels are t-convention `0xttRRGGBB` u32 (t=0
-        // opaque, t=255 transparent). Convert to α-convention here — and ONLY here:
-        //   1. `flip_t_to_alpha` always — every host wants α in the top byte (α = 255 - t).
-        //   2. `premultiply_buffer` on Linux only — KWin/Mutter blend with premultiplied α.
-        //      Toggleable at runtime via Ctrl+Shift+D+P for A/B testing.
-        // macOS wgpu PostMultiplied + softbuffer α-byte → both want straight-α; flip is enough.
+        // Pixel-convention boundary. Internal pixels are t-convention `0xttRRGGBB` u32 (t=0 opaque, t=255 transparent). Convert to α-convention here — and ONLY here — via [`paint::finalize_for_os`], which folds the t→α flip + window-shape clip-mask multiply + Linux premultiply + pack into a single pass.
+        // Present chain — topmost-first. Buffer is initialized to the canonical empty value `0xFFFFFFFF` (t=255 transparent, RGB=255 — invisible at full transparency, byte-uniform so the fill compiles to memset). Each Group's `flatten_into` paints its content underneath whatever's already accumulated above; once `dst.t` reaches 0 at a pixel, subsequent Groups short-circuit on that pixel via the under early-out.
+        //   1. cursor  (topmost — blinkey wave additively over textbox)
+        //   2. textbox (under cursor)
+        //   3. chrome  (under textbox — controls/edges/hairlines/bg via internal Stack)
         #[cfg(target_os = "macos")]
         {
-            let Some(renderer) = self.renderer.as_mut() else { return; };
+            let Some(renderer) = self.renderer.as_mut() else {
+                return;
+            };
             let mut buffer = renderer.lock_buffer();
-            if let Some(g) = self.chrome_group.as_mut() { g.flatten_into(&mut buffer, buf_w, buf_h); }
-            if let Some(g) = self.textbox_group.as_mut() { g.flatten_into(&mut buffer, buf_w, buf_h); }
-            if let Some(g) = self.cursor_group.as_mut() { g.flatten_into(&mut buffer, buf_w, buf_h); }
-            paint::flip_t_to_alpha(&mut buffer);
+            for px in buffer.iter_mut() {
+                *px = 0xFFFFFFFF;
+            }
+            if let Some(g) = self.cursor_group.as_mut() {
+                g.flatten_into(&mut buffer, buf_w, buf_h);
+            }
+            if let Some(g) = self.textbox_group.as_mut() {
+                g.flatten_into(&mut buffer, buf_w, buf_h);
+            }
+            if let Some(g) = self.chrome_group.as_mut() {
+                g.flatten_into(&mut buffer, buf_w, buf_h);
+            }
+            paint::finalize_for_os(&mut buffer, &self.clip_mask);
             let _ = buffer.present();
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let Some(surface) = self.surface.as_mut() else { return; };
+            let Some(surface) = self.surface.as_mut() else {
+                return;
+            };
             let mut buffer = surface.buffer_mut().expect("softbuffer buffer_mut");
-            if let Some(g) = self.chrome_group.as_mut() { g.flatten_into(&mut buffer, buf_w, buf_h); }
-            if let Some(g) = self.textbox_group.as_mut() { g.flatten_into(&mut buffer, buf_w, buf_h); }
-            if let Some(g) = self.cursor_group.as_mut() { g.flatten_into(&mut buffer, buf_w, buf_h); }
-            paint::flip_t_to_alpha(&mut buffer);
-            #[cfg(target_os = "linux")]
-            if !paint::DEBUG_SKIP_PREMULT.load(std::sync::atomic::Ordering::Relaxed) {
-                paint::premultiply_buffer(&mut buffer);
+            for px in buffer.iter_mut() {
+                *px = 0xFFFFFFFF;
             }
+            if let Some(g) = self.cursor_group.as_mut() {
+                g.flatten_into(&mut buffer, buf_w, buf_h);
+            }
+            if let Some(g) = self.textbox_group.as_mut() {
+                g.flatten_into(&mut buffer, buf_w, buf_h);
+            }
+            if let Some(g) = self.chrome_group.as_mut() {
+                g.flatten_into(&mut buffer, buf_w, buf_h);
+            }
+            paint::finalize_for_os(&mut buffer, &self.clip_mask);
             buffer.present().expect("softbuffer buffer.present");
         }
     }
@@ -369,12 +393,17 @@ impl DesktopApp {
     /// macOS: poll mouse position and button state directly from AppKit. Called from `about_to_wait()` to track the cursor even when it's outside the window (winit stops delivering CursorMoved once the cursor leaves during resize).
     #[cfg(target_os = "macos")]
     fn poll_macos_resize(&mut self) -> bool {
-        let Some(window) = self.window.as_ref() else { return false; };
+        let Some(window) = self.window.as_ref() else {
+            return false;
+        };
         use std::ffi::{c_char, c_void};
 
         #[repr(C)]
         #[derive(Clone, Copy)]
-        struct NSPoint { x: f64, y: f64 }
+        struct NSPoint {
+            x: f64,
+            y: f64,
+        }
 
         unsafe extern "C" {
             fn objc_msgSend(receiver: *const c_void, sel: *const c_void) -> usize;
@@ -418,8 +447,12 @@ impl DesktopApp {
     /// macOS: compute new window size from current mouse delta and apply via `request_inner_size` + `set_outer_position`.
     #[cfg(target_os = "macos")]
     fn apply_resize(&self) {
-        let Some(window) = self.window.as_ref() else { return; };
-        let Ok(window_pos) = window.outer_position() else { return; };
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let Ok(window_pos) = window.outer_position() else {
+            return;
+        };
 
         let current_screen_x = window_pos.x as f64 + self.cursor_x as f64;
         let current_screen_y = window_pos.y as f64 + self.cursor_y as f64;
@@ -437,7 +470,13 @@ impl DesktopApp {
             ResizeEdge::Left => {
                 let w = (self.drag_start_size.0 as Coord - dx).max(min_size) as u32;
                 let width_change = self.drag_start_size.0 as i32 - w as i32;
-                (w, self.drag_start_size.1, true, self.drag_start_window_pos.0 + width_change, self.drag_start_window_pos.1)
+                (
+                    w,
+                    self.drag_start_size.1,
+                    true,
+                    self.drag_start_window_pos.0 + width_change,
+                    self.drag_start_window_pos.1,
+                )
             }
             ResizeEdge::Bottom => {
                 let h = (self.drag_start_size.1 as Coord + dy).max(min_size) as u32;
@@ -446,20 +485,38 @@ impl DesktopApp {
             ResizeEdge::Top => {
                 let h = (self.drag_start_size.1 as Coord - dy).max(min_size) as u32;
                 let height_change = self.drag_start_size.1 as i32 - h as i32;
-                (self.drag_start_size.0, h, true, self.drag_start_window_pos.0, self.drag_start_window_pos.1 + height_change)
+                (
+                    self.drag_start_size.0,
+                    h,
+                    true,
+                    self.drag_start_window_pos.0,
+                    self.drag_start_window_pos.1 + height_change,
+                )
             }
             ResizeEdge::TopRight => {
                 let w = (self.drag_start_size.0 as Coord + dx).max(min_size) as u32;
                 let h = (self.drag_start_size.1 as Coord - dy).max(min_size) as u32;
                 let height_change = self.drag_start_size.1 as i32 - h as i32;
-                (w, h, true, self.drag_start_window_pos.0, self.drag_start_window_pos.1 + height_change)
+                (
+                    w,
+                    h,
+                    true,
+                    self.drag_start_window_pos.0,
+                    self.drag_start_window_pos.1 + height_change,
+                )
             }
             ResizeEdge::TopLeft => {
                 let w = (self.drag_start_size.0 as Coord - dx).max(min_size) as u32;
                 let h = (self.drag_start_size.1 as Coord - dy).max(min_size) as u32;
                 let width_change = self.drag_start_size.0 as i32 - w as i32;
                 let height_change = self.drag_start_size.1 as i32 - h as i32;
-                (w, h, true, self.drag_start_window_pos.0 + width_change, self.drag_start_window_pos.1 + height_change)
+                (
+                    w,
+                    h,
+                    true,
+                    self.drag_start_window_pos.0 + width_change,
+                    self.drag_start_window_pos.1 + height_change,
+                )
             }
             ResizeEdge::BottomRight => {
                 let w = (self.drag_start_size.0 as Coord + dx).max(min_size) as u32;
@@ -470,7 +527,13 @@ impl DesktopApp {
                 let w = (self.drag_start_size.0 as Coord - dx).max(min_size) as u32;
                 let h = (self.drag_start_size.1 as Coord + dy).max(min_size) as u32;
                 let width_change = self.drag_start_size.0 as i32 - w as i32;
-                (w, h, true, self.drag_start_window_pos.0 + width_change, self.drag_start_window_pos.1)
+                (
+                    w,
+                    h,
+                    true,
+                    self.drag_start_window_pos.0 + width_change,
+                    self.drag_start_window_pos.1,
+                )
             }
             ResizeEdge::None => return,
         };
@@ -484,9 +547,12 @@ impl DesktopApp {
 
 impl ApplicationHandler for DesktopApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() { return; }
+        if self.window.is_some() {
+            return;
+        }
 
-        let monitor = event_loop.primary_monitor()
+        let monitor = event_loop
+            .primary_monitor()
             .or_else(|| event_loop.available_monitors().next());
 
         // Default initial size: 4:3 window scaled to the monitor's short edge.
@@ -534,13 +600,19 @@ impl ApplicationHandler for DesktopApp {
         // --- Platform renderer init ---
         #[cfg(target_os = "macos")]
         {
-            self.renderer = Some(super::renderer_wgpu::Renderer::new(&window, initial.width, initial.height));
+            self.renderer = Some(super::renderer_wgpu::Renderer::new(
+                &window,
+                initial.width,
+                initial.height,
+            ));
         }
         #[cfg(not(target_os = "macos"))]
         {
             use std::num::NonZeroU32;
-            let context = softbuffer::Context::new(window.clone()).expect("softbuffer Context::new");
-            let mut surface = softbuffer::Surface::new(&context, window.clone()).expect("softbuffer Surface::new");
+            let context =
+                softbuffer::Context::new(window.clone()).expect("softbuffer Context::new");
+            let mut surface = softbuffer::Surface::new(&context, window.clone())
+                .expect("softbuffer Surface::new");
             surface
                 .resize(
                     NonZeroU32::new(initial.width).expect("nonzero width"),
@@ -557,30 +629,35 @@ impl ApplicationHandler for DesktopApp {
         self.update_textbox_layout();
 
         // Initialize the three composite groups.
-        let viewport_region = Region::new(0.0, 0.0, initial.width as Coord, initial.height as Coord);
+        let viewport_region =
+            Region::new(0.0, 0.0, initial.width as Coord, initial.height as Coord);
 
-        // chrome_group: full viewport. Inside Stack: bg (Replace) + chrome (AlphaOver) + hover (Add).
-        let mut cg = Group::new(viewport_region, BlendMode::Replace);
+        // chrome_group: full viewport. Stack program is topmost-first per the unified Under doctrine:
+        //   hover (additive overlay, topmost)
+        //   chrome (controls/edges/hairlines)
+        //   bg (background_noise + panes, bottom-most)
+        // Translated: Push hover, Push chrome, Under(Add), Push bg, Under(Normal).
+        let mut cg = Group::new(viewport_region, BlendMode::Normal);
         self.chrome_layer_bg = cg.new_layer();
         self.chrome_layer_chrome = cg.new_layer();
         self.chrome_layer_hover = cg.new_layer();
         cg.set_program(vec![
-            Op::Push(self.chrome_layer_bg),
-            Op::Push(self.chrome_layer_chrome),
-            Op::AlphaOver,
             Op::Push(self.chrome_layer_hover),
-            Op::Add,
+            Op::Push(self.chrome_layer_chrome),
+            Op::Under(BlendMode::Add),
+            Op::Push(self.chrome_layer_bg),
+            Op::Under(BlendMode::Normal),
         ]);
         self.chrome_group = Some(cg);
 
-        // textbox_group: bbox = textbox rect. Inside Stack: one layer for pill+text+selection.
+        // textbox_group: bbox = textbox rect. Single layer; Normal under-blend onto whatever sits behind.
         if let Some(tb) = self.demo_textbox.as_ref() {
-            let mut tg = Group::new(tb.bbox(), BlendMode::AlphaOver);
+            let mut tg = Group::new(tb.bbox(), BlendMode::Normal);
             let l = tg.new_layer();
             tg.set_program(vec![Op::Push(l)]);
             self.textbox_group = Some(tg);
 
-            // cursor_group: bbox = cursor smear (~16 × font_size pixels). Add onto target. Re-flattens on blink ticks.
+            // cursor_group: bbox = cursor smear (~16 × font_size pixels). Under(Add) onto whatever sits behind. Re-flattens on blink ticks.
             let mut crg = Group::new(tb.cursor_bbox(), BlendMode::Add);
             let l = crg.new_layer();
             crg.set_program(vec![Op::Push(l)]);
@@ -596,7 +673,9 @@ impl ApplicationHandler for DesktopApp {
         #[cfg(target_os = "macos")]
         if self.is_dragging_resize {
             if self.poll_macos_resize() {
-                if let Some(window) = self.window.as_ref() { window.request_redraw(); }
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
             }
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
                 std::time::Instant::now() + std::time::Duration::from_millis(16),
@@ -619,7 +698,8 @@ impl ApplicationHandler for DesktopApp {
                 };
                 if distance_outside > 0.0 {
                     let now = std::time::Instant::now();
-                    let dt = self.selection_scroll_time
+                    let dt = self
+                        .selection_scroll_time
                         .map(|t| now.duration_since(t).as_secs_f32())
                         .unwrap_or(0.0);
                     self.selection_scroll_time = Some(now);
@@ -634,7 +714,9 @@ impl ApplicationHandler for DesktopApp {
                     // Update cursor position for the new scroll state.
                     let clamped_x = self.cursor_x.clamp(tl, tr);
                     tb.cursor = tb.cursor_index_from_x(clamped_x);
-                    if let Some(window) = self.window.as_ref() { window.request_redraw(); }
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
                 } else {
                     self.selection_scroll_time = None;
                 }
@@ -649,8 +731,12 @@ impl ApplicationHandler for DesktopApp {
             if now >= when {
                 if let Some(tb) = self.demo_textbox.as_mut() {
                     if tb.flip_blinkey() {
-                        if let Some(g) = self.cursor_group.as_mut() { g.invalidate(); }
-                        if let Some(window) = self.window.as_ref() { window.request_redraw(); }
+                        if let Some(g) = self.cursor_group.as_mut() {
+                            g.invalidate();
+                        }
+                        if let Some(window) = self.window.as_ref() {
+                            window.request_redraw();
+                        }
                     }
                 }
                 let interval = self.next_blink_interval();
@@ -672,7 +758,9 @@ impl ApplicationHandler for DesktopApp {
                 if size.width == current_vp.width_px && size.height == current_vp.height_px {
                     return;
                 }
-                if size.width == 0 || size.height == 0 { return; }
+                if size.width == 0 || size.height == 0 {
+                    return;
+                }
 
                 #[cfg(target_os = "macos")]
                 if let Some(renderer) = self.renderer.as_mut() {
@@ -681,21 +769,30 @@ impl ApplicationHandler for DesktopApp {
                 #[cfg(not(target_os = "macos"))]
                 if let Some(surface) = self.surface.as_mut() {
                     use std::num::NonZeroU32;
-                    if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
+                    if let (Some(w), Some(h)) =
+                        (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+                    {
                         surface.resize(w, h).expect("softbuffer Surface::resize");
                     }
                 }
 
                 self.compositor.resize(size.width, size.height);
                 if let Some(g) = self.chrome_group.as_mut() {
-                    g.resize(Region::new(0.0, 0.0, size.width as Coord, size.height as Coord));
+                    g.resize(Region::new(
+                        0.0,
+                        0.0,
+                        size.width as Coord,
+                        size.height as Coord,
+                    ));
                 }
                 let map_size = (size.width as usize)
                     .checked_mul(size.height as usize)
                     .unwrap_or(0);
                 self.hit_test_map.resize(map_size, HIT_NONE);
                 self.update_textbox_layout();
-                if let Some(window) = self.window.as_ref() { window.request_redraw(); }
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_x = position.x as Coord;
@@ -713,9 +810,15 @@ impl ApplicationHandler for DesktopApp {
                         let clamped_x = self.cursor_x.clamp(tl, tr);
                         tb.cursor = tb.cursor_index_from_x(clamped_x);
                     }
-                    if let Some(g) = self.textbox_group.as_mut() { g.invalidate(); }
-                    if let Some(g) = self.cursor_group.as_mut() { g.invalidate(); }
-                    if let Some(window) = self.window.as_ref() { window.request_redraw(); }
+                    if let Some(g) = self.textbox_group.as_mut() {
+                        g.invalidate();
+                    }
+                    if let Some(g) = self.cursor_group.as_mut() {
+                        g.invalidate();
+                    }
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
                     return;
                 }
 
@@ -737,7 +840,9 @@ impl ApplicationHandler for DesktopApp {
                     if let Some(g) = self.chrome_group.as_mut() {
                         g.rpn.layers[self.chrome_layer_hover].dirty = true;
                     }
-                    if let Some(window) = self.window.as_ref() { window.request_redraw(); }
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
                 }
             }
             WindowEvent::CursorLeft { .. } => {
@@ -764,17 +869,36 @@ impl ApplicationHandler for DesktopApp {
                     self.resize_edge = ResizeEdge::None;
                 }
             }
-            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-                let Some(window) = self.window.clone() else { return; };
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let Some(window) = self.window.clone() else {
+                    return;
+                };
                 // Priority: window controls > resize edges > textbox > drag.
                 match self.hit_at_cursor() {
-                    HIT_CLOSE_BUTTON => { std::process::exit(0); }
-                    HIT_MINIMIZE_BUTTON => { window.set_minimized(true); return; }
-                    HIT_MAXIMIZE_BUTTON => { window.set_maximized(!window.is_maximized()); return; }
+                    HIT_CLOSE_BUTTON => {
+                        std::process::exit(0);
+                    }
+                    HIT_MINIMIZE_BUTTON => {
+                        window.set_minimized(true);
+                        return;
+                    }
+                    HIT_MAXIMIZE_BUTTON => {
+                        window.set_maximized(!window.is_maximized());
+                        return;
+                    }
                     _ => {}
                 }
                 let vp = self.compositor.viewport();
-                let edge = chrome::get_resize_edge(vp.width_px, vp.height_px, self.cursor_x, self.cursor_y);
+                let edge = chrome::get_resize_edge(
+                    vp.width_px,
+                    vp.height_px,
+                    self.cursor_x,
+                    self.cursor_y,
+                );
                 if edge != ResizeEdge::None {
                     // Linux: native resize protocol.
                     #[cfg(target_os = "linux")]
@@ -818,8 +942,12 @@ impl ApplicationHandler for DesktopApp {
                     if tb.focused {
                         self.is_dragging_select = true;
                         self.selection_scroll_time = None;
-                        if let Some(g) = self.textbox_group.as_mut() { g.invalidate(); }
-                        if let Some(g) = self.cursor_group.as_mut() { g.invalidate(); }
+                        if let Some(g) = self.textbox_group.as_mut() {
+                            g.invalidate();
+                        }
+                        if let Some(g) = self.cursor_group.as_mut() {
+                            g.invalidate();
+                        }
                         let interval = self.next_blink_interval();
                         self.next_blink = Some(std::time::Instant::now() + interval);
                         window.request_redraw();
@@ -827,19 +955,29 @@ impl ApplicationHandler for DesktopApp {
                     } else if was_focused {
                         self.next_blink = None;
                         self.is_dragging_select = false;
-                        if let Some(g) = self.textbox_group.as_mut() { g.invalidate(); }
-                        if let Some(g) = self.cursor_group.as_mut() { g.invalidate(); }
+                        if let Some(g) = self.textbox_group.as_mut() {
+                            g.invalidate();
+                        }
+                        if let Some(g) = self.cursor_group.as_mut() {
+                            g.invalidate();
+                        }
                         window.request_redraw();
                     }
                 }
                 let _ = window.drag_window();
             }
-            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
                 #[cfg(target_os = "macos")]
                 if self.is_dragging_resize {
                     self.is_dragging_resize = false;
                     self.resize_edge = ResizeEdge::None;
-                    if let Some(window) = self.window.as_ref() { window.request_redraw(); }
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
                 }
                 // End mouse drag selection.
                 if self.is_dragging_select {
@@ -853,41 +991,69 @@ impl ApplicationHandler for DesktopApp {
                     }
                     let interval = self.next_blink_interval();
                     self.next_blink = Some(std::time::Instant::now() + interval);
-                    if let Some(window) = self.window.as_ref() { window.request_redraw(); }
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state != ElementState::Pressed { return; }
-                let Some(tb) = self.demo_textbox.as_mut() else { return; };
-                if !tb.focused { return; }
-                let Some(text) = self.text.as_mut() else { return; };
+                if event.state != ElementState::Pressed {
+                    return;
+                }
+                let Some(tb) = self.demo_textbox.as_mut() else {
+                    return;
+                };
+                if !tb.focused {
+                    return;
+                }
+                let Some(text) = self.text.as_mut() else {
+                    return;
+                };
                 let shift = self.modifiers.shift_key();
                 let ctrl = self.modifiers.super_key() || self.modifiers.control_key();
                 let mut changed = false;
                 match &event.logical_key {
-                    Key::Named(NamedKey::Backspace) => { tb.backspace(text); changed = true; }
-                    Key::Named(NamedKey::Delete) => { tb.delete_forward(text); changed = true; }
+                    Key::Named(NamedKey::Backspace) => {
+                        tb.backspace(text);
+                        changed = true;
+                    }
+                    Key::Named(NamedKey::Delete) => {
+                        tb.delete_forward(text);
+                        changed = true;
+                    }
                     Key::Named(NamedKey::ArrowLeft) => {
-                        if shift && tb.selection_anchor.is_none() { tb.selection_anchor = Some(tb.cursor); }
-                        else if !shift { tb.selection_anchor = None; }
+                        if shift && tb.selection_anchor.is_none() {
+                            tb.selection_anchor = Some(tb.cursor);
+                        } else if !shift {
+                            tb.selection_anchor = None;
+                        }
                         tb.cursor_left();
                         changed = true;
                     }
                     Key::Named(NamedKey::ArrowRight) => {
-                        if shift && tb.selection_anchor.is_none() { tb.selection_anchor = Some(tb.cursor); }
-                        else if !shift { tb.selection_anchor = None; }
+                        if shift && tb.selection_anchor.is_none() {
+                            tb.selection_anchor = Some(tb.cursor);
+                        } else if !shift {
+                            tb.selection_anchor = None;
+                        }
                         tb.cursor_right();
                         changed = true;
                     }
                     Key::Named(NamedKey::Home) => {
-                        if shift && tb.selection_anchor.is_none() { tb.selection_anchor = Some(tb.cursor); }
-                        else if !shift { tb.selection_anchor = None; }
+                        if shift && tb.selection_anchor.is_none() {
+                            tb.selection_anchor = Some(tb.cursor);
+                        } else if !shift {
+                            tb.selection_anchor = None;
+                        }
                         tb.cursor_home();
                         changed = true;
                     }
                     Key::Named(NamedKey::End) => {
-                        if shift && tb.selection_anchor.is_none() { tb.selection_anchor = Some(tb.cursor); }
-                        else if !shift { tb.selection_anchor = None; }
+                        if shift && tb.selection_anchor.is_none() {
+                            tb.selection_anchor = Some(tb.cursor);
+                        } else if !shift {
+                            tb.selection_anchor = None;
+                        }
                         tb.cursor_end();
                         changed = true;
                     }
@@ -935,11 +1101,17 @@ impl ApplicationHandler for DesktopApp {
                     }
                 }
                 if changed {
-                    if let Some(g) = self.textbox_group.as_mut() { g.invalidate(); }
-                    if let Some(g) = self.cursor_group.as_mut() { g.invalidate(); }
+                    if let Some(g) = self.textbox_group.as_mut() {
+                        g.invalidate();
+                    }
+                    if let Some(g) = self.cursor_group.as_mut() {
+                        g.invalidate();
+                    }
                     let interval = self.next_blink_interval();
                     self.next_blink = Some(std::time::Instant::now() + interval);
-                    if let Some(window) = self.window.as_ref() { window.request_redraw(); }
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
                 }
             }
             WindowEvent::RedrawRequested => {

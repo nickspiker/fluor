@@ -32,7 +32,7 @@ The harmonic mean is the unique scaling base with:
 
 A layout specified in RU (relative units) looks correct on an 11" laptop, a 32" monitor, and an embedded display without any DPI awareness code. This combination — center-origin plus harmonic-mean unit as the dominant convention rather than an opt-in — is, as far as can be determined, unoccupied territory among compositors and GUI toolkits.
 
-### 3. Front-to-back compositing with a transparency accumulator
+### 3. Front-to-back compositing — buffer-as-accumulator, single `under` kernel
 
 Conventional compositing renders back-to-front (painter's algorithm). Each layer blends onto the accumulated result beneath it:
 
@@ -49,61 +49,63 @@ let out_r = dr * (1.0 - a) + r * a;   // sub + mul + mul + add
 
 The float division `/ 255.0` and the repeated `1.0 - a` are not free. More importantly: there is no early-out. In a UI where the frontmost layers are overwhelmingly opaque — buttons, chrome, panels — you are doing full blend work on pixels that will be completely covered. The work is pure waste.
 
-fluor renders front-to-back with a `u8` transparency accumulator. Transparency convention: `0 = fully opaque, 255 = fully transparent`. The accumulator tracks how much of the pixel's contribution budget remains unclaimed:
+fluor inverts the direction and uses the buffer itself as the transparency accumulator. The buffer's t-byte (top byte) tracks remaining transparency budget per pixel. Layers paint topmost-first via one binary operation:
 
 ```rust
-// Front-to-back, u8 transparency, no floats
-
-let mut r_acc: u16 = 0;
-let mut g_acc: u16 = 0;
-let mut b_acc: u16 = 0;
-let mut remaining: u8 = 255; // full budget: pixel is entirely unclaimed
-
-for &(pixel, t) in layers_front_to_back {
-    if remaining == 0 { break; }           // budget exhausted — skip everything behind
-
-    let a: u16 = (255 - t) as u16;        // opacity: one subtraction
-    let contrib = (remaining as u16 * a) >> 8; // budget × opacity: one mul, one shift
-
-    r_acc += contrib * ((pixel >> 16 & 0xFF) as u16) >> 8;
-    g_acc += contrib * ((pixel >>  8 & 0xFF) as u16) >> 8;
-    b_acc += contrib * ((pixel       & 0xFF) as u16) >> 8;
-
-    remaining = (remaining as u16 * t as u16 >> 8) as u8; // attenuate budget: one mul, one shift
+// t-convention: t=0 opaque, t=255 transparent. Argb8 is a type alias for u32.
+trait Blend {
+    fn under(self, bottom: Argb8, mode: BlendMode) -> Argb8;
 }
 
-// one repack at the end
-let result = 0xFF_00_00_00
-    | (r_acc as u32) << 16
-    | (g_acc as u32) <<  8
-    |  b_acc as u32;
+impl Blend for Argb8 {
+    fn under(self, bottom: Argb8, mode: BlendMode) -> Argb8 {
+        if self < 0x01000000 { return self; }       // dst opaque (t==0): single CMP early-out
+        let top_t = self >> 24;
+        let bot_t = bottom >> 24;
+        let top_opacity = 256 - top_t;
+        let contrib     = (top_t * (256 - bot_t)) >> 8;
+
+        let (mr, mg, mb) = mode.kernel(top_rgb, bot_rgb);   // pure channel function; no transparency math here
+
+        let nr = (tr * top_opacity + mr * contrib) >> 8;    // top_opacity + contrib ≤ 256 → nr ≤ 255 exactly
+        let ng = (tg * top_opacity + mg * contrib) >> 8;
+        let nb = (tb * top_opacity + mb * contrib) >> 8;
+        ((top_t * bot_t) >> 8) << 24 | (nr << 16) | (ng << 8) | nb
+    }
+}
 ```
+
+No floats. No `/ 255`. All `>> 8`. The invariant `top_opacity + contrib ≤ 256` keeps the per-channel result in `[0, 255]` without explicit saturation. Every blend mode (`Normal`, `Multiply`, `Screen`, `Add`, `Subtract`, `Overlay`, `Darken`, `Lighten`) goes through this same outer shape — only `(mr, mg, mb)` changes.
+
+#### How a frame composes
+
+The present buffer is initialized to `0xFFFFFFFF` (t=255 transparent, RGB=255 — invisible at full transparency, byte-uniform so the fill is a single `memset`). Groups flatten into it topmost-first. Each `flatten_into` walks the bbox and calls `dst[i].under(src[i], mode)` per pixel. When `dst.t` reaches 0 at a pixel, every subsequent Group short-circuits on that pixel via the `dst < 0x01000000` early-out — *one u32 compare against an immediate*, no shift, no mask.
 
 #### A concrete example
 
 Four layers: tooltip over button over panel over background.
 
 ```
-layer 0  tooltip     t=180  remaining=255  contrib=75   remaining→179
-layer 1  button      t=0    remaining=179  contrib=179  remaining→0
-layer 2  panel       t=60   remaining==0   BREAK ← never touched
-layer 3  background  t=0                   never touched
+layer 0  tooltip     t=180  buffer.t=255 (empty)   → contrib=53   buffer.t→179
+layer 1  button      t=0    buffer.t=179           → contrib=179  buffer.t→0   (now opaque)
+layer 2  panel       t=60   buffer.t==0            → EARLY-OUT, src not read
+layer 3  background  t=0    buffer.t==0            → EARLY-OUT, src not read
 ```
 
-The button is fully opaque. After layer 1 the transparency accumulator is zero. Layers 2 and 3 are never entered — not skipped at the SIMD level, not zeroed out, simply never executed.
+After layer 1 the buffer's t-byte is 0 at this pixel. Layers 2 and 3 are short-circuited — the lower bbox kernel calls visit those pixels but the very first instruction (`if self < 0x01000000`) returns immediately. Not skipped at the SIMD level, not zeroed out, simply never decoded past the early-out branch.
 
 #### Cost comparison per pixel per layer
 
-| | Bottom-up float | Front-to-back u8 |
+| | Bottom-up float | Front-to-back u8 (`under`) |
 |---|---|---|
 | Float converts | 4 (one per channel + alpha) | 0 |
 | `1.0 - α` subtractions | 1 per layer | 0 |
-| Multiplications | 8 floats per layer | 3 u16 per layer |
-| Layers executed | always N | stops at first opaque |
-| Repacks | 1 per layer | 1 total |
-| Early-out | impossible | `remaining == 0` |
+| Multiplications | 8 floats per layer | 5 u32 per layer (3 RGB + opacity + new_t) |
+| Layers executed | always N | stops at first opaque dst |
+| Repacks | 1 per layer | 0 (buffer carries packed state) |
+| Early-out | impossible | `if dst < 0x01000000` — one CMP |
 
-In a real UI the frontmost opaque surface is typically encountered at layer 1 or 2. Chrome, buttons, and panels are overwhelmingly opaque. The common case pays 3 u16 multiplications for the semi-transparent layers above the first opaque one, then stops.
+In a real UI the frontmost opaque surface is typically encountered at layer 1 or 2. Chrome, buttons, and panels are overwhelmingly opaque. The common case pays a few u32 multiplications for the semi-transparent layers above the first opaque one, then stops — and not for the entire layer, just for the pixels that haven't already become opaque from any topmost paint.
 
 ### 4. Why transparency-convention alpha (`0 = opaque`)
 
@@ -113,15 +115,25 @@ The reason is exactness, and it matters in integer arithmetic.
 
 With opacity convention and a `u8` accumulator, the ceiling is exact: `opacity = 255` contributes 100% exactly. But the floor is not: `opacity = 0` contributes `0/256`, which rounds to zero but is not mathematically zero. Invisible layers are slightly inexact.
 
-With transparency convention and a `u8` accumulator, the floor is exact: `transparency = 0` sets `remaining = 0` exactly — `(remaining * 0) >> 8 == 0`, no rounding. The accumulator hits zero cleanly and the early-out fires precisely.
+With transparency convention and a `u8` accumulator, the floor is exact: `transparency = 0` sets `new_t = (dst_t * 0) >> 8 == 0` exactly — no rounding. The buffer's t-byte hits zero cleanly and the early-out fires precisely.
 
-The ceiling is slightly inexact: `transparency = 255` attenuates the budget by `255/256 ≈ 0.996` rather than exactly 1.0. But a layer with `transparency = 255` is invisible — it would be culled before entering the blend pass. The imprecision never executes.
+The ceiling is slightly inexact: a partial layer with `t = 255` attenuates the budget by `255/256 ≈ 0.996` rather than exactly 1.0. A layer with `t = 255` everywhere is invisible and culled before entering the blend pass; the imprecision never executes on a meaningful path.
 
-The background layer closes the guarantee. The background is always fully opaque (`t = 0`), so `remaining` hits zero exactly on every pixel. There is no path to a pixel that escapes without being fully accounted for.
+A second exactness win comes from the empty-buffer value. The canonical empty pixel is `0xFFFFFFFF` (`t=255`, `RGB=255`): a single byte pattern that fills via one `memset(0xFF)` instruction, *and* the white RGB compensates the `>>8` truncation at the transparent endpoint. Painting opaque `mr=255` content into an `0xFFFFFFFF` empty buffer:
 
-The external boundary — PNG load, image decode, glyph coverage from cosmic-text — performs a one-time `255 - a` flip on import. The cost is paid once per asset load, not per pixel per frame.
+```
+nr = (255 * top_opacity + 255 * contrib) >> 8
+   = (255 * 1 + 255 * 255) >> 8
+   = 65280 >> 8 = 255   // exact
+```
 
-Internally, all variables are named `t` or `transparency`, never `alpha` or `a`. The convention is stated explicitly wherever it appears in the codebase.
+If the empty buffer were `0xFF000000` (`RGB=0`), the same paint lands at `253` — a 1-2 LSB drift per channel at every transparent pixel touched once. The white-empty trick costs nothing (transparent pixels never display their RGB) and removes the drift.
+
+The background layer closes the guarantee. The background is always fully opaque (`t = 0`), so the buffer's t-byte hits zero exactly on every pixel. There is no path to a pixel that escapes without being fully accounted for.
+
+The external boundary — PNG load, image decode, glyph coverage from cosmic-text — performs a one-time `255 - a` flip on import. The present pass flips `t → α` once before submitting to wgpu / softbuffer. The cost is paid at the edges, never per pixel per frame inside the blend kernel.
+
+Internally, all variables are named `t` or `transparency`, never `alpha` or `a`. The convention is stated explicitly wherever it appears in the codebase, and the `Blend::under` trait is the only path that composites layers — there is no painter's-algorithm fallback.
 
 ---
 
@@ -153,7 +165,7 @@ Spirix (fluor's companion floating-point arithmetic system) is welcome on precis
 |---|---|
 | Center-origin coords (`RuVec2`, `Viewport`) | ✓ float storage, harmonic-mean span/perimeter/diagonal_sq |
 | Pane tree (`Compositor`) | ✓ insert / remove / get / hit-test / focus / z-order / render |
-| Paint primitives | ✓ ARGB blend, fill_rect (solid + blend), stroke_rect, circle_filled, glyph rasterizers, background noise; `Clip` + `AlphaMask` + `Transform` types; `quantize_rotation` / `snap_rotation` helpers |
+| Paint primitives | ✓ Every primitive routes through `Blend::under` (no painter's algorithm anywhere); fill_rect (solid + blend), stroke_rect, circle_filled, glyph rasterizers, background noise; `Clip` + `AlphaMask` + `Transform` types; `quantize_rotation` / `snap_rotation` helpers |
 | Window chrome | ✓ controls strip, edges-and-mask, hairlines, hover overlay; always-visible at minimum window size via `MIN_BUTTON_HEIGHT_PX + ceil(span/32)` formula |
 | Drag / resize | ✓ drag-to-move + 8-region edge resize via winit; WM-enforced `min_inner_size = (24, 8)` |
 | Text rendering | ✓ cosmic-text + swash; Open Sans bundled; transform-aware (arbitrary rotation / skew / scale via `swash::scale`); per-glyph LRU cache keyed on `(font, glyph, size, transform)` |
@@ -195,13 +207,19 @@ Run the bundled demo: `cargo run --example panes`
 fluor (lib)
 ├── coord       — RuVec2, Coord (= f32)
 ├── geom        — Viewport with span/perimeter/diagonal_sq + RU↔pixel
-├── paint       — front-to-back blend, fill_rect, stroke_rect, circle_filled,
-│                 glyph::*, scale_alpha, blend_rgb_only, background_noise;
-│                 Clip / AlphaMask / Transform;
-│                 quantize_rotation + snap_rotation
-│                 (transparency convention: t=0 opaque, t=255 transparent)
-├── pane        — Pane, PaneId, Compositor (tree + hit-test + focus + z-order + render)
-│                 render walk is front-to-back; early-out when remaining==0
+├── pixel       — Argb8 (= u32, 0xttRRGGBB t-convention); Blend trait with the single
+│                 `under(self, bottom, mode)` kernel; BlendMode { Normal, Multiply, Screen,
+│                  Add, Subtract, Overlay, Darken, Lighten }
+├── stack       — StackCompositor + Op::{Push, Constant, Under(BlendMode)}
+│                 (Stack Notation evaluator with snapshot-based partial re-eval)
+├── group       — Group { region, rpn: StackCompositor, blend: BlendMode, hitmask, text_clip };
+│                 flatten_into walks the bbox calling dst.under(src, blend) per pixel
+├── paint       — flatten(dst, src, mode); fill_rect_solid, fill_rect_blend, stroke_rect,
+│                 circle_filled, glyph::*, background_noise; Clip / AlphaMask / Transform;
+│                 quantize_rotation + snap_rotation. ALL primitives route through Blend::under —
+│                 no painter's algorithm path exists.
+├── pane        — Pane, PaneId, Compositor (tree + hit-test + focus + z-order + render);
+│                 render iterates topmost-first; under-chain handles z-order via dst-opaque early-out
 ├── text        — TextRenderer (cosmic-text + swash); transform-aware glyph
 │                 rasterization via swash::scale; per-glyph LRU image cache
 ├── theme       — color constants (Android byte-swap behind cfg)
@@ -210,7 +228,8 @@ fluor (lib)
     │             draw_button_hairlines, draw_button_hover_by_pixels,
     │             get_resize_edge, hit_test_map
     └── desktop — winit + softbuffer host (feature `host-winit`, default;
-                  std::process::exit(0) on close for Killswitch compliance)
+                  present buffer initialized to 0xFFFFFFFF each frame; Groups flattened
+                  topmost-first; std::process::exit(0) on close for Killswitch compliance)
 ```
 
 Future: `host-bare` (no_std framebuffer for ferros), textbox + widget kit, SIMD kernels, layout VSF persistence.
