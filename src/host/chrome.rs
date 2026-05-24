@@ -260,18 +260,20 @@ fn strip_layout(
     height: u32,
     button_size: usize,
 ) -> Option<(usize, usize, usize, usize, usize, usize)> {
-    if width < 2 || height < 2 || button_size < 4 {
+    if width < 2 || height < 2 {
         return None;
     }
     let w = width as usize;
     let h = height as usize;
     let strip_w = button_size * 7 / 2;
+    // Strip can't render larger than the window — geometric, not pixel-arbitrary.
     if strip_w >= w || button_size >= h {
         return None;
     }
     let strip_x = w - strip_w;
     let button_area_offset = button_size / 4;
-    let last_row = button_size - 1;
+    // saturating_sub keeps button_size=0 from underflowing; all the `for ... in 0..button_size` loops fall through naturally with empty range.
+    let last_row = button_size.saturating_sub(1);
     Some((w, strip_w, strip_x, button_area_offset, last_row, h))
 }
 
@@ -521,12 +523,13 @@ pub fn draw_maximize_symbol(
     let mut r4 = r * r;
     r4 *= r4;
     let r3 = r * r * r;
-    let r_inner = r * 4 / 5;
+    // `.max(1)` guards the degenerate r=0 case (very small button_size). Without it, r_inner3 would be 0 and `inner_thresh` would divide-by-zero in the gradient calc below.
+    let r_inner = (r * 4 / 5).max(1);
     let mut r_inner4 = r_inner * r_inner;
     r_inner4 *= r_inner4;
     let r_inner3 = r_inner * r_inner * r_inner;
-    let outer_thresh = r3 << 2;
-    let inner_thresh = r_inner3 << 2;
+    let outer_thresh = (r3 << 2).max(1);
+    let inner_thresh = (r_inner3 << 2).max(1);
     let stroke_rgb = (
         ((stroke >> 16) & 0xFF) as u32,
         ((stroke >> 8) & 0xFF) as u32,

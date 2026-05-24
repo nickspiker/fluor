@@ -129,7 +129,8 @@ impl DefaultChrome {
 
         // Single squircle (radius = span/4, squirdleyness 24) shared by the window perimeter AND the controls-strip BL curve — same shape as photon. At typical viewport sizes the curve is too big to fit in the strip and degrades to a rectangular bottom; at high zoom it appears.
         let (start, crossings) = compute_squircle_crossings(span / 4.0, 24);
-        if start == 0 || crossings.is_empty() {
+        // No curve to draw — bail. start=0 is fine (just means the corner-of-corner cutout is empty); curve walks handle it.
+        if crossings.is_empty() {
             return;
         }
 
@@ -292,13 +293,15 @@ pub(crate) fn compute_squircle_crossings(
     squirdleyness: i32,
 ) -> (usize, Vec<(u16, u8, u8)>) {
     let mut crossings: Vec<(u16, u8, u8)> = Vec::new();
+    if radius <= 0.0 {
+        return (0, crossings);
+    }
     let mut y = 1f32;
     loop {
         let y_norm = y / radius;
-        let x_norm = crate::math::powf(
-            1.0 - crate::math::powi(y_norm, squirdleyness),
-            1.0 / squirdleyness as Coord,
-        );
+        // For y_norm > 1, the squircle equation gives a negative inner term — clamp to 0 so the (1/p) root is well-defined. This makes x = 0 → x < y → break, preventing the loop from spinning forever on tiny radii.
+        let inner = (1.0 - crate::math::powi(y_norm, squirdleyness)).max(0.0);
+        let x_norm = crate::math::powf(inner, 1.0 / squirdleyness as Coord);
         let x = x_norm * radius;
         let inset = radius - x;
         if inset > 0.0 {
