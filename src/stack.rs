@@ -4,7 +4,7 @@
 //!
 //! `Push` loads a layer's pixel buffer onto the evaluation stack; `Under(mode)` pops two operands (the second-from-top is the partial composite from layers above, the top is the new layer going behind) and folds them via [`crate::pixel::Blend::under`] with the chosen [`BlendMode`]. The same evaluator handles simple ordered stacks (`Push top, Push next_behind, Under(Normal)`) and complex expressions (`Push 0, Push 1, Under(Multiply), Push 2, Under(Add)`).
 //!
-//! Re-execution policy: a per-layer `dirty` flag gates expensive rasterization upstream of the Stack (text shaping, glyph rendering, squircle math). The Stack itself caches the *final* composite from the last `evaluate()`; if no layer is dirty, that cache returns directly without re-running the program. If anything is dirty, the entire program re-runs — no per-instruction snapshot cache. Under-blend's per-pixel early-out (`dst < 0x01000000`) makes the per-pixel work cheap, and the typical program is short enough (3-5 ops) that running it whole is faster than maintaining intermediate state.
+//! Re-execution policy: a per-layer `dirty` flag gates expensive rasterization upstream of the Stack (text shaping, glyph rendering, squircle math). The Stack itself caches the *final* composite from the last `evaluate()`; if no layer is dirty, that cache returns directly without re-running the program. If anything is dirty, the entire program re-runs — no per-instruction snapshot cache. Under-blend's per-pixel early-out (`dst >= 0xFF000000`, i.e. α=0xFF opaque) makes the per-pixel work cheap, and the typical program is short enough (3-5 ops) that running it whole is faster than maintaining intermediate state.
 
 use crate::pixel::{Argb8, Blend, BlendMode};
 use alloc::vec::Vec;
@@ -29,19 +29,19 @@ pub struct StackLayer {
 impl StackLayer {
     pub fn new(size: usize) -> Self {
         Self {
-            pixels: alloc::vec![0xFFFFFFFF; size],
+            pixels: alloc::vec![0u32; size],
             dirty: true,
         }
     }
 
-    /// Reset every pixel to the canonical empty value: `0xFFFFFFFF` — `t = 255` (fully transparent), RGB = 255 (white). White is invisible at full transparency (the OS never displays a transparent pixel's RGB), and starting RGB at 255 compensates the `>>8` truncation at the transparent endpoint so opaque paints into an empty buffer land exact instead of 1-2 LSB low. Pattern is byte-uniform (`0xFF`) so the fill compiles to a single `memset`.
+    /// Reset every pixel to the canonical empty value: `0x00000000` — `α = 0` (fully transparent), darkness = 0 (no ink). Both halves of the pixel accumulate up from 0, so empty is the natural zero element of the Under accumulator. Zero-init means `vec![0u32; n]` uses calloc → zero pages → genuinely free; `Vec::fill(0)` is also the fastest possible re-clear.
     pub fn clear(&mut self) {
-        self.pixels.fill(0xFFFFFFFF);
+        self.pixels.fill(0);
     }
 
     pub fn resize(&mut self, size: usize) {
-        self.pixels.resize(size, 0xFFFFFFFF);
-        self.pixels.fill(0xFFFFFFFF);
+        self.pixels.resize(size, 0);
+        self.pixels.fill(0);
         self.dirty = true;
     }
 }
@@ -105,11 +105,11 @@ impl StackCompositor {
     /// Acquire a temporary buffer from the pool or allocate a new one. New buffers start fully-transparent.
     fn acquire_buf(&mut self) -> Vec<Argb8> {
         if let Some(mut buf) = self.pool.pop() {
-            buf.resize(self.size, 0xFFFFFFFF);
-            buf.fill(0xFFFFFFFF);
+            buf.resize(self.size, 0);
+            buf.fill(0);
             buf
         } else {
-            alloc::vec![0xFFFFFFFF; self.size]
+            alloc::vec![0u32; self.size]
         }
     }
 
@@ -120,7 +120,7 @@ impl StackCompositor {
 
     /// Evaluate the program. Returns a reference to the final composite.
     ///
-    /// If no layer is dirty AND a cached composite exists, returns the cache directly. Otherwise runs the entire program: walks each `Op` in order, allocating temporary buffers from the pool. The per-pixel work inside `Op::Under` is dominated by `Blend::under`'s `dst < 0x01000000` early-out, so re-running the whole program is cheap even when only one layer changed — no per-instruction snapshot machinery needed.
+    /// If no layer is dirty AND a cached composite exists, returns the cache directly. Otherwise runs the entire program: walks each `Op` in order, allocating temporary buffers from the pool. The per-pixel work inside `Op::Under` is dominated by `Blend::under`'s `dst >= 0xFF000000` (top opaque) early-out, so re-running the whole program is cheap even when only one layer changed — no per-instruction snapshot machinery needed.
     pub fn evaluate(&mut self) -> &[Argb8] {
         if self.program.is_empty() {
             return &[];
@@ -194,51 +194,58 @@ mod tests {
     fn single_push_returns_layer() {
         let mut stk = make_stack(4);
         let l0 = stk.new_layer();
-        stk.layers[l0].pixels = alloc::vec![0x00_11_22_33; 4];
+        // Arbitrary opaque colour in α + darkness: α=0xFF, dark=(0xEE, 0xDD, 0xCC) → visible (0x11, 0x22, 0x33).
+        stk.layers[l0].pixels = alloc::vec![0xFF_EE_DD_CC; 4];
         stk.set_program(alloc::vec![Op::Push(l0)]);
         let result = stk.evaluate();
-        assert_eq!(result, &[0x00_11_22_33; 4]);
+        assert_eq!(result, &[0xFF_EE_DD_CC; 4]);
     }
 
     #[test]
     fn under_normal_opaque_top_returns_top() {
         // Topmost (opaque red) above bottom (opaque blue) — top wins via early-out.
+        // Opaque red: α=0xFF, dark=(0,0xFF,0xFF) → visible (0xFF,0,0).
+        // Opaque blue: α=0xFF, dark=(0xFF,0xFF,0) → visible (0,0,0xFF).
         let mut stk = make_stack(2);
         let top = stk.new_layer();
         let bot = stk.new_layer();
-        stk.layers[top].pixels = alloc::vec![0x00_FF_00_00; 2];
-        stk.layers[bot].pixels = alloc::vec![0x00_00_00_FF; 2];
+        stk.layers[top].pixels = alloc::vec![0xFF_00_FF_FF; 2];
+        stk.layers[bot].pixels = alloc::vec![0xFF_FF_FF_00; 2];
         stk.set_program(alloc::vec![
             Op::Push(top),
             Op::Push(bot),
             Op::Under(BlendMode::Normal)
         ]);
         let result = stk.evaluate();
-        assert_eq!(result, &[0x00_FF_00_00; 2]);
+        assert_eq!(result, &[0xFF_00_FF_FF; 2]);
     }
 
     #[test]
-    fn under_normal_translucent_top_attenuates_budget() {
+    fn under_normal_translucent_top_accumulates_opacity() {
+        // Top: 50% α, visible black (= α=128, dark=255 = 0x80_FF_FF_FF).
+        // Bottom: 50% α, visible red (= α=128, dark=(0, 255, 255) = 0x80_00_FF_FF).
+        // consumed = (128 × 128) >> 8 = 64. new_α = 128 + 64 = 192. Porter-Duff over: 1 − 0.5×0.5 = 0.75 ≈ 192/255.
         let mut stk = make_stack(1);
         let top = stk.new_layer();
         let bot = stk.new_layer();
-        stk.layers[top].pixels = alloc::vec![0x80_00_00_00];
-        stk.layers[bot].pixels = alloc::vec![0x80_FF_00_00];
+        stk.layers[top].pixels = alloc::vec![0x80_FF_FF_FF];
+        stk.layers[bot].pixels = alloc::vec![0x80_00_FF_FF];
         stk.set_program(alloc::vec![
             Op::Push(top),
             Op::Push(bot),
             Op::Under(BlendMode::Normal)
         ]);
         let result = stk.evaluate()[0];
-        assert_eq!(result >> 24, 64, "new_t should be 64 (128*128 >> 8)");
+        assert_eq!(result >> 24, 192, "new_α should be 192 (Porter-Duff over)");
     }
 
     #[test]
     fn constant_op_fills() {
         let mut stk = make_stack(3);
-        stk.set_program(alloc::vec![Op::Constant(0x00_10_10_10)]);
+        // Opaque visible dark-gray (0x10, 0x10, 0x10) → α=0xFF, dark=(0xEF, 0xEF, 0xEF).
+        stk.set_program(alloc::vec![Op::Constant(0xFF_EF_EF_EF)]);
         let result = stk.evaluate();
-        assert_eq!(result, &[0x00_10_10_10; 3]);
+        assert_eq!(result, &[0xFF_EF_EF_EF; 3]);
     }
 
     #[test]
@@ -246,26 +253,28 @@ mod tests {
         let mut stk = make_stack(2);
         let top = stk.new_layer();
         let bot = stk.new_layer();
-        stk.layers[top].pixels = alloc::vec![0xFFFFFFFF; 2]; // canonical empty top
-        stk.layers[bot].pixels = alloc::vec![0x00_00_FF_00; 2]; // opaque green bottom
+        stk.layers[top].pixels = alloc::vec![0u32; 2]; // canonical empty top
+        // Opaque green: α=0xFF, dark=(0xFF, 0, 0xFF).
+        stk.layers[bot].pixels = alloc::vec![0xFF_FF_00_FF; 2];
         stk.set_program(alloc::vec![
             Op::Push(top),
             Op::Push(bot),
             Op::Under(BlendMode::Normal)
         ]);
         let _ = stk.evaluate();
-        // Modify only the bottom layer and mark it dirty. The whole program re-runs (no partial reeval) and produces a result ≈ new bottom (within 1-LSB drift from >>8 endpoint).
-        stk.layers[bot].pixels = alloc::vec![0x00_00_00_FF; 2];
+        // Swap the bottom to opaque blue: α=0xFF, dark=(0xFF, 0xFF, 0). Re-evaluate produces darkness ≈ bottom (1-LSB drift from >>8 endpoint).
+        stk.layers[bot].pixels = alloc::vec![0xFF_FF_FF_00; 2];
         stk.layers[bot].dirty = true;
         let result = stk.evaluate()[0];
-        assert!(result & 0xFF >= 0xFE, "result blue channel = {:#x}", result & 0xFF);
+        // B-darkness ≈ 0 means visible blue ≈ 255.
+        assert!(result & 0xFF <= 0x01, "result B darkness = {:#x}", result & 0xFF);
     }
 
     #[test]
     fn clean_evaluation_returns_cached_composite() {
         let mut stk = make_stack(4);
         let l0 = stk.new_layer();
-        stk.layers[l0].pixels = alloc::vec![0x00_11_22_33; 4];
+        stk.layers[l0].pixels = alloc::vec![0xFF_EE_DD_CC; 4];
         stk.set_program(alloc::vec![Op::Push(l0)]);
         let first = stk.evaluate().to_vec();
         // No dirty layer — second evaluate hits the cached composite, same bytes.

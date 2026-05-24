@@ -2,133 +2,129 @@
 //!
 //! # Convention — locked
 //!
-//! **Internal pixel format**: `0xttRRGGBB` packed in a `u32` — top byte is **transparency**, not alpha. LE byte layout `[B, G, R, t]`. Every paint primitive, every layer buffer, every Group composite uses this. `Argb8` is a type alias for `u32`; the byte layout hasn't changed, only the top byte's interpretation.
+//! **Internal pixel format**: `0xααRRGGBB` packed in a `u32` — top byte is **α (opacity)**; RGB bytes are **darkness** (`0 = white potential`, `255 = black ink`). LE byte layout `[B, G, R, α]`. Every paint primitive, every layer buffer, every Group composite uses this. `Argb8` is a type alias for `u32`; the byte layout matches a typical compositor pixel, but the RGB bytes are the *bitwise complement* of visible RGB.
 //!
-//! **Transparency semantics**: `t = 0` = fully opaque, `t = 255` = (almost) fully transparent. Variables in code are named `t` / `transparency` — never `alpha` or `a` — so the convention is unambiguous at every read site. RGB channels store the straight (non-premultiplied) intrinsic color.
+//! **Opacity semantics**: `α = 0` = fully transparent, `α = 255` = fully opaque — industry-standard direction. Empty pixel = `0x00000000` (no opacity, no darkness — calloc-free zero-init). Both halves of the pixel accumulate up from 0: α adds, darkness adds.
 //!
-//! **Why t-convention** (mirroring the README): the hot-loop early-out fires precisely when a fully-opaque layer is hit, because `remaining = (remaining * t) >> 8 = 0` exactly when `t = 0`. Single u32 compare against an immediate detects opacity classes without any shift or mask: `if pixel < 0x01000000` is "this pixel is fully opaque" in one CMP. Sort order primary-sorts by transparency for free.
+//! **Why this convention** (mirroring the README): the Under accumulator is pure addition (`new_dark = top_dark + (mod_dark × consumed >> 8)`, `new_α = top_α + consumed`) — no `255 − x` anywhere on the hot path. Three subtractions saved per pixel per Under call versus the old visible-RGB convention. Hot-loop early-out fires when the top is fully opaque: `if self >= 0xFF000000` is "top α-byte is 0xFF" in one CMP (α-byte saturating implies the lower bits don't matter for the result — bottom is invisible). Empty marker is the zero pattern, so `vec![0u32; n]` uses calloc → zero pages → genuinely free init.
 //!
-//! **The 256-vs-255 gap**: fully-transparent layers never enter the blend pass — they're culled at the caller level (you don't draw an invisible layer). Per-pixel `t = 255` within a partial-transparency layer contributes exact 0 to RGB and attenuates `remaining` by `255/256`; the 1-LSB drift is invisible at expected stacking depths. We never need to represent `t = 256` and the missing slot is a happy coincidence.
+//! **Overflow proof**: with `top_α ∈ [0, 254]` on the math path (255 hits the early-out), let `k = 256 − top_α ∈ [2, 256]`. Then `consumed = floor(k × bot_α / 256) ≤ floor(k × 255 / 256) = k − 1 = 255 − top_α`. So `new_α = top_α + consumed ≤ 255`, never overflows. The invariant `dark ≤ α` is preserved inductively (base `(0, 0)`; step uses `contrib − consumed ≤ 0` from the same floor argument). Therefore `new_dark ≤ new_α ≤ 255` strictly — **plain `+` is safe everywhere, no `saturating_add` needed**.
 //!
-//! **Boundary**: paint primitives write `t` directly. The host present pass flips `t → α` (XOR top byte with `0xFF`) right before submitting to wgpu / softbuffer — folded into the existing `premultiply_buffer` step on Linux. External inputs (cosmic-text glyph coverage, `pack_argb`) flip once at the import boundary, never per-frame.
+//! **Boundary**: paint primitives write α + darkness directly. The host present pass applies a single `pixel ^= 0x00FFFFFF` right before submitting to wgpu / softbuffer — flips darkness → visible RGB; α stays. Folded into `finalize_for_os` alongside the clip-mask multiply and (on Linux) the premultiply step. External inputs (cosmic-text glyph coverage, `pack_argb`) flip once at the import boundary, never per-frame.
 //!
 //! # The unified `Blend::under` kernel
 //!
-//! Every compositing op in fluor — Normal source-under, Multiply, Screen, Add, Subtract, Overlay, Darken, Lighten — flows through one trait method: `top.under(bottom, mode)`. `top` is the partial composite already accumulated above (its t-byte = remaining transparency budget; its RGB = the "visible-over-white" running color, with the canonical empty value `0xFFFFFFFF` representing "no paint yet, FF-white default fill in the remaining budget"). `bottom` is the new layer going behind. The mode shapes only how `bottom`'s RGB is interpreted.
+//! Every compositing op in fluor — Normal source-under, Multiply, Screen, Add, Subtract, Overlay, Darken, Lighten — flows through one trait method: `top.under(bottom, mode)`. `top` is the partial composite already accumulated above (its α-byte = opacity so far; its RGB = darkness accumulated so far, with the canonical empty value `0x00000000` representing "nothing here yet"). `bottom` is the new layer going behind. The mode shapes only how `bottom`'s darkness is interpreted before contributing.
 //!
-//! Convention: each new layer DARKENS the buffer's RGB from white by `(255 - layer_rgb) * consumed >> 8` per channel, where `consumed = (top_t * (256 - bot_t)) >> 8` (how much of the remaining budget the new layer fills). The transparency budget attenuates as `new_t = (top_t * bot_t) >> 8`. This way, the buffer's RGB always represents the visible color assuming the unfilled portion is white — preserving the `0xFFFFFFFF` invariant.
+//! Convention: each new layer ADDS darkness to the buffer at `mod_dark × consumed >> 8` per channel, where `consumed = ((256 − top_α) × bot_α) >> 8` (how much of the remaining opacity budget the new layer fills). The opacity accumulates as `new_α = top_α + consumed`. Mode kernels operate in *darkness space* but preserve the *visible-space* semantic the mode name promises (e.g., `BlendMode::Multiply` still darkens the visible result like Photoshop multiply).
 
-/// Packed pixel in t-convention: `0xttRRGGBB`. Type alias for `u32` — `&[Argb8]` and `&[u32]` are the same slice. The name carries the convention contract, not a new type.
+/// Packed pixel in α + darkness convention: `0xααRRGGBB`. Type alias for `u32` — `&[Argb8]` and `&[u32]` are the same slice. The name carries the convention contract, not a new type.
 pub type Argb8 = u32;
 
-/// How `bottom`'s RGB is mixed into the partial composite `top` when composing front-to-back.
+/// How `bottom`'s darkness is mixed into the partial composite `top` when composing front-to-back.
 ///
-/// Each mode is a pure channel-wise function of `(top_rgb, bottom_rgb)` that produces a "modulated bottom" `(mr, mg, mb)`. The transparency-budget math around it is identical across all modes — see [`Blend::under`].
+/// Each mode is a pure channel-wise function of `(top_dark, bottom_dark)` that produces a "modulated bottom darkness" `(mr, mg, mb)`. The opacity-accumulator math around it is identical across all modes — see [`Blend::under`]. Mode names describe the *visible-space* semantic (e.g., "Multiply" darkens like Photoshop multiply on visible RGB); the formulas below operate on darkness operands and produce darkness output that round-trips through the OS XOR boundary to match the named visible-space behavior.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlendMode {
-    /// Source-under: bottom passes through unchanged. `mr = br`. Standard front-to-back compositing.
+    /// Source-under: bottom passes through unchanged. `mr = bd`. Standard front-to-back compositing.
     Normal,
-    /// Multiplicative darkening per channel: `mr = (tr * br) >> 8`. Bottom is "filtered through" top's intensity.
+    /// Visible-multiply (darken-darken): `mr = 255 − (((255 − td) × (255 − bd)) >> 8)`. Bottom is "filtered through" top's intensity in visible space.
     Multiply,
-    /// Inverse-multiply (Photoshop screen): `mr = 255 - (((255 - tr) * (255 - br)) >> 8)`. Brightens.
+    /// Visible-screen (brighten-brighten): `mr = (td × bd) >> 8`. The darkness-space dual of visible-multiply.
     Screen,
-    /// Saturating per-channel add: `mr = (tr + br).min(255)`. Additive light.
+    /// Saturating per-channel visible-add (brightens): `mr = (td + bd).saturating_sub(255)`. Additive light in visible space.
     Add,
-    /// Saturating per-channel subtract: `mr = tr.saturating_sub(br)`. Darkening light.
+    /// Saturating per-channel visible-subtract (darkens): `mr = 255 − bd.saturating_sub(td)`. Subtractive light in visible space.
     Subtract,
-    /// Contrast-shifting Photoshop overlay: multiply where bottom is dark, screen where bottom is bright. Pivot at 0x80.
+    /// Contrast-shifting Photoshop overlay: multiply where bottom is dark, screen where bottom is bright. Pivot at `bd > 0x80` (= `bv < 0x80`).
     Overlay,
-    /// Per-channel min: `mr = tr.min(br)`. Keeps the darker channel.
+    /// Per-channel visible-min (keeps the darker channel): `mr = td.max(bd)`.
     Darken,
-    /// Per-channel max: `mr = tr.max(br)`. Keeps the brighter channel.
+    /// Per-channel visible-max (keeps the brighter channel): `mr = td.min(bd)`.
     Lighten,
 }
 
 /// The single compositing operation in fluor. Front-to-back source-under with selectable blend mode.
 pub trait Blend {
-    /// Compose `bottom` *underneath* `self` (the partial composite from layers above). `self`'s t-byte is the remaining transparency budget; `self`'s RGB is the visible-over-white running color (canonical empty value `0xFFFFFFFF` = "FF-white fill in the remaining budget").
+    /// Compose `bottom` *underneath* `self` (the partial composite from layers above). `self`'s α-byte is the accumulated opacity; `self`'s RGB is the accumulated darkness (canonical empty value `0x00000000` = "nothing yet").
     ///
-    /// Single early-out: `self < 0x01000000` ⇔ `self.t == 0` (top opaque). Returns `self` unchanged — bottom is invisible behind a fully-opaque top.
+    /// Single early-out: `self >= 0xFF000000` ⇔ `self.α == 0xFF` (top opaque). Returns `self` unchanged — bottom is invisible behind a fully-opaque top.
     ///
     /// Math (all `>> 8`, no `/ 255`, no floats):
     /// ```text
-    /// consumed     = (top_t * (256 - bot_t)) >> 8     (0..=255) — how much of the remaining budget the new layer fills
-    /// (mr, mg, mb) = mode_kernel(top_rgb, bot_rgb)    (0..=255 per channel)
-    /// delta_ch     = ((255 - m_ch) * consumed) >> 8   (loss of FF-white from new layer's darkening)
-    /// out_ch       = top_ch.saturating_sub(delta_ch)
-    /// new_t        = (top_t * bot_t) >> 8
+    /// consumed     = ((256 − top_α) × bot_α) >> 8         (0..=255 − top_α) — amount the new layer contributes
+    /// (mr, mg, mb) = mode_kernel(top_dark, bot_dark)      (0..=255 per channel) in darkness space
+    /// contrib_ch   = (m_ch × consumed) >> 8               (darkness this layer deposits)
+    /// out_dark_ch  = top_dark_ch + contrib_ch             (plain +, bounded ≤ 255 by floor proof)
+    /// new_α        = top_α + consumed                     (plain +, bounded ≤ 255 by floor proof)
     /// ```
-    /// Starting from `0xFFFFFFFF` (white potential, full budget), each new layer subtracts `(255 - layer_color) × consumed / 256` per channel — the loss of white as the layer fills part of the budget. Multiple stacked layers compose by repeatedly attenuating from the running white potential.
+    /// Starting from `0x00000000` (no opacity, no darkness), each new layer adds darkness and opacity to the running total. Multi-layer stacking is repeated addition until α saturates or layers exhaust.
     fn under(self, bottom: Argb8, mode: BlendMode) -> Argb8;
 }
 
 impl Blend for Argb8 {
     #[inline]
     fn under(self, bottom: Argb8, mode: BlendMode) -> Argb8 {
-        if self < 0x01000000 {
+        if self >= 0xFF000000 {
             return self;
         } // top opaque — top wins, bottom invisible.
-        let top_t = self >> 24;
-        let bot_t = bottom >> 24;
+        let top_a = self >> 24;
+        let bot_a = bottom >> 24;
 
-        let contrib = (top_t * (256 - bot_t)) >> 8;
+        let consumed = ((256 - top_a) * bot_a) >> 8;
 
-        let tr = (self >> 16) & 0xFF;
-        let tg = (self >> 8) & 0xFF;
-        let tb = self & 0xFF;
-        let br = (bottom >> 16) & 0xFF;
-        let bg = (bottom >> 8) & 0xFF;
-        let bb = bottom & 0xFF;
+        let td_r = (self >> 16) & 0xFF;
+        let td_g = (self >> 8) & 0xFF;
+        let td_b = self & 0xFF;
+        let bd_r = (bottom >> 16) & 0xFF;
+        let bd_g = (bottom >> 8) & 0xFF;
+        let bd_b = bottom & 0xFF;
 
         let (mr, mg, mb) = match mode {
-            BlendMode::Normal => (br, bg, bb),
-            BlendMode::Multiply => ((tr * br) >> 8, (tg * bg) >> 8, (tb * bb) >> 8),
-            BlendMode::Screen => (
-                0xFF - (((0xFF - tr) * (0xFF - br)) >> 8),
-                0xFF - (((0xFF - tg) * (0xFF - bg)) >> 8),
-                0xFF - (((0xFF - tb) * (0xFF - bb)) >> 8),
+            BlendMode::Normal => (bd_r, bd_g, bd_b),
+            BlendMode::Multiply => (
+                0xFF - (((0xFF - td_r) * (0xFF - bd_r)) >> 8),
+                0xFF - (((0xFF - td_g) * (0xFF - bd_g)) >> 8),
+                0xFF - (((0xFF - td_b) * (0xFF - bd_b)) >> 8),
             ),
+            BlendMode::Screen => ((td_r * bd_r) >> 8, (td_g * bd_g) >> 8, (td_b * bd_b) >> 8),
             BlendMode::Add => (
-                (tr + br).min(0xFF),
-                (tg + bg).min(0xFF),
-                (tb + bb).min(0xFF),
+                (td_r + bd_r).saturating_sub(0xFF),
+                (td_g + bd_g).saturating_sub(0xFF),
+                (td_b + bd_b).saturating_sub(0xFF),
             ),
             BlendMode::Subtract => (
-                tr.saturating_sub(br),
-                tg.saturating_sub(bg),
-                tb.saturating_sub(bb),
+                0xFF - bd_r.saturating_sub(td_r),
+                0xFF - bd_g.saturating_sub(td_g),
+                0xFF - bd_b.saturating_sub(td_b),
             ),
             BlendMode::Overlay => (
-                if br < 0x80 {
-                    (2 * tr * br) >> 8
+                if bd_r > 0x80 {
+                    (2 * td_r * bd_r) >> 8
                 } else {
-                    0xFF - ((2 * (0xFF - tr) * (0xFF - br)) >> 8)
+                    0xFF - ((2 * (0xFF - td_r) * (0xFF - bd_r)) >> 8)
                 },
-                if bg < 0x80 {
-                    (2 * tg * bg) >> 8
+                if bd_g > 0x80 {
+                    (2 * td_g * bd_g) >> 8
                 } else {
-                    0xFF - ((2 * (0xFF - tg) * (0xFF - bg)) >> 8)
+                    0xFF - ((2 * (0xFF - td_g) * (0xFF - bd_g)) >> 8)
                 },
-                if bb < 0x80 {
-                    (2 * tb * bb) >> 8
+                if bd_b > 0x80 {
+                    (2 * td_b * bd_b) >> 8
                 } else {
-                    0xFF - ((2 * (0xFF - tb) * (0xFF - bb)) >> 8)
+                    0xFF - ((2 * (0xFF - td_b) * (0xFF - bd_b)) >> 8)
                 },
             ),
-            BlendMode::Darken => (tr.min(br), tg.min(bg), tb.min(bb)),
-            BlendMode::Lighten => (tr.max(br), tg.max(bg), tb.max(bb)),
+            BlendMode::Darken => (td_r.max(bd_r), td_g.max(bd_g), td_b.max(bd_b)),
+            BlendMode::Lighten => (td_r.min(bd_r), td_g.min(bd_g), td_b.min(bd_b)),
         };
 
-        // The new layer darkens `top` from FF-white by `(255 - layer) * consumed >> 8` per channel.
-        let delta_r = ((255 - mr) * contrib) >> 8;
-        let delta_g = ((255 - mg) * contrib) >> 8;
-        let delta_b = ((255 - mb) * contrib) >> 8;
+        let nr = td_r + ((mr * consumed) >> 8);
+        let ng = td_g + ((mg * consumed) >> 8);
+        let nb = td_b + ((mb * consumed) >> 8);
+        let na = top_a + consumed;
 
-        let nr = tr.saturating_sub(delta_r);
-        let ng = tg.saturating_sub(delta_g);
-        let nb = tb.saturating_sub(delta_b);
-
-        ((top_t * bot_t) >> 8) << 24 | (nr << 16) | (ng << 8) | nb
+        (na << 24) | (nr << 16) | (ng << 8) | nb
     }
 }
 
@@ -138,8 +134,9 @@ mod tests {
 
     #[test]
     fn under_opaque_top_returns_top_unchanged() {
-        let top: Argb8 = 0x00_AA_BB_CC;
-        let bottom: Argb8 = 0x00_11_22_33;
+        // α=255 means fully opaque — early-out fires regardless of RGB bits.
+        let top: Argb8 = 0xFF_AA_BB_CC;
+        let bottom: Argb8 = 0xFF_11_22_33;
         for mode in [
             BlendMode::Normal,
             BlendMode::Multiply,
@@ -156,8 +153,8 @@ mod tests {
 
     #[test]
     fn under_opaque_top_skips_bottom_read() {
-        // top_t == 0 → early-out fires; bottom value is irrelevant.
-        let top: Argb8 = 0x00_AA_BB_CC;
+        // top α==0xFF → early-out fires; bottom value is irrelevant.
+        let top: Argb8 = 0xFF_AA_BB_CC;
         let r1 = top.under(0x00_00_00_00, BlendMode::Normal);
         let r2 = top.under(0xFF_FF_FF_FF, BlendMode::Normal);
         assert_eq!(r1, r2);
@@ -166,50 +163,50 @@ mod tests {
 
     #[test]
     fn under_empty_top_opaque_black_yields_opaque_black() {
-        // Canonical empty (0xFFFFFFFF = white potential, full budget) + opaque black under → opaque black.
-        // consumed = 255. delta = (255 - 0) * 255 >> 8 = 254. nr = 255 - 254 = 1 (≈ 0).
-        let top: Argb8 = 0xFFFFFFFF;
-        let bottom: Argb8 = 0x00_00_00_00;
+        // Canonical empty (0x00000000 = no opacity, no darkness) + opaque black (α=255, dark=255) → opaque black.
+        // consumed = 255. contrib = (255 × 255) >> 8 = 254. nr ≈ 254 (≈ 255 after rounding). new_α = 255.
+        let top: Argb8 = 0x00000000;
+        let bottom: Argb8 = 0xFF_FF_FF_FF;
         let result = top.under(bottom, BlendMode::Normal);
-        let new_t = result >> 24;
+        let new_a = result >> 24;
         let nr = (result >> 16) & 0xFF;
-        assert_eq!(new_t, 0, "new_t expected 0 (opaque bottom)");
-        assert!(nr <= 0x02, "nr expected ~0x00, got {nr:#x}");
+        assert_eq!(new_a, 0xFF, "new_α expected 0xFF (opaque)");
+        assert!(nr >= 0xFD, "nr expected ~0xFF, got {nr:#x}");
     }
 
     #[test]
     fn under_empty_top_opaque_mid_gray_yields_mid_gray() {
-        // Empty + opaque mid-gray under → ~mid-gray.
-        // consumed = 255. delta = (255 - 128) * 255 >> 8 = 127. nr = 255 - 127 = 128.
-        let top: Argb8 = 0xFFFFFFFF;
-        let bottom: Argb8 = 0x00_80_80_80;
+        // Empty + opaque mid-gray (α=255, dark=128 ≈ visible 127 ≈ mid-gray) → ~mid-gray.
+        // consumed = 255. contrib = (128 × 255) >> 8 = 127. nr ≈ 127.
+        let top: Argb8 = 0x00000000;
+        let bottom: Argb8 = 0xFF_80_80_80;
         let result = top.under(bottom, BlendMode::Normal);
-        let new_t = result >> 24;
+        let new_a = result >> 24;
         let nr = (result >> 16) & 0xFF;
-        assert_eq!(new_t, 0);
-        assert!(nr >= 0x7F && nr <= 0x81, "nr expected ~0x80, got {nr:#x}");
+        assert_eq!(new_a, 0xFF);
+        assert!(nr >= 0x7E && nr <= 0x80, "nr expected ~0x7F, got {nr:#x}");
     }
 
     #[test]
-    fn under_empty_top_20pct_mid_gray_preserves_white() {
-        // Empty + 20% mid-gray (t=0xCD ≈ 205) → ~0xCC_E6_E6_E6 (mostly white, slightly darkened).
-        // consumed = (255 * 51) >> 8 = 50. delta = (255 - 128) * 50 >> 8 = 24. nr = 255 - 24 = 231 ≈ 0xE7.
-        let top: Argb8 = 0xFFFFFFFF;
-        let bottom: Argb8 = 0xCD_80_80_80;
+    fn under_empty_top_20pct_opaque_black_yields_20pct_black() {
+        // Empty + 20% opaque pure black (α=51, dark=255) → 20% α, 20% darkness.
+        // consumed = (256 × 51) >> 8 = 51. contrib = (255 × 51) >> 8 = 50. new_α = 51.
+        let top: Argb8 = 0x00000000;
+        let bottom: Argb8 = 0x33_FF_FF_FF;
         let result = top.under(bottom, BlendMode::Normal);
-        let new_t = result >> 24;
+        let new_a = result >> 24;
         let nr = (result >> 16) & 0xFF;
-        assert!(new_t >= 0xCB && new_t <= 0xCD, "new_t expected ~0xCC, got {new_t:#x}");
-        assert!(nr >= 0xE4 && nr <= 0xE8, "nr expected ~0xE6, got {nr:#x}");
+        assert_eq!(new_a, 0x33, "new_α expected 0x33 (~20%)");
+        assert!(nr >= 0x31 && nr <= 0x33, "nr expected ~0x32, got {nr:#x}");
     }
 
     #[test]
-    fn under_two_translucent_layers_attenuates_budget() {
-        // top_t=128, bot_t=128 → new_t = (128*128)>>8 = 64. Multi-layer translucency composes.
-        let top: Argb8 = 0x80_FF_FF_FF;
-        let bottom: Argb8 = 0x80_FF_FF_FF;
+    fn under_two_translucent_layers_accumulates_opacity() {
+        // Two 50%-α opaque-white layers (dark=0 to preserve the `dark ≤ α` invariant): top α=128 dark=0, bot α=128 dark=0 → consumed = (128 × 128) >> 8 = 64, new_α = 128 + 64 = 192. Porter-Duff over: 1 − (1 − 0.5)(1 − 0.5) = 0.75 ≈ 192/255.
+        let top: Argb8 = 0x80_00_00_00;
+        let bottom: Argb8 = 0x80_00_00_00;
         let result = top.under(bottom, BlendMode::Normal);
-        let new_t = result >> 24;
-        assert_eq!(new_t, 64);
+        let new_a = result >> 24;
+        assert_eq!(new_a, 192);
     }
 }

@@ -239,10 +239,10 @@ impl DesktopApp {
         if let Some(cg) = chrome_group.as_mut() {
             let layers = &mut cg.rpn.layers;
 
-            // Layer bg: background noise + panes. Layer starts TRANSPARENT (t=255) so paint primitives can blend into a clean accumulator. Filling with 0 here would be opaque black and freeze the layer via the dst-opaque early-out.
+            // Layer bg: background noise + panes. Layer starts TRANSPARENT (α=0, dark=0) so paint primitives can blend into a clean accumulator. Zero-init is calloc-free.
             if layers[*chrome_layer_bg].dirty {
                 let bg = &mut layers[*chrome_layer_bg].pixels;
-                bg.fill(0xFFFFFFFF);
+                bg.fill(0);
                 paint::background_noise(bg, buf_w, buf_h, 0, false, 0, None); // fullscreen=false leaves a 1px transparent border so the chrome perimeter's partial-t outer edge passes through to the OS for soft AA against the desktop.
                 compositor.render(bg, buf_w, buf_h);
             }
@@ -250,7 +250,7 @@ impl DesktopApp {
             // Layer chrome: perimeter hairline only (ONLY THE HAIRLINE scaffold step). Compute squircle crossings inline, then call the perimeter rasterizer. Buttons + title text + hover are deferred to subsequent scaffold steps.
             if layers[*chrome_layer_chrome].dirty {
                 let chrome_buf = &mut layers[*chrome_layer_chrome].pixels;
-                chrome_buf.fill(0xFFFFFFFF);
+                chrome_buf.fill(0);
                 let span = 2.0 * vp_w as Coord * vp_h as Coord / (vp_w as Coord + vp_h as Coord);
                 let radius = span / 4.0;
                 let squirdleyness = 24i32;
@@ -295,18 +295,18 @@ impl DesktopApp {
 
             // Hover layer: cleared to transparent. Hover overlay returns with the controls scaffold step.
             if layers[*chrome_layer_hover].dirty {
-                layers[*chrome_layer_hover].pixels.fill(0xFFFFFFFF);
+                layers[*chrome_layer_hover].pixels.fill(0);
                 let _ = (hover_state, hover_pixel_list);
             }
         }
 
-        // --- textbox_group: pill + glow + text + selection (bbox-sized, Under(Normal) onto target). Layer pre-cleared to TRANSPARENT before rasterization so painted content blends into a clean accumulator. ---
+        // --- textbox_group: pill + glow + text + selection (bbox-sized, Under(Normal) onto target). Layer pre-cleared to TRANSPARENT (α=0, dark=0) before rasterization so painted content blends into a clean accumulator. ---
         if let (Some(tg), Some(tb)) = (textbox_group.as_mut(), demo_textbox.as_mut()) {
             if tg.rpn.layers[0].dirty {
                 let (tw, th) = tg.dims();
                 let bbox = tb.bbox();
                 let buf = &mut tg.rpn.layers[0].pixels;
-                buf.fill(0xFFFFFFFF);
+                buf.fill(0);
                 if let Some(t) = text.as_mut() {
                     tb.render_content_into(buf, tw, th, bbox.x, bbox.y, t, None, None);
                 }
@@ -319,14 +319,14 @@ impl DesktopApp {
                 let (cw, ch) = cg.dims();
                 let cbox = tb.cursor_bbox();
                 let buf = &mut cg.rpn.layers[0].pixels;
-                buf.fill(0xFFFFFFFF);
+                buf.fill(0);
                 tb.render_blinkey_into(buf, cw, ch, cbox.x, cbox.y);
             }
         }
 
         // --- Flatten groups onto the present buffer ---
-        // Pixel-convention boundary. Internal pixels are t-convention `0xttRRGGBB` u32 (t=0 opaque, t=255 transparent). Convert to α-convention here — and ONLY here — via [`paint::finalize_for_os`], which folds the t→α flip + window-shape clip-mask multiply + Linux premultiply + pack into a single pass.
-        // Present chain — topmost-first. Buffer is initialized to the canonical empty value `0xFFFFFFFF` (t=255 transparent, RGB=255 — invisible at full transparency, byte-uniform so the fill compiles to memset). Each Group's `flatten_into` paints its content underneath whatever's already accumulated above; once `dst.t` reaches 0 at a pixel, subsequent Groups short-circuit on that pixel via the under early-out.
+        // Pixel-convention boundary. Internal pixels are α + darkness `0xααRRGGBB` u32 (α=0xFF opaque, α=0 transparent; RGB = darkness). Convert to the host's α + visible-RGB form here — and ONLY here — via [`paint::finalize_for_os`], which does a single `pixel ^= 0x00FFFFFF` to flip darkness → visible and folds the window-shape clip-mask multiply + Linux premultiply + pack into the same pass.
+        // Present chain — topmost-first. Buffer is initialized to the canonical empty value `0x00000000` (α=0 transparent, darkness=0 — zero-init is calloc-free). Each Group's `flatten_into` adds its content underneath whatever's already accumulated above; once α saturates at 0xFF, subsequent Groups short-circuit on that pixel via the under early-out.
         //   1. cursor  (topmost — blinkey wave additively over textbox)
         //   2. textbox (under cursor)
         //   3. chrome  (under textbox — controls/edges/hairlines/bg via internal Stack)
@@ -337,7 +337,7 @@ impl DesktopApp {
             };
             let mut buffer = renderer.lock_buffer();
             for px in buffer.iter_mut() {
-                *px = 0xFFFFFFFF;
+                *px = 0;
             }
             if let Some(g) = self.cursor_group.as_mut() {
                 g.flatten_into(&mut buffer, buf_w, buf_h);
@@ -358,7 +358,7 @@ impl DesktopApp {
             };
             let mut buffer = surface.buffer_mut().expect("softbuffer buffer_mut");
             for px in buffer.iter_mut() {
-                *px = 0xFFFFFFFF;
+                *px = 0;
             }
             if let Some(g) = self.cursor_group.as_mut() {
                 g.flatten_into(&mut buffer, buf_w, buf_h);

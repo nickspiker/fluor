@@ -182,14 +182,14 @@ impl<A: FluorApp> DesktopShell<A> {
             cursor_y: self.cursor_y,
         };
 
-        // Boundary: present buffer init to canonical empty (`0xFFFFFFFF` — byte-uniform memset, t=255 transparent), consumer renders into it (writing t-convention pixels + carving `ctx.clip_mask`), then `finalize_for_os` does the t→α flip + clip-mask multiply + Linux premult + pack in one pass. `ctx` drops first so we can re-borrow `self.clip_mask` immutably for the boundary call.
+        // Boundary: present buffer init to canonical empty (`0x00000000` — α=0 transparent, darkness=0; zero-init is calloc-free), consumer renders into it (writing α + darkness pixels + carving `ctx.clip_mask`), then `finalize_for_os` does the single `pixel ^= 0x00FFFFFF` darkness→visible flip + clip-mask multiply + Linux premult + pack in one pass. `ctx` drops first so we can re-borrow `self.clip_mask` immutably for the boundary call.
         #[cfg(target_os = "macos")]
         {
             let Some(renderer) = self.renderer.as_mut() else {
                 return;
             };
             let mut buffer = renderer.lock_buffer();
-            buffer.fill(0xFFFFFFFF);
+            buffer.fill(0);
             self.app.render(&mut buffer, &mut ctx);
             drop(ctx);
             crate::paint::finalize_for_os(&mut buffer, &self.clip_mask);
@@ -201,7 +201,7 @@ impl<A: FluorApp> DesktopShell<A> {
                 return;
             };
             let mut buffer = surface.buffer_mut().expect("softbuffer buffer_mut");
-            buffer.fill(0xFFFFFFFF);
+            buffer.fill(0);
             self.app.render(&mut buffer, &mut ctx);
             drop(ctx);
             crate::paint::finalize_for_os(&mut buffer, &self.clip_mask);
