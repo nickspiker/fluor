@@ -93,10 +93,8 @@ impl DefaultChrome {
         if !layer.dirty {
             return;
         }
-        // t-convention: transparent init so any pixels the closure doesn't paint don't end up
-        // as opaque black (t=0). The closure is expected to fully cover the bg, but defaulting
-        // to transparent is the safe failure mode.
-        layer.pixels.fill(0xFFFFFFFF);
+        // α + darkness: transparent init (α=0) so pixels the closure doesn't paint stay transparent rather than becoming spurious opaque content. The closure is expected to fully cover the bg, but defaulting to transparent is the safe failure mode. Zero-init is calloc-free.
+        layer.pixels.fill(0);
         paint(&mut layer.pixels, w, h);
     }
 
@@ -115,8 +113,8 @@ impl DefaultChrome {
         self.hit_test_map.fill(HIT_NONE);
 
         let chrome_buf = &mut self.group.rpn.layers[self.layer_chrome].pixels;
-        // t-convention: transparent init so the bg shows through everywhere except the hairline + AA pixels.
-        chrome_buf.fill(0xFFFFFFFF);
+        // α + darkness: transparent init (α=0, dark=0) so the bg shows through everywhere except the hairline + AA pixels.
+        chrome_buf.fill(0);
 
         if vp_w < 2 || vp_h < 2 {
             return;
@@ -243,7 +241,7 @@ impl DefaultChrome {
         if !layer.dirty {
             return;
         }
-        layer.pixels.fill(0xFFFFFFFF);
+        layer.pixels.fill(0);
         layer.dirty = false;
     }
 

@@ -1,6 +1,6 @@
 //! Window chrome — minimal top-down rasterization. Each pixel in the chrome layer is written by exactly one site. No painter's algorithm anywhere.
 //!
-//! Currently scoped to **window perimeter hairline** with squircle corner AA. The chrome layer starts at the canonical empty value (`0xFFFFFFFF`); this function paints only the hairline pixels. Everywhere else in the chrome layer stays transparent so panes / bg can pass through the chrome group's Stack composition. Buttons, glyphs, title text, hover overlay — all deferred to subsequent scaffold steps; reintroduce them only when each can be added without overwriting earlier writes within this same layer.
+//! Currently scoped to **window perimeter hairline** with squircle corner AA. The chrome layer starts at the canonical empty value (`0x00000000` = α=0 transparent, darkness=0); this function paints only the hairline pixels. Everywhere else in the chrome layer stays transparent so panes / bg can pass through the chrome group's Stack composition. Buttons, glyphs, title text, hover overlay — all deferred to subsequent scaffold steps; reintroduce them only when each can be added without overwriting earlier writes within this same layer.
 //!
 //! Hit-test IDs and the `ResizeEdge` enum live here so the desktop host's mouse routing can reference them without depending on the (future, larger) controls implementation.
 //!
@@ -67,7 +67,7 @@ pub fn get_resize_edge(window_width: u32, window_height: u32, x: Coord, y: Coord
 
 /// Rasterize the window-perimeter hairline into `pixels` (the chrome layer) AND the per-pixel window-shape `clip_mask`. Two outputs, single pass per crossing — the chrome layer carries opaque RGB only (no partial-t), and ALL partial-α information lives in the clip mask. The boundary's [`crate::paint::finalize_for_os`] multiplies the clip mask into each pixel's α before the OS sees it.
 ///
-/// Pre-conditions: `pixels` already at the canonical empty value `0xFFFFFFFF`, `clip_mask` already at the host's default of `255` (fully visible window-interior assumption).
+/// Pre-conditions: `pixels` already at the canonical empty value `0x00000000` (α=0 transparent, darkness=0 — calloc-free), `clip_mask` already at the host's default of `255` (fully visible window-interior assumption).
 ///
 /// Topology: straight edges paint opaque RGB in non-corner ranges (`cap..(end-cap)`) and leave the clip mask alone (= 255, fully visible). Each crossing entry handles **one row** of the curve region for the four corners: zero out the cutout cols, write opaque hairline RGB at the curve's outer + inner pixel positions, and write `h_cov` / `l` into the clip mask at those same positions. Above-the-curve rows (`0..start`) and below-the-curve rows (`h-start..h`) are *entirely* cutout — the curve never enters them — so the full cap-width at those rows is zeroed in the clip mask.
 ///
@@ -150,11 +150,11 @@ pub fn draw_window_edges_and_mask(
         let col_left = start + i;
         let col_right = w - 1 - start - i;
 
-        // Two-sided AA convention. OUTER pixel = on the curve, partially outside the window: clip_mask = h_cov trims against the OS bg; chrome stays opaque (t=0) because the entire inside-window portion IS hairline. INNER pixel = one step inside the curve: clip_mask = 255 (fully inside the window shape); chrome's t-byte carries the hairline-vs-bg AA, set to `inner_t` so the Under blend mixes h_cov/256 of hairline color over (256-h_cov)/256 of window bg. The `l` slot in each crossing entry is the linear-coverage counterpart of h_cov, retained for the outer-pixel chrome-t AA when we move from a 2-pixel hairline to a 1-pixel-with-halo hairline.
+        // Two-sided AA convention. OUTER pixel = on the curve, partially outside the window: clip_mask = h_cov trims against the OS bg; chrome stays opaque (α=0xFF) because the entire inside-window portion IS hairline. INNER pixel = one step inside the curve: clip_mask = 255 (fully inside the window shape); chrome's α-byte carries the hairline-vs-bg AA, set to `inner_α = 255 − h_cov` so the Under blend mixes (255−h_cov)/256 of hairline color over h_cov/256 of window bg. The `l` slot in each crossing entry is the linear-coverage counterpart of h_cov, retained for the outer-pixel chrome-α AA when we move from a 2-pixel hairline to a 1-pixel-with-halo hairline.
         let _ = l;
-        let inner_t = (h_cov as u32) << 24;
-        let light_inner = (light & 0x00FFFFFF) | inner_t;
-        let shadow_inner = (shadow & 0x00FFFFFF) | inner_t;
+        let inner_alpha = ((255 - h_cov) as u32) << 24;
+        let light_inner = (light & 0x00FFFFFF) | inner_alpha;
+        let shadow_inner = (shadow & 0x00FFFFFF) | inner_alpha;
 
         // TL row-walk
         for c in 0..inset {
@@ -177,7 +177,7 @@ pub fn draw_window_edges_and_mask(
         pixels[idx] = pixels[idx].under(tr_color(row_top, tr_out_col), BlendMode::Normal);
         clip_mask[idx] = h_cov;
         let idx = row_top * w + tr_in_col;
-        let layer = (tr_color(row_top, tr_in_col) & 0x00FFFFFF) | inner_t;
+        let layer = (tr_color(row_top, tr_in_col) & 0x00FFFFFF) | inner_alpha;
         pixels[idx] = pixels[idx].under(layer, BlendMode::Normal);
         clip_mask[idx] = 255;
 
@@ -189,7 +189,7 @@ pub fn draw_window_edges_and_mask(
         pixels[idx] = pixels[idx].under(bl_color(row_bot, inset), BlendMode::Normal);
         clip_mask[idx] = h_cov;
         let idx = row_bot * w + inset + 1;
-        let layer = (bl_color(row_bot, inset + 1) & 0x00FFFFFF) | inner_t;
+        let layer = (bl_color(row_bot, inset + 1) & 0x00FFFFFF) | inner_alpha;
         pixels[idx] = pixels[idx].under(layer, BlendMode::Normal);
         clip_mask[idx] = 255;
 
@@ -223,7 +223,7 @@ pub fn draw_window_edges_and_mask(
         pixels[idx] = pixels[idx].under(tr_color(inset, col_right), BlendMode::Normal);
         clip_mask[idx] = h_cov;
         let idx = (inset + 1) * w + col_right;
-        let layer = (tr_color(inset + 1, col_right) & 0x00FFFFFF) | inner_t;
+        let layer = (tr_color(inset + 1, col_right) & 0x00FFFFFF) | inner_alpha;
         pixels[idx] = pixels[idx].under(layer, BlendMode::Normal);
         clip_mask[idx] = 255;
 
@@ -237,7 +237,7 @@ pub fn draw_window_edges_and_mask(
         pixels[idx] = pixels[idx].under(bl_color(bl_out_row, col_left), BlendMode::Normal);
         clip_mask[idx] = h_cov;
         let idx = bl_in_row * w + col_left;
-        let layer = (bl_color(bl_in_row, col_left) & 0x00FFFFFF) | inner_t;
+        let layer = (bl_color(bl_in_row, col_left) & 0x00FFFFFF) | inner_alpha;
         pixels[idx] = pixels[idx].under(layer, BlendMode::Normal);
         clip_mask[idx] = 255;
 
@@ -313,8 +313,8 @@ pub fn draw_strip_curves(
     }
     let edge = theme::WINDOW_LIGHT_EDGE;
     // Hairline geometry: a 1-pixel line extending inward from the curve into the strip body.
-    //   Outer pixel coverage = 1 - fract → opacity = l (sqrt-gamma'd) → chrome t = 255 - l.
-    //   Inner pixel coverage = fract → opacity = h_cov → chrome t = 255 - h_cov.
+    //   Outer pixel coverage = 1 − fract → α = l (sqrt-gamma'd, stored directly).
+    //   Inner pixel coverage = fract → α = h_cov (stored directly).
     // Under composition handles the actual blending with whatever bg is below the chrome layer.
 
     // Row-walk.
@@ -328,11 +328,12 @@ pub fn draw_strip_curves(
             continue;
         }
         let py = last_row - dy;
-        let outer_v = (edge & 0x00FFFFFF) | (((255u32).saturating_sub(l as u32)) << 24);
+        // α-conv: opacity α=l for the outer pixel (=255−old_t where old_t=255−l).
+        let outer_v = (edge & 0x00FFFFFF) | ((l as u32) << 24);
         let outer_idx = py * w + strip_x + inset;
         pixels[outer_idx] = pixels[outer_idx].under(outer_v, BlendMode::Normal);
         if inset + 1 < strip_w {
-            let inner_v = (edge & 0x00FFFFFF) | (((255u32).saturating_sub(h_cov as u32)) << 24);
+            let inner_v = (edge & 0x00FFFFFF) | ((h_cov as u32) << 24);
             let inner_idx = py * w + strip_x + inset + 1;
             pixels[inner_idx] = pixels[inner_idx].under(inner_v, BlendMode::Normal);
         }
@@ -349,11 +350,11 @@ pub fn draw_strip_curves(
             continue;
         }
         let outer_py = last_row - inset;
-        let outer_v = (edge & 0x00FFFFFF) | (((255u32).saturating_sub(l as u32)) << 24);
+        let outer_v = (edge & 0x00FFFFFF) | ((l as u32) << 24);
         let outer_idx = outer_py * w + strip_x + dx;
         pixels[outer_idx] = pixels[outer_idx].under(outer_v, BlendMode::Normal);
         if inset + 1 < button_size {
-            let inner_v = (edge & 0x00FFFFFF) | (((255u32).saturating_sub(h_cov as u32)) << 24);
+            let inner_v = (edge & 0x00FFFFFF) | ((h_cov as u32) << 24);
             let inner_py = last_row - (inset + 1);
             let inner_idx = inner_py * w + strip_x + dx;
             pixels[inner_idx] = pixels[inner_idx].under(inner_v, BlendMode::Normal);
@@ -495,13 +496,13 @@ pub fn draw_minimize_symbol(
             }
             let idx = (py as usize) * width + (px as usize);
             let gradient = ((r4 - dist4) << 8) / (r3 << 2);
-            // AA via t-byte: opacity = gradient/256 (clamped to 256 = fully opaque).
+            // AA via α-byte: opacity = gradient/256 (clamped to 255 = fully opaque).
             let opacity = gradient.min(256) as u32;
             if opacity == 0 {
                 continue;
             }
-            let chrome_t = (256 - opacity).min(255);
-            let value = (stroke & 0x00FFFFFF) | (chrome_t << 24);
+            let chrome_alpha = opacity.min(255);
+            let value = (stroke & 0x00FFFFFF) | (chrome_alpha << 24);
             pixels[idx] = pixels[idx].under(value, BlendMode::Normal);
         }
     }
@@ -560,7 +561,7 @@ pub fn draw_maximize_symbol(
             let idx = (py as usize) * width + (px as usize);
 
             let value = if dist4 <= r_inner4 {
-                // INSIDE inner squircle = fill region. Inner edge (stroke ↔ fill) is between two known glyph colors, so pre-blending is correct here (both colors are deterministic, no bg layer involvement).
+                // INSIDE inner squircle = fill region. Inner edge (stroke ↔ fill) is between two known glyph colors, so pre-blending is correct here (both colors are deterministic, no bg layer involvement). Both `stroke` and `fill` are stored in darkness (theme constants); linear interpolation in darkness space = linear interpolation in visible space, so the formula is identical to the visible-space version. Theme constants are α=0xFF (opaque) by default.
                 let dist_from_inner = r_inner4 - dist4;
                 if dist_from_inner <= inner_thresh {
                     let gradient = (dist_from_inner << 8) / inner_thresh;
@@ -569,12 +570,12 @@ pub fn draw_maximize_symbol(
                     let r_blend = (stroke_rgb.0 * inv + fill_rgb.0 * alpha) >> 8;
                     let g_blend = (stroke_rgb.1 * inv + fill_rgb.1 * alpha) >> 8;
                     let b_blend = (stroke_rgb.2 * inv + fill_rgb.2 * alpha) >> 8;
-                    (r_blend << 16) | (g_blend << 8) | b_blend
+                    0xFF000000 | (r_blend << 16) | (g_blend << 8) | b_blend
                 } else {
                     fill
                 }
             } else {
-                // RING region (between inner and outer). Outer edge AA against the bg layer goes via the chrome t-byte — no pre-blending.
+                // RING region (between inner and outer). Outer edge AA against the bg layer goes via the chrome α-byte — strip the theme const's default α=0xFF and replace with the AA-modulated value.
                 let dist_from_outer = r4 - dist4;
                 if dist_from_outer <= outer_thresh {
                     let gradient = (dist_from_outer << 8) / outer_thresh;
@@ -582,8 +583,8 @@ pub fn draw_maximize_symbol(
                     if opacity == 0 {
                         continue;
                     }
-                    let chrome_t = (256 - opacity).min(255);
-                    (stroke & 0x00FFFFFF) | (chrome_t << 24)
+                    let chrome_alpha = opacity.min(255);
+                    (stroke & 0x00FFFFFF) | (chrome_alpha << 24)
                 } else {
                     stroke
                 }
@@ -677,13 +678,13 @@ pub fn draw_close_symbol(
                 continue;
             }
             let idx = py * width + px;
-            // AA via t-byte: opacity = alpha_f (clamped to 1.0 = fully opaque).
+            // AA via α-byte: opacity = alpha_f (clamped to 1.0 = fully opaque).
             let opacity = (alpha_f * 256.0).min(256.0) as u32;
             if opacity == 0 {
                 continue;
             }
-            let chrome_t = (256 - opacity).min(255);
-            let value = (stroke & 0x00FFFFFF) | (chrome_t << 24);
+            let chrome_alpha = opacity.min(255);
+            let value = (stroke & 0x00FFFFFF) | (chrome_alpha << 24);
             pixels[idx] = pixels[idx].under(value, BlendMode::Normal);
         }
     }

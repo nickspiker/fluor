@@ -306,7 +306,7 @@ impl FluorApp for PanesDemo {
                                     s ^= s >> 17;
                                     s ^= s << 5;
                                     let b = (s >> 16) & 0xFF;
-                                    // t-convention: t=0 (top byte = 0) means opaque.
+                                    // α + darkness: α=0xFF means opaque. RGB stored as darkness — the value here is debug-overlay color, used only by the hit-id visualization which OR's it directly into a presented buffer slot, so leave it in the host-facing convention (α=0 transparent doesn't matter; this isn't a fluor pixel).
                                     self.debug_hit_colours.push((r << 16) | (g << 8) | b);
                                 }
                             }
@@ -314,11 +314,6 @@ impl FluorApp for PanesDemo {
                             let cur = paint::DEBUG_SKIP_PREMULT
                                 .load(std::sync::atomic::Ordering::Relaxed);
                             paint::DEBUG_SKIP_PREMULT
-                                .store(!cur, std::sync::atomic::Ordering::Relaxed);
-                        } else if c == "m" || c == "M" {
-                            let cur =
-                                paint::DEBUG_SKIP_FLIP.load(std::sync::atomic::Ordering::Relaxed);
-                            paint::DEBUG_SKIP_FLIP
                                 .store(!cur, std::sync::atomic::Ordering::Relaxed);
                         } else if c == "a" || c == "A" {
                             // Cycle: off (0) → grayscale (1) → force-opaque (2) → off.

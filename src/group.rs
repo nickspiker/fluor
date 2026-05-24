@@ -178,12 +178,12 @@ impl Group {
 mod tests {
     use super::*;
 
-    /// Build an opaque pixel (t=0) with the given RGB.
-    fn opaque(rgb: u32) -> u32 {
-        rgb & 0x00FFFFFF
+    /// Build an opaque pixel (α=0xFF) from visible RGB — flips RGB to darkness storage.
+    fn opaque(visible_rgb: u32) -> u32 {
+        0xFF000000 | ((visible_rgb & 0x00FFFFFF) ^ 0x00FFFFFF)
     }
-    /// The canonical transparent pixel — t=255, RGB=0. Target buffers must be initialized to this before `flatten_into` so the under-blend has a clean accumulator state.
-    const TRANSPARENT: u32 = 0xFFFFFFFF;
+    /// The canonical transparent pixel — α=0, darkness=0. Target buffers must be initialized to this before `flatten_into` so the under-blend has a clean accumulator state.
+    const TRANSPARENT: u32 = 0x00000000;
 
     #[test]
     fn new_group_has_correct_bbox_buffers() {
@@ -205,9 +205,9 @@ mod tests {
     #[test]
     fn flatten_under_normal_blits_opaque_layer_at_offset() {
         // Group at (1, 1), 2x2, Normal under-blend, single layer = solid opaque red.
-        // Target is pre-initialized to TRANSPARENT (t=255) — the caller-side contract for any
+        // Target is pre-initialized to TRANSPARENT (α=0, dark=0) — the caller-side contract for any
         // buffer participating in the under-chain. Opaque red bottom blended underneath
-        // transparent target → 1-LSB-off red lands at the group's pixels.
+        // transparent target → near-opaque-red lands at the group's pixels (1-LSB drift from the >>8 endpoint).
         let mut g = Group::new(Region::new(1.0, 1.0, 2.0, 2.0), BlendMode::Normal);
         let l = g.new_layer();
         g.rpn.layers[l].pixels = alloc::vec![opaque(0xFF0000); 4];
@@ -216,13 +216,13 @@ mod tests {
         let mut target = alloc::vec![TRANSPARENT; 4 * 4];
         g.flatten_into(&mut target, 4, 4);
 
-        // Group's pixels (1,1)..(2,2) land near opaque red (off-by-1-LSB from the (contrib+1) trick going through Blend::under once).
+        // Opaque red is stored darkness (α=0xFF, R_dark=0, G_dark=0xFF, B_dark=0xFF). Under empty top: new α=0xFF, R_dark stays near 0 (visible red ≈ 0xFF), G/B_dark near 0xFE.
         for &(x, y) in &[(1, 1), (2, 1), (1, 2), (2, 2)] {
             let p = target[y * 4 + x];
-            let r = (p >> 16) & 0xFF;
-            let t = p >> 24;
-            assert_eq!(t, 0, "pixel ({x},{y}) t expected 0, got {t:#x}");
-            assert!(r >= 0xFD, "pixel ({x},{y}) r expected ~0xFE, got {r:#x}");
+            let r_dark = (p >> 16) & 0xFF;
+            let a = p >> 24;
+            assert_eq!(a, 0xFF, "pixel ({x},{y}) α expected 0xFF, got {a:#x}");
+            assert!(r_dark <= 0x01, "pixel ({x},{y}) R-darkness expected ~0, got {r_dark:#x}");
         }
         // Pixels outside the group's bbox stay at TRANSPARENT.
         assert_eq!(target[0 * 4 + 0], TRANSPARENT);
@@ -241,13 +241,14 @@ mod tests {
         g.flatten_into(&mut target, 4, 4);
 
         // Group's (1, 1) lands at target (0, 0); its (3, 3) lands at target (2, 2). target (3, 3) untouched.
+        // Opaque green: α=0xFF, dark=(0xFF, 0, 0xFF). After under from empty: G-darkness near 0 (visible G ≈ 0xFF).
         let g_pixel = target[0 * 4 + 0];
         assert_eq!(
             g_pixel >> 24,
-            0,
-            "blitted pixel should be opaque after under-blend"
+            0xFF,
+            "blitted pixel should be opaque (α=0xFF) after under-blend"
         );
-        assert!(((g_pixel >> 8) & 0xFF) >= 0xFD, "G channel ~0xFE");
+        assert!(((g_pixel >> 8) & 0xFF) <= 0x01, "G-darkness ~0 (visible green)");
         assert_eq!(target[3 * 4 + 3], TRANSPARENT);
     }
 
@@ -263,7 +264,7 @@ mod tests {
         let mut target = alloc::vec![TRANSPARENT; 4];
         g.flatten_into(&mut target, 2, 2);
         let first = target[0];
-        assert_eq!(first >> 24, 0, "first blit should make pixel opaque");
+        assert_eq!(first >> 24, 0xFF, "first blit should make pixel opaque (α=0xFF)");
 
         // Simulate a back-buffer swap: target is now TRANSPARENT again (the OTHER frame buffer).
         target.fill(TRANSPARENT);
@@ -272,7 +273,7 @@ mod tests {
         let second = target[0];
         assert_eq!(
             second >> 24,
-            0,
+            0xFF,
             "second blit must reproduce content (double-buffer safety)"
         );
         assert_eq!(first, second);

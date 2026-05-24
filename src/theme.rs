@@ -1,6 +1,8 @@
 //! Theme constants — colours and geometry shared between paint primitives, chrome, and (eventually) widgets. Sourced from photon's [theme.rs](/mnt/Octopus/Code/photon/src/ui/theme.rs); names match photon exactly so cross-codebase greps work.
 //!
-//! Colour layout: `0xttRRGGBB` (fluor's t-convention internal format — top byte is transparency, `t=0` opaque). The `0x00_xx_yy_zz` constants here are all opaque. Android byte-swap (RGB byte-flip) lives behind a cfg here so call sites stay platform-neutral.
+//! Colour layout: `0xααRRGGBB` (fluor internal format — top byte is α opacity, `α=0xFF` opaque; RGB bytes are DARKNESS, `0 = white potential, 255 = black`). The `0x00_xx_yy_zz` literals here are written with `t = 0` (which would have been opaque under the old convention) and visible RGB; [`fmt`] handles platform byte-swap and [`dark`] inverts the RGB at compile time. Constants here keep `α = 0` — colour palette only; the α-byte is set per-pixel at the use site (`opacity << 24 | dark(theme_const)`).
+//!
+//! At the OS boundary, [`crate::paint::finalize_for_os`] does a single `pixel ^= 0x00FFFFFF` that flips RGB darkness back to visible; α passes through (already opacity-direction in storage) — putting the pixel in the format the host compositor wants.
 
 #[cfg(target_os = "android")]
 const fn fmt(trgb: u32) -> u32 {
@@ -16,43 +18,53 @@ const fn fmt(trgb: u32) -> u32 {
     trgb
 }
 
-// Background texture (organic noise, scrollable). All opaque (t=0).
+/// Compile-time visible-RGB → stored α + darkness conversion: flips the RGB bytes (`255 − R, 255 − G, 255 − B`) AND sets α=0xFF (opaque). Theme colour constants default to OPAQUE since most use sites paint them as solid fills; partial-α sites (AA edges, glow accumulation) explicitly mask α off first via `(theme_const & 0x00FFFFFF) | (modulated_α << 24)`. Glow colour constants use [`dark_rgb_only`] to keep α=0 since the glow function sets α per pixel.
+const fn dark(trgb: u32) -> u32 {
+    (trgb ^ 0x00FFFFFF) | 0xFF000000
+}
+
+/// Variant of [`dark`] that leaves α=0 instead of setting it to 0xFF. Used for colour constants where the α-byte is filled in per-pixel at the use site (the textbox glow function).
+const fn dark_rgb_only(trgb: u32) -> u32 {
+    trgb ^ 0x00FFFFFF
+}
+
+// Background texture (organic noise, scrollable). These are NOISE-MATH constants — bit-patterns the noise function uses (base colour + low-bit variance mask + speckle mask), not display colours. They operate in visible-RGB space (matching photon's reference); the noise function does its math then flips the result to stored darkness at the store site (`result ^ 0x00FFFFFF`). NOT wrapped with `dark()` so the photon-original patterns survive.
 pub const BG_BASE: u32 = fmt(0x00_0C_14_0E);
 pub const BG_MASK: u32 = fmt(0x00_0F_07_1F);
 pub const BG_SPECKLE: u32 = fmt(0x00_3F_1F_7F);
 
 // Window edges + controls background.
-pub const WINDOW_LIGHT_EDGE: u32 = fmt(0x00_44_41_37);
-pub const WINDOW_SHADOW_EDGE: u32 = fmt(0x00_2B_34_37);
-pub const WINDOW_CONTROLS_BG: u32 = fmt(0x00_1E_1E_1E);
-pub const WINDOW_CONTROLS_HAIRLINE: u32 = fmt(0x00_44_41_37);
+pub const WINDOW_LIGHT_EDGE: u32 = dark(fmt(0x00_44_41_37));
+pub const WINDOW_SHADOW_EDGE: u32 = dark(fmt(0x00_2B_34_37));
+pub const WINDOW_CONTROLS_BG: u32 = dark(fmt(0x00_1E_1E_1E));
+pub const WINDOW_CONTROLS_HAIRLINE: u32 = dark(fmt(0x00_44_41_37));
 
-// Button hover deltas (RGB channels wrap intentionally; the t-byte is forced opaque after).
-pub const CLOSE_HOVER: u32 = fmt(0x00_21_FD_F9);
-pub const MAXIMIZE_HOVER: u32 = fmt(0x00_FA_10_FA);
-pub const MINIMIZE_HOVER: u32 = fmt(0x00_F7_FA_25);
+// Button hover deltas (RGB channels wrap intentionally; α is 0xFF opaque from `dark()`).
+pub const CLOSE_HOVER: u32 = dark(fmt(0x00_21_FD_F9));
+pub const MAXIMIZE_HOVER: u32 = dark(fmt(0x00_FA_10_FA));
+pub const MINIMIZE_HOVER: u32 = dark(fmt(0x00_F7_FA_25));
 
 // Generic UI text.
-pub const TEXT_COLOUR: u32 = fmt(0x00_D0_D0_D0);
-pub const LABEL_COLOUR: u32 = fmt(0x00_80_80_80);
+pub const TEXT_COLOUR: u32 = dark(fmt(0x00_D0_D0_D0));
+pub const LABEL_COLOUR: u32 = dark(fmt(0x00_80_80_80));
 
 // Window control glyph colours (drawn on top of WINDOW_CONTROLS_BG).
-pub const CLOSE_GLYPH: u32 = fmt(0x00_80_20_20);
-pub const MAXIMIZE_GLYPH: u32 = fmt(0x00_48_6B_3A);
-pub const MAXIMIZE_GLYPH_INTERIOR: u32 = fmt(0x00_28_2D_2E);
-pub const MINIMIZE_GLYPH: u32 = fmt(0x00_33_30_C7);
+pub const CLOSE_GLYPH: u32 = dark(fmt(0x00_80_20_20));
+pub const MAXIMIZE_GLYPH: u32 = dark(fmt(0x00_48_6B_3A));
+pub const MAXIMIZE_GLYPH_INTERIOR: u32 = dark(fmt(0x00_28_2D_2E));
+pub const MINIMIZE_GLYPH: u32 = dark(fmt(0x00_33_30_C7));
 
 // Textbox.
-pub const TEXTBOX_FILL: u32 = fmt(0x00_06_08_09);
-pub const TEXTBOX_HOVER: u32 = fmt(0x00_12_16_18);
-pub const TEXTBOX_ACTIVE: u32 = fmt(0x00_00_00_00);
-pub const TEXTBOX_LIGHT_EDGE: u32 = fmt(0x00_44_41_37);
-pub const TEXTBOX_SHADOW_EDGE: u32 = fmt(0x00_2B_34_37);
+pub const TEXTBOX_FILL: u32 = dark(fmt(0x00_06_08_09));
+pub const TEXTBOX_HOVER: u32 = dark(fmt(0x00_12_16_18));
+pub const TEXTBOX_ACTIVE: u32 = dark(fmt(0x00_00_00_00));
+pub const TEXTBOX_LIGHT_EDGE: u32 = dark(fmt(0x00_44_41_37));
+pub const TEXTBOX_SHADOW_EDGE: u32 = dark(fmt(0x00_2B_34_37));
 
 // Cursor (blinkey).
 pub const CURSOR_BRIGHTNESS: f32 = 100.0;
 
-// Textbox glow colours (RGB only — t-byte is set per-pixel by the glow function).
-pub const GLOW_DEFAULT: u32 = fmt(0x00_FF_FF_FF);
-pub const GLOW_SUCCESS: u32 = fmt(0x00_40_FF_40);
-pub const GLOW_ERROR: u32 = fmt(0x00_FF_60_60);
+// Textbox glow colours (RGB only — α-byte is set per-pixel by the glow function).
+pub const GLOW_DEFAULT: u32 = dark_rgb_only(fmt(0x00_FF_FF_FF));
+pub const GLOW_SUCCESS: u32 = dark_rgb_only(fmt(0x00_40_FF_40));
+pub const GLOW_ERROR: u32 = dark_rgb_only(fmt(0x00_FF_60_60));

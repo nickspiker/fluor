@@ -155,7 +155,7 @@ impl Compositor {
         }
     }
 
-    /// Paint every pane into the `target` buffer, **topmost-first** (highest-z first). `fill_rect` uses `Blend::under` internally, so where a topmost pane has already painted opaque pixels, lower panes are skipped automatically via the dst-opaque early-out. The buffer must be pre-initialized to the canonical empty value `0xFFFFFFFF` (t=255, RGB=255 — invisible at full transparency, byte-uniform memset) by the caller so the under-chain has a clean starting accumulator state.
+    /// Paint every pane into the `target` buffer, **topmost-first** (highest-z first). `fill_rect` uses `Blend::under` internally, so where a topmost pane has already painted opaque pixels, lower panes are skipped automatically via the dst-opaque early-out (`self >= 0xFF000000`). The buffer must be pre-initialized to the canonical empty value `0x00000000` (α=0 transparent, darkness=0; zero-init is calloc-free) by the caller so the under-chain has a clean starting accumulator state.
     pub fn render(&self, target: &mut [u32], buf_w: usize, buf_h: usize) {
         for pane in self.panes.iter().rev() {
             let (cx, cy) = self.viewport.ru_to_px(pane.center);
@@ -280,8 +280,8 @@ mod tests {
             RuVec2::splat(0.25),
             pack_argb(255, 0, 0, 255),
         );
-        // Buffer pre-initialized to canonical empty (0xFFFFFFFF) per the under-chain contract.
-        let mut buf = vec![0xFFFFFFFFu32; 8 * 8];
+        // Buffer pre-initialized to canonical empty (0x00000000) per the under-chain contract.
+        let mut buf = vec![0u32; 8 * 8];
         c.render(&mut buf, 8, 8);
         // Center pixel at (4, 4): opaque red pane painted under transparent dst → ~opaque red (1-LSB drift on the dark channels from the >>8 endpoint).
         let center = buf[4 * 8 + 4];
