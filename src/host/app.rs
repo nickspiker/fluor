@@ -6,7 +6,7 @@
 //!
 //! The current `desktop::run(compositor, title)` is a transitional shim that wraps the legacy demo into a `FluorApp`. New code should use [`run_app`] directly.
 
-use super::chrome::{self, ResizeEdge};
+use super::chrome::ResizeEdge;
 use crate::coord::Coord;
 use crate::geom::Viewport;
 use crate::text::TextRenderer;
@@ -18,6 +18,47 @@ use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::ModifiersState;
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
+
+/// X11-only: issue a SINGLE `XConfigureWindow` with all four of `(x, y, width, height)` so the WM applies position AND size atomically — eliminates the visible "first-size-then-position" seam you get when winit's separate `set_outer_position` / `request_inner_size` calls each generate their own ConfigureRequest. Returns `true` if the atomic call succeeded (window is X11 and the request was sent); `false` if the window is Wayland or the X11 connection failed → caller falls back to winit's separate calls (which is the correct path on Wayland anyway, since `set_outer_position` is a no-op there).
+#[cfg(target_os = "linux")]
+mod x11_atomic {
+    use std::sync::OnceLock;
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{ConfigureWindowAux, ConnectionExt};
+    use x11rb::rust_connection::RustConnection;
+
+    /// Lazily-opened XCB connection, shared across all atomic-geometry calls. Independent of the connection winit holds internally (which we can't access) — the X server doesn't care which client sends the ConfigureRequest as long as we name the right window ID.
+    fn conn() -> Option<&'static RustConnection> {
+        static CONN: OnceLock<Option<RustConnection>> = OnceLock::new();
+        CONN.get_or_init(|| x11rb::connect(None).ok().map(|(c, _screen)| c))
+            .as_ref()
+    }
+
+    pub fn set_geometry(window: &winit::window::Window, x: i32, y: i32, w: u32, h: u32) -> bool {
+        let Ok(handle) = window.window_handle() else {
+            return false;
+        };
+        let xid = match handle.as_raw() {
+            RawWindowHandle::Xcb(h) => h.window.get(),
+            RawWindowHandle::Xlib(h) => h.window as u32,
+            _ => return false, // Wayland or other non-X11 — caller falls back to winit
+        };
+        let Some(conn) = conn() else {
+            return false;
+        };
+        let aux = ConfigureWindowAux::new()
+            .x(Some(x))
+            .y(Some(y))
+            .width(Some(w))
+            .height(Some(h));
+        if conn.configure_window(xid, &aux).is_err() {
+            return false;
+        }
+        let _ = conn.flush();
+        true
+    }
+}
 
 /// Per-callback access to host-owned shared resources. Re-borrowed for each call into the trait — the consumer can keep references for the duration of the call but not across calls.
 pub struct Context<'a> {
@@ -112,19 +153,12 @@ struct DesktopShell<A: FluorApp> {
     cursor_y: Coord,
     modifiers: ModifiersState,
 
-    // --- macOS manual resize tracking (winit stops delivering CursorMoved during edge-drag on macOS) ---
-    #[cfg(target_os = "macos")]
+    // --- Self-driven resize tracking. fluor owns the input side of the resize-drag loop on every platform: on edge-press we capture start geometry; on cursor-move we compute the new target geometry and push it to the OS via request_inner_size + set_outer_position. The OS confirms via Resized events which trigger the actual surface resize + paint — keeping buffer size == window size always, eliminating X11 PutImage mismatch smear. Replaces the WM-driven drag_resize_window path AND the macOS NSEvent polling hack with one unified flow.
     is_dragging_resize: bool,
-    #[cfg(target_os = "macos")]
     resize_edge: ResizeEdge,
-    #[cfg(target_os = "macos")]
     drag_start_size: (u32, u32),
-    #[cfg(target_os = "macos")]
     drag_start_window_pos: (i32, i32),
-    #[cfg(target_os = "macos")]
-    drag_start_cursor_screen_pos: (f64, f64),
-    #[cfg(target_os = "macos")]
-    screen_height: u32,
+    drag_start_cursor_screen_pos: (i32, i32),
 }
 
 impl<A: FluorApp> DesktopShell<A> {
@@ -142,18 +176,11 @@ impl<A: FluorApp> DesktopShell<A> {
             cursor_x: 0.0,
             cursor_y: 0.0,
             modifiers: ModifiersState::empty(),
-            #[cfg(target_os = "macos")]
             is_dragging_resize: false,
-            #[cfg(target_os = "macos")]
             resize_edge: ResizeEdge::None,
-            #[cfg(target_os = "macos")]
             drag_start_size: (0, 0),
-            #[cfg(target_os = "macos")]
             drag_start_window_pos: (0, 0),
-            #[cfg(target_os = "macos")]
-            drag_start_cursor_screen_pos: (0.0, 0.0),
-            #[cfg(target_os = "macos")]
-            screen_height: 0,
+            drag_start_cursor_screen_pos: (0, 0),
         }
     }
 
@@ -232,101 +259,33 @@ impl<A: FluorApp> DesktopShell<A> {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    /// Begin a self-driven resize drag. Captures the start geometry (size + outer window position + screen-relative cursor anchor) so subsequent cursor moves can compute the target geometry by delta from these starting values. Uniform across platforms — we drive the resize loop on Linux, Windows, AND macOS (replaces both the WM-driven `drag_resize_window` path and the macOS NSEvent polling hack).
     fn start_resize(&mut self, edge: ResizeEdge, window: &Window) {
-        if let Some(dir) = resize_direction(edge) {
-            let _ = window.drag_resize_window(dir);
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    fn start_resize(&mut self, edge: ResizeEdge, window: &Window) {
-        if let Some(dir) = resize_direction(edge) {
-            let _ = window.drag_resize_window(dir);
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn start_resize(&mut self, edge: ResizeEdge, window: &Window) {
-        // macOS: manual resize tracking via NSEvent polling — winit stops delivering CursorMoved once the cursor leaves during a resize drag on macOS.
         self.is_dragging_resize = true;
         self.resize_edge = edge;
         self.drag_start_size = (self.viewport.width_px, self.viewport.height_px);
         if let Ok(window_pos) = window.outer_position() {
             self.drag_start_window_pos = (window_pos.x, window_pos.y);
+            // Anchor cursor position in SCREEN coordinates (window_outer + window-relative cursor) so window-position changes during the drag don't shift the reference frame.
             self.drag_start_cursor_screen_pos = (
-                window_pos.x as f64 + self.cursor_x as f64,
-                window_pos.y as f64 + self.cursor_y as f64,
+                window_pos.x + self.cursor_x as i32,
+                window_pos.y + self.cursor_y as i32,
             );
         }
     }
 
-    // --- macOS manual resize ---
-
-    #[cfg(target_os = "macos")]
-    fn poll_macos_resize(&mut self) -> bool {
-        let Some(window) = self.window.as_ref() else {
-            return false;
-        };
-        use std::ffi::{c_char, c_void};
-
-        #[repr(C)]
-        #[derive(Clone, Copy)]
-        struct NSPoint {
-            x: f64,
-            y: f64,
-        }
-
-        unsafe extern "C" {
-            fn objc_msgSend(receiver: *const c_void, sel: *const c_void) -> usize;
-            fn sel_registerName(name: *const c_char) -> *const c_void;
-            fn objc_getClass(name: *const c_char) -> *const c_void;
-        }
-
-        unsafe {
-            let cls = objc_getClass(b"NSEvent\0".as_ptr() as *const c_char);
-
-            let sel_loc = sel_registerName(b"mouseLocation\0".as_ptr() as *const c_char);
-            let mouse_location: extern "C" fn(*const c_void, *const c_void) -> NSPoint =
-                std::mem::transmute(objc_msgSend as *const ());
-            let ns_point = mouse_location(cls, sel_loc);
-
-            let sel_btn = sel_registerName(b"pressedMouseButtons\0".as_ptr() as *const c_char);
-            let buttons = objc_msgSend(cls, sel_btn);
-            let left_held = buttons & 1 != 0;
-
-            let scale = window.scale_factor();
-            let phys_x = ns_point.x * scale;
-            let phys_y = self.screen_height as f64 - ns_point.y * scale;
-
-            if let Ok(window_pos) = window.outer_position() {
-                self.cursor_x = (phys_x - window_pos.x as f64) as Coord;
-                self.cursor_y = (phys_y - window_pos.y as f64) as Coord;
-            }
-
-            if !left_held {
-                self.is_dragging_resize = false;
-                self.resize_edge = ResizeEdge::None;
-                return true;
-            }
-
-            self.apply_macos_resize();
-        }
-        false
-    }
-
-    #[cfg(target_os = "macos")]
-    fn apply_macos_resize(&self) {
-        let Some(window) = self.window.as_ref() else {
+    /// Apply one tick of the self-driven resize drag. Called from `RedrawRequested` when `is_dragging_resize` (throttled to vsync). Just pushes the new target geometry to the OS — does NOT resize our surface, viewport, or paint here. The actual surface resize + viewport update + on_resize + paint happens in the `Resized` event handler when the OS confirms the new size. This guarantees the buffer we paint is ALWAYS the same size as the displayed window (no X11 PutImage clipping mismatch, no "smeared" content during drag).
+    fn apply_resize_drag(&mut self) {
+        let Some(window) = self.window.as_ref().cloned() else {
             return;
         };
         let Ok(window_pos) = window.outer_position() else {
             return;
         };
 
-        let current_screen_x = window_pos.x as f64 + self.cursor_x as f64;
-        let current_screen_y = window_pos.y as f64 + self.cursor_y as f64;
-
+        // Screen-relative cursor delta from drag-start anchor (unchanged across the window's own position shifts during the drag, since the anchor is captured in screen coords).
+        let current_screen_x = window_pos.x + self.cursor_x as i32;
+        let current_screen_y = window_pos.y + self.cursor_y as i32;
         let dx = (current_screen_x - self.drag_start_cursor_screen_pos.0) as Coord;
         let dy = (current_screen_y - self.drag_start_cursor_screen_pos.1) as Coord;
 
@@ -408,10 +367,37 @@ impl<A: FluorApp> DesktopShell<A> {
             ResizeEdge::None => return,
         };
 
-        if should_move {
-            let _ = window.set_outer_position(winit::dpi::PhysicalPosition::new(new_x, new_y));
+        // Push the new geometry to the OS — only issue the calls that actually changed. The OS will process and reply with Resized / Moved events which trigger the actual surface resize + paint in the normal event handlers.
+        let size_changed =
+            new_width != self.viewport.width_px || new_height != self.viewport.height_px;
+        let pos_changed = should_move && (new_x != window_pos.x || new_y != window_pos.y);
+
+        // Atomic geometry path (Linux X11 only): when BOTH size and position change in the same tick — i.e. left/top/topleft/topright/bottomleft drags — issue ONE XConfigureWindow with x|y|width|height instead of winit's two separate calls. Without this the WM applies size and position in sequence, producing a visible seam (the right/bottom edge briefly moves before the left/top edge catches up). Returns true on X11; false on Wayland or any failure → falls through to winit's separate calls.
+        #[cfg(target_os = "linux")]
+        let atomic_done = size_changed
+            && pos_changed
+            && x11_atomic::set_geometry(&window, new_x, new_y, new_width, new_height);
+        #[cfg(not(target_os = "linux"))]
+        let atomic_done = false;
+
+        if !atomic_done {
+            if size_changed {
+                let _ = window
+                    .request_inner_size(winit::dpi::PhysicalSize::new(new_width, new_height));
+            }
+            if pos_changed {
+                let _ =
+                    window.set_outer_position(winit::dpi::PhysicalPosition::new(new_x, new_y));
+            }
         }
-        let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(new_width, new_height));
+
+        if pos_changed {
+            // X11 (and most other platforms) does NOT synthesize a CursorMoved when we move the window programmatically — the cursor's screen position didn't change, so X11 sees no movement event to deliver. But the cursor's window-relative position DID change (window moved underneath a stationary hand). Without compensation, the next drag tick computes screen = new_window_pos + stale_window_relative_cursor → wrong screen position → wrong delta → runaway.
+            let dx_w = window_pos.x - new_x;
+            let dy_w = window_pos.y - new_y;
+            self.cursor_x += dx_w as Coord;
+            self.cursor_y += dy_w as Coord;
+        }
     }
 }
 
@@ -435,18 +421,13 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
             winit::dpi::PhysicalSize::new(1280, 800)
         };
 
-        #[cfg(target_os = "macos")]
-        if let Some(ref mon) = monitor {
-            self.screen_height = mon.size().height;
-        }
-
         let attrs = WindowAttributes::default()
             .with_title(self.app.title())
             .with_inner_size(initial)
             .with_min_inner_size(winit::dpi::PhysicalSize::new(24u32, 8u32))
             .with_decorations(false)
             .with_transparent(true)
-            .with_resizable(cfg!(not(target_os = "macos")));
+            .with_resizable(true);
         let window = Arc::new(event_loop.create_window(attrs).expect("create_window"));
 
         #[cfg(target_os = "macos")]
@@ -511,19 +492,6 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        #[cfg(target_os = "macos")]
-        if self.is_dragging_resize {
-            if self.poll_macos_resize() {
-                if let Some(window) = self.window.as_ref() {
-                    window.request_redraw();
-                }
-            }
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
-                std::time::Instant::now() + std::time::Duration::from_millis(16),
-            ));
-            return;
-        }
-
         let needs_redraw = if let (Some(window), Some(text)) =
             (self.window.as_ref().cloned(), self.text.as_mut())
         {
@@ -557,6 +525,7 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 std::process::exit(0);
             }
             WindowEvent::Resized(size) => {
+                // The OS confirms a new window size — process it whether or not we initiated it (drag, maximize, restore, OS rotation, etc.). This is the SINGLE place that resizes the surface + viewport + clip_mask, ensuring our buffer is always the same size as the displayed window. Without this consistency, X11's PutImage clips or stretches the buffer→window mapping and we get smear artifacts during drag.
                 if size.width == self.viewport.width_px && size.height == self.viewport.height_px {
                     return;
                 }
@@ -597,12 +566,21 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                         cursor_y: self.cursor_y,
                     };
                     self.app.on_resize(size.width, size.height, &mut ctx);
-                    window.request_redraw();
                 }
+                // Paint immediately at the new size — don't wait for the next RedrawRequested vsync. During a drag this minimizes the gap between OS-confirmed-resize and visible-paint to a single frame: cursor moves → request_inner_size → Resized → paint → display. Waiting for RedrawRequested would add another vsync of lag and let the WM tile-fill the new area meanwhile.
+                self.render_frame();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_x = position.x as Coord;
                 self.cursor_y = position.y as Coord;
+
+                // During a self-driven resize drag, CursorMoved fires at hundreds of Hz (raw input rate) AND we synthesize more via set_outer_position (window-relative cursor pos changes when the window moves). Doing a full resize+paint+OS-update per event floods X11 (`XIO: fatal IO error 11`) and creates a multi-second backlog of stale requests that play back after release. Coalesce: just stash the new cursor pos and request a redraw — winit caps RedrawRequested to vsync (~60-144 Hz), and the actual drag tick runs there. Skips consumer event dispatch too (consumer doesn't need to see resize-drag cursor moves).
+                if self.is_dragging_resize {
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
+                    return;
+                }
 
                 if let (Some(window), Some(text)) =
                     (self.window.as_ref().cloned(), self.text.as_mut())
@@ -628,8 +606,8 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 self.dispatch_event(event);
             }
             WindowEvent::Focused(false) => {
-                #[cfg(target_os = "macos")]
-                {
+                // Cancel any in-progress resize drag if we lose focus mid-drag (the user alt-tabbed or the WM stole focus). Keeps state consistent.
+                if self.is_dragging_resize {
                     self.is_dragging_resize = false;
                     self.resize_edge = ResizeEdge::None;
                 }
@@ -640,17 +618,19 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 button: MouseButton::Left,
                 ..
             } => {
-                #[cfg(target_os = "macos")]
+                // End of resize drag — release ownership of the loop. The buffer is already in the final state from the last drag tick; no extra repaint needed.
                 if self.is_dragging_resize {
                     self.is_dragging_resize = false;
                     self.resize_edge = ResizeEdge::None;
-                    if let Some(window) = self.window.as_ref() {
-                        window.request_redraw();
-                    }
                 }
                 self.dispatch_event(event);
             }
             WindowEvent::RedrawRequested => {
+                // During a self-driven resize drag, push the new target geometry to the OS first. This is async: the OS will confirm via a later Resized event which triggers its own paint at the confirmed size.
+                if self.is_dragging_resize {
+                    self.apply_resize_drag();
+                }
+                // ALWAYS paint per vsync — even during a drag. Otherwise the screen "sticks" for however many vsyncs the OS takes to confirm our request_inner_size. Painting at the current viewport (= last OS-confirmed size) is correct: buffer size matches window size, no smear; when OS finally confirms a new size, Resized handler resizes + paints again at the new size, and we converge.
                 self.render_frame();
             }
             _ => {
@@ -680,18 +660,3 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn resize_direction(edge: ResizeEdge) -> Option<winit::window::ResizeDirection> {
-    use winit::window::ResizeDirection;
-    Some(match edge {
-        ResizeEdge::Top => ResizeDirection::North,
-        ResizeEdge::Bottom => ResizeDirection::South,
-        ResizeEdge::Left => ResizeDirection::West,
-        ResizeEdge::Right => ResizeDirection::East,
-        ResizeEdge::TopLeft => ResizeDirection::NorthWest,
-        ResizeEdge::TopRight => ResizeDirection::NorthEast,
-        ResizeEdge::BottomLeft => ResizeDirection::SouthWest,
-        ResizeEdge::BottomRight => ResizeDirection::SouthEast,
-        ResizeEdge::None => return None,
-    })
-}

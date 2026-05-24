@@ -570,6 +570,7 @@ dependencies = [
  "swash",
  "wgpu",
  "winit",
+ "x11rb",
 ]
 
 [[package]]
