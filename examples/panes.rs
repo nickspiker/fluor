@@ -116,7 +116,7 @@ impl PanesDemo {
         let vp = ctx.viewport;
         let span = 2.0 * vp.width_px as Coord * vp.height_px as Coord
             / (vp.width_px as Coord + vp.height_px as Coord);
-        let bw = chrome::MIN_BUTTON_HEIGHT_PX as Coord + (span / 32.0).ceil();
+        let bw = (span / 32.0).ceil();
         // Aspect-driven horizontal shift: square window centers the textbox; wider pushes it right, taller pushes it left. Magnitude scales with span so the shift is visible but bounded.
         let aspect = vp.width_px as Coord / vp.height_px as Coord;
         let center_x = vp.width_px as Coord * 0.5 + (aspect - 1.0) * span * 0.25;
@@ -331,6 +331,13 @@ impl FluorApp for PanesDemo {
                             let cur = paint::DEBUG_SKIP_CHROME
                                 .load(std::sync::atomic::Ordering::Relaxed);
                             paint::DEBUG_SKIP_CHROME
+                                .store(!cur, std::sync::atomic::Ordering::Relaxed);
+                            self.chrome.invalidate_chrome();
+                            ctx.window.request_redraw();
+                        } else if c == "x" || c == "X" {
+                            let cur = paint::DEBUG_SKIP_CONTROLS
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            paint::DEBUG_SKIP_CONTROLS
                                 .store(!cur, std::sync::atomic::Ordering::Relaxed);
                             self.chrome.invalidate_chrome();
                             ctx.window.request_redraw();

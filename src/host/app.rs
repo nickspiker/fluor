@@ -166,7 +166,7 @@ impl<A: FluorApp> DesktopShell<A> {
         // Make sure the clip mask is sized to the current viewport. Default fill is 255 = fully visible (consumer is opting in to clip-shape carving).
         let needed = buf_w * buf_h;
         if self.clip_mask.len() != needed {
-            self.clip_mask.resize(needed, 255);
+            self.clip_mask = vec![255u8; needed];
         }
         let Some(text) = self.text.as_mut() else {
             return;
@@ -488,7 +488,7 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
         // Allocate the clip-mask buffer matched to the initial viewport (default 255 = fully visible — consumer carves shape via DefaultChrome or similar).
         let needed = self.viewport.width_px as usize * self.viewport.height_px as usize;
         if self.clip_mask.len() != needed {
-            self.clip_mask.resize(needed, 255);
+            self.clip_mask = vec![255u8; needed];
         }
 
         // Hand control to the consumer's init.
@@ -581,7 +581,7 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 self.viewport = Viewport::new(size.width, size.height);
                 let needed = size.width as usize * size.height as usize;
                 if self.clip_mask.len() != needed {
-                    self.clip_mask.resize(needed, 255);
+                    self.clip_mask = vec![255u8; needed];
                 }
 
                 if let (Some(window), Some(text)) =

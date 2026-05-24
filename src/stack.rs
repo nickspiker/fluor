@@ -246,7 +246,7 @@ mod tests {
         let mut stk = make_stack(2);
         let top = stk.new_layer();
         let bot = stk.new_layer();
-        stk.layers[top].pixels = alloc::vec![0xFF_FF_00_00; 2]; // fully transparent top
+        stk.layers[top].pixels = alloc::vec![0xFFFFFFFF; 2]; // canonical empty top
         stk.layers[bot].pixels = alloc::vec![0x00_00_FF_00; 2]; // opaque green bottom
         stk.set_program(alloc::vec![
             Op::Push(top),
@@ -254,11 +254,11 @@ mod tests {
             Op::Under(BlendMode::Normal)
         ]);
         let _ = stk.evaluate();
-        // Modify only the bottom layer and mark it dirty. The whole program re-runs (no partial reeval) and produces a result ≈ new bottom.
+        // Modify only the bottom layer and mark it dirty. The whole program re-runs (no partial reeval) and produces a result ≈ new bottom (within 1-LSB drift from >>8 endpoint).
         stk.layers[bot].pixels = alloc::vec![0x00_00_00_FF; 2];
         stk.layers[bot].dirty = true;
         let result = stk.evaluate()[0];
-        assert!(result & 0xFF >= 0xFE);
+        assert!(result & 0xFF >= 0xFE, "result blue channel = {:#x}", result & 0xFF);
     }
 
     #[test]

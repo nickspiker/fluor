@@ -496,6 +496,10 @@ pub const DEBUG_SHOW_ALPHA_FORCE_OPAQUE: u8 = 2;
 pub static DEBUG_SKIP_CHROME: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Debug toggle that suppresses ONLY the controls strip (curves + hairlines + glyphs + dividers + strip-bg fill) while keeping the window perimeter intact. Bound to the `Ctrl/Cmd + Shift + D + X` chord. Useful for isolating perimeter rendering from controls rendering. Stays `false` by default.
+pub static DEBUG_SKIP_CONTROLS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Boundary conversion from internal t-convention to host-facing α-convention. Two modes:
 /// * Normal (default while scaffolding): OR-mask `*p |= 0xFF000000` — force every pixel fully opaque (α=255), RGB passes through unblended. Lets us see the raw kernel/paint-primitive output without OS compositing. Swap the OR for XOR (`*p ^= 0xFF000000`) when partial-t AA needs to round-trip properly through the OS compositor (α = 255 − t).
 /// * `DEBUG_SHOW_ALPHA` (Ctrl+Shift+D+A chord): replace every pixel with `(α, α, α, 255)` — α value rendered as grayscale, alpha-byte forced opaque so the OS displays the grayscale. RGB is discarded for this view. Lets you visually inspect where partial-t pixels live without the RGB content distracting.
@@ -1876,10 +1880,9 @@ mod tests {
 
     #[test]
     fn under_fully_transparent_top_yields_bottom_within_one_lsb() {
-        // top with t=255 (fully transparent) over opaque bottom → result ≈ bottom with ≤1 LSB drift
-        // from the >>8 shortcut at the transparent endpoint.
-        let top = pack_argb(255, 0, 0, 0); // t=255, RGB=0
-        let bottom = pack_argb(100, 150, 200, 255); // opaque, RGB=(100,150,200)
+        // Canonical empty top (RGB=255, a=0 → 0xFFFFFFFF) over opaque bottom → result ≈ bottom with ≤1 LSB drift from the >>8 truncation.
+        let top = pack_argb(255, 255, 255, 0);
+        let bottom = pack_argb(100, 150, 200, 255);
         let result = top.under(bottom, BlendMode::Normal);
         let (r, g, b, _) = unpack_argb(result);
         assert!((r as i32 - 100).abs() <= 1, "r got {}", r);
@@ -1969,15 +1972,14 @@ mod tests {
 
     #[test]
     fn under_half_top_blends_with_opaque_bottom() {
-        // top is half-transparent (t=128, RGB=(200,200,200)) over opaque black bottom.
-        // top_opacity=128, contrib=(128*256)>>8=128. nr = (200*128 + 0*128) >> 8 = 100.
-        let top = pack_argb(200, 200, 200, 128);
+        // Canonical half-empty top (RGB=255, a=128 → 50% white potential) over opaque black bottom → mid-gray (50% white + 50% black ≈ 128 per channel).
+        let top = pack_argb(255, 255, 255, 128);
         let bottom = pack_argb(0, 0, 0, 255);
         let result = top.under(bottom, BlendMode::Normal);
         let (r, g, b, _) = unpack_argb(result);
-        assert!((r as i32 - 100).abs() <= 1, "r got {}", r);
-        assert!((g as i32 - 100).abs() <= 1, "g got {}", g);
-        assert!((b as i32 - 100).abs() <= 1, "b got {}", b);
+        assert!((r as i32 - 128).abs() <= 2, "r got {}", r);
+        assert!((g as i32 - 128).abs() <= 2, "g got {}", g);
+        assert!((b as i32 - 128).abs() <= 2, "b got {}", b);
     }
 
     #[test]

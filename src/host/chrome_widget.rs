@@ -6,7 +6,7 @@
 //!
 //! Pattern: `chrome.rasterize_bg(|bg, w, h| { /* paint into bg */ });` → `chrome.rasterize_chrome(text);` → `chrome.rasterize_hover();` → `chrome.flatten_into(target, w, h);`. Each rasterize_* checks the layer's dirty bit internally and is a no-op on clean.
 
-use super::chrome::{self, HIT_NONE, MIN_BUTTON_HEIGHT_PX};
+use super::chrome::{self, HIT_NONE};
 use crate::coord::Coord;
 use crate::geom::Viewport;
 use crate::group::Group;
@@ -122,53 +122,115 @@ impl DefaultChrome {
             return;
         }
 
-        // Compute squircle start + crossings (lifted from `chrome::draw_window_controls`, button bits stripped).
+        // Compute span + button size shared by controls and squircle.
         let span = 2.0 * vp_w as Coord * vp_h as Coord / (vp_w as Coord + vp_h as Coord);
-        let radius = span / 4.0;
-        let squirdleyness = 24i32;
-        let mut crossings: Vec<(u16, u8, u8)> = Vec::new();
-        let mut y = 1f32;
-        loop {
-            let y_norm = y / radius;
-            let x_norm = crate::math::powf(
-                1.0 - crate::math::powi(y_norm, squirdleyness),
-                1.0 / squirdleyness as Coord,
-            );
-            let x = x_norm * radius;
-            let inset = radius - x;
-            if inset > 0.0 {
-                crossings.push((
-                    inset as u16,
-                    (crate::math::sqrt(crate::math::fract(inset)) * 256.0) as u8,
-                    (crate::math::sqrt(1.0 - crate::math::fract(inset)) * 256.0) as u8,
-                ));
-            }
-            if x < y {
-                break;
-            }
-            y += 1.0;
-        }
-        let start = (radius - y) as usize;
-        let crossings: Vec<(u16, u8, u8)> = crossings.into_iter().rev().collect();
+        // Span-relative: button height is span/32, where span is the harmonic mean of viewport dims. Strip layout bails downstream if the result is too small to render glyphs.
+        let button_size = crate::math::ceil(span / 32.0) as usize;
 
+        // Single squircle (radius = span/4, squirdleyness 24) shared by the window perimeter AND the controls-strip BL curve — same shape as photon. At typical viewport sizes the curve is too big to fit in the strip and degrades to a rectangular bottom; at high zoom it appears.
+        let (start, crossings) = compute_squircle_crossings(span / 4.0, 24);
         if start == 0 || crossings.is_empty() {
             return;
         }
 
-        chrome::draw_window_edges_and_mask(
+        // Front-to-back chrome rendering. Glyphs (the topmost visible features within a button) have highest priority and run first. Each step uses paint_if_empty so later writers can't overwrite earlier ones.
+        //
+        // Order (top → down):
+        //   1. Window perimeter — writes chrome + carves clip_mask at window boundary.
+        //   2. Maximize glyph (interior + exterior).
+        //   3. Other glyphs (minimize, close).
+        //   4. Strip BL squircle curves.
+        //   5. Strip vertical hairlines (dividers + bottom hairline).
+        //   6. Strip background fill (lowest — fills remaining empty pixels in the strip).
+        // Ctrl+Shift+D+C: skip ONLY the window edge/perimeter. Controls still render. clip_mask stays at host default (255 everywhere), so the window appears as a rectangle (no rounded corners).
+        if !crate::paint::DEBUG_SKIP_CHROME.load(std::sync::atomic::Ordering::Relaxed) {
+            chrome::draw_window_edges_and_mask(
+                chrome_buf,
+                &mut self.hit_test_map,
+                clip_mask,
+                vp_w,
+                vp_h,
+                start,
+                &crossings,
+            );
+        }
+
+        // Ctrl+Shift+D+X: skip ONLY the controls strip (perimeter stays).
+        if crate::paint::DEBUG_SKIP_CONTROLS.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+
+        let strip_w = button_size * 7 / 2;
+        let strip_x = buf_w - strip_w;
+        let button_area_x = strip_x + button_size / 4;
+        let glyph_y = button_size / 2;
+        let glyph_r = button_size / 4;
+        let min_cx = button_area_x + button_size / 2;
+        let max_cx = button_area_x + button_size + button_size / 2;
+        let close_cx = button_area_x + button_size * 2 + button_size / 2;
+
+        chrome::draw_maximize_symbol(
             chrome_buf,
-            &mut self.hit_test_map,
-            clip_mask,
+            buf_w,
+            buf_h,
+            max_cx,
+            glyph_y,
+            glyph_r,
+            theme::MAXIMIZE_GLYPH,
+            theme::MAXIMIZE_GLYPH_INTERIOR,
+            theme::WINDOW_CONTROLS_BG,
+        );
+        chrome::draw_minimize_symbol(
+            chrome_buf,
+            buf_w,
+            buf_h,
+            min_cx,
+            glyph_y,
+            glyph_r,
+            theme::MINIMIZE_GLYPH,
+            theme::WINDOW_CONTROLS_BG,
+        );
+        chrome::draw_close_symbol(
+            chrome_buf,
+            buf_w,
+            buf_h,
+            close_cx,
+            glyph_y,
+            glyph_r,
+            theme::CLOSE_GLYPH,
+            theme::WINDOW_CONTROLS_BG,
+        );
+
+        // Hairlines (dividers + bottom) BEFORE curves: solid lines have to win at intersection pixels, otherwise the curve's inner-AA hairline (which is mostly transparent in the linear region) fragments them. With this order, dividers and bottom hairline claim their pixels first; the BL curve's hairlines fill in only the gaps the straight lines didn't reach.
+        chrome::draw_strip_hairlines(
+            chrome_buf,
             vp_w,
             vp_h,
+            button_size,
             start,
             &crossings,
         );
 
-        // Ctrl+Shift+D+C: suppress chrome RGB so the layers underneath show through. Clip-mask carving (above) is preserved so the window-shape trim stays visible.
-        if crate::paint::DEBUG_SKIP_CHROME.load(std::sync::atomic::Ordering::Relaxed) {
-            chrome_buf.fill(0xFFFFFFFF);
-        }
+        chrome::draw_strip_curves(
+            chrome_buf,
+            &mut self.hit_test_map,
+            vp_w,
+            vp_h,
+            button_size,
+            start,
+            &crossings,
+        );
+
+        chrome::draw_strip_bg(
+            chrome_buf,
+            &mut self.hit_test_map,
+            vp_w,
+            vp_h,
+            button_size,
+            start,
+            &crossings,
+        );
+
     }
 
     /// Paint the hover-overlay delta if the hover layer is dirty. The delta is added (per-channel wrap) onto the chrome layer at the currently-hovered button's pixel positions; on hover_state == HIT_NONE the layer is just zeroed (Add of 0 = no-op).
@@ -222,6 +284,38 @@ impl DefaultChrome {
     pub fn invalidate_chrome(&mut self) {
         self.group.rpn.layers[self.layer_chrome].dirty = true;
     }
+}
+
+/// Compute squircle crossings table for a corner with the given `radius` and `squirdleyness`. Returns `(start, crossings)` where `start` is the distance from the corner-of-corner inward to the curve's first integer-row crossing, and `crossings` is the rev'd table indexed by `i in 0..count` such that at row offset `start + i` the curve is at column `inset_i` with AA values `h_cov_i` and `l_i`. Used for both the window perimeter (radius = span/4) and the controls-strip BL curve (radius = button_size).
+pub(crate) fn compute_squircle_crossings(
+    radius: Coord,
+    squirdleyness: i32,
+) -> (usize, Vec<(u16, u8, u8)>) {
+    let mut crossings: Vec<(u16, u8, u8)> = Vec::new();
+    let mut y = 1f32;
+    loop {
+        let y_norm = y / radius;
+        let x_norm = crate::math::powf(
+            1.0 - crate::math::powi(y_norm, squirdleyness),
+            1.0 / squirdleyness as Coord,
+        );
+        let x = x_norm * radius;
+        let inset = radius - x;
+        if inset > 0.0 {
+            crossings.push((
+                inset as u16,
+                (crate::math::sqrt(crate::math::fract(inset)) * 256.0) as u8,
+                (crate::math::sqrt(1.0 - crate::math::fract(inset)) * 256.0) as u8,
+            ));
+        }
+        if x < y {
+            break;
+        }
+        y += 1.0;
+    }
+    let start = (radius - y) as usize;
+    let crossings: Vec<(u16, u8, u8)> = crossings.into_iter().rev().collect();
+    (start, crossings)
 }
 
 #[cfg(test)]
