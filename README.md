@@ -172,6 +172,18 @@ Spirix (fluor's companion floating-point arithmetic system) is welcome on precis
 
 ---
 
+## The same kernel could scale to a multi-app system compositor
+
+fluor's `Group` — a buffer with a dirty flag, an internal layer stack, and a cached composite — is also the right primitive for a multi-app system compositor. Each app's content becomes one or several Groups in a system-wide z-stack. When app A changes, only A's Groups re-rasterize; every other app's cached composite is reused. The top-level Under chain stitches them together front-to-back with the same `dst >= 0xFF000000` early-out from section 3: opaque content in higher Groups stops the descent for those pixels, so apps below aren't walked where they can't be seen. It's the single-kernel mechanism scaled out one level — every property fluor relies on inside a single app holds at multi-app scale.
+
+That front-to-back ordering becomes a security primitive when enforced through the protocol itself rather than through policy or trust. A lower app cannot overpaint a higher one — the compositor silently drops paints into pixels already claimed by an opaque higher Group. Compare to X11 (no compositor enforces anything; any app can XPutImage anywhere) or Wayland (apps rigidly clipped to per-window surfaces, no cross-window effects possible without bolted-on protocol extensions). The Group model gets both: apps declare paint regions anywhere on screen (absolute mode, in screen RU) or within their own window (relative mode, in window-local RU), and the compositor decides what's actually visible. Privacy is built into the protocol — apps submit Groups but never receive composited results, so they never see other apps' pixels unless the user explicitly grants a read capability (screen capture, accessibility, recording).
+
+"Windows" stop being a kernel primitive and become a shell convention. The shell might give apps a window-sized Group decorated with chrome by default, but a tooltip popping past the window's edge is just a second Group at the right z-slice. System tray icons, notification popovers, modal dim overlays, drag-ghost images that follow the cursor across windows — all just Groups, no per-case protocol extensions of the kind Wayland accumulates. Everything the legacy window primitive struggles to express because the primitive is the wrong abstraction at that level.
+
+**This is not specific to any one compositor.** Any system — wlroots-based, a custom DRM/KMS scanout, a userspace replacement for KWin or Mutter, ferros's own — could adopt this model. fluor's primitives (`Group` for sub-viewport caching, RU for scale invariance, front-to-back for the early-out, one `Under` kernel for one code path) were each chosen for a different local reason; the system-level architecture falls out of them. The generalization is cheap to reach from where fluor already is, but the architectural argument is independent: any compositor built around these primitives gets the same scaling, security, and clarity benefits regardless of what's underneath it.
+
+---
+
 ## Status
 
 **v0 — pre-alpha.** Window chrome, pane composition, and transform-aware text rendering all work end-to-end. Textboxes, widgets, and layout persistence are not yet built. Expect breaking changes at every layer until the first consumer migration validates the API.
@@ -182,7 +194,7 @@ Spirix (fluor's companion floating-point arithmetic system) is welcome on precis
 | Pane tree (`Compositor`) | ✓ insert / remove / get / hit-test / focus / z-order / render |
 | Paint primitives | ✓ Every primitive routes through `Blend::under` (no painter's algorithm anywhere); fill_rect (solid + blend), stroke_rect, circle_filled, glyph rasterizers, background noise; `Clip` + `AlphaMask` + `Transform` types; `quantize_rotation` / `snap_rotation` helpers |
 | Window chrome | ✓ controls strip, edges-and-mask, hairlines, hover overlay; always-visible at minimum window size via `ceil(span/32)` span-relative formula |
-| Drag / resize | ✓ drag-to-move + 8-region edge resize via winit; WM-enforced `min_inner_size = (24, 8)` |
+| Drag / resize | ✓ self-driven loop on every platform — fluor owns input, computes target geometry, pushes via `request_inner_size` / `set_outer_position`; paints every vsync at the OS-confirmed size; Linux X11 uses one atomic `XConfigureWindow` (via `x11rb`) when both size and position change so the WM applies them together. Unified across Linux/Windows/macOS — no WM `drag_resize_window` path, no macOS NSEvent polling hack. WM-enforced `min_inner_size = (24, 8)` |
 | Text rendering | ✓ cosmic-text + swash; Open Sans bundled; transform-aware (arbitrary rotation / skew / scale via `swash::scale`); per-glyph LRU cache keyed on `(font, glyph, size, transform)` |
 | Killswitch close | ✓ `std::process::exit(0)` on close + `CloseRequested` — no Drop chain, kernel reclaims everything |
 | Textbox / widgets | ✗ planned |
@@ -247,6 +259,8 @@ fluor (lib)
                   present buffer initialized to 0x00000000 each frame (calloc-free);
                   Groups flattened topmost-first; finalize_for_os does darkness→visible
                   XOR + clip + premult in a single pass at the OS boundary;
+                  self-driven resize loop owns input → request_inner_size/set_outer_position;
+                  Linux X11: atomic XConfigureWindow via x11rb when both size+pos change;
                   std::process::exit(0) on close for Killswitch compliance)
 ```
 
