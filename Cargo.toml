@@ -48,6 +48,10 @@ cosmic-text = { version = "0.14", optional = true }
 # FontRef + ScaleContext interop trivial.
 swash = { version = "0.2", optional = true }
 
+# x11rb is Linux-only; used to issue ONE atomic XConfigureWindow with all four of (x, y, width, height) when a self-driven resize drag changes both size AND position (left/top/TL/TR/BL edges). winit exposes `request_inner_size` and `set_outer_position` as two separate XConfigureWindow calls — the WM applies them in sequence which is visually distinct ("first size, then position" or vice versa). One atomic call eliminates the seam. Windows (SetWindowPos) and macOS (NSWindow.setFrame) are already atomic via their respective APIs; Wayland disallows client-driven position so the question doesn't arise there.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = "0.13"
+
 [dev-dependencies]
 proptest = "1.5"
 
