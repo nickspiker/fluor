@@ -283,11 +283,11 @@ mod tests {
         // Buffer pre-initialized to canonical empty (0xFFFFFFFF) per the under-chain contract.
         let mut buf = vec![0xFFFFFFFFu32; 8 * 8];
         c.render(&mut buf, 8, 8);
-        // Center pixel at (4, 4): opaque red pane painted under transparent dst → ~opaque red (1-LSB drift).
+        // Center pixel at (4, 4): opaque red pane painted under transparent dst → ~opaque red (1-LSB drift on the dark channels from the >>8 endpoint).
         let center = buf[4 * 8 + 4];
         let (r, g, b, _) = unpack_argb(center);
         assert!(
-            r >= 0xFE && g == 0 && b == 0,
+            r >= 0xFE && g <= 1 && b <= 1,
             "center pixel = {:#010x}",
             center
         );

@@ -10,6 +10,7 @@
 
 use crate::coord::Coord;
 use crate::math;
+use crate::pixel::{Blend, BlendMode};
 use crate::theme;
 
 /// Hit-test IDs that the per-pixel hit_test_map can carry. `HIT_NONE` = clicks pass through. Button IDs are placeholders for the future controls scaffold step.
@@ -17,9 +18,6 @@ pub const HIT_NONE: u8 = 0;
 pub const HIT_MINIMIZE_BUTTON: u8 = 1;
 pub const HIT_MAXIMIZE_BUTTON: u8 = 2;
 pub const HIT_CLOSE_BUTTON: u8 = 3;
-
-/// Minimum pixel height for a control button. The button-sizing formula in higher scaffold steps is `MIN_BUTTON_HEIGHT_PX + ceil(span/32 * ru)` — the floor guarantees controls remain visible (and that symbol-rasterizer integer math never floors to zero) at any window size the WM permits. Kept as a public const so the host can compute layout pre-rasterization.
-pub const MIN_BUTTON_HEIGHT_PX: u32 = 24;
 
 /// Resize-edge classification returned by [`get_resize_edge`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,14 +101,17 @@ pub fn draw_window_edges_and_mask(
         return;
     }
 
-    // Straight edges — opaque RGB only. Clip mask along these edges stays at the host's 255 default (fully visible).
+    // Straight edges — opaque chrome composed via Under. Clip mask along these edges stays at the host's 255 default (fully visible).
     for x in cap..(w - cap) {
-        pixels[x] = light; // top row
-        pixels[(h - 1) * w + x] = shadow; // bottom row
+        pixels[x] = pixels[x].under(light, BlendMode::Normal); // top row
+        let idx = (h - 1) * w + x;
+        pixels[idx] = pixels[idx].under(shadow, BlendMode::Normal); // bottom row
     }
     for y in cap..(h - cap) {
-        pixels[y * w] = light; // left col
-        pixels[y * w + (w - 1)] = shadow; // right col
+        let lidx = y * w;
+        pixels[lidx] = pixels[lidx].under(light, BlendMode::Normal); // left col
+        let ridx = y * w + (w - 1);
+        pixels[ridx] = pixels[ridx].under(shadow, BlendMode::Normal); // right col
     }
 
     // Corner-of-corner cutout (start × start at each corner): the small outer square that the curve never reaches under any squircle parameter. The rest of the cap (the inner L-shape: rows 0..start × cols start..cap, and rows start..cap × cols 0..start) is handled per-pixel by the curve row-walks (zero c in 0..inset at row=start+i) and col-walks (zero r in 0..inset at col=start+i). Curve interior (rows start..cap × cols start..cap, inside the squircle) stays at the default 255.
@@ -159,10 +160,12 @@ pub fn draw_window_edges_and_mask(
         for c in 0..inset {
             clip_mask[row_top * w + c] = 0;
         }
-        pixels[row_top * w + inset] = light;
-        clip_mask[row_top * w + inset] = h_cov;
-        pixels[row_top * w + inset + 1] = light_inner;
-        clip_mask[row_top * w + inset + 1] = 255;
+        let idx = row_top * w + inset;
+        pixels[idx] = pixels[idx].under(light, BlendMode::Normal);
+        clip_mask[idx] = h_cov;
+        let idx = row_top * w + inset + 1;
+        pixels[idx] = pixels[idx].under(light_inner, BlendMode::Normal);
+        clip_mask[idx] = 255;
 
         // TR row-walk
         for c in (w - inset)..w {
@@ -170,49 +173,59 @@ pub fn draw_window_edges_and_mask(
         }
         let tr_out_col = w - 1 - inset;
         let tr_in_col = w - 2 - inset;
-        pixels[row_top * w + tr_out_col] = tr_color(row_top, tr_out_col);
-        clip_mask[row_top * w + tr_out_col] = h_cov;
-        pixels[row_top * w + tr_in_col] =
-            (tr_color(row_top, tr_in_col) & 0x00FFFFFF) | inner_t;
-        clip_mask[row_top * w + tr_in_col] = 255;
+        let idx = row_top * w + tr_out_col;
+        pixels[idx] = pixels[idx].under(tr_color(row_top, tr_out_col), BlendMode::Normal);
+        clip_mask[idx] = h_cov;
+        let idx = row_top * w + tr_in_col;
+        let layer = (tr_color(row_top, tr_in_col) & 0x00FFFFFF) | inner_t;
+        pixels[idx] = pixels[idx].under(layer, BlendMode::Normal);
+        clip_mask[idx] = 255;
 
         // BL row-walk
         for c in 0..inset {
             clip_mask[row_bot * w + c] = 0;
         }
-        pixels[row_bot * w + inset] = bl_color(row_bot, inset);
-        clip_mask[row_bot * w + inset] = h_cov;
-        pixels[row_bot * w + inset + 1] =
-            (bl_color(row_bot, inset + 1) & 0x00FFFFFF) | inner_t;
-        clip_mask[row_bot * w + inset + 1] = 255;
+        let idx = row_bot * w + inset;
+        pixels[idx] = pixels[idx].under(bl_color(row_bot, inset), BlendMode::Normal);
+        clip_mask[idx] = h_cov;
+        let idx = row_bot * w + inset + 1;
+        let layer = (bl_color(row_bot, inset + 1) & 0x00FFFFFF) | inner_t;
+        pixels[idx] = pixels[idx].under(layer, BlendMode::Normal);
+        clip_mask[idx] = 255;
 
         // BR row-walk
         for c in (w - inset)..w {
             clip_mask[row_bot * w + c] = 0;
         }
-        pixels[row_bot * w + (w - 1 - inset)] = shadow;
-        clip_mask[row_bot * w + (w - 1 - inset)] = h_cov;
-        pixels[row_bot * w + (w - 2 - inset)] = shadow_inner;
-        clip_mask[row_bot * w + (w - 2 - inset)] = 255;
+        let idx = row_bot * w + (w - 1 - inset);
+        pixels[idx] = pixels[idx].under(shadow, BlendMode::Normal);
+        clip_mask[idx] = h_cov;
+        let idx = row_bot * w + (w - 2 - inset);
+        pixels[idx] = pixels[idx].under(shadow_inner, BlendMode::Normal);
+        clip_mask[idx] = 255;
 
         // TL col-walk (near-horizontal portion of TL corner).
         for r in 0..inset {
             clip_mask[r * w + col_left] = 0;
         }
-        pixels[inset * w + col_left] = light;
-        clip_mask[inset * w + col_left] = h_cov;
-        pixels[(inset + 1) * w + col_left] = light_inner;
-        clip_mask[(inset + 1) * w + col_left] = 255;
+        let idx = inset * w + col_left;
+        pixels[idx] = pixels[idx].under(light, BlendMode::Normal);
+        clip_mask[idx] = h_cov;
+        let idx = (inset + 1) * w + col_left;
+        pixels[idx] = pixels[idx].under(light_inner, BlendMode::Normal);
+        clip_mask[idx] = 255;
 
         // TR col-walk.
         for r in 0..inset {
             clip_mask[r * w + col_right] = 0;
         }
-        pixels[inset * w + col_right] = tr_color(inset, col_right);
-        clip_mask[inset * w + col_right] = h_cov;
-        pixels[(inset + 1) * w + col_right] =
-            (tr_color(inset + 1, col_right) & 0x00FFFFFF) | inner_t;
-        clip_mask[(inset + 1) * w + col_right] = 255;
+        let idx = inset * w + col_right;
+        pixels[idx] = pixels[idx].under(tr_color(inset, col_right), BlendMode::Normal);
+        clip_mask[idx] = h_cov;
+        let idx = (inset + 1) * w + col_right;
+        let layer = (tr_color(inset + 1, col_right) & 0x00FFFFFF) | inner_t;
+        pixels[idx] = pixels[idx].under(layer, BlendMode::Normal);
+        clip_mask[idx] = 255;
 
         // BL col-walk.
         for r in (h - inset)..h {
@@ -220,28 +233,455 @@ pub fn draw_window_edges_and_mask(
         }
         let bl_out_row = h - 1 - inset;
         let bl_in_row = h - 2 - inset;
-        pixels[bl_out_row * w + col_left] = bl_color(bl_out_row, col_left);
-        clip_mask[bl_out_row * w + col_left] = h_cov;
-        pixels[bl_in_row * w + col_left] =
-            (bl_color(bl_in_row, col_left) & 0x00FFFFFF) | inner_t;
-        clip_mask[bl_in_row * w + col_left] = 255;
+        let idx = bl_out_row * w + col_left;
+        pixels[idx] = pixels[idx].under(bl_color(bl_out_row, col_left), BlendMode::Normal);
+        clip_mask[idx] = h_cov;
+        let idx = bl_in_row * w + col_left;
+        let layer = (bl_color(bl_in_row, col_left) & 0x00FFFFFF) | inner_t;
+        pixels[idx] = pixels[idx].under(layer, BlendMode::Normal);
+        clip_mask[idx] = 255;
 
         // BR col-walk.
         for r in (h - inset)..h {
             clip_mask[r * w + col_right] = 0;
         }
-        pixels[(h - 1 - inset) * w + col_right] = shadow;
-        clip_mask[(h - 1 - inset) * w + col_right] = h_cov;
-        pixels[(h - 2 - inset) * w + col_right] = shadow_inner;
-        clip_mask[(h - 2 - inset) * w + col_right] = 255;
+        let idx = (h - 1 - inset) * w + col_right;
+        pixels[idx] = pixels[idx].under(shadow, BlendMode::Normal);
+        clip_mask[idx] = h_cov;
+        let idx = (h - 2 - inset) * w + col_right;
+        pixels[idx] = pixels[idx].under(shadow_inner, BlendMode::Normal);
+        clip_mask[idx] = 255;
     }
 }
 
-// Removed in the "ONLY THE HAIRLINE" simplification (each was painter's-algorithm internally):
-//   - draw_window_controls         — button strip; opaque bg painted first, then read back by blend_rgb_only at AA crossings (classic painter's).
-//   - draw_button_hairlines        — walked vertically reading just-painted pixels to detect where to stop.
-//   - pixels_for_button            — consumer of the hit_test_map after the controls scaffold.
-//   - draw_button_hover_by_pixels  — additive overlay; depends on the controls scaffold.
-//   - rasterize_window_silhouette  — was for the deleted Op::Or knockout.
-//
-// Each will be re-added as a separate scaffold step, redesigned top-down (compute layout once, write each pixel from a single deterministic source) when the time comes.
+/// Strip geometry consumed by the three `draw_strip_*` functions. Returns `None` if the strip can't fit in the viewport.
+fn strip_layout(
+    width: u32,
+    height: u32,
+    button_size: usize,
+) -> Option<(usize, usize, usize, usize, usize, usize)> {
+    if width < 2 || height < 2 || button_size < 4 {
+        return None;
+    }
+    let w = width as usize;
+    let h = height as usize;
+    let strip_w = button_size * 7 / 2;
+    if strip_w >= w || button_size >= h {
+        return None;
+    }
+    let strip_x = w - strip_w;
+    let button_area_offset = button_size / 4;
+    let last_row = button_size - 1;
+    Some((w, strip_w, strip_x, button_area_offset, last_row, h))
+}
+
+#[inline]
+fn hit_for_dx(dx: usize, button_size: usize, button_area_offset: usize) -> u8 {
+    if dx < button_area_offset {
+        HIT_MINIMIZE_BUTTON
+    } else {
+        let x_in = dx - button_area_offset;
+        if x_in < button_size {
+            HIT_MINIMIZE_BUTTON
+        } else if x_in < button_size * 2 {
+            HIT_MAXIMIZE_BUTTON
+        } else {
+            HIT_CLOSE_BUTTON
+        }
+    }
+}
+
+/// **Step 2** in the chrome rasterizer (after window perimeter). Paint the BL squircle hairline of the controls strip — row-walk (the curve's near-vertical leg) and col-walk (the near-horizontal leg). Uses [`paint_if_empty`] so writes from the window perimeter are not overwritten. Each curve pixel gets at most ONE writer (this function or the perimeter, whichever ran first).
+pub fn draw_strip_curves(
+    pixels: &mut [u32],
+    hit_test_map: &mut [u8],
+    width: u32,
+    height: u32,
+    button_size: usize,
+    start: usize,
+    crossings: &[(u16, u8, u8)],
+) {
+    let Some((w, strip_w, strip_x, button_area_offset, last_row, _h)) =
+        strip_layout(width, height, button_size)
+    else {
+        return;
+    };
+    if start >= button_size {
+        return;
+    }
+    let edge = theme::WINDOW_LIGHT_EDGE;
+    // Hairline geometry: a 1-pixel line extending inward from the curve into the strip body.
+    //   Outer pixel coverage = 1 - fract → opacity = l (sqrt-gamma'd) → chrome t = 255 - l.
+    //   Inner pixel coverage = fract → opacity = h_cov → chrome t = 255 - h_cov.
+    // Under composition handles the actual blending with whatever bg is below the chrome layer.
+
+    // Row-walk.
+    for (i, &(inset_raw, h_cov, l)) in crossings.iter().enumerate() {
+        let dy = start + i;
+        if dy >= button_size {
+            break;
+        }
+        let inset = inset_raw as usize;
+        if inset >= strip_w {
+            continue;
+        }
+        let py = last_row - dy;
+        let outer_v = (edge & 0x00FFFFFF) | (((255u32).saturating_sub(l as u32)) << 24);
+        let outer_idx = py * w + strip_x + inset;
+        pixels[outer_idx] = pixels[outer_idx].under(outer_v, BlendMode::Normal);
+        if inset + 1 < strip_w {
+            let inner_v = (edge & 0x00FFFFFF) | (((255u32).saturating_sub(h_cov as u32)) << 24);
+            let inner_idx = py * w + strip_x + inset + 1;
+            pixels[inner_idx] = pixels[inner_idx].under(inner_v, BlendMode::Normal);
+        }
+    }
+
+    // Col-walk (mirror of row-walk by x↔y symmetry).
+    for (i, &(inset_raw, h_cov, l)) in crossings.iter().enumerate() {
+        let dx = start + i;
+        if dx >= strip_w {
+            break;
+        }
+        let inset = inset_raw as usize;
+        if inset >= button_size {
+            continue;
+        }
+        let outer_py = last_row - inset;
+        let outer_v = (edge & 0x00FFFFFF) | (((255u32).saturating_sub(l as u32)) << 24);
+        let outer_idx = outer_py * w + strip_x + dx;
+        pixels[outer_idx] = pixels[outer_idx].under(outer_v, BlendMode::Normal);
+        if inset + 1 < button_size {
+            let inner_v = (edge & 0x00FFFFFF) | (((255u32).saturating_sub(h_cov as u32)) << 24);
+            let inner_py = last_row - (inset + 1);
+            let inner_idx = inner_py * w + strip_x + dx;
+            pixels[inner_idx] = pixels[inner_idx].under(inner_v, BlendMode::Normal);
+        }
+    }
+    let _ = (hit_test_map, button_area_offset);
+}
+
+/// **Step 3** in the chrome rasterizer. Vertical divider hairlines between min/max and max/close buttons, plus the linear bottom hairline (only relevant when the BL curve doesn't fit). Uses [`paint_if_empty`].
+pub fn draw_strip_hairlines(
+    pixels: &mut [u32],
+    width: u32,
+    height: u32,
+    button_size: usize,
+    start: usize,
+    crossings: &[(u16, u8, u8)],
+) {
+    let Some((w, _strip_w, strip_x, button_area_offset, last_row, _h)) =
+        strip_layout(width, height, button_size)
+    else {
+        return;
+    };
+    let edge = theme::WINDOW_LIGHT_EDGE;
+    let div1 = button_area_offset + button_size;
+    let div2 = button_area_offset + 2 * button_size;
+    let cap = start + crossings.len();
+    let curve_active = start < button_size;
+
+    // Vertical dividers — full height of the strip.
+    for py in 0..button_size {
+        let row_base = py * w;
+        let idx = row_base + strip_x + div1;
+        pixels[idx] = pixels[idx].under(edge, BlendMode::Normal);
+        let idx = row_base + strip_x + div2;
+        pixels[idx] = pixels[idx].under(edge, BlendMode::Normal);
+    }
+
+    // Bottom hairline. When the BL curve is active and cap ≫ strip_w (the typical case), the col-walk's `inset=0` outer pixels already form the visible bottom hairline; this loop only paints the fallback rectangular case (no curve) or the linear region beyond cap.
+    let bottom_row = last_row * w;
+    for px in strip_x..w {
+        let dx = px - strip_x;
+        if !curve_active || dx >= cap {
+            pixels[bottom_row + px] = pixels[bottom_row + px].under(edge, BlendMode::Normal);
+        }
+    }
+}
+
+/// **Step 6** (last). Strip background fill. For every pixel in the strip's geometric interior (= NOT in the BL cutout, NOT the curve's outer pixel), compose `WINDOW_CONTROLS_BG` under via `paint_if_empty`. Empty pixels get filled with strip bg directly; partial-opacity pixels (curve inner, glyph AA) compose strip bg underneath, darkening them toward strip bg — making the chrome layer fully opaque in the strip area.
+///
+/// The curve's OUTER pixel is explicitly skipped because geometrically it sits on the strip's boundary; its "behind" is the bg-layer (panes), not strip bg. Leaving it partial preserves the correct visible-over-panes composite at the Stack step.
+pub fn draw_strip_bg(
+    pixels: &mut [u32],
+    hit_test_map: &mut [u8],
+    width: u32,
+    height: u32,
+    button_size: usize,
+    start: usize,
+    crossings: &[(u16, u8, u8)],
+) {
+    let Some((w, _strip_w, strip_x, button_area_offset, last_row, _h)) =
+        strip_layout(width, height, button_size)
+    else {
+        return;
+    };
+    let bg = theme::WINDOW_CONTROLS_BG;
+    let curve_active = start < button_size;
+    let cap = start + crossings.len();
+
+    let in_strip_interior = |dx: usize, dy: usize| -> bool {
+        if !curve_active {
+            return true;
+        }
+        if dy >= cap || dx >= cap {
+            return true;
+        }
+        // Corner-of-corner cutout — always outside.
+        if dy < start && dx < start {
+            return false;
+        }
+        // Curve row: outer at dx = inset. Inside iff dx > inset.
+        if dy >= start {
+            let inset = crossings[dy - start].0 as usize;
+            return dx > inset;
+        }
+        // Curve col (dy < start, dx >= start): outer at dy = inset.
+        let inset = crossings[dx - start].0 as usize;
+        dy > inset
+    };
+
+    for py in 0..button_size {
+        let dy = last_row - py;
+        let row_base = py * w;
+        for px in strip_x..w {
+            let dx = px - strip_x;
+            if !in_strip_interior(dx, dy) {
+                continue;
+            }
+            let idx = row_base + px;
+            pixels[idx] = pixels[idx].under(bg, BlendMode::Normal);
+            // Hit map is independent of chrome layering — every in-strip-interior pixel registers as the button at this dx, regardless of whether a higher-priority paint (divider/curve/glyph) already claimed the chrome pixel.
+            hit_test_map[idx] = hit_for_dx(dx, button_size, button_area_offset);
+        }
+    }
+}
+
+/// Rasterize the minimize glyph (a small horizontal squircle dash) centered at `(cx, cy)` with radius `r`. Top-down per-pixel: each pixel inside the squircle footprint computes its coverage and writes either the solid `stroke` color or a `stroke`-blended-with-`bg` color. The chrome layer is opaque at the button bg before this call; this function only overwrites pixels INSIDE the glyph footprint.
+pub fn draw_minimize_symbol(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    cx: usize,
+    cy: usize,
+    r: usize,
+    stroke: u32,
+    bg: u32,
+) {
+    let _ = bg;
+    let r = r + 1;
+    let r_render = r / 4 + 1;
+    let r2 = r_render * r_render;
+    let r4 = r2 * r2;
+    let r3 = r_render * r_render * r_render;
+
+    for h in -(r_render as isize)..=(r_render as isize) {
+        for ww in -(r as isize)..=(r as isize) {
+            let h2 = h * h;
+            let h4 = h2 * h2;
+            let a = (ww.abs() - (r * 3 / 4) as isize).max(0);
+            let w2 = a * a;
+            let w4 = w2 * w2;
+            let dist4 = (h4 + w4) as usize;
+            if dist4 > r4 {
+                continue;
+            }
+            let px = cx as isize + ww;
+            let py = cy as isize + h + (r / 2) as isize;
+            if px < 0 || py < 0 || (px as usize) >= width || (py as usize) >= height {
+                continue;
+            }
+            let idx = (py as usize) * width + (px as usize);
+            let gradient = ((r4 - dist4) << 8) / (r3 << 2);
+            // AA via t-byte: opacity = gradient/256 (clamped to 256 = fully opaque).
+            let opacity = gradient.min(256) as u32;
+            if opacity == 0 {
+                continue;
+            }
+            let chrome_t = (256 - opacity).min(255);
+            let value = (stroke & 0x00FFFFFF) | (chrome_t << 24);
+            pixels[idx] = pixels[idx].under(value, BlendMode::Normal);
+        }
+    }
+}
+
+/// Rasterize the maximize glyph (a squircle ring — outer stroke, inner fill) centered at `(cx, cy)`. Top-down per-pixel inside the outer squircle footprint.
+pub fn draw_maximize_symbol(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    cx: usize,
+    cy: usize,
+    r: usize,
+    stroke: u32,
+    fill: u32,
+    bg: u32,
+) {
+    let r = r + 1;
+    let mut r4 = r * r;
+    r4 *= r4;
+    let r3 = r * r * r;
+    let r_inner = r * 4 / 5;
+    let mut r_inner4 = r_inner * r_inner;
+    r_inner4 *= r_inner4;
+    let r_inner3 = r_inner * r_inner * r_inner;
+    let outer_thresh = r3 << 2;
+    let inner_thresh = r_inner3 << 2;
+    let stroke_rgb = (
+        ((stroke >> 16) & 0xFF) as u32,
+        ((stroke >> 8) & 0xFF) as u32,
+        (stroke & 0xFF) as u32,
+    );
+    let fill_rgb = (
+        ((fill >> 16) & 0xFF) as u32,
+        ((fill >> 8) & 0xFF) as u32,
+        (fill & 0xFF) as u32,
+    );
+    let _ = bg;
+
+    for h in -(r as isize)..=(r as isize) {
+        for ww in -(r as isize)..=(r as isize) {
+            let h2 = h * h;
+            let h4 = h2 * h2;
+            let w2 = ww * ww;
+            let w4 = w2 * w2;
+            let dist4 = (h4 + w4) as usize;
+            if dist4 > r4 {
+                continue;
+            }
+            let px = cx as isize + ww;
+            let py = cy as isize + h;
+            if px < 0 || py < 0 || (px as usize) >= width || (py as usize) >= height {
+                continue;
+            }
+            let idx = (py as usize) * width + (px as usize);
+
+            let value = if dist4 <= r_inner4 {
+                // INSIDE inner squircle = fill region. Inner edge (stroke ↔ fill) is between two known glyph colors, so pre-blending is correct here (both colors are deterministic, no bg layer involvement).
+                let dist_from_inner = r_inner4 - dist4;
+                if dist_from_inner <= inner_thresh {
+                    let gradient = (dist_from_inner << 8) / inner_thresh;
+                    let alpha = gradient as u32;
+                    let inv = 256 - alpha;
+                    let r_blend = (stroke_rgb.0 * inv + fill_rgb.0 * alpha) >> 8;
+                    let g_blend = (stroke_rgb.1 * inv + fill_rgb.1 * alpha) >> 8;
+                    let b_blend = (stroke_rgb.2 * inv + fill_rgb.2 * alpha) >> 8;
+                    (r_blend << 16) | (g_blend << 8) | b_blend
+                } else {
+                    fill
+                }
+            } else {
+                // RING region (between inner and outer). Outer edge AA against the bg layer goes via the chrome t-byte — no pre-blending.
+                let dist_from_outer = r4 - dist4;
+                if dist_from_outer <= outer_thresh {
+                    let gradient = (dist_from_outer << 8) / outer_thresh;
+                    let opacity = gradient.min(256) as u32;
+                    if opacity == 0 {
+                        continue;
+                    }
+                    let chrome_t = (256 - opacity).min(255);
+                    (stroke & 0x00FFFFFF) | (chrome_t << 24)
+                } else {
+                    stroke
+                }
+            };
+            pixels[idx] = pixels[idx].under(value, BlendMode::Normal);
+        }
+    }
+}
+
+/// Distance from `(px, py)` to the capsule (rounded-line) `[(x1,y1)..(x2,y2)]` with radius `rad`. Negative inside, positive outside. Used by [`draw_close_symbol`] to rasterize the two diagonals.
+fn distance_to_capsule(px: f32, py: f32, x1: f32, y1: f32, x2: f32, y2: f32, rad: f32) -> f32 {
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let len_sq = dx * dx + dy * dy;
+    let t = if len_sq > 0.0 {
+        let raw = ((px - x1) * dx + (py - y1) * dy) / len_sq;
+        if raw < 0.0 {
+            0.0
+        } else if raw > 1.0 {
+            1.0
+        } else {
+            raw
+        }
+    } else {
+        0.0
+    };
+    let cx = x1 + t * dx;
+    let cy = y1 + t * dy;
+    let ddx = px - cx;
+    let ddy = py - cy;
+    math::sqrt(ddx * ddx + ddy * ddy) - rad
+}
+
+/// Rasterize the close glyph (an X made of two diagonal capsules) centered at `(cx, cy)` with arm half-length `r`. Top-down per-pixel inside the X's bounding box.
+pub fn draw_close_symbol(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    cx: usize,
+    cy: usize,
+    r: usize,
+    stroke: u32,
+    bg: u32,
+) {
+    let r = r + 1;
+    let thickness = ((r / 3).max(1)) as f32;
+    let radius = thickness * 0.5;
+    let end = (r * 2) as f32 / 3.0;
+    let cxf = cx as f32;
+    let cyf = cy as f32;
+    let x1s = cxf - end;
+    let y1s = cyf - end;
+    let x1e = cxf + end;
+    let y1e = cyf + end;
+    let x2s = cxf + end;
+    let y2s = cyf - end;
+    let x2e = cxf - end;
+    let y2e = cyf + end;
+    let stroke_rgb = (
+        ((stroke >> 16) & 0xFF) as u32,
+        ((stroke >> 8) & 0xFF) as u32,
+        (stroke & 0xFF) as u32,
+    );
+    let _ = bg;
+    let _ = stroke_rgb;
+
+    let min_x = cx.saturating_sub(r);
+    let max_x = (cx + r).min(width);
+    let min_y = cy.saturating_sub(r);
+    let max_y = (cy + r).min(height);
+
+    for py in min_y..max_y {
+        for px in min_x..max_x {
+            let pxf = px as f32 + 0.5;
+            let pyf = py as f32 + 0.5;
+            // Choose the diagonal whose orientation matches this quadrant.
+            let use_d1 = (px >= cx && py >= cy) || (px < cx && py < cy);
+            let dist = if use_d1 {
+                distance_to_capsule(pxf, pyf, x1s, y1s, x1e, y1e, radius)
+            } else {
+                distance_to_capsule(pxf, pyf, x2s, y2s, x2e, y2e, radius)
+            };
+            let alpha_f = if dist < -0.5 {
+                1.0
+            } else if dist < 0.5 {
+                0.5 - dist
+            } else {
+                0.0
+            };
+            if alpha_f <= 0.0 {
+                continue;
+            }
+            let idx = py * width + px;
+            // AA via t-byte: opacity = alpha_f (clamped to 1.0 = fully opaque).
+            let opacity = (alpha_f * 256.0).min(256.0) as u32;
+            if opacity == 0 {
+                continue;
+            }
+            let chrome_t = (256 - opacity).min(255);
+            let value = (stroke & 0x00FFFFFF) | (chrome_t << 24);
+            pixels[idx] = pixels[idx].under(value, BlendMode::Normal);
+        }
+    }
+}
