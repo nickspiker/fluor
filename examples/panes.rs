@@ -457,6 +457,12 @@ impl FluorApp for PanesDemo {
                 }
                 EventResponse::Handled
             }
+            WindowEvent::Focused(focused) => {
+                if self.chrome.set_focused(*focused) {
+                    ctx.window.request_redraw();
+                }
+                EventResponse::Pass
+            }
             _ => EventResponse::Pass,
         }
     }
