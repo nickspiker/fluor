@@ -10,7 +10,9 @@
 
 use crate::coord::Coord;
 use crate::math;
+use crate::paint::Clip;
 use crate::pixel::{Blend, BlendMode};
+use crate::text::TextRenderer;
 use crate::theme;
 
 /// Hit-test IDs that the per-pixel hit_test_map can carry. `HIT_NONE` = clicks pass through. Button IDs are placeholders for the future controls scaffold step.
@@ -252,6 +254,45 @@ pub fn draw_window_edges_and_mask(
         pixels[idx] = pixels[idx].under(shadow_inner, BlendMode::Normal);
         clip_mask[idx] = 255;
     }
+}
+
+/// Rasterize the window title text into the chrome layer, left-aligned in the area between the perimeter hairline (left edge) and the controls strip (right edge). Vertically centered in the strip-tall band. Bails on empty title or impractically small `button_size` (below readability — the text wouldn't be legible anyway). Clip rect prevents the title from painting over the controls strip even at long titles or narrow windows. Color is `theme::TEXT_COLOUR`; font is "Open Sans" regular at `button_size * 0.55` — proportional to the rest of the chrome under the current zoom (since button_size is derived from `effective_span`).
+pub fn draw_title_text(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    title: &str,
+    text_renderer: &mut TextRenderer,
+    button_size: usize,
+    strip_x: usize,
+) {
+    if title.is_empty() || button_size < 8 {
+        return;
+    }
+    let left_margin = button_size / 2;
+    let right_margin = button_size / 4;
+    let clip_x_end = strip_x.saturating_sub(right_margin);
+    if left_margin >= clip_x_end {
+        return;
+    }
+    let font_size = button_size as Coord * 0.55;
+    let y_center = button_size as Coord * 0.5;
+    let clip = Clip::new(left_margin, 0, clip_x_end, button_size);
+    text_renderer.draw_text_left_u32(
+        pixels,
+        width,
+        height,
+        title,
+        left_margin as f32,
+        y_center,
+        font_size,
+        400,
+        theme::TEXT_COLOUR,
+        "Open Sans",
+        Some(clip),
+        None,
+        None,
+    );
 }
 
 /// Strip geometry consumed by the three `draw_strip_*` functions. Returns `None` if the strip can't fit in the viewport.
