@@ -115,6 +115,8 @@ impl DefaultChrome {
             return;
         }
 
+        // Reset clip_mask to 255 (fully visible) BEFORE re-carving. The corner cutout is a side effect of `chrome::draw_window_edges_and_mask`, so it MUST run on the same dirty-cycle that resets the mask — otherwise the old (larger or smaller) carving persists. Done here (inside the dirty check) rather than in the host's render_frame, because a per-frame reset there would wipe the carving on frames where chrome is clean and never re-carve, producing rectangular windows whenever the cursor is idle for a tick.
+        clip_mask.fill(255);
         self.hit_test_map.fill(HIT_NONE);
 
         let chrome_buf = &mut self.group.rpn.layers[self.layer_chrome].pixels;
