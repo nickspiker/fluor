@@ -26,6 +26,8 @@ pub struct DefaultChrome {
     pub hit_test_map: Vec<u8>,
     /// Window title rendered into the chrome layer (left-aligned in the controls strip). Empty string = skip text rendering.
     pub title: String,
+    /// Optional bottom status bar. `None` = no bar, panes/bg fill all the way to the squircle bottom (default behaviour). `Some(text)` = paint a `button_size / 2`-tall band at the bottom with the given text left-aligned. Mutate via [`set_status_text`](Self::set_status_text) to mark the chrome layer dirty automatically.
+    pub status_text: Option<String>,
     /// Optional app-icon orb painted in the top-left chrome slot. `None` = no orb, title text starts at the left margin. When `Some`, [`chrome::draw_app_icon`] runs after the perimeter and the title text shifts right by `button_size + button_size/4` so it doesn't overlap.
     pub app_icon: Option<crate::host::icon::Icon>,
     /// Window-focus state. `true` = active (full edge bevel, bright title, ring follows perimeter, icon at full saturation). `false` = inactive (edges + title + orb ring collapse to `LABEL_COLOUR`; orb image desaturates 50 % toward grey when `orb_tint` is `FollowFocus`). Host wires this from `WindowEvent::Focused`. Mutate via [`set_focused`](Self::set_focused) to mark the chrome layer dirty automatically.
@@ -47,7 +49,12 @@ impl DefaultChrome {
     /// Allocate the chrome group + hit_test_map sized to `viewport`. Three layers (bg, chrome, hover) all start dirty so the first frame paints from scratch.
     ///
     /// **Topmost-first scaffold:** the Stack program is the minimal front-to-back composite — `Push chrome, Push bg, Under(Normal)`. Chrome is the topmost layer (controls, edges, hairlines, title), bg is the layer behind it (background_noise + panes). Stack order matches the visual stack: first push lands on the bottom of the eval stack and is the topmost layer; second push goes underneath via `Under`. The hover layer still exists and is rasterized so the API surface is stable; it's omitted from the program until the hover overlay is wired back up via `Push hover, Under(Add)` as the topmost step. Corner knockout (formerly a separate silhouette layer + `Op::Or`) is handled at chrome rasterization time by writing `t=255` directly into the chrome layer's corner pixels — no separate Stack op under the unified Under model.
-    pub fn new(viewport: Viewport, title: impl Into<String>, app_icon: Option<crate::host::icon::Icon>) -> Self {
+    pub fn new(
+        viewport: Viewport,
+        title: impl Into<String>,
+        app_icon: Option<crate::host::icon::Icon>,
+        status_text: Option<String>,
+    ) -> Self {
         let region = Region::new(
             0.0,
             0.0,
@@ -69,6 +76,7 @@ impl DefaultChrome {
             group,
             hit_test_map: alloc::vec![HIT_NONE; map_len],
             title: title.into(),
+            status_text,
             app_icon,
             focused: true,
             orb_tint: chrome::OrbTint::FollowFocus,
@@ -327,6 +335,25 @@ impl DefaultChrome {
             &crossings,
         );
 
+        // Status bar — bottom band, half the height of the top strip. Painted last (after every top-side chrome element) but the regions never overlap, so order is just for readability. `band_h = 0` ⇒ no-op rasterizer when `status_text` is `None` or empty. Hairline uses `edge_light` (same colour as the top strip's dividers); bg matches the top strip's `WINDOW_CONTROLS_BG` so both bands read as the same material. Title-text colour reuses the same focus-driven `title_color` so the status text dims when the window is unfocused.
+        let status_band_h = match self.status_text.as_deref() {
+            Some(t) if !t.is_empty() => button_size / 2,
+            _ => 0,
+        };
+        if status_band_h > 0 {
+            chrome::draw_status_bar(
+                chrome_buf,
+                buf_w,
+                buf_h,
+                status_band_h,
+                theme::WINDOW_CONTROLS_BG,
+                edge_light,
+                self.status_text.as_deref().unwrap_or(""),
+                text,
+                title_color,
+            );
+        }
+
         // Hover overlay: raw wrap-add of the hover colour's darkness into every chrome pixel whose hit_test_map matches the current hover_state. Done LAST so `hit_test_map` is fully populated. This is photon's intentional-wrap hover effect — `chrome_dark.wrapping_add(hover_dark)` per channel, α stays opaque. The wrap is the point: a cyan/magenta/yellow hover colour added to chrome's existing darkness shifts the visible RGB by exactly the hover colour (no overflow = identity), giving a distinct hover state without obscuring the glyph. `.under()` won't work here because chrome's button pixels are opaque after `draw_strip_bg`, so the opaque-top early-out fires and any blend gets silently dropped.
         if self.hover_state != HIT_NONE {
             let hover_color = match self.hover_state {
@@ -405,6 +432,21 @@ impl DefaultChrome {
         true
     }
 
+    /// Update the status bar text. `None` or empty string hides the band entirely. Returns `true` iff the value changed. Marks the chrome layer dirty so the band re-rasterizes (or vanishes) on the next paint.
+    pub fn set_status_text(&mut self, text: Option<String>) -> bool {
+        let changed = match (&self.status_text, &text) {
+            (None, None) => false,
+            (Some(a), Some(b)) => a != b,
+            _ => true,
+        };
+        if !changed {
+            return false;
+        }
+        self.status_text = text;
+        self.group.rpn.layers[self.layer_chrome].dirty = true;
+        true
+    }
+
     /// Mark the bg layer dirty (consumer should call when their bg content needs repaint — pane edits, animation tick, etc.).
     pub fn invalidate_bg(&mut self) {
         self.group.rpn.layers[self.layer_bg].dirty = true;
@@ -456,7 +498,7 @@ mod tests {
 
     #[test]
     fn new_allocates_full_viewport_buffers() {
-        let chrome = DefaultChrome::new(Viewport::new(800, 600), "test", None);
+        let chrome = DefaultChrome::new(Viewport::new(800, 600), "test", None, None);
         assert_eq!(chrome.dims(), (800, 600));
         assert_eq!(chrome.hit_test_map.len(), 800 * 600);
         assert_eq!(chrome.title, "test");
@@ -465,7 +507,7 @@ mod tests {
 
     #[test]
     fn hit_at_outside_viewport_returns_hit_none() {
-        let chrome = DefaultChrome::new(Viewport::new(100, 100), "", None);
+        let chrome = DefaultChrome::new(Viewport::new(100, 100), "", None, None);
         assert_eq!(chrome.hit_at(-1.0, 50.0), HIT_NONE);
         assert_eq!(chrome.hit_at(50.0, -1.0), HIT_NONE);
         assert_eq!(chrome.hit_at(101.0, 50.0), HIT_NONE);
@@ -474,7 +516,7 @@ mod tests {
 
     #[test]
     fn set_hover_returns_true_on_change_only() {
-        let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "", None);
+        let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "", None, None);
         assert!(chrome.set_hover(chrome::HIT_CLOSE_BUTTON)); // changed
         assert!(!chrome.set_hover(chrome::HIT_CLOSE_BUTTON)); // same
         assert!(chrome.set_hover(HIT_NONE)); // changed back
@@ -482,7 +524,7 @@ mod tests {
 
     #[test]
     fn set_hover_marks_chrome_layer_dirty() {
-        let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "", None);
+        let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "", None, None);
         // Run a flatten cycle so StackCompositor::evaluate clears all initial-dirty flags.
         let mut target = alloc::vec![0u32; 100 * 100];
         chrome.flatten_into(&mut target, 100, 100);
@@ -494,7 +536,7 @@ mod tests {
 
     #[test]
     fn resize_marks_layers_dirty_and_resizes_hit_map() {
-        let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "", None);
+        let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "", None, None);
         let mut target = alloc::vec![0u32; 100 * 100];
         chrome.flatten_into(&mut target, 100, 100);
         chrome.resize(Viewport::new(200, 150));

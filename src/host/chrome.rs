@@ -317,6 +317,73 @@ pub fn draw_title_text(
     );
 }
 
+/// Rasterize the bottom status band: a thin strip at `height − band_h .. height` filled with `bg`, topped by a 1-px `hairline_color` divider where the band meets the pane content. Optional left-aligned `text` paints in `text_color` (Open Sans, font size = `band_h × 0.55`). The band is short — `band_h` is typically `button_size / 2` — so it reads as a secondary surface, distinct from the top controls strip.
+///
+/// The window perimeter's clip_mask carving handles the BL/BR squircle corners for free: chrome pixels in the corner cutout are written but masked off at the OS boundary, so the band's rectangular fill becomes a rounded bottom edge without per-pixel geometry here. Bails on `band_h == 0` or impractical `band_h` (>= height) so the rasterizer can be called unconditionally from a `chrome_widget` that always has a status field, with `band_h = 0` meaning "no status bar".
+pub fn draw_status_bar(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    band_h: usize,
+    bg: u32,
+    hairline_color: u32,
+    text: &str,
+    text_renderer: &mut TextRenderer,
+    text_color: u32,
+) {
+    if band_h == 0 || band_h + 1 >= height || width == 0 {
+        return;
+    }
+    let y_top = height - band_h;
+
+    // Top hairline (1 px) — claims y_top across the full width. The squircle perimeter's clip_mask handles rounding at BL/BR.
+    let hairline = 0xFF000000 | (hairline_color & 0x00FFFFFF);
+    let row_top = y_top * width;
+    for x in 0..width {
+        let idx = row_top + x;
+        pixels[idx] = pixels[idx].under(hairline, BlendMode::Normal);
+    }
+
+    // BG fill — opaque pixels in (y_top, height). Front-to-back under-blend means earlier writers (perimeter hairline + corner curve pixels) keep their values; bg fills only the empty interior.
+    let bg_opaque = 0xFF000000 | (bg & 0x00FFFFFF);
+    for y in (y_top + 1)..height {
+        let row_base = y * width;
+        for x in 0..width {
+            let idx = row_base + x;
+            pixels[idx] = pixels[idx].under(bg_opaque, BlendMode::Normal);
+        }
+    }
+
+    // Status text (optional). Horizontally centered in the band; vertically centered in the band's height. `band_h / 2` of side padding on both edges defines the clip so very long status strings don't bleed past the curves. Font size proportional to band height.
+    if text.is_empty() {
+        return;
+    }
+    let side_margin = band_h / 2;
+    let clip_x_end = width.saturating_sub(side_margin);
+    if side_margin >= clip_x_end {
+        return;
+    }
+    let font_size = band_h as Coord * 0.55;
+    let x_center = width as Coord * 0.5;
+    let y_center = y_top as Coord + band_h as Coord * 0.5;
+    let clip = Clip::new(side_margin, y_top, clip_x_end, height);
+    text_renderer.draw_text_center_u32(
+        pixels,
+        width,
+        height,
+        text,
+        x_center,
+        y_center,
+        font_size,
+        400,
+        text_color,
+        "Open Sans",
+        Some(clip),
+        None,
+        None,
+    );
+}
+
 /// Rasterize the top-left app-icon orb: a circular sample of `icon` clipped to `radius`, wrapped in an optional 1-px AA ring stroked in `ring_color`. Topology mirrors [`draw_window_edges_and_mask`]'s two-sided AA: ring is 1px solid + 1px inner-AA + 1px outer-AA. `cx`/`cy` give the orb centre in pixel coords; `radius` is the icon sampling radius (ring extends outward from it). Without an `icon`, the interior fills with `ring_color` (treated as a solid dark disk). Without a `ring_color`, the orb is just the icon clipped to a circle (1-pixel outer-AA against the chrome).
 ///
 /// Pixel sampling is nearest-neighbour from `icon`'s `width × height` source — the source is square in practice (`vsfimg` doesn't reshape) but the math doesn't assume that. Per-pixel cost is one map index + one `under` composite; total work is `O(diameter²)`, well under a millisecond at typical chrome sizes (~30–100 px orbs).

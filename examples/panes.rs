@@ -67,7 +67,12 @@ impl PanesDemo {
         // Decode the bundled app-icon orb (256×256 uncompressed VSF, hp+hb hashes). Bake-in via include_bytes! so the example is a single-file artefact at runtime — no on-disk asset lookup.
         let orb_bytes = include_bytes!("assets/example_orb.vsf");
         let app_icon = Icon::from_vsf_bytes(orb_bytes).ok();
-        let chrome = DefaultChrome::new(viewport, title.clone(), app_icon);
+        let chrome = DefaultChrome::new(
+            viewport,
+            title.clone(),
+            app_icon,
+            Some("ready".to_string()),
+        );
 
         // Placeholder textbox + groups — actual geometry computed in `init`/`on_resize`.
         // textbox_group has two layers: content (under) + glow (on top, pre-knocked by (255-mask)).
