@@ -22,7 +22,7 @@ pub struct Viewport {
     pub perimeter: Coord,
     /// `width² + height²` in pixel units.
     pub diagonal_sq: Coord,
-    /// RU multiplier: 1 RU corresponds to `span * ru` pixels. Default 1.0 — consumers scale this to match their UI density (e.g. set to 1/64 for em-like sizing).
+    /// RU multiplier (zoom). 1 RU corresponds to `span * ru` pixels. Default 1.0 = 100%. Modified at runtime via [`adjust_zoom`](Self::adjust_zoom) / [`reset_zoom`](Self::reset_zoom) bound to `Ctrl/Cmd + plus/minus/0/scroll` in the host. Use [`effective_span`](Self::effective_span) instead of `span` directly anywhere zoom should apply (chrome button size, widget font size, etc.) — bare `span` is the pixel harmonic mean and ignores zoom.
     pub ru: Coord,
     half_w: Coord,
     half_h: Coord,
@@ -86,5 +86,26 @@ impl Viewport {
             x: (px as Coord - self.half_w) / span_ru,
             y: (py as Coord - self.half_h) / span_ru,
         }
+    }
+
+    /// Pixel size of 1 RU under the current zoom (`span * ru`). Use this everywhere "scale by viewport" math used to use bare `span` — chrome button size, glyph font size, widget hairlines, anything the user-facing zoom should affect. Bare `span` is the unzoomed pixel harmonic mean and only matters for OS-edge-adjacent things (e.g. WM resize-border hit zones).
+    #[inline]
+    pub fn effective_span(&self) -> Coord {
+        self.span * self.ru
+    }
+
+    /// Adjust zoom by `steps` (positive = zoom in, negative = zoom out). Asymmetric photon-style log curve: each in-step multiplies `ru` by `32/31` (≈ +3.23%), each out-step by `32/33` (≈ −3.03%). The slight asymmetry means in/out aren't exact inverses — `in_then_out` drifts by `1024/1023 ≈ 1.001` per pair, which is visually imperceptible but matches photon's behaviour exactly so cross-codebase muscle memory transfers. **Unbounded by design** — clamp at the consumer layer if a particular widget needs guardrails; the host applies no min/max.
+    pub fn adjust_zoom(&mut self, steps: f32) {
+        let factor = if steps < 0.0 {
+            (33.0_f32 / 32.0).powf(steps)
+        } else {
+            (31.0_f32 / 32.0).powf(-steps)
+        };
+        self.ru *= factor;
+    }
+
+    /// Reset zoom to 1.0 (bound to `Ctrl/Cmd + 0` in the host).
+    pub fn reset_zoom(&mut self) {
+        self.ru = 1.0;
     }
 }

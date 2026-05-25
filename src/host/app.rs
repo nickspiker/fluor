@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::error::EventLoopError;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::ModifiersState;
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
@@ -198,6 +198,9 @@ impl<A: FluorApp> DesktopShell<A> {
         let Some(text) = self.text.as_mut() else {
             return;
         };
+
+        // Reset clip_mask to 255 (fully visible) each frame BEFORE handing to consumer. Chrome's `rasterize_chrome` carves the corner cutouts and any other shape-trim regions to 0; without resetting, carved bytes from a previous frame's larger chrome (e.g. before a Ctrl+0 zoom reset, or after the window shrank) would persist as permanently-transparent artifacts. memset of width*height bytes is ~0.1ms even at 4K — negligible vs the paint that follows.
+        self.clip_mask.fill(255);
 
         let mut ctx = Context {
             viewport: self.viewport,
@@ -605,6 +608,45 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 self.modifiers = mods.state();
                 self.dispatch_event(event);
             }
+            WindowEvent::KeyboardInput {
+                event: key_event, ..
+            } if (self.modifiers.control_key() || self.modifiers.super_key())
+                && key_event.state == ElementState::Pressed =>
+            {
+                // Ctrl/Cmd + =/+/-/0 → zoom. Match `logical_key.to_text()` (the produced character) rather than `physical_key` so non-US layouts (Colemak/Dvorak/etc.) work — the user pressing the key labelled `=` should zoom in regardless of which physical-position that key occupies. `+` covers Shift+= and the numpad `+`; `=` covers the plain key on US. `-` covers minus and the numpad `-`. `0` covers digit and numpad 0.
+                if let Some(text) = key_event.logical_key.to_text() {
+                    match text {
+                        "=" | "+" => {
+                            self.apply_zoom_change(Some(1.0));
+                            return;
+                        }
+                        "-" => {
+                            self.apply_zoom_change(Some(-1.0));
+                            return;
+                        }
+                        "0" => {
+                            self.apply_zoom_change(None);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                self.dispatch_event(event);
+            }
+            WindowEvent::MouseWheel { delta, .. }
+                if self.modifiers.control_key() || self.modifiers.super_key() =>
+            {
+                // Ctrl/Cmd + scroll → zoom. 1 step per scroll notch (LineDelta). Trackpad PixelDelta accumulates many small events; ~30px per step matches typical trackpad density.
+                let steps: f32 = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => *y,
+                    MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 30.0,
+                };
+                if steps != 0.0 {
+                    self.apply_zoom_change(Some(steps));
+                    return;
+                }
+                self.dispatch_event(event);
+            }
             WindowEvent::Focused(false) => {
                 // Cancel any in-progress resize drag if we lose focus mid-drag (the user alt-tabbed or the WM stole focus). Keeps state consistent.
                 if self.is_dragging_resize {
@@ -641,6 +683,29 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
 }
 
 impl<A: FluorApp + 'static> DesktopShell<A> {
+    /// Apply a zoom change to `self.viewport.ru` and propagate to the consumer. `steps = Some(s)` adjusts by `s` photon-asymmetric log steps (positive in, negative out); `steps = None` resets to 1.0 (Ctrl+0 binding). Calls `app.on_resize` with unchanged pixel dimensions so the consumer's existing resize path picks up the new `ctx.viewport.ru`, marks chrome / widget layers dirty (via their internal Group resize), and re-rasterizes at the new effective span. No separate `on_zoom` callback needed — the consumer's on_resize is the single "viewport changed" entry point.
+    fn apply_zoom_change(&mut self, steps: Option<f32>) {
+        match steps {
+            Some(s) => self.viewport.adjust_zoom(s),
+            None => self.viewport.reset_zoom(),
+        }
+        if let (Some(window), Some(text)) = (self.window.as_ref().cloned(), self.text.as_mut()) {
+            let mut ctx = Context {
+                viewport: self.viewport,
+                text,
+                clip_mask: &mut self.clip_mask,
+                window: &window,
+                modifiers: self.modifiers,
+                cursor_x: self.cursor_x,
+                cursor_y: self.cursor_y,
+            };
+            self.app
+                .on_resize(self.viewport.width_px, self.viewport.height_px, &mut ctx);
+            drop(ctx);
+            window.request_redraw();
+        }
+    }
+
     /// Helper: dispatch a generic event to `app.on_event`, applying any returned [`EventResponse`].
     fn dispatch_event(&mut self, event: WindowEvent) {
         if let (Some(window), Some(text)) = (self.window.as_ref().cloned(), self.text.as_mut()) {

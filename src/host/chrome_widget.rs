@@ -30,6 +30,8 @@ pub struct DefaultChrome {
     pub hover_state: u8,
     /// Cached pixel index list for the currently hovered button — recomputed on hover-state change.
     pub hover_pixel_list: Vec<usize>,
+    /// Last viewport passed to `new` or `resize`. Stored so chrome rasterization can read `effective_span` (= `span * ru`) and pick up the user's zoom multiplier automatically — chrome control sizing scales with the same `ceil(effective_span/32)` formula, so Ctrl+/ Ctrl-/ Ctrl+scroll zoom the chrome together with content.
+    viewport: Viewport,
     layer_bg: usize,
     layer_chrome: usize,
     layer_hover: usize,
@@ -62,13 +64,14 @@ impl DefaultChrome {
             title: title.into(),
             hover_state: HIT_NONE,
             hover_pixel_list: Vec::new(),
+            viewport,
             layer_bg,
             layer_chrome,
             layer_hover,
         }
     }
 
-    /// Resize the chrome group + hit_test_map to a new viewport. All layers go dirty.
+    /// Resize the chrome group + hit_test_map to a new viewport. Also called when only zoom (`viewport.ru`) changed without size, so chrome re-rasterizes at the new effective span. All layers go dirty either way.
     pub fn resize(&mut self, viewport: Viewport) {
         let region = Region::new(
             0.0,
@@ -79,6 +82,7 @@ impl DefaultChrome {
         self.group.resize(region);
         let map_len = (viewport.width_px as usize).saturating_mul(viewport.height_px as usize);
         self.hit_test_map.resize(map_len, HIT_NONE);
+        self.viewport = viewport;
     }
 
     /// Buffer dimensions (full viewport).
@@ -120,9 +124,9 @@ impl DefaultChrome {
             return;
         }
 
-        // Compute span + button size shared by controls and squircle.
-        let span = 2.0 * vp_w as Coord * vp_h as Coord / (vp_w as Coord + vp_h as Coord);
-        // Span-relative: button height is span/32, where span is the harmonic mean of viewport dims. Strip layout bails downstream if the result is too small to render glyphs.
+        // Compute span + button size shared by controls and squircle. Use the viewport's `effective_span` (= `span * ru`) so chrome scales with the user's zoom — Ctrl+/Ctrl-/Ctrl+scroll zoom the chrome together with content.
+        let span = self.viewport.effective_span();
+        // Span-relative: button height is span/32, where span is the harmonic mean of viewport dims times zoom. Strip layout bails downstream if the result is too small to render glyphs.
         let button_size = crate::math::ceil(span / 32.0) as usize;
 
         // Single squircle (radius = span/4, squirdleyness 24) shared by the window perimeter AND the controls-strip BL curve — same shape as photon. At typical viewport sizes the curve is too big to fit in the strip and degrades to a rectangular bottom; at high zoom it appears.
