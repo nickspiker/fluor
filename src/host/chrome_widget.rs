@@ -26,6 +26,8 @@ pub struct DefaultChrome {
     pub hit_test_map: Vec<u8>,
     /// Window title rendered into the chrome layer (left-aligned in the controls strip). Empty string = skip text rendering.
     pub title: String,
+    /// Optional app-icon orb painted in the top-left chrome slot. `None` = no orb, title text starts at the left margin. When `Some`, [`chrome::draw_app_icon`] runs after the perimeter and the title text shifts right by `button_size + button_size/4` so it doesn't overlap.
+    pub app_icon: Option<crate::host::icon::Icon>,
     /// Currently-hovered button id (HIT_NONE if none). Rasterized as a colour delta on the hover layer.
     pub hover_state: u8,
     /// Cached pixel index list for the currently hovered button — recomputed on hover-state change.
@@ -41,7 +43,7 @@ impl DefaultChrome {
     /// Allocate the chrome group + hit_test_map sized to `viewport`. Three layers (bg, chrome, hover) all start dirty so the first frame paints from scratch.
     ///
     /// **Topmost-first scaffold:** the Stack program is the minimal front-to-back composite — `Push chrome, Push bg, Under(Normal)`. Chrome is the topmost layer (controls, edges, hairlines, title), bg is the layer behind it (background_noise + panes). Stack order matches the visual stack: first push lands on the bottom of the eval stack and is the topmost layer; second push goes underneath via `Under`. The hover layer still exists and is rasterized so the API surface is stable; it's omitted from the program until the hover overlay is wired back up via `Push hover, Under(Add)` as the topmost step. Corner knockout (formerly a separate silhouette layer + `Op::Or`) is handled at chrome rasterization time by writing `t=255` directly into the chrome layer's corner pixels — no separate Stack op under the unified Under model.
-    pub fn new(viewport: Viewport, title: impl Into<String>) -> Self {
+    pub fn new(viewport: Viewport, title: impl Into<String>, app_icon: Option<crate::host::icon::Icon>) -> Self {
         let region = Region::new(
             0.0,
             0.0,
@@ -63,6 +65,7 @@ impl DefaultChrome {
             group,
             hit_test_map: alloc::vec![HIT_NONE; map_len],
             title: title.into(),
+            app_icon,
             hover_state: HIT_NONE,
             hover_pixel_list: Vec::new(),
             viewport,
@@ -143,6 +146,22 @@ impl DefaultChrome {
         let strip_w = button_size * 7 / 2;
         let strip_x = buf_w.saturating_sub(strip_w);
 
+        // App-icon orb layout: centered in the top-left `button_size`-tall band, mirroring the right-side controls strip. Diameter is half the band height so the orb reads as a tasteful badge rather than a full button. Title text shifts right by the orb's footprint when an icon is present. `draw_app_icon` has an `r < 2` early-return so degenerate sizes pass through without drawing — no min-size guard needed here.
+        let orb_present = self.app_icon.is_some();
+        let orb_diameter = if orb_present {
+            (button_size / 2) as isize
+        } else {
+            0
+        };
+        let orb_radius = orb_diameter / 2;
+        let orb_cx = (button_size / 2) as isize;
+        let orb_cy = (button_size / 2) as isize;
+        let title_left_extra = if orb_present {
+            orb_diameter as usize
+        } else {
+            0
+        };
+
         // Front-to-back chrome rendering. Earliest writers WIN — `pixels[i].under(...)`'s opaque-top early-out makes later writes a no-op on pixels a previous step already claimed opaque.
         //
         // Order (top → down):
@@ -164,6 +183,19 @@ impl DefaultChrome {
                 start,
                 &crossings,
             );
+            if orb_present {
+                chrome::draw_app_icon(
+                    chrome_buf,
+                    Some(&mut self.hit_test_map),
+                    buf_w,
+                    buf_h,
+                    orb_cx,
+                    orb_cy,
+                    orb_radius,
+                    self.app_icon.as_ref(),
+                    Some(theme::WINDOW_LIGHT_EDGE),
+                );
+            }
             chrome::draw_title_text(
                 chrome_buf,
                 buf_w,
@@ -172,6 +204,7 @@ impl DefaultChrome {
                 text,
                 button_size,
                 strip_x,
+                title_left_extra,
             );
         }
 
@@ -358,7 +391,7 @@ mod tests {
 
     #[test]
     fn new_allocates_full_viewport_buffers() {
-        let chrome = DefaultChrome::new(Viewport::new(800, 600), "test");
+        let chrome = DefaultChrome::new(Viewport::new(800, 600), "test", None);
         assert_eq!(chrome.dims(), (800, 600));
         assert_eq!(chrome.hit_test_map.len(), 800 * 600);
         assert_eq!(chrome.title, "test");
@@ -367,7 +400,7 @@ mod tests {
 
     #[test]
     fn hit_at_outside_viewport_returns_hit_none() {
-        let chrome = DefaultChrome::new(Viewport::new(100, 100), "");
+        let chrome = DefaultChrome::new(Viewport::new(100, 100), "", None);
         assert_eq!(chrome.hit_at(-1.0, 50.0), HIT_NONE);
         assert_eq!(chrome.hit_at(50.0, -1.0), HIT_NONE);
         assert_eq!(chrome.hit_at(101.0, 50.0), HIT_NONE);
@@ -376,7 +409,7 @@ mod tests {
 
     #[test]
     fn set_hover_returns_true_on_change_only() {
-        let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "");
+        let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "", None);
         assert!(chrome.set_hover(chrome::HIT_CLOSE_BUTTON)); // changed
         assert!(!chrome.set_hover(chrome::HIT_CLOSE_BUTTON)); // same
         assert!(chrome.set_hover(HIT_NONE)); // changed back
@@ -384,7 +417,7 @@ mod tests {
 
     #[test]
     fn set_hover_marks_chrome_layer_dirty() {
-        let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "");
+        let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "", None);
         // Run a flatten cycle so StackCompositor::evaluate clears all initial-dirty flags.
         let mut target = alloc::vec![0u32; 100 * 100];
         chrome.flatten_into(&mut target, 100, 100);
@@ -396,7 +429,7 @@ mod tests {
 
     #[test]
     fn resize_marks_layers_dirty_and_resizes_hit_map() {
-        let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "");
+        let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "", None);
         let mut target = alloc::vec![0u32; 100 * 100];
         chrome.flatten_into(&mut target, 100, 100);
         chrome.resize(Viewport::new(200, 150));
