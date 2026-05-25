@@ -105,8 +105,8 @@ impl DefaultChrome {
 
     /// **Scaffold step 1 (top of stack: AA rounded hairline only):** paint the squircle-cornered window-perimeter hairline into the chrome layer via [`chrome::draw_window_edges_and_mask`]. Chrome layer carries OPAQUE RGB only at the hairline; partial-α window-shape coverage (corner curve AA + outside-curve cutout) is written into `clip_mask` so the OS boundary can fold it into the final alpha in one pass.
     ///
-    /// The `text` parameter is accepted for forward-compat with the title text pass; currently unused.
-    pub fn rasterize_chrome(&mut self, _text: &mut TextRenderer, clip_mask: &mut [u8]) {
+    /// `text` is used by the title text rasterization pass (Open Sans, span-relative font size, left-aligned in the area to the left of the controls strip).
+    pub fn rasterize_chrome(&mut self, text: &mut TextRenderer, clip_mask: &mut [u8]) {
         let (buf_w, buf_h) = self.dims();
         let vp_w = buf_w as u32;
         let vp_h = buf_h as u32;
@@ -139,16 +139,21 @@ impl DefaultChrome {
             return;
         }
 
-        // Front-to-back chrome rendering. Glyphs (the topmost visible features within a button) have highest priority and run first. Each step uses paint_if_empty so later writers can't overwrite earlier ones.
+        // Controls-strip layout. Computed early so the title text pass can clip against `strip_x` (title shouldn't paint over the buttons even at long titles or narrow windows). The strip lives in the top-right `button_size`-tall band, `strip_w` wide.
+        let strip_w = button_size * 7 / 2;
+        let strip_x = buf_w.saturating_sub(strip_w);
+
+        // Front-to-back chrome rendering. Earliest writers WIN — `pixels[i].under(...)`'s opaque-top early-out makes later writes a no-op on pixels a previous step already claimed opaque.
         //
         // Order (top → down):
         //   1. Window perimeter — writes chrome + carves clip_mask at window boundary.
-        //   2. Maximize glyph (interior + exterior).
-        //   3. Other glyphs (minimize, close).
-        //   4. Strip BL squircle curves.
-        //   5. Strip vertical hairlines (dividers + bottom hairline).
+        //   2. Title text — left-aligned in the area to the left of the controls strip, on top of whatever strip_bg would later paint.
+        //   3. Maximize / minimize / close glyphs (per-button).
+        //   4. Strip vertical hairlines (dividers + bottom hairline).
+        //   5. Strip BL squircle curves.
         //   6. Strip background fill (lowest — fills remaining empty pixels in the strip).
-        // Ctrl+Shift+D+C: skip ONLY the window edge/perimeter. Controls still render. clip_mask stays at host default (255 everywhere), so the window appears as a rectangle (no rounded corners).
+        //   7. Hover-state tint baked into chrome (wrap-add on hit_test_map matches).
+        // Ctrl+Shift+D+C: skip the window edge/perimeter AND title text (both are "decoration"). Controls still render. clip_mask stays at host default (255 everywhere), so the window appears as a rectangle (no rounded corners).
         if !crate::paint::DEBUG_SKIP_CHROME.load(std::sync::atomic::Ordering::Relaxed) {
             chrome::draw_window_edges_and_mask(
                 chrome_buf,
@@ -159,15 +164,22 @@ impl DefaultChrome {
                 start,
                 &crossings,
             );
+            chrome::draw_title_text(
+                chrome_buf,
+                buf_w,
+                buf_h,
+                &self.title,
+                text,
+                button_size,
+                strip_x,
+            );
         }
 
-        // Ctrl+Shift+D+X: skip ONLY the controls strip (perimeter stays).
+        // Ctrl+Shift+D+X: skip ONLY the controls strip (perimeter + title stay).
         if crate::paint::DEBUG_SKIP_CONTROLS.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
 
-        let strip_w = button_size * 7 / 2;
-        let strip_x = buf_w - strip_w;
         let button_area_x = strip_x + button_size / 4;
         let glyph_y = button_size / 2;
         let glyph_r = button_size / 4;
