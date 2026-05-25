@@ -23,6 +23,24 @@ pub const HIT_MAXIMIZE_BUTTON: u8 = 2;
 pub const HIT_CLOSE_BUTTON: u8 = 3;
 pub const HIT_APP_ICON: u8 = 4;
 
+/// Orb visual state. The app sets this to give the orb a meaning beyond window-focus (network indicator, recording badge, presence light). Layered defaults: `FollowFocus` means "ring matches the perimeter, image dims when the window is unfocused" with zero app code; `Custom` lets the app dictate ring colour + brightness regardless of window state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrbTint {
+    /// Default — ring colour equals the active perimeter colour and the orb image desaturates to 50 % grey when the window is unfocused. Window-state-as-orb-state, no app intervention.
+    FollowFocus,
+    /// App-driven override. `ring` paints the AA ring (already darkness-packed, e.g. a `theme::*` constant or `dark(fmt(0x00_FF_FF_FF))`). `brighten = true` applies photon's 3/2 lift to the icon image (online/active state), `false` leaves it as decoded.
+    Custom {
+        ring: u32,
+        brighten: bool,
+    },
+}
+
+impl Default for OrbTint {
+    fn default() -> Self {
+        OrbTint::FollowFocus
+    }
+}
+
 /// Resize-edge classification returned by [`get_resize_edge`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResizeEdge {
@@ -86,6 +104,8 @@ pub fn draw_window_edges_and_mask(
     height: u32,
     start: usize,
     crossings: &[(u16, u8, u8)],
+    light: u32,
+    shadow: u32,
 ) {
     let _ = hit_test_map;
     if width < 2 || height < 2 {
@@ -96,9 +116,6 @@ pub fn draw_window_edges_and_mask(
     if start * 2 >= w || start * 2 >= h {
         return;
     }
-
-    let light = theme::WINDOW_LIGHT_EDGE;
-    let shadow = theme::WINDOW_SHADOW_EDGE;
     let count = crossings.len();
     let cap = start + count;
     if cap * 2 >= w || cap * 2 >= h {
@@ -258,7 +275,7 @@ pub fn draw_window_edges_and_mask(
     }
 }
 
-/// Rasterize the window title text into the chrome layer, left-aligned in the area between the perimeter hairline (left edge) and the controls strip (right edge). Vertically centered in the strip-tall band. `left_extra` shifts the start position right to make room for the app-icon orb (pass `0` when no orb). Bails on empty title or impractically small `button_size` (below readability — the text wouldn't be legible anyway). Clip rect prevents the title from painting over the controls strip even at long titles or narrow windows. Color is `theme::TEXT_COLOUR`; font is "Open Sans" regular at `button_size * 0.55` — proportional to the rest of the chrome under the current zoom (since button_size is derived from `effective_span`).
+/// Rasterize the window title text into the chrome layer, left-aligned in the area between the perimeter hairline (left edge) and the controls strip (right edge). Vertically centered in the strip-tall band. `left_extra` shifts the start position right to make room for the app-icon orb (pass `0` when no orb). `color` is darkness-packed (typically `theme::TEXT_COLOUR` when focused, `theme::LABEL_COLOUR` when unfocused). Bails on empty title or impractically small `button_size` (below readability — the text wouldn't be legible anyway). Clip rect prevents the title from painting over the controls strip even at long titles or narrow windows. Font is "Open Sans" regular at `button_size * 0.55` — proportional to the rest of the chrome under the current zoom (since button_size is derived from `effective_span`).
 pub fn draw_title_text(
     pixels: &mut [u32],
     width: usize,
@@ -268,6 +285,7 @@ pub fn draw_title_text(
     button_size: usize,
     strip_x: usize,
     left_extra: usize,
+    color: u32,
 ) {
     if title.is_empty() || button_size < 8 {
         return;
@@ -291,7 +309,7 @@ pub fn draw_title_text(
         y_center,
         font_size,
         400,
-        theme::TEXT_COLOUR,
+        color,
         "Open Sans",
         Some(clip),
         None,
@@ -314,6 +332,8 @@ pub fn draw_app_icon(
     radius: isize,
     icon: Option<&Icon>,
     ring_color: Option<u32>,
+    darken: u8,
+    brighten: bool,
 ) {
     let r = radius;
     if r < 2 {
@@ -373,10 +393,10 @@ pub fn draw_app_icon(
             if let Some(ring) = ring_color {
                 let ring_rgb = ring & 0x00FFFFFF;
                 if dist2 <= r_inner_inner2 {
-                    let top = sample_icon(icon, dx, dy, r, ring);
+                    let top = sample_icon(icon, dx, dy, r, ring, darken, brighten);
                     pixels[idx] = pixels[idx].under(top, BlendMode::Normal);
                 } else if dist2 < r_inner2 {
-                    let icon_pixel = sample_icon(icon, dx, dy, r, ring);
+                    let icon_pixel = sample_icon(icon, dx, dy, r, ring, darken, brighten);
                     // dist2 ∈ (r_inner_inner², r_inner²) (strict on both sides). numerator < diff_inner, (numerator << 8) < diff_inner << 8, division < 256 — fits a u8 cleanly with no clamp.
                     let t = ((dist2 - r_inner_inner2) << 8) / diff_inner;
                     let mixed = mix_rgb(icon_pixel, 0xFF000000 | ring_rgb, t as u32);
@@ -394,10 +414,10 @@ pub fn draw_app_icon(
                     continue;
                 }
                 if dist2 <= r_inner_inner2 {
-                    let top = sample_icon(icon, dx, dy, r, 0);
+                    let top = sample_icon(icon, dx, dy, r, 0, darken, brighten);
                     pixels[idx] = pixels[idx].under(top, BlendMode::Normal);
                 } else {
-                    let icon_pixel = sample_icon(icon, dx, dy, r, 0);
+                    let icon_pixel = sample_icon(icon, dx, dy, r, 0, darken, brighten);
                     // dist2 ∈ (r_inner_inner², r_inner²]. r_inner² − dist2 ∈ [0, diff_inner), so (numerator << 8)/diff_inner < 256 — fits u8 with no clamp.
                     let edge_a = ((r_inner2 - dist2) << 8) / diff_inner;
                     let top = ((edge_a as u32) << 24) | (icon_pixel & 0x00FFFFFF);
@@ -408,11 +428,19 @@ pub fn draw_app_icon(
     }
 }
 
-/// Nearest-neighbour fetch from `icon` for offset `(dx, dy)` from the orb centre, scaled to fit `radius`. Returns an opaque α + darkness pixel. Falls back to a solid darkened version of `ring_color` (or solid dark grey) when no icon is present — keeps the orb visually anchored even without art.
+/// Nearest-neighbour fetch from `icon` for offset `(dx, dy)` from the orb centre, scaled to fit `radius`. Returns an opaque α + darkness pixel after applying `brighten` (photon's 3/2 visible-RGB lift) and `darken` (linear blend toward mid-grey: 0 = icon as-is, 255 = fully grey). Falls back to a solid `fallback_ring` (or dark grey) when no icon is present.
 ///
 /// Precondition: caller only invokes this when `dx² + dy² ≤ r_inner² = (r−1)²`, so `|dx|, |dy| ≤ r−1` and `u = (dx+r+0.5)/(2r) ∈ (0, 1)` strictly — `sx = (u * img.width) as usize` is therefore `< img.width`. Violating that precondition panics on the index (fail loud).
-fn sample_icon(icon: Option<&Icon>, dx: isize, dy: isize, radius: isize, fallback_ring: u32) -> u32 {
-    if let Some(img) = icon {
+fn sample_icon(
+    icon: Option<&Icon>,
+    dx: isize,
+    dy: isize,
+    radius: isize,
+    fallback_ring: u32,
+    darken: u8,
+    brighten: bool,
+) -> u32 {
+    let raw = if let Some(img) = icon {
         let diameter = (radius * 2) as f32;
         let u = ((dx + radius) as f32 + 0.5) / diameter;
         let v = ((dy + radius) as f32 + 0.5) / diameter;
@@ -423,7 +451,35 @@ fn sample_icon(icon: Option<&Icon>, dx: isize, dy: isize, radius: isize, fallbac
         0xFF000000 | (fallback_ring & 0x00FFFFFF)
     } else {
         0xFF7F7F7F
+    };
+    modulate_icon_pixel(raw, darken, brighten)
+}
+
+/// Apply photon-style brighten (visible_RGB × 3/2 saturating) and a linear-blend-toward-mid-grey darken in one pass. α byte is preserved (always opaque for icon pixels).
+///
+/// In α + darkness terms: brighten visible_R = `min(255, vR × 3/2)` becomes `dR_new = dR.saturating_sub((255 − dR) / 2)`. saturating_sub kept because brightening already-dark pixels (`dR < 85`) would wrap u32 below zero without it — clamping at 0 is the correct "can't brighten past full visible" outcome.
+fn modulate_icon_pixel(pixel: u32, darken: u8, brighten: bool) -> u32 {
+    let mut dr = (pixel >> 16) & 0xFF;
+    let mut dg = (pixel >> 8) & 0xFF;
+    let mut db = pixel & 0xFF;
+
+    if brighten {
+        dr = dr.saturating_sub((255 - dr) / 2);
+        dg = dg.saturating_sub((255 - dg) / 2);
+        db = db.saturating_sub((255 - db) / 2);
     }
+
+    if darken > 0 {
+        let f = darken as u32;
+        let inv = 255 - f;
+        // Mid-grey in darkness space (= mid-grey in visible space, since 0x80 ≈ 255 − 0x7F). Linear lerp on each darkness channel toward this neutral.
+        let grey = 0x80u32;
+        dr = (dr * inv + grey * f) / 255;
+        dg = (dg * inv + grey * f) / 255;
+        db = (db * inv + grey * f) / 255;
+    }
+
+    (pixel & 0xFF000000) | (dr << 16) | (dg << 8) | db
 }
 
 /// Per-channel linear interpolation in darkness space: `t = 0` returns `a`, `t = 255` returns `b`. Keeps the α byte from `a`. Used for blending the icon with the ring across the inner-AA edge.
@@ -490,6 +546,8 @@ pub fn draw_strip_curves(
     button_size: usize,
     start: usize,
     crossings: &[(u16, u8, u8)],
+    edge_vert: u32,
+    edge_horiz: u32,
 ) {
     let Some((w, strip_w, strip_x, button_area_offset, last_row, _h)) =
         strip_layout(width, height, button_size)
@@ -499,13 +557,14 @@ pub fn draw_strip_curves(
     if start >= button_size {
         return;
     }
-    let edge = theme::WINDOW_LIGHT_EDGE;
     // Hairline geometry: a 1-pixel line extending inward from the curve into the strip body.
     //   Outer pixel coverage = 1 − fract → α = l (sqrt-gamma'd, stored directly).
     //   Inner pixel coverage = fract → α = h_cov (stored directly).
     // Under composition handles the actual blending with whatever bg is below the chrome layer.
+    //
+    // Two colours: row-walk paints pixels along the curve's *vertical* face (extends UP the strip's left edge — continues the left-of-window light bevel), col-walk paints along the curve's *horizontal* face (extends RIGHT along the strip's bottom — continues the bottom-of-window shadow bevel). Same shape, two colours because two edges meet at this corner.
 
-    // Row-walk.
+    // Row-walk — vertical face → light edge.
     for (i, &(inset_raw, h_cov, l)) in crossings.iter().enumerate() {
         let dy = start + i;
         if dy >= button_size {
@@ -517,17 +576,17 @@ pub fn draw_strip_curves(
         }
         let py = last_row - dy;
         // α-conv: opacity α=l for the outer pixel (=255−old_t where old_t=255−l).
-        let outer_v = (edge & 0x00FFFFFF) | ((l as u32) << 24);
+        let outer_v = (edge_vert & 0x00FFFFFF) | ((l as u32) << 24);
         let outer_idx = py * w + strip_x + inset;
         pixels[outer_idx] = pixels[outer_idx].under(outer_v, BlendMode::Normal);
         if inset + 1 < strip_w {
-            let inner_v = (edge & 0x00FFFFFF) | ((h_cov as u32) << 24);
+            let inner_v = (edge_vert & 0x00FFFFFF) | ((h_cov as u32) << 24);
             let inner_idx = py * w + strip_x + inset + 1;
             pixels[inner_idx] = pixels[inner_idx].under(inner_v, BlendMode::Normal);
         }
     }
 
-    // Col-walk (mirror of row-walk by x↔y symmetry).
+    // Col-walk — horizontal face → shadow edge.
     for (i, &(inset_raw, h_cov, l)) in crossings.iter().enumerate() {
         let dx = start + i;
         if dx >= strip_w {
@@ -538,11 +597,11 @@ pub fn draw_strip_curves(
             continue;
         }
         let outer_py = last_row - inset;
-        let outer_v = (edge & 0x00FFFFFF) | ((l as u32) << 24);
+        let outer_v = (edge_horiz & 0x00FFFFFF) | ((l as u32) << 24);
         let outer_idx = outer_py * w + strip_x + dx;
         pixels[outer_idx] = pixels[outer_idx].under(outer_v, BlendMode::Normal);
         if inset + 1 < button_size {
-            let inner_v = (edge & 0x00FFFFFF) | ((h_cov as u32) << 24);
+            let inner_v = (edge_horiz & 0x00FFFFFF) | ((h_cov as u32) << 24);
             let inner_py = last_row - (inset + 1);
             let inner_idx = inner_py * w + strip_x + dx;
             pixels[inner_idx] = pixels[inner_idx].under(inner_v, BlendMode::Normal);
@@ -559,13 +618,13 @@ pub fn draw_strip_hairlines(
     button_size: usize,
     start: usize,
     crossings: &[(u16, u8, u8)],
+    edge: u32,
 ) {
     let Some((w, _strip_w, strip_x, button_area_offset, last_row, _h)) =
         strip_layout(width, height, button_size)
     else {
         return;
     };
-    let edge = theme::WINDOW_LIGHT_EDGE;
     let div1 = button_area_offset + button_size;
     let div2 = button_area_offset + 2 * button_size;
     let cap = start + crossings.len();

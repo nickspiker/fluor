@@ -288,6 +288,8 @@ impl DesktopApp {
                         vp_h,
                         start,
                         &crossings,
+                        crate::theme::WINDOW_LIGHT_EDGE,
+                        crate::theme::WINDOW_SHADOW_EDGE,
                     );
                 }
                 let _ = title; // title + text rendering deferred to the next scaffold step

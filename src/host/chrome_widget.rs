@@ -28,6 +28,10 @@ pub struct DefaultChrome {
     pub title: String,
     /// Optional app-icon orb painted in the top-left chrome slot. `None` = no orb, title text starts at the left margin. When `Some`, [`chrome::draw_app_icon`] runs after the perimeter and the title text shifts right by `button_size + button_size/4` so it doesn't overlap.
     pub app_icon: Option<crate::host::icon::Icon>,
+    /// Window-focus state. `true` = active (full edge bevel, bright title, ring follows perimeter, icon at full saturation). `false` = inactive (edges + title + orb ring collapse to `LABEL_COLOUR`; orb image desaturates 50 % toward grey when `orb_tint` is `FollowFocus`). Host wires this from `WindowEvent::Focused`. Mutate via [`set_focused`](Self::set_focused) to mark the chrome layer dirty automatically.
+    pub focused: bool,
+    /// Orb visual state. Default `OrbTint::FollowFocus` makes the orb a window-state indicator; `OrbTint::Custom` lets the app turn it into a network/recording/presence badge. Mutate via [`set_orb_tint`](Self::set_orb_tint) to mark the chrome layer dirty automatically.
+    pub orb_tint: chrome::OrbTint,
     /// Currently-hovered button id (HIT_NONE if none). Rasterized as a colour delta on the hover layer.
     pub hover_state: u8,
     /// Cached pixel index list for the currently hovered button — recomputed on hover-state change.
@@ -66,6 +70,8 @@ impl DefaultChrome {
             hit_test_map: alloc::vec![HIT_NONE; map_len],
             title: title.into(),
             app_icon,
+            focused: true,
+            orb_tint: chrome::OrbTint::FollowFocus,
             hover_state: HIT_NONE,
             hover_pixel_list: Vec::new(),
             viewport,
@@ -173,6 +179,35 @@ impl DefaultChrome {
         //   6. Strip background fill (lowest — fills remaining empty pixels in the strip).
         //   7. Hover-state tint baked into chrome (wrap-add on hit_test_map matches).
         // Ctrl+Shift+D+C: skip the window edge/perimeter AND title text (both are "decoration"). Controls still render. clip_mask stays at host default (255 everywhere), so the window appears as a rectangle (no rounded corners).
+        // Focus-driven palette. Each element pulls from a named theme constant so a downstream consumer can override (e.g. an app that wants a totally different unfocused look) by swapping the theme module rather than re-implementing the rasterizer wiring.
+        let (edge_light, edge_shadow, title_color) = if self.focused {
+            (
+                theme::WINDOW_LIGHT_EDGE,
+                theme::WINDOW_SHADOW_EDGE,
+                theme::TEXT_COLOUR,
+            )
+        } else {
+            (
+                theme::WINDOW_LIGHT_EDGE_UNFOCUSED,
+                theme::WINDOW_SHADOW_EDGE_UNFOCUSED,
+                theme::TEXT_COLOUR_UNFOCUSED,
+            )
+        };
+
+        // Orb tint: FollowFocus → ring matches the active perimeter colour, icon gets `theme::ORB_DARKEN_UNFOCUSED` blend when the window is unfocused. Custom → app dictates ring + brighten; window-focus state doesn't dim a Custom orb (apps using it as a status indicator want it stable).
+        let (orb_ring, orb_brighten, orb_darken) = match self.orb_tint {
+            chrome::OrbTint::FollowFocus => (
+                edge_light,
+                false,
+                if self.focused {
+                    0
+                } else {
+                    theme::ORB_DARKEN_UNFOCUSED
+                },
+            ),
+            chrome::OrbTint::Custom { ring, brighten } => (ring, brighten, 0),
+        };
+
         if !crate::paint::DEBUG_SKIP_CHROME.load(std::sync::atomic::Ordering::Relaxed) {
             chrome::draw_window_edges_and_mask(
                 chrome_buf,
@@ -182,6 +217,8 @@ impl DefaultChrome {
                 vp_h,
                 start,
                 &crossings,
+                edge_light,
+                edge_shadow,
             );
             if orb_present {
                 chrome::draw_app_icon(
@@ -193,7 +230,9 @@ impl DefaultChrome {
                     orb_cy,
                     orb_radius,
                     self.app_icon.as_ref(),
-                    Some(theme::WINDOW_LIGHT_EDGE),
+                    Some(orb_ring),
+                    orb_darken,
+                    orb_brighten,
                 );
             }
             chrome::draw_title_text(
@@ -205,6 +244,7 @@ impl DefaultChrome {
                 button_size,
                 strip_x,
                 title_left_extra,
+                title_color,
             );
         }
 
@@ -253,6 +293,8 @@ impl DefaultChrome {
         );
 
         // Hairlines (dividers + bottom) BEFORE curves: solid lines have to win at intersection pixels, otherwise the curve's inner-AA hairline (which is mostly transparent in the linear region) fragments them. With this order, dividers and bottom hairline claim their pixels first; the BL curve's hairlines fill in only the gaps the straight lines didn't reach.
+        //
+        // Strip-frame colours follow the focus palette: vertical dividers + bottom hairline take `edge_light` (same as the top/left window perimeter), the BL squircle curve's vertical face takes `edge_light` (continues the left-of-strip vertical hairline) and its horizontal face takes `edge_shadow` (continues the bottom-of-strip hairline if no curve is present, and matches the bottom-of-window shadow) — so the strip reads as a continuation of the window edge, not a separate piece.
         chrome::draw_strip_hairlines(
             chrome_buf,
             vp_w,
@@ -260,6 +302,7 @@ impl DefaultChrome {
             button_size,
             start,
             &crossings,
+            edge_light,
         );
 
         chrome::draw_strip_curves(
@@ -270,6 +313,8 @@ impl DefaultChrome {
             button_size,
             start,
             &crossings,
+            edge_light,
+            edge_shadow,
         );
 
         chrome::draw_strip_bg(
@@ -336,6 +381,26 @@ impl DefaultChrome {
             return false;
         }
         self.hover_state = new_hit;
+        self.group.rpn.layers[self.layer_chrome].dirty = true;
+        true
+    }
+
+    /// Update window-focus state. Returns `true` iff the value changed. Host wires this from `WindowEvent::Focused`. Marks the chrome layer dirty so the focus palette swap re-rasterizes on the next paint.
+    pub fn set_focused(&mut self, focused: bool) -> bool {
+        if focused == self.focused {
+            return false;
+        }
+        self.focused = focused;
+        self.group.rpn.layers[self.layer_chrome].dirty = true;
+        true
+    }
+
+    /// Update the orb tint. Returns `true` iff the value changed. App calls this when the orb's semantic state shifts (network came online, recording started, presence flipped). Marks the chrome layer dirty.
+    pub fn set_orb_tint(&mut self, tint: chrome::OrbTint) -> bool {
+        if tint == self.orb_tint {
+            return false;
+        }
+        self.orb_tint = tint;
         self.group.rpn.layers[self.layer_chrome].dirty = true;
         true
     }

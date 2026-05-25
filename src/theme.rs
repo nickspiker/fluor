@@ -33,20 +33,29 @@ pub const BG_BASE: u32 = fmt(0x00_0C_14_0E);
 pub const BG_MASK: u32 = fmt(0x00_0F_07_1F);
 pub const BG_SPECKLE: u32 = fmt(0x00_3F_1F_7F);
 
-// Window edges + controls background.
-pub const WINDOW_LIGHT_EDGE: u32 = dark(fmt(0x00_44_41_37));
-pub const WINDOW_SHADOW_EDGE: u32 = dark(fmt(0x00_2B_34_37));
+// Window edges (focused). Saturated warm top/left + saturated cool bottom/right give the chrome its 3D bevel cue. Brighter than the unfocused variants below — an active window earns the eye's attention.
+pub const WINDOW_LIGHT_EDGE: u32 = dark(fmt(0x00_5C_4F_35));
+pub const WINDOW_SHADOW_EDGE: u32 = dark(fmt(0x00_29_3A_4A));
+
+// Window edges (unfocused). Desaturated (channels pulled toward grey, keeping a slight warm vs cool hint so the bevel survives) and darker than the focused variants. Reads as "this window is quiet, but I can still see it's a window."
+pub const WINDOW_LIGHT_EDGE_UNFOCUSED: u32 = dark(fmt(0x00_36_34_30));
+pub const WINDOW_SHADOW_EDGE_UNFOCUSED: u32 = dark(fmt(0x00_2A_2D_32));
+
+// Controls strip background. The strip stays functional/clickable even when the window is unfocused, so the bg is focus-invariant. Strip hairlines + BL curve are NOT constants here — they now follow the focus-driven edge palette (vertical dividers + bottom hairline = `WINDOW_LIGHT_EDGE[_UNFOCUSED]`; BL squircle = `WINDOW_SHADOW_EDGE[_UNFOCUSED]`) so the strip's framing dims with the rest of the window.
 pub const WINDOW_CONTROLS_BG: u32 = dark(fmt(0x00_1E_1E_1E));
-pub const WINDOW_CONTROLS_HAIRLINE: u32 = dark(fmt(0x00_44_41_37));
 
 // Button hover deltas (RGB channels wrap intentionally; α is 0xFF opaque from `dark()`).
 pub const CLOSE_HOVER: u32 = dark(fmt(0x00_21_FD_F9));
 pub const MAXIMIZE_HOVER: u32 = dark(fmt(0x00_FA_10_FA));
 pub const MINIMIZE_HOVER: u32 = dark(fmt(0x00_F7_FA_25));
 
-// Generic UI text.
-pub const TEXT_COLOUR: u32 = dark(fmt(0x00_D0_D0_D0));
+// Generic UI text. `TEXT_COLOUR` is the focused title + primary body text (brighter than the previous 0xD0 for a stronger active-window contrast). `TEXT_COLOUR_UNFOCUSED` dims for inactive-window titles (between `LABEL_COLOUR` and the focused value — readable but obviously quiet). `LABEL_COLOUR` stays as the secondary/labels grey used everywhere else.
+pub const TEXT_COLOUR: u32 = dark(fmt(0x00_E8_E8_E8));
+pub const TEXT_COLOUR_UNFOCUSED: u32 = dark(fmt(0x00_6A_6A_6A));
 pub const LABEL_COLOUR: u32 = dark(fmt(0x00_80_80_80));
+
+// Orb image desaturation factor applied when an unfocused window uses `OrbTint::FollowFocus`. `0 = full colour`, `255 = fully grey`. 128 = 50% lerp toward mid-grey — visibly quieted without losing app recognition. `Custom` orb tints ignore this (apps use the orb as a status indicator and want it stable).
+pub const ORB_DARKEN_UNFOCUSED: u8 = 128;
 
 // Window control glyph colours (drawn on top of WINDOW_CONTROLS_BG).
 pub const CLOSE_GLYPH: u32 = dark(fmt(0x00_80_20_20));
