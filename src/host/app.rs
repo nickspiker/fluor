@@ -222,6 +222,9 @@ struct DesktopShell<A: FluorApp> {
     is_dragging_move: bool,
     drag_move_anchor_screen: (i32, i32),
     drag_move_rect_start: (i32, i32),
+
+    /// `false` until the first `WindowEvent::Resized` arrives confirming the OS surface size. Most WMs open a default-sized window (800×600 or similar) and then animate / configure it to fullscreen — Resized fires when the actual surface is ready. Until then, painting positions chrome against a stale `window_rect` (sized for the monitor we expected) inside a buffer that's smaller than expected, producing a brief "chrome in the top-left of a tiny window" flash as the WM grows the surface. Defer all rendering until this flips true.
+    surface_ready: bool,
 }
 
 impl<A: FluorApp> DesktopShell<A> {
@@ -250,10 +253,14 @@ impl<A: FluorApp> DesktopShell<A> {
             is_dragging_move: false,
             drag_move_anchor_screen: (0, 0),
             drag_move_rect_start: (0, 0),
+            surface_ready: false,
         }
     }
 
     fn render_frame(&mut self) {
+        if !self.surface_ready {
+            return;
+        }
         let Some(window) = self.window.as_ref().cloned() else {
             return;
         };
@@ -353,145 +360,113 @@ impl<A: FluorApp> DesktopShell<A> {
         }
     }
 
-    /// Begin a self-driven resize drag. Captures the start geometry (size + outer window position + screen-relative cursor anchor) so subsequent cursor moves can compute the target geometry by delta from these starting values. Uniform across platforms — we drive the resize loop on Linux, Windows, AND macOS (replaces both the WM-driven `drag_resize_window` path and the macOS NSEvent polling hack).
-    fn start_resize(&mut self, edge: ResizeEdge, window: &Window) {
+    /// Begin a self-driven resize drag. In the fullscreen-compositor model we resize `window_rect` inside our own screen buffer instead of asking the OS to resize the OS window (which is fullscreen). Captures the start geometry (window_rect size + position) and the screen-space cursor anchor; subsequent cursor moves compute the new (w, h, x, y) by delta from these starting values.
+    fn start_resize(&mut self, edge: ResizeEdge, _window: &Window) {
         self.is_dragging_resize = true;
         self.resize_edge = edge;
-        self.drag_start_size = (self.viewport.width_px, self.viewport.height_px);
-        if let Ok(window_pos) = window.outer_position() {
-            self.drag_start_window_pos = (window_pos.x, window_pos.y);
-            // Anchor cursor position in SCREEN coordinates (window_outer + window-relative cursor) so window-position changes during the drag don't shift the reference frame.
-            self.drag_start_cursor_screen_pos = (
-                window_pos.x + self.cursor_x as i32,
-                window_pos.y + self.cursor_y as i32,
-            );
-        }
+        self.drag_start_size = (self.window_rect.w, self.window_rect.h);
+        self.drag_start_window_pos = (self.window_rect.x, self.window_rect.y);
+        // cursor_x/y are screen-space (raw from winit, OS window = screen in fullscreen) so no translation needed for the anchor.
+        self.drag_start_cursor_screen_pos = (self.cursor_x as i32, self.cursor_y as i32);
     }
 
-    /// Apply one tick of the self-driven resize drag. Called from `RedrawRequested` when `is_dragging_resize` (throttled to vsync). Just pushes the new target geometry to the OS — does NOT resize our surface, viewport, or paint here. The actual surface resize + viewport update + on_resize + paint happens in the `Resized` event handler when the OS confirms the new size. This guarantees the buffer we paint is ALWAYS the same size as the displayed window (no X11 PutImage clipping mismatch, no "smeared" content during drag).
+    /// Apply one tick of the self-driven resize drag — in-buffer. Called from `RedrawRequested` when `is_dragging_resize` (throttled to vsync). Updates `window_rect` directly (no OS round-trip — the OS window is fullscreen and request_inner_size / set_outer_position are no-ops). When the size changed, resizes `scratch` + `clip_mask` to the new dimensions and calls the consumer's `on_resize` so they can reflow. Always pushes a new XShape input region so click-through follows the visible window. The subsequent `render_frame` paints at the new geometry into the screen buffer.
     fn apply_resize_drag(&mut self) {
         let Some(window) = self.window.as_ref().cloned() else {
             return;
         };
-        let Ok(window_pos) = window.outer_position() else {
-            return;
-        };
 
-        // Screen-relative cursor delta from drag-start anchor (unchanged across the window's own position shifts during the drag, since the anchor is captured in screen coords).
-        let current_screen_x = window_pos.x + self.cursor_x as i32;
-        let current_screen_y = window_pos.y + self.cursor_y as i32;
-        let dx = (current_screen_x - self.drag_start_cursor_screen_pos.0) as Coord;
-        let dy = (current_screen_y - self.drag_start_cursor_screen_pos.1) as Coord;
+        // Screen-relative cursor delta from the drag-start anchor. cursor_x/y is already screen-space (raw winit / OS = screen in fullscreen) so no per-frame translation needed.
+        let dx = (self.cursor_x as i32 - self.drag_start_cursor_screen_pos.0) as Coord;
+        let dy = (self.cursor_y as i32 - self.drag_start_cursor_screen_pos.1) as Coord;
 
+        // Min size keeps the squircle math from degenerating. 128 px matches the pre-pivot limit.
         let min_size: Coord = 128.0;
 
-        let (new_width, new_height, should_move, new_x, new_y) = match self.resize_edge {
+        let (new_w, new_h, new_x, new_y) = match self.resize_edge {
             ResizeEdge::Right => {
                 let w = (self.drag_start_size.0 as Coord + dx).max(min_size) as u32;
-                (w, self.drag_start_size.1, false, 0, 0)
+                (w, self.drag_start_size.1, self.drag_start_window_pos.0, self.drag_start_window_pos.1)
             }
             ResizeEdge::Left => {
                 let w = (self.drag_start_size.0 as Coord - dx).max(min_size) as u32;
-                let width_change = self.drag_start_size.0 as i32 - w as i32;
-                (
-                    w,
-                    self.drag_start_size.1,
-                    true,
-                    self.drag_start_window_pos.0 + width_change,
-                    self.drag_start_window_pos.1,
-                )
+                let dw = self.drag_start_size.0 as i32 - w as i32;
+                (w, self.drag_start_size.1, self.drag_start_window_pos.0 + dw, self.drag_start_window_pos.1)
             }
             ResizeEdge::Bottom => {
                 let h = (self.drag_start_size.1 as Coord + dy).max(min_size) as u32;
-                (self.drag_start_size.0, h, false, 0, 0)
+                (self.drag_start_size.0, h, self.drag_start_window_pos.0, self.drag_start_window_pos.1)
             }
             ResizeEdge::Top => {
                 let h = (self.drag_start_size.1 as Coord - dy).max(min_size) as u32;
-                let height_change = self.drag_start_size.1 as i32 - h as i32;
-                (
-                    self.drag_start_size.0,
-                    h,
-                    true,
-                    self.drag_start_window_pos.0,
-                    self.drag_start_window_pos.1 + height_change,
-                )
+                let dh = self.drag_start_size.1 as i32 - h as i32;
+                (self.drag_start_size.0, h, self.drag_start_window_pos.0, self.drag_start_window_pos.1 + dh)
             }
             ResizeEdge::TopRight => {
                 let w = (self.drag_start_size.0 as Coord + dx).max(min_size) as u32;
                 let h = (self.drag_start_size.1 as Coord - dy).max(min_size) as u32;
-                let height_change = self.drag_start_size.1 as i32 - h as i32;
-                (
-                    w,
-                    h,
-                    true,
-                    self.drag_start_window_pos.0,
-                    self.drag_start_window_pos.1 + height_change,
-                )
+                let dh = self.drag_start_size.1 as i32 - h as i32;
+                (w, h, self.drag_start_window_pos.0, self.drag_start_window_pos.1 + dh)
             }
             ResizeEdge::TopLeft => {
                 let w = (self.drag_start_size.0 as Coord - dx).max(min_size) as u32;
                 let h = (self.drag_start_size.1 as Coord - dy).max(min_size) as u32;
-                let width_change = self.drag_start_size.0 as i32 - w as i32;
-                let height_change = self.drag_start_size.1 as i32 - h as i32;
-                (
-                    w,
-                    h,
-                    true,
-                    self.drag_start_window_pos.0 + width_change,
-                    self.drag_start_window_pos.1 + height_change,
-                )
+                let dw = self.drag_start_size.0 as i32 - w as i32;
+                let dh = self.drag_start_size.1 as i32 - h as i32;
+                (w, h, self.drag_start_window_pos.0 + dw, self.drag_start_window_pos.1 + dh)
             }
             ResizeEdge::BottomRight => {
                 let w = (self.drag_start_size.0 as Coord + dx).max(min_size) as u32;
                 let h = (self.drag_start_size.1 as Coord + dy).max(min_size) as u32;
-                (w, h, false, 0, 0)
+                (w, h, self.drag_start_window_pos.0, self.drag_start_window_pos.1)
             }
             ResizeEdge::BottomLeft => {
                 let w = (self.drag_start_size.0 as Coord - dx).max(min_size) as u32;
                 let h = (self.drag_start_size.1 as Coord + dy).max(min_size) as u32;
-                let width_change = self.drag_start_size.0 as i32 - w as i32;
-                (
-                    w,
-                    h,
-                    true,
-                    self.drag_start_window_pos.0 + width_change,
-                    self.drag_start_window_pos.1,
-                )
+                let dw = self.drag_start_size.0 as i32 - w as i32;
+                (w, h, self.drag_start_window_pos.0 + dw, self.drag_start_window_pos.1)
             }
             ResizeEdge::None => return,
         };
 
-        // Push the new geometry to the OS — only issue the calls that actually changed. The OS will process and reply with Resized / Moved events which trigger the actual surface resize + paint in the normal event handlers.
-        let size_changed =
-            new_width != self.viewport.width_px || new_height != self.viewport.height_px;
-        let pos_changed = should_move && (new_x != window_pos.x || new_y != window_pos.y);
+        let size_changed = new_w != self.window_rect.w || new_h != self.window_rect.h;
+        let pos_changed = new_x != self.window_rect.x || new_y != self.window_rect.y;
+        if !size_changed && !pos_changed {
+            return;
+        }
 
-        // Atomic geometry path (Linux X11 only): when BOTH size and position change in the same tick — i.e. left/top/topleft/topright/bottomleft drags — issue ONE XConfigureWindow with x|y|width|height instead of winit's two separate calls. Without this the WM applies size and position in sequence, producing a visible seam (the right/bottom edge briefly moves before the left/top edge catches up). Returns true on X11; false on Wayland or any failure → falls through to winit's separate calls.
+        self.window_rect = WindowRect {
+            x: new_x,
+            y: new_y,
+            w: new_w,
+            h: new_h,
+        };
+
+        if size_changed {
+            // Carry the user's zoom (ru) across the resize so Ctrl+/Ctrl-/Ctrl+scroll state survives.
+            self.viewport = Viewport::new(new_w, new_h).with_ru(self.viewport.ru);
+            let win_px = (new_w as usize) * (new_h as usize);
+            self.scratch = vec![0u32; win_px];
+            self.clip_mask = vec![255u8; win_px];
+
+            // Let the consumer reflow — they may relayout panes, recompute glyph metrics, etc.
+            if let Some(text) = self.text.as_mut() {
+                let mut ctx = Context {
+                    viewport: self.viewport,
+                    text,
+                    clip_mask: &mut self.clip_mask,
+                    window: &window,
+                    modifiers: self.modifiers,
+                    cursor_x: self.cursor_x - self.window_rect.x as Coord,
+                    cursor_y: self.cursor_y - self.window_rect.y as Coord,
+                };
+                self.app.on_resize(new_w, new_h, &mut ctx);
+            }
+        }
+
+        // Update click-through region so the OS routes clicks based on the new rect.
         #[cfg(target_os = "linux")]
-        let atomic_done = size_changed
-            && pos_changed
-            && x11_atomic::set_geometry(&window, new_x, new_y, new_width, new_height);
-        #[cfg(not(target_os = "linux"))]
-        let atomic_done = false;
-
-        if !atomic_done {
-            if size_changed {
-                let _ = window
-                    .request_inner_size(winit::dpi::PhysicalSize::new(new_width, new_height));
-            }
-            if pos_changed {
-                let _ =
-                    window.set_outer_position(winit::dpi::PhysicalPosition::new(new_x, new_y));
-            }
-        }
-
-        if pos_changed {
-            // X11 (and most other platforms) does NOT synthesize a CursorMoved when we move the window programmatically — the cursor's screen position didn't change, so X11 sees no movement event to deliver. But the cursor's window-relative position DID change (window moved underneath a stationary hand). Without compensation, the next drag tick computes screen = new_window_pos + stale_window_relative_cursor → wrong screen position → wrong delta → runaway.
-            let dx_w = window_pos.x - new_x;
-            let dy_w = window_pos.y - new_y;
-            self.cursor_x += dx_w as Coord;
-            self.cursor_y += dy_w as Coord;
-        }
+        x11_atomic::set_input_region(&window, new_x, new_y, new_w, new_h);
     }
 }
 
@@ -501,12 +476,21 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
             return;
         }
 
-        // Fullscreen borderless transparent — fluor owns the whole screen buffer. The "window" the consumer sees is just a rectangle inside that buffer; everywhere else stays α=0 and the OS compositor shows whatever's behind us.
+        // Probe the monitor BEFORE creating the window so we can request an OS surface of exactly the right size + position. We deliberately avoid `with_fullscreen` — it triggers the WM's animated transition (default-window-size → grow → fullscreen) which makes the chrome appear to scale up from the top-left. Instead, ask for a plain borderless transparent window covering the monitor: the WM creates it at the requested geometry directly, no animation.
+        let (mon_w, mon_h) = event_loop
+            .primary_monitor()
+            .or_else(|| event_loop.available_monitors().next())
+            .map(|m| (m.size().width.max(1), m.size().height.max(1)))
+            .unwrap_or((1920, 1080));
+        self.screen_size = (mon_w, mon_h);
+
         let attrs = WindowAttributes::default()
             .with_title(self.app.title())
-            .with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)))
+            .with_inner_size(winit::dpi::PhysicalSize::new(mon_w, mon_h))
+            .with_position(winit::dpi::PhysicalPosition::new(0i32, 0i32))
             .with_decorations(false)
-            .with_transparent(true);
+            .with_transparent(true)
+            .with_resizable(false);
         let window = Arc::new(event_loop.create_window(attrs).expect("create_window"));
 
         #[cfg(target_os = "macos")]
@@ -514,14 +498,6 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
             use winit::platform::macos::WindowExtMacOS;
             window.set_has_shadow(false);
         }
-
-        // Use the monitor probe for the initial screen size — `window.inner_size()` returns the pre-fullscreen default (800×600 on most platforms) until the WM asynchronously applies fullscreen, then fires Resized with the actual screen dimensions. Trusting inner_size here gives us a tiny window_rect in the top-left corner of an eventually-huge screen. The monitor probe is what we'll end up with.
-        let (mon_w, mon_h) = event_loop
-            .primary_monitor()
-            .or_else(|| event_loop.available_monitors().next())
-            .map(|m| (m.size().width.max(1), m.size().height.max(1)))
-            .unwrap_or((1920, 1080));
-        self.screen_size = (mon_w, mon_h);
 
         // Initial visible-window size: half the screen in each axis, centred. Matches the desktop convention of "open at a reasonable fraction of the display, centred." User can drag/resize from there.
         let initial_w = (mon_w / 2).max(1);
@@ -585,8 +561,10 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
         }
 
         self.window = Some(window.clone());
+        // Surface is created at the requested monitor size — we can paint immediately. The Resized handler still flips this flag if it sees a different first size, but with the non-fullscreen approach we expect the surface to come up at the right size on the first frame.
+        self.surface_ready = true;
 
-        // Click-through: tell X11 our hittable area is just `window_rect`. Clicks outside the rect (i.e. the fullscreen transparent margin) pass through to whatever app is beneath us. The Resized handler doesn't re-call this — window_rect doesn't change when the screen resizes — but step 3 (drag-to-move) and step 4 (resize-drag) will call it on every rect change. No-op on non-X11 platforms; macOS/Windows passthrough handling lands in their own backend modules later.
+        // Click-through: tell X11 our hittable area is just `window_rect`. Clicks outside the rect pass through to whatever app is beneath us. Drag-to-move + resize-drag steps will re-call this on every rect change. No-op on non-X11 platforms; macOS/Windows passthrough handling lands in their own backend modules later.
         #[cfg(target_os = "linux")]
         x11_atomic::set_input_region(
             &window,
@@ -633,11 +611,14 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 std::process::exit(0);
             }
             WindowEvent::Resized(size) => {
-                // In the fullscreen-compositor architecture, the OS surface is the whole screen — `size` is the SCREEN size, not the consumer-visible viewport (= window_rect dimensions). On a normal run this fires once at startup with the monitor size; later it may fire if the user switches monitors or the resolution changes. window_rect stays where it is (the visible window inside the screen buffer); the consumer's viewport is unchanged.
-                if size.width == self.screen_size.0 && size.height == self.screen_size.1 {
+                // In the fullscreen-compositor architecture, the OS surface is the whole screen — `size` is the SCREEN size, not the consumer-visible viewport. WMs commonly fire Resized multiple times during fullscreen activation (default-window-size → animating → final fullscreen); each tick we resize the surface to match, re-centre the visible window inside the new bounds, and re-issue the input region. Suppresses the "chrome appears in the top-left of a growing window" artefact during WM fullscreen animations.
+                if size.width == 0 || size.height == 0 {
                     return;
                 }
-                if size.width == 0 || size.height == 0 {
+                if size.width == self.screen_size.0
+                    && size.height == self.screen_size.1
+                    && self.surface_ready
+                {
                     return;
                 }
 
@@ -657,7 +638,50 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                     }
                 }
 
-                // Paint at the new screen size — same window content, just the surface backing it changed.
+                // Re-centre + clamp window_rect to the current screen. Keeps the visible window at half-screen size, centred, on every screen size change (initial fullscreen, monitor switch, etc.). Skip during an active drag — the user is steering the rect themselves.
+                if !self.is_dragging_resize && !self.is_dragging_move {
+                    let new_w = (size.width / 2).max(1).min(size.width);
+                    let new_h = (size.height / 2).max(1).min(size.height);
+                    let new_x = ((size.width as i32) - (new_w as i32)) / 2;
+                    let new_y = ((size.height as i32) - (new_h as i32)) / 2;
+                    let rect_changed = new_w != self.window_rect.w
+                        || new_h != self.window_rect.h
+                        || new_x != self.window_rect.x
+                        || new_y != self.window_rect.y;
+                    self.window_rect = WindowRect {
+                        x: new_x,
+                        y: new_y,
+                        w: new_w,
+                        h: new_h,
+                    };
+                    if rect_changed {
+                        self.viewport = Viewport::new(new_w, new_h).with_ru(self.viewport.ru);
+                        let win_px = (new_w as usize) * (new_h as usize);
+                        self.scratch = vec![0u32; win_px];
+                        self.clip_mask = vec![255u8; win_px];
+                        if let (Some(window), Some(text)) =
+                            (self.window.as_ref().cloned(), self.text.as_mut())
+                        {
+                            let mut ctx = Context {
+                                viewport: self.viewport,
+                                text,
+                                clip_mask: &mut self.clip_mask,
+                                window: &window,
+                                modifiers: self.modifiers,
+                                cursor_x: self.cursor_x - new_x as Coord,
+                                cursor_y: self.cursor_y - new_y as Coord,
+                            };
+                            self.app.on_resize(new_w, new_h, &mut ctx);
+                        }
+                        #[cfg(target_os = "linux")]
+                        if let Some(window) = self.window.as_ref() {
+                            x11_atomic::set_input_region(window, new_x, new_y, new_w, new_h);
+                        }
+                    }
+                }
+
+                // First Resized confirms the OS surface is actually allocated — safe to start painting.
+                self.surface_ready = true;
                 self.render_frame();
             }
             WindowEvent::CursorMoved { position, .. } => {
