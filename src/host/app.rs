@@ -239,8 +239,8 @@ impl<A: FluorApp> DesktopShell<A> {
         drop(ctx);
 
         let scr_w = self.screen_size.0 as usize;
-        let rect_x = self.window_rect.x.max(0) as usize;
-        let rect_y = self.window_rect.y.max(0) as usize;
+        let rect_x = self.window_rect.x;
+        let rect_y = self.window_rect.y;
         #[cfg(target_os = "macos")]
         {
             let Some(renderer) = self.renderer.as_mut() else {
@@ -450,25 +450,7 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
             return;
         }
 
-        let monitor = event_loop
-            .primary_monitor()
-            .or_else(|| event_loop.available_monitors().next());
-
-        // Pick the visible-window initial size — 3/4 of the monitor short axis, 4:3 (same heuristic as the pre-fullscreen path). This is what the consumer will see as `viewport.width_px × viewport.height_px`; the fullscreen OS surface is monitor-sized regardless.
-        let (mon_w, mon_h) = if let Some(ref mon) = monitor {
-            let s = mon.size();
-            (s.width, s.height)
-        } else {
-            (1920, 1080)
-        };
-        let initial = {
-            let short = mon_w.min(mon_h);
-            let h = short * 3 / 4;
-            let w = h * 4 / 3;
-            winit::dpi::PhysicalSize::new(w, h)
-        };
-
-        // Fullscreen borderless transparent — fluor owns the whole screen buffer. The "window" the consumer sees is just a rectangle inside that buffer; everywhere else stays α=0 and the OS compositor shows whatever's behind us. with_resizable / min_inner_size are irrelevant in fullscreen mode and dropped.
+        // Fullscreen borderless transparent — fluor owns the whole screen buffer. The "window" the consumer sees is just a rectangle inside that buffer; everywhere else stays α=0 and the OS compositor shows whatever's behind us.
         let attrs = WindowAttributes::default()
             .with_title(self.app.title())
             .with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)))
@@ -482,20 +464,26 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
             window.set_has_shadow(false);
         }
 
-        // After window creation, query the actual fullscreen inner_size — it may differ from monitor.size() if winit / WM adjusts (HiDPI scale, taskbar exclusion, etc.). Use whatever the OS gave us.
-        let surface_size = window.inner_size();
-        self.screen_size = (surface_size.width, surface_size.height);
+        // Use the monitor probe for the initial screen size — `window.inner_size()` returns the pre-fullscreen default (800×600 on most platforms) until the WM asynchronously applies fullscreen, then fires Resized with the actual screen dimensions. Trusting inner_size here gives us a tiny window_rect in the top-left corner of an eventually-huge screen. The monitor probe is what we'll end up with.
+        let (mon_w, mon_h) = event_loop
+            .primary_monitor()
+            .or_else(|| event_loop.available_monitors().next())
+            .map(|m| (m.size().width.max(1), m.size().height.max(1)))
+            .unwrap_or((1920, 1080));
+        self.screen_size = (mon_w, mon_h);
 
-        // Centre the visible window in the screen. window_rect is the only thing the consumer sees as their viewport.
-        let win_x = ((self.screen_size.0 as i32) - (initial.width as i32)) / 2;
-        let win_y = ((self.screen_size.1 as i32) - (initial.height as i32)) / 2;
+        // Initial visible-window size: half the screen in each axis, centred. Matches the desktop convention of "open at a reasonable fraction of the display, centred." User can drag/resize from there.
+        let initial_w = (mon_w / 2).max(1);
+        let initial_h = (mon_h / 2).max(1);
+        let win_x = ((mon_w as i32) - (initial_w as i32)) / 2;
+        let win_y = ((mon_h as i32) - (initial_h as i32)) / 2;
         self.window_rect = WindowRect {
             x: win_x,
             y: win_y,
-            w: initial.width,
-            h: initial.height,
+            w: initial_w,
+            h: initial_h,
         };
-        self.viewport = Viewport::new(initial.width, initial.height);
+        self.viewport = Viewport::new(initial_w, initial_h);
 
         #[cfg(target_os = "macos")]
         {
