@@ -58,6 +58,46 @@ mod x11_atomic {
         let _ = conn.flush();
         true
     }
+
+    /// Restrict the window's INPUT region to the given screen-space rectangle. Clicks outside this rect pass through to whatever window is behind us. Used by the fullscreen-compositor architecture: our OS surface covers the whole screen but the visible window is just a sub-rect, so we tell X11 "I'm only hittable inside that sub-rect" — the rest is mouse-transparent. Call once per `window_rect` change (initial creation, drag-to-move, resize-drag, monitor change).
+    ///
+    /// The rect is in window-relative coordinates (= screen coords when the OS window is fullscreen at the screen origin). Negative offsets get clamped to 0 since XShape rectangles must be unsigned. Returns `true` if the call was sent successfully, `false` if the window isn't X11 or the connection failed.
+    pub fn set_input_region(
+        window: &winit::window::Window,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+    ) -> bool {
+        use x11rb::protocol::shape::{ConnectionExt as _, SK, SO};
+        use x11rb::protocol::xproto::{ClipOrdering, Rectangle};
+
+        let Ok(handle) = window.window_handle() else {
+            return false;
+        };
+        let xid = match handle.as_raw() {
+            RawWindowHandle::Xcb(h) => h.window.get(),
+            RawWindowHandle::Xlib(h) => h.window as u32,
+            _ => return false,
+        };
+        let Some(conn) = conn() else {
+            return false;
+        };
+        let rect = Rectangle {
+            x: x.max(0).min(i16::MAX as i32) as i16,
+            y: y.max(0).min(i16::MAX as i32) as i16,
+            width: w.min(u16::MAX as u32) as u16,
+            height: h.min(u16::MAX as u32) as u16,
+        };
+        if conn
+            .shape_rectangles(SO::SET, SK::INPUT, ClipOrdering::UNSORTED, xid, 0, 0, &[rect])
+            .is_err()
+        {
+            return false;
+        }
+        let _ = conn.flush();
+        true
+    }
 }
 
 /// Per-callback access to host-owned shared resources. Re-borrowed for each call into the trait — the consumer can keep references for the duration of the call but not across calls.
@@ -229,8 +269,8 @@ impl<A: FluorApp> DesktopShell<A> {
             clip_mask: &mut self.clip_mask,
             window: &window,
             modifiers: self.modifiers,
-            cursor_x: self.cursor_x,
-            cursor_y: self.cursor_y,
+            cursor_x: self.cursor_x - self.window_rect.x as Coord,
+            cursor_y: self.cursor_y - self.window_rect.y as Coord,
         };
 
         // Step 1: render consumer into the window-sized scratch (α + darkness convention, with clip_mask carving — UNCHANGED from the pre-fullscreen pipeline). Step 2: clear the screen buffer (so pixels outside window_rect are α=0 and the OS compositor sees through us). Step 3: finalize_into_screen reads scratch + clip_mask once per pixel and writes OS-ready ARGB into the screen buffer at window_rect offset — one pass over pixels, same per-pixel cost as the old in-place finalize_for_os.
@@ -527,13 +567,24 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 clip_mask: &mut self.clip_mask,
                 window: &window,
                 modifiers: self.modifiers,
-                cursor_x: self.cursor_x,
-                cursor_y: self.cursor_y,
+                cursor_x: self.cursor_x - self.window_rect.x as Coord,
+                cursor_y: self.cursor_y - self.window_rect.y as Coord,
             };
             self.app.init(&mut ctx);
         }
 
         self.window = Some(window.clone());
+
+        // Click-through: tell X11 our hittable area is just `window_rect`. Clicks outside the rect (i.e. the fullscreen transparent margin) pass through to whatever app is beneath us. The Resized handler doesn't re-call this — window_rect doesn't change when the screen resizes — but step 3 (drag-to-move) and step 4 (resize-drag) will call it on every rect change. No-op on non-X11 platforms; macOS/Windows passthrough handling lands in their own backend modules later.
+        #[cfg(target_os = "linux")]
+        x11_atomic::set_input_region(
+            &window,
+            self.window_rect.x,
+            self.window_rect.y,
+            self.window_rect.w,
+            self.window_rect.h,
+        );
+
         window.request_redraw();
     }
 
@@ -547,8 +598,8 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 clip_mask: &mut self.clip_mask,
                 window: &window,
                 modifiers: self.modifiers,
-                cursor_x: self.cursor_x,
-                cursor_y: self.cursor_y,
+                cursor_x: self.cursor_x - self.window_rect.x as Coord,
+                cursor_y: self.cursor_y - self.window_rect.y as Coord,
             };
             self.app.tick(&mut ctx)
         } else {
@@ -619,8 +670,8 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                         clip_mask: &mut self.clip_mask,
                         window: &window,
                         modifiers: self.modifiers,
-                        cursor_x: self.cursor_x,
-                        cursor_y: self.cursor_y,
+                        cursor_x: self.cursor_x - self.window_rect.x as Coord,
+                        cursor_y: self.cursor_y - self.window_rect.y as Coord,
                     };
                     let response = self.app.on_event(&event, &mut ctx);
                     let icon = self.app.cursor_for(self.cursor_x, self.cursor_y, &ctx);
@@ -721,8 +772,8 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
                 clip_mask: &mut self.clip_mask,
                 window: &window,
                 modifiers: self.modifiers,
-                cursor_x: self.cursor_x,
-                cursor_y: self.cursor_y,
+                cursor_x: self.cursor_x - self.window_rect.x as Coord,
+                cursor_y: self.cursor_y - self.window_rect.y as Coord,
             };
             self.app
                 .on_resize(self.viewport.width_px, self.viewport.height_px, &mut ctx);
@@ -740,8 +791,8 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
                 clip_mask: &mut self.clip_mask,
                 window: &window,
                 modifiers: self.modifiers,
-                cursor_x: self.cursor_x,
-                cursor_y: self.cursor_y,
+                cursor_x: self.cursor_x - self.window_rect.x as Coord,
+                cursor_y: self.cursor_y - self.window_rect.y as Coord,
             };
             let response = self.app.on_event(&event, &mut ctx);
             drop(ctx);
