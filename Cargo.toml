@@ -54,9 +54,9 @@ cosmic-text = { version = "0.14", optional = true }
 # FontRef + ScaleContext interop trivial.
 swash = { version = "0.2", optional = true }
 
-# x11rb is Linux-only; used to issue ONE atomic XConfigureWindow with all four of (x, y, width, height) when a self-driven resize drag changes both size AND position (left/top/TL/TR/BL edges). winit exposes `request_inner_size` and `set_outer_position` as two separate XConfigureWindow calls — the WM applies them in sequence which is visually distinct ("first size, then position" or vice versa). One atomic call eliminates the seam. Windows (SetWindowPos) and macOS (NSWindow.setFrame) are already atomic via their respective APIs; Wayland disallows client-driven position so the question doesn't arise there.
+# x11rb is Linux-only. Used for two things: (1) ONE atomic XConfigureWindow with all four of (x, y, width, height) for self-driven resize drags (eliminates the visible "first-size-then-position" seam from winit's separate calls). (2) `xcb_shape_rectangles(SK_INPUT, ...)` to set the click-through input region — the fullscreen transparent surface only accepts clicks inside `window_rect`; everything else passes through to whatever's behind us. `shape` feature pulls in the XShape extension bindings.
 [target.'cfg(target_os = "linux")'.dependencies]
-x11rb = "0.13"
+x11rb = { version = "0.13", features = ["shape"] }
 
 [dev-dependencies]
 proptest = "1.5"
