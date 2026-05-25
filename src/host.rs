@@ -3,6 +3,7 @@
 //! Per `## API / Implementation Separation` in AGENT.md, hosts are interchangeable: the same `Compositor` API drives the desktop winit+softbuffer host, the future ferros bare-metal framebuffer host, and anything else. Each host is gated by a Cargo feature so consumers compile in only what they need.
 
 pub mod chrome;
+pub mod icon;
 
 #[cfg(feature = "text")]
 pub mod chrome_widget;
