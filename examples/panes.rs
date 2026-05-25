@@ -114,8 +114,8 @@ impl PanesDemo {
     /// Recompute textbox geometry from the viewport span and resize the textbox + cursor groups to match.
     fn update_layout(&mut self, ctx: &mut Context) {
         let vp = ctx.viewport;
-        let span = 2.0 * vp.width_px as Coord * vp.height_px as Coord
-            / (vp.width_px as Coord + vp.height_px as Coord);
+        // Use effective_span (= span * ru) so all derived sizes pick up the user's zoom — Ctrl+/Ctrl-/Ctrl+scroll grow/shrink the textbox + cursor + rotation regions together with chrome.
+        let span = vp.effective_span();
         let bw = (span / 32.0).ceil();
         // Aspect-driven horizontal shift: square window centers the textbox; wider pushes it right, taller pushes it left. Magnitude scales with span so the shift is visible but bounded.
         let aspect = vp.width_px as Coord / vp.height_px as Coord;
