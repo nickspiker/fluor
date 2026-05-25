@@ -9,6 +9,7 @@
 //! All RGB values stored in the chrome layer are straight-α (the canonical buffer convention). The OS conversion layer at the present boundary handles platform-specific premultiplication.
 
 use crate::coord::Coord;
+use crate::host::icon::Icon;
 use crate::math;
 use crate::paint::Clip;
 use crate::pixel::{Blend, BlendMode};
@@ -20,6 +21,7 @@ pub const HIT_NONE: u8 = 0;
 pub const HIT_MINIMIZE_BUTTON: u8 = 1;
 pub const HIT_MAXIMIZE_BUTTON: u8 = 2;
 pub const HIT_CLOSE_BUTTON: u8 = 3;
+pub const HIT_APP_ICON: u8 = 4;
 
 /// Resize-edge classification returned by [`get_resize_edge`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,7 +258,7 @@ pub fn draw_window_edges_and_mask(
     }
 }
 
-/// Rasterize the window title text into the chrome layer, left-aligned in the area between the perimeter hairline (left edge) and the controls strip (right edge). Vertically centered in the strip-tall band. Bails on empty title or impractically small `button_size` (below readability — the text wouldn't be legible anyway). Clip rect prevents the title from painting over the controls strip even at long titles or narrow windows. Color is `theme::TEXT_COLOUR`; font is "Open Sans" regular at `button_size * 0.55` — proportional to the rest of the chrome under the current zoom (since button_size is derived from `effective_span`).
+/// Rasterize the window title text into the chrome layer, left-aligned in the area between the perimeter hairline (left edge) and the controls strip (right edge). Vertically centered in the strip-tall band. `left_extra` shifts the start position right to make room for the app-icon orb (pass `0` when no orb). Bails on empty title or impractically small `button_size` (below readability — the text wouldn't be legible anyway). Clip rect prevents the title from painting over the controls strip even at long titles or narrow windows. Color is `theme::TEXT_COLOUR`; font is "Open Sans" regular at `button_size * 0.55` — proportional to the rest of the chrome under the current zoom (since button_size is derived from `effective_span`).
 pub fn draw_title_text(
     pixels: &mut [u32],
     width: usize,
@@ -265,12 +267,14 @@ pub fn draw_title_text(
     text_renderer: &mut TextRenderer,
     button_size: usize,
     strip_x: usize,
+    left_extra: usize,
 ) {
     if title.is_empty() || button_size < 8 {
         return;
     }
-    let left_margin = button_size / 2;
+    let left_margin = button_size / 2 + left_extra;
     let right_margin = button_size / 4;
+    // strip_x = buf_w − strip_w can collapse to 0 on tiny viewports (buf_w ≤ strip_w). Without saturating_sub, `strip_x − right_margin` would underflow usize and wrap to ~usize::MAX, producing a clip rect that spans the whole row. saturating_sub returns 0, the `left_margin >= clip_x_end` check below catches it, and the function returns cleanly without drawing.
     let clip_x_end = strip_x.saturating_sub(right_margin);
     if left_margin >= clip_x_end {
         return;
@@ -293,6 +297,149 @@ pub fn draw_title_text(
         None,
         None,
     );
+}
+
+/// Rasterize the top-left app-icon orb: a circular sample of `icon` clipped to `radius`, wrapped in an optional 1-px AA ring stroked in `ring_color`. Topology mirrors [`draw_window_edges_and_mask`]'s two-sided AA: ring is 1px solid + 1px inner-AA + 1px outer-AA. `cx`/`cy` give the orb centre in pixel coords; `radius` is the icon sampling radius (ring extends outward from it). Without an `icon`, the interior fills with `ring_color` (treated as a solid dark disk). Without a `ring_color`, the orb is just the icon clipped to a circle (1-pixel outer-AA against the chrome).
+///
+/// Pixel sampling is nearest-neighbour from `icon`'s `width × height` source — the source is square in practice (`vsfimg` doesn't reshape) but the math doesn't assume that. Per-pixel cost is one map index + one `under` composite; total work is `O(diameter²)`, well under a millisecond at typical chrome sizes (~30–100 px orbs).
+///
+/// Hit-test: every pixel inside `r_outer²` (excluding the AA fringe) is tagged `HIT_APP_ICON` so the host can route clicks. Decorative-only consumers can pass `None` for `hit_test_map` to skip the tag.
+pub fn draw_app_icon(
+    pixels: &mut [u32],
+    hit_test_map: Option<&mut [u8]>,
+    width: usize,
+    height: usize,
+    cx: isize,
+    cy: isize,
+    radius: isize,
+    icon: Option<&Icon>,
+    ring_color: Option<u32>,
+) {
+    let r = radius;
+    if r < 2 {
+        return;
+    }
+    // Stroke matches photon: `r / 16` with no floor. At small orbs (r < 16) this is 0 — the ring degrades to just the 1-px outer-AA edge instead of a forced 2-px band, so the orb stays proportional at chrome-button sizes.
+    let stroke_width = r / 16;
+
+    let r_inner = r - 1;
+    let r_inner2 = r_inner * r_inner;
+    let r_inner_inner = r - 2;
+    let r_inner_inner2 = r_inner_inner * r_inner_inner;
+    let r_outer = r + stroke_width;
+    let r_outer2 = r_outer * r_outer;
+    let r_outer_outer = r_outer + 1;
+    let r_outer_outer2 = r_outer_outer * r_outer_outer;
+    // diff_inner = r_inner² − r_inner_inner² = (r−1)² − (r−2)² = 2r − 3, which is ≥ 1 given the `r < 2` early return above. diff_outer = (r+sw+1)² − (r+sw)² = 2(r+sw) + 1 ≥ 5. Both are safe divisors; no max() guard needed.
+    let diff_inner = r_inner2 - r_inner_inner2;
+    let diff_outer = r_outer_outer2 - r_outer2;
+
+    // BBox intersection with screen. WHY: caller can pass any (cx, cy) — orb may be partially or fully off-screen (e.g. scroll offsets in a future viewport). PROOF: clip the circle bounding box to `[0, width) × [0, height)`, returning early if the intersection is empty. PREVENTS: a negative isize converting to usize would wrap to a huge value and the iteration would index well past the buffer end (out-of-bounds → panic, or in release with overflow-checks=false → undefined behaviour).
+    let max_r = if ring_color.is_some() {
+        r_outer_outer
+    } else {
+        r_inner
+    };
+    let y_min_i = (cy - max_r).max(0);
+    let y_max_i = (cy + max_r + 1).min(height as isize);
+    let x_min_i = (cx - max_r).max(0);
+    let x_max_i = (cx + max_r + 1).min(width as isize);
+    if y_max_i <= y_min_i || x_max_i <= x_min_i {
+        return;
+    }
+    let (y_min, y_max, x_min, x_max) = (
+        y_min_i as usize,
+        y_max_i as usize,
+        x_min_i as usize,
+        x_max_i as usize,
+    );
+
+    let mut htm = hit_test_map;
+
+    for y in y_min..y_max {
+        let dy = y as isize - cy;
+        let dy2 = dy * dy;
+        for x in x_min..x_max {
+            let dx = x as isize - cx;
+            let dist2 = dx * dx + dy2;
+            let idx = y * width + x;
+
+            if let Some(map) = htm.as_mut() {
+                if dist2 <= r_outer2 {
+                    map[idx] = HIT_APP_ICON;
+                }
+            }
+
+            if let Some(ring) = ring_color {
+                let ring_rgb = ring & 0x00FFFFFF;
+                if dist2 <= r_inner_inner2 {
+                    let top = sample_icon(icon, dx, dy, r, ring);
+                    pixels[idx] = pixels[idx].under(top, BlendMode::Normal);
+                } else if dist2 < r_inner2 {
+                    let icon_pixel = sample_icon(icon, dx, dy, r, ring);
+                    // dist2 ∈ (r_inner_inner², r_inner²) (strict on both sides). numerator < diff_inner, (numerator << 8) < diff_inner << 8, division < 256 — fits a u8 cleanly with no clamp.
+                    let t = ((dist2 - r_inner_inner2) << 8) / diff_inner;
+                    let mixed = mix_rgb(icon_pixel, 0xFF000000 | ring_rgb, t as u32);
+                    pixels[idx] = pixels[idx].under(mixed, BlendMode::Normal);
+                } else if dist2 <= r_outer2 {
+                    pixels[idx] = pixels[idx].under(0xFF000000 | ring_rgb, BlendMode::Normal);
+                } else if dist2 <= r_outer_outer2 {
+                    // dist2 ∈ (r_outer², r_outer_outer²]. numerator ∈ [0, diff_outer), (numerator << 8) < diff_outer << 8, division < 256.
+                    let edge_a = ((r_outer_outer2 - dist2) << 8) / diff_outer;
+                    let top = ((edge_a as u32) << 24) | ring_rgb;
+                    pixels[idx] = pixels[idx].under(top, BlendMode::Normal);
+                }
+            } else {
+                if dist2 > r_inner2 {
+                    continue;
+                }
+                if dist2 <= r_inner_inner2 {
+                    let top = sample_icon(icon, dx, dy, r, 0);
+                    pixels[idx] = pixels[idx].under(top, BlendMode::Normal);
+                } else {
+                    let icon_pixel = sample_icon(icon, dx, dy, r, 0);
+                    // dist2 ∈ (r_inner_inner², r_inner²]. r_inner² − dist2 ∈ [0, diff_inner), so (numerator << 8)/diff_inner < 256 — fits u8 with no clamp.
+                    let edge_a = ((r_inner2 - dist2) << 8) / diff_inner;
+                    let top = ((edge_a as u32) << 24) | (icon_pixel & 0x00FFFFFF);
+                    pixels[idx] = pixels[idx].under(top, BlendMode::Normal);
+                }
+            }
+        }
+    }
+}
+
+/// Nearest-neighbour fetch from `icon` for offset `(dx, dy)` from the orb centre, scaled to fit `radius`. Returns an opaque α + darkness pixel. Falls back to a solid darkened version of `ring_color` (or solid dark grey) when no icon is present — keeps the orb visually anchored even without art.
+///
+/// Precondition: caller only invokes this when `dx² + dy² ≤ r_inner² = (r−1)²`, so `|dx|, |dy| ≤ r−1` and `u = (dx+r+0.5)/(2r) ∈ (0, 1)` strictly — `sx = (u * img.width) as usize` is therefore `< img.width`. Violating that precondition panics on the index (fail loud).
+fn sample_icon(icon: Option<&Icon>, dx: isize, dy: isize, radius: isize, fallback_ring: u32) -> u32 {
+    if let Some(img) = icon {
+        let diameter = (radius * 2) as f32;
+        let u = ((dx + radius) as f32 + 0.5) / diameter;
+        let v = ((dy + radius) as f32 + 0.5) / diameter;
+        let sx = (u * img.width as f32) as usize;
+        let sy = (v * img.height as f32) as usize;
+        img.pixels[sy * img.width as usize + sx]
+    } else if fallback_ring != 0 {
+        0xFF000000 | (fallback_ring & 0x00FFFFFF)
+    } else {
+        0xFF7F7F7F
+    }
+}
+
+/// Per-channel linear interpolation in darkness space: `t = 0` returns `a`, `t = 255` returns `b`. Keeps the α byte from `a`. Used for blending the icon with the ring across the inner-AA edge.
+fn mix_rgb(a: u32, b: u32, t: u32) -> u32 {
+    let inv = 256 - t;
+    let alpha = a & 0xFF000000;
+    let ar = (a >> 16) & 0xFF;
+    let ag = (a >> 8) & 0xFF;
+    let ab = a & 0xFF;
+    let br = (b >> 16) & 0xFF;
+    let bg = (b >> 8) & 0xFF;
+    let bb = b & 0xFF;
+    let r = (ar * inv + br * t) >> 8;
+    let g = (ag * inv + bg * t) >> 8;
+    let bch = (ab * inv + bb * t) >> 8;
+    alpha | (r << 16) | (g << 8) | bch
 }
 
 /// Strip geometry consumed by the three `draw_strip_*` functions. Returns `None` if the strip can't fit in the viewport.

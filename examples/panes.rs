@@ -12,6 +12,7 @@ use fluor::host::chrome::{
     self, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE, ResizeEdge,
 };
 use fluor::host::chrome_widget::DefaultChrome;
+use fluor::host::icon::Icon;
 use fluor::paint::pack_argb;
 use fluor::paint::{self, BlendMode, Transform};
 use fluor::region::Region;
@@ -63,7 +64,10 @@ impl PanesDemo {
         );
 
         let title = title.into();
-        let chrome = DefaultChrome::new(viewport, title.clone());
+        // Decode the bundled app-icon orb (256×256 uncompressed VSF, hp+hb hashes). Bake-in via include_bytes! so the example is a single-file artefact at runtime — no on-disk asset lookup.
+        let orb_bytes = include_bytes!("assets/example_orb.vsf");
+        let app_icon = Icon::from_vsf_bytes(orb_bytes).ok();
+        let chrome = DefaultChrome::new(viewport, title.clone(), app_icon);
 
         // Placeholder textbox + groups — actual geometry computed in `init`/`on_resize`.
         // textbox_group has two layers: content (under) + glow (on top, pre-knocked by (255-mask)).

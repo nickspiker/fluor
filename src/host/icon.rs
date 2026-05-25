@@ -198,12 +198,13 @@ impl Icon {
                 let v_val = unsafe { *v_ptr.add((y / 2) * stride_uv + (x / 2)) } as f32 / 255.0;
                 let cb = u_val - 0.5;
                 let cr = v_val - 0.5;
-                let r = (y_val + 2.0 * cr).clamp(0.0, 1.0);
-                let b = (y_val + 2.0 * cb).clamp(0.0, 1.0);
-                let g = ((4.0 * y_val - r - b) / 2.0).clamp(0.0, 1.0);
-                let dr = (255.0 - r * 255.0) as u32;
-                let dg = (255.0 - g * 255.0) as u32;
-                let db = (255.0 - b * 255.0) as u32;
+                let r = y_val + 2.0 * cr;
+                let b = y_val + 2.0 * cb;
+                let g = (4.0 * y_val - r - b) / 2.0;
+                // f32 → u8 in Rust saturates (< 0 → 0, > 255 → 255, NaN → 0) so out-of-gamut YCbCr maps cleanly without explicit clamps.
+                let dr = (255.0 - r * 255.0) as u8 as u32;
+                let dg = (255.0 - g * 255.0) as u8 as u32;
+                let db = (255.0 - b * 255.0) as u8 as u32;
                 pixels.push(0xFF000000 | (dr << 16) | (dg << 8) | db);
             }
         }
