@@ -555,41 +555,61 @@ pub fn finalize_into_screen(
     win_h: usize,
     screen: &mut [u32],
     scr_w: usize,
-    rect_x: usize,
-    rect_y: usize,
+    rect_x: i32,
+    rect_y: i32,
 ) {
     let alpha_mode = DEBUG_SHOW_ALPHA.load(std::sync::atomic::Ordering::Relaxed);
-    let n = (win_w * win_h).min(scratch.len()).min(clip_mask.len());
-    for i in 0..n {
-        let sy = i / win_w;
-        let sx = i - sy * win_w;
-        let dst_idx = (rect_y + sy) * scr_w + (rect_x + sx);
+    if scr_w == 0 {
+        return;
+    }
+    let scr_h = screen.len() / scr_w;
 
-        let v = scratch[i] ^ 0x00FFFFFF;
-        let m = clip_mask[i] as u32;
-        let inner_alpha = (v >> 24) & 0xFF;
-        let final_alpha = (inner_alpha * m) >> 8;
-        if alpha_mode == DEBUG_SHOW_ALPHA_GRAYSCALE {
-            screen[dst_idx] =
-                0xFF000000 | (final_alpha << 16) | (final_alpha << 8) | final_alpha;
-            continue;
+    // Clip iteration to the rect ∩ screen. WHY: rect_x/y are screen-space coords that can be negative (window partially off-screen left/top) or push past the right/bottom edge when the surface is smaller than expected (initial size mismatch before the first Resized event, monitor change, etc.). PROOF: sy_min/sx_min skip rows/cols above/left of the screen origin; sy_max/sx_max stop at the screen edge. PREVENTS: i32 → usize wrap on negative offsets + writes past `screen.len()`.
+    let sy_min = (-rect_y).max(0) as usize;
+    let sx_min = (-rect_x).max(0) as usize;
+    let sy_max = win_h.min(((scr_h as i32) - rect_y).max(0) as usize);
+    let sx_max = win_w.min(((scr_w as i32) - rect_x).max(0) as usize);
+    if sy_min >= sy_max || sx_min >= sx_max {
+        return;
+    }
+
+    for sy in sy_min..sy_max {
+        let dst_y = (rect_y + sy as i32) as usize;
+        let dst_row = dst_y * scr_w;
+        let src_row = sy * win_w;
+        for sx in sx_min..sx_max {
+            let scratch_idx = src_row + sx;
+            if scratch_idx >= scratch.len() || scratch_idx >= clip_mask.len() {
+                break;
+            }
+            let dst_idx = dst_row + (rect_x + sx as i32) as usize;
+
+            let v = scratch[scratch_idx] ^ 0x00FFFFFF;
+            let m = clip_mask[scratch_idx] as u32;
+            let inner_alpha = (v >> 24) & 0xFF;
+            let final_alpha = (inner_alpha * m) >> 8;
+            if alpha_mode == DEBUG_SHOW_ALPHA_GRAYSCALE {
+                screen[dst_idx] =
+                    0xFF000000 | (final_alpha << 16) | (final_alpha << 8) | final_alpha;
+                continue;
+            }
+            if alpha_mode == DEBUG_SHOW_ALPHA_FORCE_OPAQUE {
+                screen[dst_idx] = 0xFF000000 | (v & 0x00FFFFFF);
+                continue;
+            }
+            #[cfg(target_os = "linux")]
+            let s = if DEBUG_SKIP_PREMULT.load(std::sync::atomic::Ordering::Relaxed) {
+                256u32
+            } else {
+                final_alpha
+            };
+            #[cfg(not(target_os = "linux"))]
+            let s = 256u32;
+            let r = (((v >> 16) & 0xFF) * s) >> 8;
+            let g = (((v >> 8) & 0xFF) * s) >> 8;
+            let b = ((v & 0xFF) * s) >> 8;
+            screen[dst_idx] = (final_alpha << 24) | (r << 16) | (g << 8) | b;
         }
-        if alpha_mode == DEBUG_SHOW_ALPHA_FORCE_OPAQUE {
-            screen[dst_idx] = 0xFF000000 | (v & 0x00FFFFFF);
-            continue;
-        }
-        #[cfg(target_os = "linux")]
-        let s = if DEBUG_SKIP_PREMULT.load(std::sync::atomic::Ordering::Relaxed) {
-            256u32
-        } else {
-            final_alpha
-        };
-        #[cfg(not(target_os = "linux"))]
-        let s = 256u32;
-        let r = (((v >> 16) & 0xFF) * s) >> 8;
-        let g = (((v >> 8) & 0xFF) * s) >> 8;
-        let b = ((v & 0xFF) * s) >> 8;
-        screen[dst_idx] = (final_alpha << 24) | (r << 16) | (g << 8) | b;
     }
 }
 
