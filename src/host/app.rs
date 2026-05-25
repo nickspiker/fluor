@@ -199,9 +199,6 @@ impl<A: FluorApp> DesktopShell<A> {
             return;
         };
 
-        // Reset clip_mask to 255 (fully visible) each frame BEFORE handing to consumer. Chrome's `rasterize_chrome` carves the corner cutouts and any other shape-trim regions to 0; without resetting, carved bytes from a previous frame's larger chrome (e.g. before a Ctrl+0 zoom reset, or after the window shrank) would persist as permanently-transparent artifacts. memset of width*height bytes is ~0.1ms even at 4K — negligible vs the paint that follows.
-        self.clip_mask.fill(255);
-
         let mut ctx = Context {
             viewport: self.viewport,
             text,
@@ -550,7 +547,9 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                     }
                 }
 
-                self.viewport = Viewport::new(size.width, size.height);
+                // Preserve the user's zoom (ru) across resizes — `Viewport::new` resets ru to 1.0 by default, but the resize event shouldn't undo Ctrl+/Ctrl-/Ctrl+scroll. Carry the existing ru forward.
+                self.viewport =
+                    Viewport::new(size.width, size.height).with_ru(self.viewport.ru);
                 let needed = size.width as usize * size.height as usize;
                 if self.clip_mask.len() != needed {
                     self.clip_mask = vec![255u8; needed];
