@@ -133,11 +133,29 @@ pub fn run_app<A: FluorApp + 'static>(app: A) -> Result<(), EventLoopError> {
     event_loop.run_app(&mut shell)
 }
 
+/// Visible-window placement inside the fullscreen screen buffer. fluor now runs as a fullscreen transparent OS window owning the whole display — the "window" the consumer paints into is a sub-rect of that screen buffer at `(x, y)` with `(w, h)` pixels. `(x, y, w, h)` are screen-space pixel coordinates. `(0, 0)` is the top-left of the display. WindowRect is mutated by drag-to-move (changes `x, y`) and resize-drag (changes `w, h`); both are in-buffer operations that don't touch the OS window geometry.
+#[derive(Clone, Copy, Debug)]
+struct WindowRect {
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+}
+
 /// The host's adapter — owns platform handles + the consumer's `App`, dispatches events through the trait. Not user-facing; constructed by [`run_app`].
+///
+/// **Compositor architecture.** The OS window is fullscreen borderless transparent — fluor owns the entire screen buffer. The consumer paints into a window-sized scratch buffer (sized to `viewport` = `window_rect.w × window_rect.h`); the host then blits that scratch into the screen buffer at the `window_rect` offset. Pixels outside the window stay α=0 so the OS compositor shows whatever's behind us. Click-through is via a per-resize input-region call (set later, see step 2 of the fullscreen-compositor pivot) so clicks outside `window_rect` route to whatever's underneath.
 struct DesktopShell<A: FluorApp> {
     app: A,
     window: Option<Arc<Window>>,
+    /// Consumer-visible viewport — sized to `window_rect.w × window_rect.h`, NOT the screen. Consumers paint and lay out as if their window is `viewport.width_px × viewport.height_px`; the host handles placing that paint inside the larger screen buffer.
     viewport: Viewport,
+    /// Display size in pixels (= OS window size in fullscreen mode). The OS surface buffer matches this.
+    screen_size: (u32, u32),
+    /// Where the visible window lives inside the screen buffer. Driven by drag-to-move + resize-drag (later steps); initialized centered with a 3/4-of-monitor-short initial size.
+    window_rect: WindowRect,
+    /// Window-sized scratch buffer. The consumer renders into this (at viewport dimensions); the host runs `finalize_for_os` on it with the window-space clip mask, then blits row-by-row into the screen buffer at `window_rect.x, window_rect.y`. Resized on `window_rect` size change.
+    scratch: Vec<u32>,
 
     // --- Renderer ---
     #[cfg(target_os = "macos")]
@@ -147,7 +165,7 @@ struct DesktopShell<A: FluorApp> {
 
     // --- Shared resources ---
     text: Option<TextRenderer>,
-    /// Window-shape clip mask, one byte α per pixel. Same dimensions as the present buffer. Consumers write to it via `ctx.clip_mask` once per resize (e.g. `DefaultChrome` carves the rounded-corner cutouts); the boundary step multiplies it into each pixel's α before handing the buffer to the OS. Default `255` (fully visible) means a consumer that doesn't touch it gets a rectangular window with no clipping.
+    /// Window-shape clip mask, one byte α per pixel. Sized to `viewport` (= window-space, NOT screen-space). The consumer carves shape into it (rounded corner cutouts etc.); `finalize_for_os` multiplies it into each pixel's α at the scratch-buffer boundary before the host blits to screen. Default `255` (fully visible) means a consumer that doesn't touch it gets a rectangular window.
     clip_mask: Vec<u8>,
     cursor_x: Coord,
     cursor_y: Coord,
@@ -167,6 +185,9 @@ impl<A: FluorApp> DesktopShell<A> {
             app,
             window: None,
             viewport: Viewport::new(1, 1),
+            screen_size: (1, 1),
+            window_rect: WindowRect { x: 0, y: 0, w: 1, h: 1 },
+            scratch: Vec::new(),
             #[cfg(target_os = "macos")]
             renderer: None,
             #[cfg(not(target_os = "macos"))]
@@ -188,12 +209,15 @@ impl<A: FluorApp> DesktopShell<A> {
         let Some(window) = self.window.as_ref().cloned() else {
             return;
         };
-        let buf_w = self.viewport.width_px as usize;
-        let buf_h = self.viewport.height_px as usize;
-        // Make sure the clip mask is sized to the current viewport. Default fill is 255 = fully visible (consumer is opting in to clip-shape carving).
-        let needed = buf_w * buf_h;
-        if self.clip_mask.len() != needed {
-            self.clip_mask = vec![255u8; needed];
+        let win_w = self.viewport.width_px as usize;
+        let win_h = self.viewport.height_px as usize;
+        let win_px = win_w * win_h;
+        // Keep scratch + clip_mask in sync with the consumer-visible viewport (= window_rect dims). Resize-drag (later step) changes these; we re-allocate when the size shifts.
+        if self.scratch.len() != win_px {
+            self.scratch = vec![0u32; win_px];
+        }
+        if self.clip_mask.len() != win_px {
+            self.clip_mask = vec![255u8; win_px];
         }
         let Some(text) = self.text.as_mut() else {
             return;
@@ -209,7 +233,14 @@ impl<A: FluorApp> DesktopShell<A> {
             cursor_y: self.cursor_y,
         };
 
-        // Boundary: present buffer init to canonical empty (`0x00000000` — α=0 transparent, darkness=0; zero-init is calloc-free), consumer renders into it (writing α + darkness pixels + carving `ctx.clip_mask`), then `finalize_for_os` does the single `pixel ^= 0x00FFFFFF` darkness→visible flip + clip-mask multiply + Linux premult + pack in one pass. `ctx` drops first so we can re-borrow `self.clip_mask` immutably for the boundary call.
+        // Step 1: render consumer into the window-sized scratch (α + darkness convention, with clip_mask carving — UNCHANGED from the pre-fullscreen pipeline). Step 2: clear the screen buffer (so pixels outside window_rect are α=0 and the OS compositor sees through us). Step 3: finalize_into_screen reads scratch + clip_mask once per pixel and writes OS-ready ARGB into the screen buffer at window_rect offset — one pass over pixels, same per-pixel cost as the old in-place finalize_for_os.
+        self.scratch.fill(0);
+        self.app.render(&mut self.scratch, &mut ctx);
+        drop(ctx);
+
+        let scr_w = self.screen_size.0 as usize;
+        let rect_x = self.window_rect.x.max(0) as usize;
+        let rect_y = self.window_rect.y.max(0) as usize;
         #[cfg(target_os = "macos")]
         {
             let Some(renderer) = self.renderer.as_mut() else {
@@ -217,9 +248,16 @@ impl<A: FluorApp> DesktopShell<A> {
             };
             let mut buffer = renderer.lock_buffer();
             buffer.fill(0);
-            self.app.render(&mut buffer, &mut ctx);
-            drop(ctx);
-            crate::paint::finalize_for_os(&mut buffer, &self.clip_mask);
+            crate::paint::finalize_into_screen(
+                &self.scratch,
+                &self.clip_mask,
+                win_w,
+                win_h,
+                &mut buffer,
+                scr_w,
+                rect_x,
+                rect_y,
+            );
             let _ = buffer.present();
         }
         #[cfg(not(target_os = "macos"))]
@@ -229,13 +267,18 @@ impl<A: FluorApp> DesktopShell<A> {
             };
             let mut buffer = surface.buffer_mut().expect("softbuffer buffer_mut");
             buffer.fill(0);
-            self.app.render(&mut buffer, &mut ctx);
-            drop(ctx);
-            crate::paint::finalize_for_os(&mut buffer, &self.clip_mask);
+            crate::paint::finalize_into_screen(
+                &self.scratch,
+                &self.clip_mask,
+                win_w,
+                win_h,
+                &mut buffer,
+                scr_w,
+                rect_x,
+                rect_y,
+            );
             buffer.present().expect("softbuffer buffer.present");
         }
-        // Drop `ctx` (releases &mut text borrow) and `buf_w`/`buf_h` shadow used for nothing — placeholder to avoid warnings if cfg drops both arms.
-        let _ = (buf_w, buf_h);
     }
 
     /// Apply an [`EventResponse`] returned from `app.on_event`. Returns `true` if the response was `Close` (caller should terminate).
@@ -411,23 +454,26 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
             .primary_monitor()
             .or_else(|| event_loop.available_monitors().next());
 
-        let initial = if let Some(ref mon) = monitor {
-            let size = mon.size();
-            let short = size.width.min(size.height);
+        // Pick the visible-window initial size — 3/4 of the monitor short axis, 4:3 (same heuristic as the pre-fullscreen path). This is what the consumer will see as `viewport.width_px × viewport.height_px`; the fullscreen OS surface is monitor-sized regardless.
+        let (mon_w, mon_h) = if let Some(ref mon) = monitor {
+            let s = mon.size();
+            (s.width, s.height)
+        } else {
+            (1920, 1080)
+        };
+        let initial = {
+            let short = mon_w.min(mon_h);
             let h = short * 3 / 4;
             let w = h * 4 / 3;
             winit::dpi::PhysicalSize::new(w, h)
-        } else {
-            winit::dpi::PhysicalSize::new(1280, 800)
         };
 
+        // Fullscreen borderless transparent — fluor owns the whole screen buffer. The "window" the consumer sees is just a rectangle inside that buffer; everywhere else stays α=0 and the OS compositor shows whatever's behind us. with_resizable / min_inner_size are irrelevant in fullscreen mode and dropped.
         let attrs = WindowAttributes::default()
             .with_title(self.app.title())
-            .with_inner_size(initial)
-            .with_min_inner_size(winit::dpi::PhysicalSize::new(24u32, 8u32))
+            .with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)))
             .with_decorations(false)
-            .with_transparent(true)
-            .with_resizable(true);
+            .with_transparent(true);
         let window = Arc::new(event_loop.create_window(attrs).expect("create_window"));
 
         #[cfg(target_os = "macos")]
@@ -436,14 +482,27 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
             window.set_has_shadow(false);
         }
 
+        // After window creation, query the actual fullscreen inner_size — it may differ from monitor.size() if winit / WM adjusts (HiDPI scale, taskbar exclusion, etc.). Use whatever the OS gave us.
+        let surface_size = window.inner_size();
+        self.screen_size = (surface_size.width, surface_size.height);
+
+        // Centre the visible window in the screen. window_rect is the only thing the consumer sees as their viewport.
+        let win_x = ((self.screen_size.0 as i32) - (initial.width as i32)) / 2;
+        let win_y = ((self.screen_size.1 as i32) - (initial.height as i32)) / 2;
+        self.window_rect = WindowRect {
+            x: win_x,
+            y: win_y,
+            w: initial.width,
+            h: initial.height,
+        };
         self.viewport = Viewport::new(initial.width, initial.height);
 
         #[cfg(target_os = "macos")]
         {
             self.renderer = Some(super::renderer_wgpu::Renderer::new(
                 &window,
-                initial.width,
-                initial.height,
+                self.screen_size.0,
+                self.screen_size.1,
             ));
         }
         #[cfg(not(target_os = "macos"))]
@@ -455,8 +514,8 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 .expect("softbuffer Surface::new");
             surface
                 .resize(
-                    NonZeroU32::new(initial.width).expect("nonzero width"),
-                    NonZeroU32::new(initial.height).expect("nonzero height"),
+                    NonZeroU32::new(self.screen_size.0).expect("nonzero screen width"),
+                    NonZeroU32::new(self.screen_size.1).expect("nonzero screen height"),
                 )
                 .expect("softbuffer Surface::resize");
             self.surface = Some(surface);
@@ -466,11 +525,10 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
             self.text = Some(TextRenderer::new());
         }
 
-        // Allocate the clip-mask buffer matched to the initial viewport (default 255 = fully visible — consumer carves shape via DefaultChrome or similar).
-        let needed = self.viewport.width_px as usize * self.viewport.height_px as usize;
-        if self.clip_mask.len() != needed {
-            self.clip_mask = vec![255u8; needed];
-        }
+        // Scratch + clip_mask are sized to the visible window (= viewport), NOT the screen. The host blits scratch into the screen buffer at window_rect offset; pixels outside the window stay at the screen buffer's α=0 init.
+        let win_px = (self.window_rect.w as usize) * (self.window_rect.h as usize);
+        self.scratch = vec![0u32; win_px];
+        self.clip_mask = vec![255u8; win_px];
 
         // Hand control to the consumer's init.
         {
@@ -525,13 +583,15 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 std::process::exit(0);
             }
             WindowEvent::Resized(size) => {
-                // The OS confirms a new window size — process it whether or not we initiated it (drag, maximize, restore, OS rotation, etc.). This is the SINGLE place that resizes the surface + viewport + clip_mask, ensuring our buffer is always the same size as the displayed window. Without this consistency, X11's PutImage clips or stretches the buffer→window mapping and we get smear artifacts during drag.
-                if size.width == self.viewport.width_px && size.height == self.viewport.height_px {
+                // In the fullscreen-compositor architecture, the OS surface is the whole screen — `size` is the SCREEN size, not the consumer-visible viewport (= window_rect dimensions). On a normal run this fires once at startup with the monitor size; later it may fire if the user switches monitors or the resolution changes. window_rect stays where it is (the visible window inside the screen buffer); the consumer's viewport is unchanged.
+                if size.width == self.screen_size.0 && size.height == self.screen_size.1 {
                     return;
                 }
                 if size.width == 0 || size.height == 0 {
                     return;
                 }
+
+                self.screen_size = (size.width, size.height);
 
                 #[cfg(target_os = "macos")]
                 if let Some(renderer) = self.renderer.as_mut() {
@@ -547,29 +607,7 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                     }
                 }
 
-                // Preserve the user's zoom (ru) across resizes — `Viewport::new` resets ru to 1.0 by default, but the resize event shouldn't undo Ctrl+/Ctrl-/Ctrl+scroll. Carry the existing ru forward.
-                self.viewport =
-                    Viewport::new(size.width, size.height).with_ru(self.viewport.ru);
-                let needed = size.width as usize * size.height as usize;
-                if self.clip_mask.len() != needed {
-                    self.clip_mask = vec![255u8; needed];
-                }
-
-                if let (Some(window), Some(text)) =
-                    (self.window.as_ref().cloned(), self.text.as_mut())
-                {
-                    let mut ctx = Context {
-                        viewport: self.viewport,
-                        text,
-                        clip_mask: &mut self.clip_mask,
-                        window: &window,
-                        modifiers: self.modifiers,
-                        cursor_x: self.cursor_x,
-                        cursor_y: self.cursor_y,
-                    };
-                    self.app.on_resize(size.width, size.height, &mut ctx);
-                }
-                // Paint immediately at the new size — don't wait for the next RedrawRequested vsync. During a drag this minimizes the gap between OS-confirmed-resize and visible-paint to a single frame: cursor moves → request_inner_size → Resized → paint → display. Waiting for RedrawRequested would add another vsync of lag and let the WM tile-fill the new area meanwhile.
+                // Paint at the new screen size — same window content, just the surface backing it changed.
                 self.render_frame();
             }
             WindowEvent::CursorMoved { position, .. } => {

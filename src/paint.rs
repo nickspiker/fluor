@@ -543,6 +543,56 @@ pub fn finalize_for_os(pixels: &mut [u32], clip_mask: &[u8]) {
     }
 }
 
+/// Combined finalize + blit: same per-pixel math as [`finalize_for_os`] (XOR darkness→visible, multiply clip_mask into α, Linux RGB×α premultiply) but reads from a `(win_w × win_h)` scratch buffer and writes into a `(scr_w × scr_h)` screen buffer at the offset `(rect_x, rect_y)`. Used by the fullscreen-compositor host path: the consumer renders into the scratch (window-space, contiguous), this function reads scratch + clip_mask once per pixel and writes the OS-ready ARGB into the screen buffer's sub-rect. The scratch buffer is **not mutated** — its α + darkness convention is preserved so a future incremental-rendering path can reuse it across frames without forcing a full re-render.
+///
+/// Pre-conditions: `rect_x + win_w ≤ scr_w` and `rect_y + win_h ≤ scr_h` (rect fits inside the screen). Caller is responsible for clearing the destination region (typically the whole screen buffer cleared to `0` so pixels outside `rect` stay α=0 and the OS compositor shows whatever's behind us).
+///
+/// One pass over pixels — same cost per pixel as `finalize_for_os` plus one address calculation for the screen-buffer offset.
+pub fn finalize_into_screen(
+    scratch: &[u32],
+    clip_mask: &[u8],
+    win_w: usize,
+    win_h: usize,
+    screen: &mut [u32],
+    scr_w: usize,
+    rect_x: usize,
+    rect_y: usize,
+) {
+    let alpha_mode = DEBUG_SHOW_ALPHA.load(std::sync::atomic::Ordering::Relaxed);
+    let n = (win_w * win_h).min(scratch.len()).min(clip_mask.len());
+    for i in 0..n {
+        let sy = i / win_w;
+        let sx = i - sy * win_w;
+        let dst_idx = (rect_y + sy) * scr_w + (rect_x + sx);
+
+        let v = scratch[i] ^ 0x00FFFFFF;
+        let m = clip_mask[i] as u32;
+        let inner_alpha = (v >> 24) & 0xFF;
+        let final_alpha = (inner_alpha * m) >> 8;
+        if alpha_mode == DEBUG_SHOW_ALPHA_GRAYSCALE {
+            screen[dst_idx] =
+                0xFF000000 | (final_alpha << 16) | (final_alpha << 8) | final_alpha;
+            continue;
+        }
+        if alpha_mode == DEBUG_SHOW_ALPHA_FORCE_OPAQUE {
+            screen[dst_idx] = 0xFF000000 | (v & 0x00FFFFFF);
+            continue;
+        }
+        #[cfg(target_os = "linux")]
+        let s = if DEBUG_SKIP_PREMULT.load(std::sync::atomic::Ordering::Relaxed) {
+            256u32
+        } else {
+            final_alpha
+        };
+        #[cfg(not(target_os = "linux"))]
+        let s = 256u32;
+        let r = (((v >> 16) & 0xFF) * s) >> 8;
+        let g = (((v >> 8) & 0xFF) * s) >> 8;
+        let b = ((v & 0xFF) * s) >> 8;
+        screen[dst_idx] = (final_alpha << 24) | (r << 16) | (g << 8) | b;
+    }
+}
+
 /// Photon's `blend_rgb_only` helper: weighted RGB blend of two colours with explicit per-pixel weights. Verbatim port from [compositing.rs:5821](/mnt/Octopus/Code/photon/src/ui/compositing.rs#L5821). Used by `draw_window_controls` for AA squircle edges.
 pub fn blend_rgb_only(bg_colour: u32, fg_colour: u32, weight_bg: u8, weight_fg: u8) -> u32 {
     let mut bg = bg_colour as u64;
