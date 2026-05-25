@@ -217,6 +217,11 @@ struct DesktopShell<A: FluorApp> {
     drag_start_size: (u32, u32),
     drag_start_window_pos: (i32, i32),
     drag_start_cursor_screen_pos: (i32, i32),
+
+    // --- Drag-to-move tracking. In the fullscreen-compositor architecture the OS window is fullscreen and `window.drag_window()` doesn't move anything — we move our internal `window_rect` inside the screen buffer instead. On press we capture the cursor's screen position + window_rect origin; on cursor-move we update window_rect.x/y by the delta and re-set the XShape input region so click-through follows the visible window.
+    is_dragging_move: bool,
+    drag_move_anchor_screen: (i32, i32),
+    drag_move_rect_start: (i32, i32),
 }
 
 impl<A: FluorApp> DesktopShell<A> {
@@ -242,6 +247,9 @@ impl<A: FluorApp> DesktopShell<A> {
             drag_start_size: (0, 0),
             drag_start_window_pos: (0, 0),
             drag_start_cursor_screen_pos: (0, 0),
+            is_dragging_move: false,
+            drag_move_anchor_screen: (0, 0),
+            drag_move_rect_start: (0, 0),
         }
     }
 
@@ -329,7 +337,10 @@ impl<A: FluorApp> DesktopShell<A> {
         match response {
             EventResponse::Handled | EventResponse::Pass => false,
             EventResponse::StartWindowDrag => {
-                let _ = window.drag_window();
+                // Fullscreen-compositor model: OS window.drag_window() would do nothing (OS window is fullscreen). Drag is internal — capture the anchor here and move window_rect on CursorMoved.
+                self.is_dragging_move = true;
+                self.drag_move_anchor_screen = (self.cursor_x as i32, self.cursor_y as i32);
+                self.drag_move_rect_start = (self.window_rect.x, self.window_rect.y);
                 false
             }
             EventResponse::StartResize(edge) => {
@@ -661,6 +672,26 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                     return;
                 }
 
+                // In-buffer drag-to-move: update window_rect.x/y by the cursor delta from the drag anchor. Also push a new XShape input region so click-through follows the visible window in real time (otherwise clicks land in the OLD rect for a frame). Skip consumer dispatch — they don't need cursor moves during the drag.
+                if self.is_dragging_move {
+                    let dx = (self.cursor_x as i32) - self.drag_move_anchor_screen.0;
+                    let dy = (self.cursor_y as i32) - self.drag_move_anchor_screen.1;
+                    self.window_rect.x = self.drag_move_rect_start.0 + dx;
+                    self.window_rect.y = self.drag_move_rect_start.1 + dy;
+                    if let Some(window) = self.window.as_ref().cloned() {
+                        #[cfg(target_os = "linux")]
+                        x11_atomic::set_input_region(
+                            &window,
+                            self.window_rect.x,
+                            self.window_rect.y,
+                            self.window_rect.w,
+                            self.window_rect.h,
+                        );
+                        window.request_redraw();
+                    }
+                    return;
+                }
+
                 if let (Some(window), Some(text)) =
                     (self.window.as_ref().cloned(), self.text.as_mut())
                 {
@@ -740,6 +771,10 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 if self.is_dragging_resize {
                     self.is_dragging_resize = false;
                     self.resize_edge = ResizeEdge::None;
+                }
+                // End of in-buffer drag-to-move. window_rect is already at its final position; input region was updated each tick. Just drop the flag.
+                if self.is_dragging_move {
+                    self.is_dragging_move = false;
                 }
                 self.dispatch_event(event);
             }
