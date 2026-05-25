@@ -461,10 +461,11 @@ impl FluorApp for PanesDemo {
         let buf_w = ctx.viewport.width_px as usize;
         let buf_h = ctx.viewport.height_px as usize;
 
-        // Hairline + background. Chrome's bg layer gets photon's background_noise; chrome layer gets the perimeter hairline (or stays empty under Ctrl+Shift+D+C). The chrome group's Stack program (`Push chrome, Push bg, Under(Normal)`) front-to-back-composites them, then flattens under the target. With chrome muted, the bg is what reaches the present buffer — perfect for testing clip-mask trim against the OS desktop.
+        // Hairline + background + hover overlay. Chrome's bg layer gets photon's background_noise; chrome layer gets the perimeter hairline + controls (or stays empty under Ctrl+Shift+D+C); hover layer gets a partial-α tint over the currently-hovered button (or stays empty if hover_state == HIT_NONE). The chrome group's Stack program (`Push hover, Push chrome, Under(Normal), Push bg, Under(Normal)`) front-to-back-composites them, then flattens under the target. Order matters: rasterize_chrome MUST run before rasterize_hover because hover reads `hit_test_map` which chrome populates.
         self.chrome
             .rasterize_bg(|buf, w, h| paint::background_noise(buf, w, h, 0, true, 0, None));
         self.chrome.rasterize_chrome(ctx.text, ctx.clip_mask);
+        self.chrome.rasterize_hover();
         self.chrome.flatten_into(target, buf_w, buf_h);
 
         // Debug overlay (photon-style): for every pixel, look up the hit_test_map's ID and paint

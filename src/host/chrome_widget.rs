@@ -52,6 +52,7 @@ impl DefaultChrome {
         let layer_bg = group.new_layer();
         let layer_chrome = group.new_layer();
         let layer_hover = group.new_layer();
+        // Front-to-back: chrome on top (controls + edges + hairlines + hover tint baked in), bg underneath (panes + background_noise). The hover layer is allocated for forward-compat with future designs that promote it to a separate Stack operand, but it's NOT in the program — hover tint is baked into the chrome layer at rasterization time via `pixels[i].under(tint, Normal)` (which composes correctly because rasterizer's Under expects straight-α bottoms; stacking a separate premultiplied hover layer would re-premultiply chrome's partial-α AA edges and trash them).
         group.set_program(alloc::vec![
             Op::Push(layer_chrome),
             Op::Push(layer_bg),
@@ -234,20 +235,34 @@ impl DefaultChrome {
             &crossings,
         );
 
+        // Hover overlay: raw wrap-add of the hover colour's darkness into every chrome pixel whose hit_test_map matches the current hover_state. Done LAST so `hit_test_map` is fully populated. This is photon's intentional-wrap hover effect — `chrome_dark.wrapping_add(hover_dark)` per channel, α stays opaque. The wrap is the point: a cyan/magenta/yellow hover colour added to chrome's existing darkness shifts the visible RGB by exactly the hover colour (no overflow = identity), giving a distinct hover state without obscuring the glyph. `.under()` won't work here because chrome's button pixels are opaque after `draw_strip_bg`, so the opaque-top early-out fires and any blend gets silently dropped.
+        if self.hover_state != HIT_NONE {
+            let hover_color = match self.hover_state {
+                chrome::HIT_CLOSE_BUTTON => theme::CLOSE_HOVER,
+                chrome::HIT_MAXIMIZE_BUTTON => theme::MAXIMIZE_HOVER,
+                chrome::HIT_MINIMIZE_BUTTON => theme::MINIMIZE_HOVER,
+                _ => 0,
+            };
+            if hover_color != 0 {
+                let h_r = ((hover_color >> 16) & 0xFF) as u8;
+                let h_g = ((hover_color >> 8) & 0xFF) as u8;
+                let h_b = (hover_color & 0xFF) as u8;
+                for (i, &hit) in self.hit_test_map.iter().enumerate() {
+                    if hit == self.hover_state {
+                        let p = chrome_buf[i];
+                        let a = p & 0xFF000000;
+                        let r = (((p >> 16) & 0xFF) as u8).wrapping_add(h_r) as u32;
+                        let g = (((p >> 8) & 0xFF) as u8).wrapping_add(h_g) as u32;
+                        let b = ((p & 0xFF) as u8).wrapping_add(h_b) as u32;
+                        chrome_buf[i] = a | (r << 16) | (g << 8) | b;
+                    }
+                }
+            }
+        }
     }
 
-    /// Paint the hover-overlay delta if the hover layer is dirty. The delta is added (per-channel wrap) onto the chrome layer at the currently-hovered button's pixel positions; on hover_state == HIT_NONE the layer is just zeroed (Add of 0 = no-op).
-    /// Stub for the future hover-overlay scaffold step. Currently leaves the hover layer at the
-    /// canonical empty value (no-op). The button hover effect depends on the controls scaffold
-    /// (which builds the per-pixel hit_test_map of button regions); it returns alongside that.
-    pub fn rasterize_hover(&mut self) {
-        let layer = &mut self.group.rpn.layers[self.layer_hover];
-        if !layer.dirty {
-            return;
-        }
-        layer.pixels.fill(0);
-        layer.dirty = false;
-    }
+    /// **No-op stub.** Hover tint is baked into the chrome layer in `rasterize_chrome` directly (last pass), not maintained as a separate Stack layer — see the explanation in `new()` for why. Kept as a public method for forward-compat with future designs that may promote hover to a separate Stack operand once an `under_premult` for premultiplied-layer stacking exists.
+    pub fn rasterize_hover(&mut self) {}
 
     /// Composite the chrome group (bg + chrome layers via internal Stack `Push chrome, Push bg, Under(Normal)`) and flatten under the present buffer. Front-to-back: chrome's composited result is blended `under` whatever's already in target, so chrome wins where opaque and bg shows through where chrome is transparent.
     pub fn flatten_into(&mut self, target: &mut [u32], target_w: usize, target_h: usize) {
@@ -268,13 +283,13 @@ impl DefaultChrome {
         }
     }
 
-    /// Update the hover state if `new_hit` differs from the current. Returns `true` iff the state changed (so the consumer knows to invalidate the hover layer + request_redraw).
+    /// Update the hover state if `new_hit` differs from the current. Returns `true` iff the state changed (so the consumer knows to request a redraw). Marks the chrome layer dirty (not a separate hover layer) — hover tint is baked into chrome at rasterize time.
     pub fn set_hover(&mut self, new_hit: u8) -> bool {
         if new_hit == self.hover_state {
             return false;
         }
         self.hover_state = new_hit;
-        self.group.rpn.layers[self.layer_hover].dirty = true;
+        self.group.rpn.layers[self.layer_chrome].dirty = true;
         true
     }
 
@@ -354,14 +369,15 @@ mod tests {
     }
 
     #[test]
-    fn set_hover_marks_hover_layer_dirty() {
+    fn set_hover_marks_chrome_layer_dirty() {
         let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "");
         // Run a flatten cycle so StackCompositor::evaluate clears all initial-dirty flags.
         let mut target = alloc::vec![0u32; 100 * 100];
         chrome.flatten_into(&mut target, 100, 100);
-        assert!(!chrome.group.rpn.layers[chrome.layer_hover].dirty);
+        assert!(!chrome.group.rpn.layers[chrome.layer_chrome].dirty);
         chrome.set_hover(chrome::HIT_CLOSE_BUTTON);
-        assert!(chrome.group.rpn.layers[chrome.layer_hover].dirty);
+        // Hover tint is baked into the chrome layer (not a separate hover stack operand), so a hover state change invalidates chrome.
+        assert!(chrome.group.rpn.layers[chrome.layer_chrome].dirty);
     }
 
     #[test]
