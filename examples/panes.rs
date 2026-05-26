@@ -42,6 +42,8 @@ struct PanesDemo {
     show_hitmask: bool,
     /// 256-entry random colour table indexed by hit_test_map byte; regenerated each time H toggles on so distinct IDs get visibly-distinct colours. Photon's debug-hit pattern.
     debug_hit_colours: Vec<u32>,
+    /// Demo rotation angle for the rotating rect — advanced every tick, used by [`paint::draw_rect_rotated`]. Shows off the rect primitive + RU-scaling: dimensions derive from `viewport.effective_span()` so the rect grows/shrinks with Ctrl+/Ctrl-/Ctrl+scroll.
+    rect_angle: Coord,
 }
 
 impl PanesDemo {
@@ -117,6 +119,7 @@ impl PanesDemo {
             d_chord_held: false,
             show_hitmask: false,
             debug_hit_colours: Vec::new(),
+            rect_angle: 0.0,
         }
     }
 
@@ -477,8 +480,19 @@ impl FluorApp for PanesDemo {
         let buf_h = ctx.viewport.height_px as usize;
 
         // Hairline + background + hover overlay. Chrome's bg layer gets photon's background_noise; chrome layer gets the perimeter hairline + controls (or stays empty under Ctrl+Shift+D+C); hover layer gets a partial-α tint over the currently-hovered button (or stays empty if hover_state == HIT_NONE). The chrome group's Stack program (`Push hover, Push chrome, Under(Normal), Push bg, Under(Normal)`) front-to-back-composites them, then flattens under the target. Order matters: rasterize_chrome MUST run before rasterize_hover because hover reads `hit_test_map` which chrome populates.
-        self.chrome
-            .rasterize_bg(|buf, w, h| paint::background_noise(buf, w, h, 0, true, 0, None));
+        //
+        // Rotating rect demo: a cyan rect rotates over `self.rect_angle` (advanced in tick) and sizes from `viewport.effective_span()` so it grows/shrinks with the RU zoom. Painted into the bg layer on top of the noise so it composites under the chrome's perimeter + controls.
+        let span = ctx.viewport.effective_span();
+        let cx = ctx.viewport.width_px as Coord * 0.5;
+        let cy = ctx.viewport.height_px as Coord * 0.7;
+        let rect_w = span / 8.0;
+        let rect_h = span / 24.0;
+        let rect_color = pack_argb(80, 220, 220, 255);
+        let angle = self.rect_angle;
+        self.chrome.rasterize_bg(move |buf, w, h| {
+            paint::background_noise(buf, w, h, 0, true, 0, None);
+            paint::draw_rect_rotated(buf, w, h, cx, cy, rect_w, rect_h, angle, rect_color);
+        });
         self.chrome.rasterize_chrome(ctx.text, ctx.clip_mask);
         self.chrome.rasterize_hover();
         self.chrome.flatten_into(target, buf_w, buf_h);
@@ -570,6 +584,12 @@ impl FluorApp for PanesDemo {
                 needs_redraw = true;
             }
         }
+
+        // Advance the rotating-rect demo. 0.03 rad/tick ≈ 1.8 rad/sec at 60 Hz vsync, ≈ 100°/sec — visible rotation, not dizzying. Invalidate the chrome bg so rasterize_bg re-runs and re-paints the rect at the new angle.
+        self.rect_angle += 0.03;
+        self.chrome.invalidate_bg();
+        let _ = ctx;
+        needs_redraw = true;
 
         needs_redraw
     }
