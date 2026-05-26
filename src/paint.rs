@@ -973,13 +973,11 @@ pub fn paint_shadow(
         cast_shadow_ray(screen, scr_w, scr_h, factor_256, shadow_seed, x, y);
     }
 
-    // Phase D (BR half — debug colors): y += 1, then advance UP-LEFT through any transparent cells. We're descending into the BR corner — chrome boundary recedes leftward AND upward as we go down (the curve cuts cells away from both right and bottom). Each step of the walk is (-1, -1): one left, one up. Paint each transparent cell ORANGE for debug visibility, then cast the ray in debug colors. Stop when our position has moved more LEFT of the BR corner than UP of it — i.e., `(right_col - x) > (bot_row - y)`. That's the geometric midpoint of the BR corner arc — halfway done with the BR shadow.
+    // Phase D (BR half — production black, gated): y += 1, then advance UP-LEFT through any transparent cells silently (no paint — the orange debug paint is now off). Each step of the walk is (-1, -1): one left, one up — the chrome BR curve cuts cells away from both right and bottom as we descend. Stop when our position has moved more LEFT of the BR corner than UP of it — `(right_col - x) > (bot_row - y)`. That's the geometric midpoint of the BR corner arc — halfway done with the BR shadow.
     let bot_row = y_chrome_end - 1;
     while y + 1 < y_chrome_end {
         y += 1;
         while ((screen[y * scr_w + x] >> 24) & 0xFF) == 0 {
-            // ORANGE direct-assign at full alpha (premult: R=0xFF, G=0x80, B=0).
-            screen[y * scr_w + x] = 0xFFFF8000;
             if x == 0 || y == 0 {
                 let _ = scr_h;
                 return;
@@ -992,7 +990,66 @@ pub fn paint_shadow(
         if dx_left > dy_up {
             break;
         }
-        cast_debug_ray(screen, scr_w, scr_h, factor_256, x, y, false);
+        cast_shadow_ray(screen, scr_w, scr_h, factor_256, shadow_seed, x, y);
+    }
+
+    // Phase E (continuation past BR midpoint — production black, gated): same algorithm structure as Phase D (outer y += 1, walk UL through transparent), silent walks. Loop bound is `x > x_center` so the trace can continue past `y == bot_row`. Y is clamped to bot_row once reached; if the walk isn't firing at bot_row (straight-bottom AA), advance x manually so the loop progresses.
+    let x_center = (x_chrome_left + x_chrome_end) / 2;
+    while x > x_center {
+        if y + 1 <= bot_row {
+            y += 1;
+        }
+        while ((screen[y * scr_w + x] >> 24) & 0xFF) == 0 {
+            if x == 0 || y == 0 {
+                let _ = scr_h;
+                return;
+            }
+            x -= 1;
+            y -= 1;
+        }
+        cast_shadow_ray(screen, scr_w, scr_h, factor_256, shadow_seed, x, y);
+        if y >= bot_row && x > x_center {
+            if x == 0 {
+                let _ = scr_h;
+                return;
+            }
+            x -= 1;
+        }
+    }
+
+    // Phase F (BL mirror — production black, gated): start a fresh trace from the chrome's BL corner going RIGHT to x_center. Mirror of Phase A+B+C: seed via diagonal walk from bbox BL corner going UR (+1, -1) until first non-zero pixel. Then outer x += 1; when the new cell is opaque chrome interior (>= 0xFE — BL curve descends as x increases), walk DR (+1, +1) silently until we land on a non-opaque cell. Cast shadow ray from each landing. Stop at the horizontal midpoint, meeting Phase E.
+    let mut xf = x_chrome_left;
+    let mut yf = bot_row;
+    let mut found_f = false;
+    loop {
+        let a = (screen[yf * scr_w + xf] >> 24) & 0xFF;
+        if a != 0 {
+            found_f = true;
+            break;
+        }
+        if xf + 1 >= x_chrome_end || yf == y_chrome_top {
+            break;
+        }
+        xf += 1;
+        yf -= 1;
+    }
+    if found_f {
+        cast_shadow_ray(screen, scr_w, scr_h, factor_256, shadow_seed, xf, yf);
+        while xf < x_center {
+            xf += 1;
+            if xf >= scr_w {
+                break;
+            }
+            while ((screen[yf * scr_w + xf] >> 24) & 0xFF) >= 0xFE {
+                if xf + 1 >= scr_w || yf + 1 >= scr_h {
+                    let _ = scr_h;
+                    return;
+                }
+                xf += 1;
+                yf += 1;
+            }
+            cast_shadow_ray(screen, scr_w, scr_h, factor_256, shadow_seed, xf, yf);
+        }
     }
 
     let _ = scr_h;
