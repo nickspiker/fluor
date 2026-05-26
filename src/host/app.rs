@@ -218,10 +218,12 @@ struct DesktopShell<A: FluorApp> {
     drag_start_window_pos: (i32, i32),
     drag_start_cursor_screen_pos: (i32, i32),
 
-    // --- Drag-to-move tracking. In the fullscreen-compositor architecture the OS window is fullscreen and `window.drag_window()` doesn't move anything — we move our internal `window_rect` inside the screen buffer instead. On press we capture the cursor's screen position + window_rect origin; on cursor-move we update window_rect.x/y by the delta and re-set the XShape input region so click-through follows the visible window.
+    // --- Drag-to-move tracking. In the fullscreen-compositor architecture the OS window is fullscreen and `window.drag_window()` doesn't move anything — we move our internal `window_rect` inside the screen buffer instead. On press we capture the cursor's screen position + window_rect origin; on cursor-move we update window_rect.x/y by the delta. The actual screen-buffer shift happens at vsync (RedrawRequested) via paint::shift_screen_wrap — skipping consumer render + finalize + shadow entirely during the drag. On drag release, a request_redraw kicks off a clean full re-render that overwrites the wrap artefacts.
     is_dragging_move: bool,
     drag_move_anchor_screen: (i32, i32),
     drag_move_rect_start: (i32, i32),
+    /// Last window_rect (x, y, w, h) that was actually painted into the screen buffer. Set after every render_frame; consulted at drag-move vsync ticks to compute the (dx, dy) delta to feed into `shift_screen_wrap`. Without this we'd have no way to know "how much did the window move since the last frame" because the cursor anchor describes total drag distance, not per-frame increment.
+    last_painted_rect: WindowRect,
 
     /// `false` until the first `WindowEvent::Resized` arrives confirming the OS surface size. Most WMs open a default-sized window (800×600 or similar) and then animate / configure it to fullscreen — Resized fires when the actual surface is ready. Until then, painting positions chrome against a stale `window_rect` (sized for the monitor we expected) inside a buffer that's smaller than expected, producing a brief "chrome in the top-left of a tiny window" flash as the WM grows the surface. Defer all rendering until this flips true.
     surface_ready: bool,
@@ -253,6 +255,7 @@ impl<A: FluorApp> DesktopShell<A> {
             is_dragging_move: false,
             drag_move_anchor_screen: (0, 0),
             drag_move_rect_start: (0, 0),
+            last_painted_rect: WindowRect { x: 0, y: 0, w: 1, h: 1 },
             surface_ready: false,
         }
     }
@@ -372,6 +375,49 @@ impl<A: FluorApp> DesktopShell<A> {
             );
             buffer.present().expect("softbuffer buffer.present");
         }
+        // Record what we just painted so the next drag-tick can compute its delta.
+        self.last_painted_rect = self.window_rect;
+    }
+
+    /// Drag-tick fast path: shift the screen buffer in place by the delta since the last paint, push the input region update, and present. Skips consumer render, scratch fill, finalize, and shadow rasterization entirely — the existing chrome pixels just slide through the screen buffer, with anything that falls off any edge wrapping to the opposite side. On drag release, a normal `render_frame` overwrites the wrap artefacts in one clean frame.
+    fn apply_move_drag_shift(&mut self) {
+        let dx = self.window_rect.x - self.last_painted_rect.x;
+        let dy = self.window_rect.y - self.last_painted_rect.y;
+        if dx == 0 && dy == 0 {
+            return;
+        }
+        let scr_w = self.screen_size.0 as usize;
+        let scr_h = self.screen_size.1 as usize;
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        #[cfg(target_os = "macos")]
+        {
+            let Some(renderer) = self.renderer.as_mut() else {
+                return;
+            };
+            let mut buffer = renderer.lock_buffer();
+            crate::paint::shift_screen_wrap(&mut buffer, scr_w, scr_h, dx, dy);
+            let _ = buffer.present();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let Some(surface) = self.surface.as_mut() else {
+                return;
+            };
+            let mut buffer = surface.buffer_mut().expect("softbuffer buffer_mut");
+            crate::paint::shift_screen_wrap(&mut buffer, scr_w, scr_h, dx, dy);
+            buffer.present().expect("softbuffer buffer.present");
+        }
+        #[cfg(target_os = "linux")]
+        x11_atomic::set_input_region(
+            &window,
+            self.window_rect.x,
+            self.window_rect.y,
+            self.window_rect.w,
+            self.window_rect.h,
+        );
+        self.last_painted_rect = self.window_rect;
     }
 
     /// Apply an [`EventResponse`] returned from `app.on_event`. Returns `true` if the response was `Close` (caller should terminate).
@@ -734,21 +780,13 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                     return;
                 }
 
-                // In-buffer drag-to-move: update window_rect.x/y by the cursor delta from the drag anchor. Also push a new XShape input region so click-through follows the visible window in real time (otherwise clicks land in the OLD rect for a frame). Skip consumer dispatch — they don't need cursor moves during the drag.
+                // In-buffer drag-to-move: update window_rect.x/y by the cursor delta from the drag anchor. The actual screen-buffer shift + input-region update + present happens at vsync in `apply_move_drag_shift` (called from RedrawRequested), naturally coalescing the 200+ Hz raw input rate down to the display refresh rate. Skip consumer dispatch — they don't need cursor moves during the drag.
                 if self.is_dragging_move {
                     let dx = (self.cursor_x as i32) - self.drag_move_anchor_screen.0;
                     let dy = (self.cursor_y as i32) - self.drag_move_anchor_screen.1;
                     self.window_rect.x = self.drag_move_rect_start.0 + dx;
                     self.window_rect.y = self.drag_move_rect_start.1 + dy;
-                    if let Some(window) = self.window.as_ref().cloned() {
-                        #[cfg(target_os = "linux")]
-                        x11_atomic::set_input_region(
-                            &window,
-                            self.window_rect.x,
-                            self.window_rect.y,
-                            self.window_rect.w,
-                            self.window_rect.h,
-                        );
+                    if let Some(window) = self.window.as_ref() {
                         window.request_redraw();
                     }
                     return;
@@ -834,18 +872,25 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                     self.is_dragging_resize = false;
                     self.resize_edge = ResizeEdge::None;
                 }
-                // End of in-buffer drag-to-move. window_rect is already at its final position; input region was updated each tick. Just drop the flag.
+                // End of in-buffer drag-to-move. Drop the flag and request one full redraw — the wrap-shift fast-path leaves wrap artefacts at whichever edges the window slid across; a normal render_frame overwrites the entire screen buffer cleanly and the artefacts vanish in one frame.
                 if self.is_dragging_move {
                     self.is_dragging_move = false;
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
                 }
                 self.dispatch_event(event);
             }
             WindowEvent::RedrawRequested => {
-                // During a self-driven resize drag, push the new target geometry to the OS first. This is async: the OS will confirm via a later Resized event which triggers its own paint at the confirmed size.
+                // Drag-to-move fast path: shift the existing screen pixels by the per-tick delta instead of re-rendering anything. Skips consumer.render(), scratch fill, finalize, and shadow rasterization.
+                if self.is_dragging_move {
+                    self.apply_move_drag_shift();
+                    return;
+                }
+                // Resize drag: apply the new geometry in-buffer, then paint at the new size.
                 if self.is_dragging_resize {
                     self.apply_resize_drag();
                 }
-                // ALWAYS paint per vsync — even during a drag. Otherwise the screen "sticks" for however many vsyncs the OS takes to confirm our request_inner_size. Painting at the current viewport (= last OS-confirmed size) is correct: buffer size matches window size, no smear; when OS finally confirms a new size, Resized handler resizes + paints again at the new size, and we converge.
                 self.render_frame();
             }
             _ => {
