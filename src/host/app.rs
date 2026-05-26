@@ -316,12 +316,11 @@ impl<A: FluorApp> DesktopShell<A> {
                 rect_x,
                 rect_y,
             );
-            // Drop shadow: L→R + T→B geometric-decay passes scoped to the window's right/bottom edges. factor_256 derived from `effective_span` so shadow radius scales with chrome (RU-invariant): target radius ≈ effective_span / 16; `factor_256 ≈ 256 − 1240/r` keeps the decay rate proportional. `inset` is how far back from the rectangle's right/bottom edge to start scanning — must cover the squircle's max corner inset so we catch the curve at corner rows. For our squircle (radius = span/4), corner inset is ≈ `radius × (1 − 1/√2) ≈ span × 0.073`; use span/13 for headroom.
+            // Drop shadow: 45-degree diagonal rays cast from each chrome right/bottom edge pixel. factor_256 derived from `effective_span` so ray length is RU-invariant: target ≈ effective_span / 16; `factor_256 ≈ 256 − 1240/r`.
             let span = self.viewport.effective_span();
             let target_radius = (span / 16.0).max(8.0);
             let drop = (1240.0 / target_radius) as u32;
             let factor_256 = (256u32.saturating_sub(drop)).clamp(96, 254);
-            let shadow_inset = (span / 13.0).max(8.0) as i32;
             let rect_for_shadow = (
                 self.window_rect.x,
                 self.window_rect.y,
@@ -333,7 +332,6 @@ impl<A: FluorApp> DesktopShell<A> {
                 scr_w,
                 factor_256,
                 rect_for_shadow,
-                shadow_inset,
             );
             let _ = buffer.present();
         }
@@ -354,12 +352,11 @@ impl<A: FluorApp> DesktopShell<A> {
                 rect_x,
                 rect_y,
             );
-            // Drop shadow: L→R + T→B geometric-decay passes scoped to the window's right/bottom edges. factor_256 derived from `effective_span` so shadow radius scales with chrome (RU-invariant): target radius ≈ effective_span / 16; `factor_256 ≈ 256 − 1240/r` keeps the decay rate proportional. `inset` is how far back from the rectangle's right/bottom edge to start scanning — must cover the squircle's max corner inset so we catch the curve at corner rows. For our squircle (radius = span/4), corner inset is ≈ `radius × (1 − 1/√2) ≈ span × 0.073`; use span/13 for headroom.
+            // Drop shadow: 45-degree diagonal rays cast from each chrome right/bottom edge pixel. factor_256 derived from `effective_span` so ray length is RU-invariant: target ≈ effective_span / 16; `factor_256 ≈ 256 − 1240/r`.
             let span = self.viewport.effective_span();
             let target_radius = (span / 16.0).max(8.0);
             let drop = (1240.0 / target_radius) as u32;
             let factor_256 = (256u32.saturating_sub(drop)).clamp(96, 254);
-            let shadow_inset = (span / 13.0).max(8.0) as i32;
             let rect_for_shadow = (
                 self.window_rect.x,
                 self.window_rect.y,
@@ -371,7 +368,6 @@ impl<A: FluorApp> DesktopShell<A> {
                 scr_w,
                 factor_256,
                 rect_for_shadow,
-                shadow_inset,
             );
             buffer.present().expect("softbuffer buffer.present");
         }
