@@ -952,18 +952,16 @@ pub fn paint_shadow(
     }
 
     // Cast Ray 0 from the seed cell.
-    cast_debug_ray(screen, scr_w, scr_h, factor_256, x0, y0, true);
+    cast_shadow_ray(screen, scr_w, scr_h, factor_256, x0, y0);
 
-    // Each subsequent ray: y += 1, then walk diagonally past any opaque cells (chrome interior absorbed by the curve since the last ray). Cache (x, y) — we never need to revisit because the chrome curve doesn't cut inward, so x only stays or grows. Cast the ray from the first non-opaque landing. Stop when y reaches the chrome's vertical center.
+    // Phase C (TR half): production black shadow. Each subsequent ray: y += 1, then advance through any opaque cells (chrome interior absorbed by the curve since the last ray). Cache (x, y) — the chrome curve doesn't cut inward in the TR quadrant, so x only stays or grows. Cast the ray from the first non-opaque landing. Stop when y reaches the chrome's vertical center.
     let y_center = (y_chrome_top + y_chrome_end) / 2;
     let mut x = x0;
     let mut y = y0;
     while y < y_center && y + 1 < y_chrome_end {
         y += 1;
-        // Fully-opaque chrome cells land at α=0xFE after finalize (premult: (0xFF*0xFF)>>8 = 0xFE), so "opaque interior" is >= 0xFE.
+        // Fully-opaque chrome cells land at α=0xFE after finalize (premult: (0xFF*0xFF)>>8 = 0xFE).
         while ((screen[y * scr_w + x] >> 24) & 0xFF) >= 0xFE {
-            // YELLOW direct-assign at full alpha — the opaque walk lives outside the ray's taper.
-            screen[y * scr_w + x] = 0xFFFFFF00;
             if x + 1 >= scr_w || y + 1 >= scr_h {
                 let _ = scr_h;
                 return;
@@ -971,17 +969,38 @@ pub fn paint_shadow(
             x += 1;
             y += 1;
         }
+        cast_shadow_ray(screen, scr_w, scr_h, factor_256, x, y);
+    }
+
+    // Phase D (BR half — debug colors): y += 1, then advance UP-LEFT through any transparent cells. We're descending into the BR corner — chrome boundary recedes leftward AND upward as we go down (the curve cuts cells away from both right and bottom). Each step of the walk is (-1, -1): one left, one up. Paint each transparent cell ORANGE for debug visibility, then cast the ray in debug colors. Stop when our position has moved more LEFT of the BR corner than UP of it — i.e., `(right_col - x) > (bot_row - y)`. That's the geometric midpoint of the BR corner arc — halfway done with the BR shadow.
+    let bot_row = y_chrome_end - 1;
+    while y + 1 < y_chrome_end {
+        y += 1;
+        while ((screen[y * scr_w + x] >> 24) & 0xFF) == 0 {
+            // ORANGE direct-assign at full alpha (premult: R=0xFF, G=0x80, B=0).
+            screen[y * scr_w + x] = 0xFFFF8000;
+            if x == 0 || y == 0 {
+                let _ = scr_h;
+                return;
+            }
+            x -= 1;
+            y -= 1;
+        }
+        let dx_left = right_col.saturating_sub(x);
+        let dy_up = bot_row.saturating_sub(y);
+        if dx_left > dy_up {
+            break;
+        }
         cast_debug_ray(screen, scr_w, scr_h, factor_256, x, y, false);
     }
 
     let _ = scr_h;
 }
 
-/// Debug ray cast — flat loop, single zero check.
-/// Per cell: classify by current α.
-///   * α > 0 (AA) → under-blend BLUE (ray 0) or GREEN (rays 1+).
-///   * α == 0 (transparent) → direct-assign RED (ray 0) or MAGENTA (rays 1+).
-/// Decay shadow_alpha by factor_256 each step; stop on zero or screen edge.
+/// Debug-color ray cast. Same shape as [`cast_shadow_ray`] but per cell:
+///   * α > 0 → under-blend BLUE (ray 0) or GREEN (rays 1+) — α boost + corresponding channel boost.
+///   * α == 0 → direct-assign RED (ray 0) or MAGENTA (rays 1+) premult.
+/// Used in development phases to validate trace geometry; swap for `cast_shadow_ray` once the phase is correct.
 fn cast_debug_ray(
     screen: &mut [u32],
     scr_w: usize,
@@ -1016,6 +1035,40 @@ fn cast_debug_ray(
                 let ng = (cg + boost).min(0xFF);
                 (na << 24) | (cr << 16) | (ng << 8) | cb
             };
+        }
+        shadow_alpha = (shadow_alpha * factor_256) >> 8;
+        if shadow_alpha == 0 || x + 1 >= scr_w || y + 1 >= scr_h {
+            break;
+        }
+        x += 1;
+        y += 1;
+    }
+}
+
+/// Cast one DR shadow ray. Flat loop, single zero check on shadow_alpha or screen edge. Per cell:
+///   * α > 0 (chrome AA) → under-blend black: α += shadow_alpha * (256 - α) >> 8; chrome RGB stays (shadow's premult RGB is 0 since visible black).
+///   * α == 0 (transparent) → direct-assign black premult: (shadow_alpha << 24), RGB all zero.
+/// Decay shadow_alpha by factor_256 each step.
+fn cast_shadow_ray(
+    screen: &mut [u32],
+    scr_w: usize,
+    scr_h: usize,
+    factor_256: u32,
+    mut x: usize,
+    mut y: usize,
+) {
+    let mut shadow_alpha: u32 = 0x80;
+    loop {
+        let idx = y * scr_w + x;
+        let p = screen[idx];
+        let a = (p >> 24) & 0xFF;
+        if a == 0 {
+            screen[idx] = shadow_alpha << 24;
+        } else {
+            let cover = 256 - a;
+            let boost = (shadow_alpha * cover) >> 8;
+            let na = (a + boost).min(0xFF);
+            screen[idx] = (p & 0x00FFFFFF) | (na << 24);
         }
         shadow_alpha = (shadow_alpha * factor_256) >> 8;
         if shadow_alpha == 0 || x + 1 >= scr_w || y + 1 >= scr_h {
