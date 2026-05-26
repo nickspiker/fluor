@@ -658,19 +658,20 @@ pub fn finalize_into_screen(
     }
 }
 
-/// Directional drop shadow via two recursive geometric-decay passes. Each shadow pixel inherits a fraction of the previous pixel's alpha: `α_next = (α_prev × factor_256) >> 8`. `factor_256` is a per-pixel decay multiplier in `[1, 255]` — `128` = halving (×½, ~9-pixel radius), `192` = ×¾ (~18-pixel), `240` = ×0.9375 (~60-pixel), `250` = ×0.9766 (~150-pixel). Light comes from the upper-left → shadow on the right + below the window, matching the chrome's existing bevel convention.
+/// Directional drop shadow via 45-degree diagonal rays cast from each chrome edge pixel. For each row in chrome's y-range, scan leftward from the rectangle's right edge to find that row's rightmost chrome pixel (handles squircle corners where chrome ends inside the rectangle), then cast a single diagonal ray stepping `(x+1, y+1)` per pixel with α decaying by `factor_256` each step. Same pattern for the bottom edge per column. Light source is upper-left → rays trail to the lower-right.
 ///
-/// Hot-loop cost per pixel: one read + one mul + one shift + one write (only when α changes). No divide. The caller scales `factor_256` to the viewport / chrome size — pass a value derived from `effective_span` so shadow stays proportional to chrome under zoom (RU-invariant).
+/// `factor_256` is the per-pixel decay multiplier in `[1, 255]`: 240 ≈ ×0.9375 (~60-pixel ray), 250 ≈ ×0.9766 (~150-pixel). Caller scales from `effective_span` so shadow length is RU-invariant.
 ///
-/// The screen buffer at call time has chrome pixels with `α > 0` inside `window_rect` and `α = 0` everywhere else. Shadow paints pure-black (R=G=B=0) pixels with the decayed α into the previously-transparent region just past the chrome on the right/below; premultiplied-alpha math is identity-safe for black pixels regardless of α (`0 × any_α = 0`) so it composites correctly on Linux's premult surface.
+/// Visual: each chrome edge pixel emits one diagonal ray. Adjacent rows emit adjacent diagonals → together they cover the shadow region with parallel diagonal stripes. Right-edge rays and bottom-edge rays only overlap in a thin BR corner area ("minimal double taps") and max-compose there.
 ///
-/// The vertical pass reads the buffer modified by the horizontal pass, so corner pixels (just below-right of chrome) get the natural radial-ish decay from the combined L→R + T→B walks. Pixels left of or above the chrome stay untouched (carry starts at 0 and never gets seeded). Once carry hits 0 after being seeded, the rest of the row/column is all-zero (no more chrome to re-seed) — break out and start the next.
+/// AA-edge fix folded in: when the scan finds the chrome edge pixel, if its α is partial (squircle AA), force it to 0xFF in place. Chrome's premult RGB over the implicit black shadow underneath is identity, so opaque-with-premult-RGB blends correctly.
+///
+/// Per chrome edge pixel: ~1-N scan reads (1 for straight middle rows; up to the squircle inset for corner rows) + up to `log_factor(1/255)` ray writes. Total work ≈ chrome perimeter × shadow-extent.
 pub fn paint_shadow(
     screen: &mut [u32],
     scr_w: usize,
     factor_256: u32,
     window_rect: (i32, i32, i32, i32),
-    inset: i32,
 ) {
     if scr_w == 0 || factor_256 == 0 || factor_256 >= 256 {
         return;
@@ -680,65 +681,153 @@ pub fn paint_shadow(
     if rw <= 0 || rh <= 0 {
         return;
     }
+    let x_chrome_left = rx.max(0) as usize;
+    let y_chrome_top = ry.max(0) as usize;
+    let x_chrome_end = ((rx + rw).max(0) as usize).min(scr_w);
+    let y_chrome_end = ((ry + rh).max(0) as usize).min(scr_h);
 
-    // Horizontal L→R. Scans only rows that overlap the window, and within each row starts at `(rx + rw - inset)` — far enough inside the rectangle to catch the squircle's curved right edge at corner rows, but skipping the chrome interior we'd otherwise read pointlessly. Chrome detection still uses non-zero RGB; shadow detection uses zero RGB; the carry seeds from real chrome only.
-    let y_start = ry.max(0) as usize;
-    let y_end = ((ry + rh).max(0) as usize).min(scr_h);
-    let x_start_lr = (rx + rw - inset).max(0) as usize;
-    for y in y_start..y_end {
+    // Right edge: per row, find rightmost chrome pixel, cast diagonal ray (x+1, y+1).
+    for y in y_chrome_top..y_chrome_end {
         let row = y * scr_w;
-        let mut carry: u32 = 0;
-        let mut seeded = false;
-        for x in x_start_lr..scr_w {
-            let idx = row + x;
-            let p = screen[idx];
-            let is_chrome = (p & 0x00FFFFFF) != 0;
-            if is_chrome {
-                // Force the chrome AA edge fully opaque. The chrome's outermost pixels have partial α from the squircle anti-aliasing — without this, the OS compositor blends them against the desktop behind us, which on a bright desktop shows a visible bright stripe between chrome and shadow. Math: chrome sits on top of full-strength shadow at this position; premult RGB composited over black (shadow) is identity, so we just force α to 0xFF while leaving the premult RGB unchanged. Result: AA edge transitions smoothly into solid shadow instead of leaking the desktop through.
-                screen[idx] = (p & 0x00FFFFFF) | 0xFF000000;
-                // Seed at full strength so the shadow starts opaque at the chrome's outer edge — the AA fade-out is geometric (sub-pixel coverage), not real opacity, and shouldn't dim the shadow's onset.
-                carry = 0xFF;
-                seeded = true;
-            } else if carry > 0 {
-                carry = (carry * factor_256) >> 8;
-                if carry == 0 {
+        let mut cx: Option<usize> = None;
+        for scan_x in (x_chrome_left..x_chrome_end).rev() {
+            let p = screen[row + scan_x];
+            if (p & 0x00FFFFFF) != 0 {
+                if (p >> 24) & 0xFF < 0xFF {
+                    screen[row + scan_x] = (p & 0x00FFFFFF) | 0xFF000000;
+                }
+                cx = Some(scan_x);
+                break;
+            }
+        }
+        if let Some(start_x) = cx {
+            let mut alpha: u32 = 0x40;
+            let mut x = start_x + 1;
+            let mut yy = y + 1;
+            while x < scr_w && yy < scr_h {
+                alpha = (alpha * factor_256) >> 8;
+                if alpha == 0 {
                     break;
                 }
-                let existing = (p >> 24) & 0xFF;
-                if carry > existing {
-                    screen[idx] = carry << 24;
+                let idx = yy * scr_w + x;
+                let existing = (screen[idx] >> 24) & 0xFF;
+                if alpha > existing {
+                    screen[idx] = alpha << 24;
                 }
-            } else if seeded {
-                break;
+                x += 1;
+                yy += 1;
             }
         }
     }
 
-    // Vertical T→B. Mirror: scans only cols that overlap the window, starts at `(ry + rh - inset)` to catch the squircle's curved bottom edge at corner cols. RGB-based chrome/shadow discrimination prevents L→R-painted shadow from re-seeding this pass.
-    let x_start = rx.max(0) as usize;
-    let x_end = ((rx + rw).max(0) as usize).min(scr_w);
-    let y_start_tb = (ry + rh - inset).max(0) as usize;
-    for x in x_start..x_end {
-        let mut carry: u32 = 0;
-        let mut seeded = false;
-        for y in y_start_tb..scr_h {
-            let idx = y * scr_w + x;
-            let p = screen[idx];
-            let is_chrome = (p & 0x00FFFFFF) != 0;
-            if is_chrome {
-                carry = 0xFF;
-                seeded = true;
-            } else if carry > 0 {
-                carry = (carry * factor_256) >> 8;
-                if carry == 0 {
+    // Bottom edge: per col, find bottommost chrome pixel, cast diagonal ray (x+1, y+1).
+    for x in x_chrome_left..x_chrome_end {
+        let mut cy: Option<usize> = None;
+        for scan_y in (y_chrome_top..y_chrome_end).rev() {
+            let p = screen[scan_y * scr_w + x];
+            if (p & 0x00FFFFFF) != 0 {
+                if (p >> 24) & 0xFF < 0xFF {
+                    screen[scan_y * scr_w + x] = (p & 0x00FFFFFF) | 0xFF000000;
+                }
+                cy = Some(scan_y);
+                break;
+            }
+        }
+        if let Some(start_y) = cy {
+            let mut alpha: u32 = 0x40;
+            let mut xx = x + 1;
+            let mut y = start_y + 1;
+            while xx < scr_w && y < scr_h {
+                alpha = (alpha * factor_256) >> 8;
+                if alpha == 0 {
                     break;
                 }
-                let existing = (p >> 24) & 0xFF;
-                if carry > existing {
-                    screen[idx] = carry << 24;
+                let idx = y * scr_w + xx;
+                let existing = (screen[idx] >> 24) & 0xFF;
+                if alpha > existing {
+                    screen[idx] = alpha << 24;
                 }
-            } else if seeded {
+                xx += 1;
+                y += 1;
+            }
+        }
+    }
+
+    // Upper-left pass: identical geometry mirrored, half intensity. Suggests a subtle ambient occlusion on the side of the window facing the light; combines with the bottom-right shadow to give the chrome a "raised card" feel rather than just a one-sided drop.
+    // Top edge: per col, find topmost chrome pixel, cast (-1, -1) ray.
+    for x in x_chrome_left..x_chrome_end {
+        let mut cy: Option<usize> = None;
+        for scan_y in y_chrome_top..y_chrome_end {
+            let p = screen[scan_y * scr_w + x];
+            if (p & 0x00FFFFFF) != 0 {
+                if (p >> 24) & 0xFF < 0xFF {
+                    screen[scan_y * scr_w + x] = (p & 0x00FFFFFF) | 0xFF000000;
+                }
+                cy = Some(scan_y);
                 break;
+            }
+        }
+        if let Some(start_y) = cy {
+            let mut alpha: u32 = 0x20;
+            if x == 0 || start_y == 0 {
+                continue;
+            }
+            let mut xx = x - 1;
+            let mut y = start_y - 1;
+            loop {
+                alpha = (alpha * factor_256) >> 8;
+                if alpha == 0 {
+                    break;
+                }
+                let idx = y * scr_w + xx;
+                let existing = (screen[idx] >> 24) & 0xFF;
+                if alpha > existing {
+                    screen[idx] = alpha << 24;
+                }
+                if xx == 0 || y == 0 {
+                    break;
+                }
+                xx -= 1;
+                y -= 1;
+            }
+        }
+    }
+    // Left edge: per row, find leftmost chrome pixel, cast (-1, -1) ray.
+    for y in y_chrome_top..y_chrome_end {
+        let row = y * scr_w;
+        let mut cx: Option<usize> = None;
+        for scan_x in x_chrome_left..x_chrome_end {
+            let p = screen[row + scan_x];
+            if (p & 0x00FFFFFF) != 0 {
+                if (p >> 24) & 0xFF < 0xFF {
+                    screen[row + scan_x] = (p & 0x00FFFFFF) | 0xFF000000;
+                }
+                cx = Some(scan_x);
+                break;
+            }
+        }
+        if let Some(start_x) = cx {
+            let mut alpha: u32 = 0x20;
+            if start_x == 0 || y == 0 {
+                continue;
+            }
+            let mut x = start_x - 1;
+            let mut yy = y - 1;
+            loop {
+                alpha = (alpha * factor_256) >> 8;
+                if alpha == 0 {
+                    break;
+                }
+                let idx = yy * scr_w + x;
+                let existing = (screen[idx] >> 24) & 0xFF;
+                if alpha > existing {
+                    screen[idx] = alpha << 24;
+                }
+                if x == 0 || yy == 0 {
+                    break;
+                }
+                x -= 1;
+                yy -= 1;
             }
         }
     }
