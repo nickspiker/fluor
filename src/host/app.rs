@@ -227,6 +227,9 @@ struct DesktopShell<A: FluorApp> {
 
     /// `false` until the first `WindowEvent::Resized` arrives confirming the OS surface size. Most WMs open a default-sized window (800×600 or similar) and then animate / configure it to fullscreen — Resized fires when the actual surface is ready. Until then, painting positions chrome against a stale `window_rect` (sized for the monitor we expected) inside a buffer that's smaller than expected, producing a brief "chrome in the top-left of a tiny window" flash as the WM grows the surface. Defer all rendering until this flips true.
     surface_ready: bool,
+
+    /// Tracks `WindowEvent::Focused` so the drop shadow can dim when the window is inactive — focused windows cast a stronger shadow (`SHADOW_SEED_FOCUSED`), unfocused ones use a quarter-strength shadow (`SHADOW_SEED_UNFOCUSED`).
+    is_focused: bool,
 }
 
 impl<A: FluorApp> DesktopShell<A> {
@@ -257,6 +260,7 @@ impl<A: FluorApp> DesktopShell<A> {
             drag_move_rect_start: (0, 0),
             last_painted_rect: WindowRect { x: 0, y: 0, w: 1, h: 1 },
             surface_ready: false,
+            is_focused: true,
         }
     }
 
@@ -316,11 +320,12 @@ impl<A: FluorApp> DesktopShell<A> {
                 rect_x,
                 rect_y,
             );
-            // Drop shadow: 45-degree diagonal rays cast from each chrome right/bottom edge pixel. factor_256 derived from `effective_span` so ray length is RU-invariant: target ≈ effective_span / 16; `factor_256 ≈ 256 − 1240/r`.
+            // Drop shadow: 45-degree diagonal rays cast from each chrome right/bottom edge pixel. factor_256 derived from `effective_span` so ray length is RU-invariant: target ≈ effective_span / 16; `factor_256 ≈ 256 − 1240/r`. Seed is the starting shadow α: 0x80 when focused, 0x40 (quarter strength) when unfocused.
             let span = self.viewport.effective_span();
             let target_radius = (span / 16.0).max(8.0);
             let drop = (1240.0 / target_radius) as u32;
             let factor_256 = (256u32.saturating_sub(drop)).clamp(96, 254);
+            let shadow_seed: u32 = if self.is_focused { 0x80 } else { 0x40 };
             let rect_for_shadow = (
                 self.window_rect.x,
                 self.window_rect.y,
@@ -331,6 +336,7 @@ impl<A: FluorApp> DesktopShell<A> {
                 &mut buffer,
                 scr_w,
                 factor_256,
+                shadow_seed,
                 rect_for_shadow,
             );
             let _ = buffer.present();
@@ -352,11 +358,12 @@ impl<A: FluorApp> DesktopShell<A> {
                 rect_x,
                 rect_y,
             );
-            // Drop shadow: 45-degree diagonal rays cast from each chrome right/bottom edge pixel. factor_256 derived from `effective_span` so ray length is RU-invariant: target ≈ effective_span / 16; `factor_256 ≈ 256 − 1240/r`.
+            // Drop shadow: 45-degree diagonal rays cast from each chrome right/bottom edge pixel. factor_256 derived from `effective_span` so ray length is RU-invariant: target ≈ effective_span / 16; `factor_256 ≈ 256 − 1240/r`. Seed is the starting shadow α: 0x80 when focused, 0x40 (quarter strength) when unfocused.
             let span = self.viewport.effective_span();
             let target_radius = (span / 16.0).max(8.0);
             let drop = (1240.0 / target_radius) as u32;
             let factor_256 = (256u32.saturating_sub(drop)).clamp(96, 254);
+            let shadow_seed: u32 = if self.is_focused { 0x80 } else { 0x40 };
             let rect_for_shadow = (
                 self.window_rect.x,
                 self.window_rect.y,
@@ -367,6 +374,7 @@ impl<A: FluorApp> DesktopShell<A> {
                 &mut buffer,
                 scr_w,
                 factor_256,
+                shadow_seed,
                 rect_for_shadow,
             );
             buffer.present().expect("softbuffer buffer.present");
@@ -850,13 +858,19 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 }
                 self.dispatch_event(event);
             }
-            WindowEvent::Focused(false) => {
+            WindowEvent::Focused(focused) => {
+                let focused = *focused;
+                self.is_focused = focused;
                 // Cancel any in-progress resize drag if we lose focus mid-drag (the user alt-tabbed or the WM stole focus). Keeps state consistent.
-                if self.is_dragging_resize {
+                if !focused && self.is_dragging_resize {
                     self.is_dragging_resize = false;
                     self.resize_edge = ResizeEdge::None;
                 }
                 self.dispatch_event(event);
+                // Repaint so the drop shadow dims/brightens immediately.
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
             }
             WindowEvent::MouseInput {
                 state: ElementState::Released,

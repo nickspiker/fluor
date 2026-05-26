@@ -898,6 +898,7 @@ pub fn paint_shadow(
     screen: &mut [u32],
     scr_w: usize,
     factor_256: u32,
+    shadow_seed: u32,
     window_rect: (i32, i32, i32, i32),
 ) {
     if scr_w == 0 || factor_256 == 0 || factor_256 >= 256 {
@@ -952,7 +953,7 @@ pub fn paint_shadow(
     }
 
     // Cast Ray 0 from the seed cell.
-    cast_shadow_ray(screen, scr_w, scr_h, factor_256, x0, y0);
+    cast_shadow_ray(screen, scr_w, scr_h, factor_256, shadow_seed, x0, y0);
 
     // Phase C (TR half): production black shadow. Each subsequent ray: y += 1, then advance through any opaque cells (chrome interior absorbed by the curve since the last ray). Cache (x, y) — the chrome curve doesn't cut inward in the TR quadrant, so x only stays or grows. Cast the ray from the first non-opaque landing. Stop when y reaches the chrome's vertical center.
     let y_center = (y_chrome_top + y_chrome_end) / 2;
@@ -969,7 +970,7 @@ pub fn paint_shadow(
             x += 1;
             y += 1;
         }
-        cast_shadow_ray(screen, scr_w, scr_h, factor_256, x, y);
+        cast_shadow_ray(screen, scr_w, scr_h, factor_256, shadow_seed, x, y);
     }
 
     // Phase D (BR half — debug colors): y += 1, then advance UP-LEFT through any transparent cells. We're descending into the BR corner — chrome boundary recedes leftward AND upward as we go down (the curve cuts cells away from both right and bottom). Each step of the walk is (-1, -1): one left, one up. Paint each transparent cell ORANGE for debug visibility, then cast the ray in debug colors. Stop when our position has moved more LEFT of the BR corner than UP of it — i.e., `(right_col - x) > (bot_row - y)`. That's the geometric midpoint of the BR corner arc — halfway done with the BR shadow.
@@ -1054,10 +1055,11 @@ fn cast_shadow_ray(
     scr_w: usize,
     scr_h: usize,
     factor_256: u32,
+    shadow_seed: u32,
     mut x: usize,
     mut y: usize,
 ) {
-    let mut shadow_alpha: u32 = 0x80;
+    let mut shadow_alpha: u32 = shadow_seed;
     loop {
         let idx = y * scr_w + x;
         let p = screen[idx];
