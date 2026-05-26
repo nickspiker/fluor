@@ -543,6 +543,51 @@ pub fn finalize_for_os(pixels: &mut [u32], clip_mask: &[u8]) {
     }
 }
 
+/// 2D wrap-shift the screen buffer in place. Two passes — one per axis. The X pass walks each row, memmoves the row by `dx` columns, and pastes the wrap segment (the pixels that fall off one edge) at the opposite edge. The Y pass treats the whole buffer as a stack of rows, memmoves the rows by `dy` rows, and pastes the wrap row-block at the opposite end.
+///
+/// Used during in-buffer drag-to-move to skip the chrome / panes / shadow re-rasterization entirely — the window just slides through the screen buffer with its existing pixels, and pixels that fall off any edge wrap around to the opposite end. On drag release the host does one full re-render to clear the wrap artefacts.
+///
+/// Per-pixel cost: one read + one write, via `slice::copy_within` which lowers to platform `memmove`. No branches inside the inner copy loops — the direction (right/left, up/down) selects between two precomputed `(src_range, dst_offset, wrap_src_range, wrap_dst_range)` tuples, then the copies execute unconditionally.
+///
+/// `dx` / `dy` are bounded by per-frame cursor motion (≪ screen dimensions in practice). debug_assert catches absurd deltas; release trusts the caller.
+pub fn shift_screen_wrap(screen: &mut [u32], scr_w: usize, scr_h: usize, dx: i32, dy: i32) {
+    let nx = dx.unsigned_abs() as usize;
+    let ny = dy.unsigned_abs() as usize;
+    debug_assert!(nx < scr_w, "dx must be less than screen width");
+    debug_assert!(ny < scr_h, "dy must be less than screen height");
+
+    // X pass — per row. Direction picks the (wrap-source, body-source, body-destination, wrap-destination) tuple once; the per-row work is three unconditional copies. For dx == 0 the function never enters either branch and the X pass is skipped entirely (nx == 0 → tmp_x.len() == 0 → all three copies are 0-byte no-ops).
+    if dx != 0 {
+        let mut tmp_x = alloc::vec![0u32; nx];
+        let (wrap_src, body_src, body_dst, wrap_dst) = if dx > 0 {
+            (scr_w - nx..scr_w, 0..scr_w - nx, nx, 0..nx)
+        } else {
+            (0..nx, nx..scr_w, 0, scr_w - nx..scr_w)
+        };
+        for y in 0..scr_h {
+            let row_start = y * scr_w;
+            let row = &mut screen[row_start..row_start + scr_w];
+            tmp_x.copy_from_slice(&row[wrap_src.clone()]);
+            row.copy_within(body_src.clone(), body_dst);
+            row[wrap_dst.clone()].copy_from_slice(&tmp_x);
+        }
+    }
+
+    // Y pass — whole rows as a block. Same precomputed-direction pattern, applied to the buffer as a flat row-major slice (one body memmove of contiguous bytes, no per-row loop).
+    if dy != 0 {
+        let mut tmp_y = alloc::vec![0u32; ny * scr_w];
+        let split = (scr_h - ny) * scr_w;
+        let (wrap_src, body_src, body_dst, wrap_dst) = if dy > 0 {
+            (split..scr_h * scr_w, 0..split, ny * scr_w, 0..ny * scr_w)
+        } else {
+            (0..ny * scr_w, ny * scr_w..scr_h * scr_w, 0, split..scr_h * scr_w)
+        };
+        tmp_y.copy_from_slice(&screen[wrap_src]);
+        screen.copy_within(body_src, body_dst);
+        screen[wrap_dst].copy_from_slice(&tmp_y);
+    }
+}
+
 /// Combined finalize + blit: same per-pixel math as [`finalize_for_os`] (XOR darkness→visible, multiply clip_mask into α, Linux RGB×α premultiply) but reads from a `(win_w × win_h)` scratch buffer and writes into a `(scr_w × scr_h)` screen buffer at the offset `(rect_x, rect_y)`. Used by the fullscreen-compositor host path: the consumer renders into the scratch (window-space, contiguous), this function reads scratch + clip_mask once per pixel and writes the OS-ready ARGB into the screen buffer's sub-rect. The scratch buffer is **not mutated** — its α + darkness convention is preserved so a future incremental-rendering path can reuse it across frames without forcing a full re-render.
 ///
 /// Pre-conditions: `rect_x + win_w ≤ scr_w` and `rect_y + win_h ≤ scr_h` (rect fits inside the screen). Caller is responsible for clearing the destination region (typically the whole screen buffer cleared to `0` so pixels outside `rect` stay α=0 and the OS compositor shows whatever's behind us).
@@ -649,7 +694,9 @@ pub fn paint_shadow(
             let p = screen[idx];
             let is_chrome = (p & 0x00FFFFFF) != 0;
             if is_chrome {
-                // Seed at full strength so the shadow starts opaque at the chrome's outer edge — the AA fade-out at the squircle perimeter is geometric (sub-pixel coverage), not real opacity, and shouldn't dim the shadow's onset.
+                // Force the chrome AA edge fully opaque. The chrome's outermost pixels have partial α from the squircle anti-aliasing — without this, the OS compositor blends them against the desktop behind us, which on a bright desktop shows a visible bright stripe between chrome and shadow. Math: chrome sits on top of full-strength shadow at this position; premult RGB composited over black (shadow) is identity, so we just force α to 0xFF while leaving the premult RGB unchanged. Result: AA edge transitions smoothly into solid shadow instead of leaking the desktop through.
+                screen[idx] = (p & 0x00FFFFFF) | 0xFF000000;
+                // Seed at full strength so the shadow starts opaque at the chrome's outer edge — the AA fade-out is geometric (sub-pixel coverage), not real opacity, and shouldn't dim the shadow's onset.
                 carry = 0xFF;
                 seeded = true;
             } else if carry > 0 {
