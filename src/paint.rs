@@ -667,6 +667,82 @@ pub fn finalize_into_screen(
 /// AA-edge fix folded in: when the scan finds the chrome edge pixel, if its α is partial (squircle AA), force it to 0xFF in place. Chrome's premult RGB over the implicit black shadow underneath is identity, so opaque-with-premult-RGB blends correctly.
 ///
 /// Per chrome edge pixel: ~1-N scan reads (1 for straight middle rows; up to the squircle inset for corner rows) + up to `log_factor(1/255)` ray writes. Total work ≈ chrome perimeter × shadow-extent.
+/// Compose shadow underneath a chrome AA edge pixel in place. Premultiplied-alpha "Under" math: `α_out = α_chrome + α_shadow × (1 − α_chrome / 255)`; premult RGB stays unchanged (shadow's straight RGB is black, so its premult contribution to RGB is zero — chrome's dim premult RGB IS already chrome compositing over black). Result: AA edge α gets boosted by the shadow's local strength, but stays partial when the shadow itself is partial (e.g., the TL halo at 0x20 seed). On bright desktops the AA still blends naturally instead of going crunchy from a force-opaque hack.
+///
+/// `shadow_seed` is the shadow's full-strength α at the chrome edge (`0x40` for the BR pass, `0x20` for the TL pass). The integer formula uses `(256 − α_chrome)` so the divide by 256 lowers to a `>> 8` shift instead of an actual `/ 255` (which would emit an IDIV on the hot path). Overestimates the true blend by ~1/255 — negligible for AA pixels.
+#[inline]
+fn blend_aa_edge(screen: &mut [u32], idx: usize, shadow_seed: u32) {
+    let p = screen[idx];
+    let chrome_a = (p >> 24) & 0xFF;
+    // Bounds: new_a = chrome_a × (1 − seed/256) + seed. For seed ≤ 0x40 and chrome_a ≤ 0xFF, max new_a = 0xFF (at chrome_a = 0xFF: 0xFF + 0 = 0xFF; at chrome_a = 0: seed ≤ 0x40). No clamp needed.
+    let boost = (shadow_seed * (256 - chrome_a)) >> 8;
+    let new_a = chrome_a + boost;
+    screen[idx] = (p & 0x00FFFFFF) | (new_a << 24);
+}
+
+/// Cast a (+1, +1) shadow ray starting from `(start_x + 1, start_y + 1)` with α seeded at `seed` and decaying by `factor_256` per step. The ray stops when it hits the screen edge or α decays to 0. Writes only if the new α beats the existing (max compose).
+#[inline]
+fn cast_ray_dr(
+    screen: &mut [u32],
+    scr_w: usize,
+    scr_h: usize,
+    factor_256: u32,
+    start_x: usize,
+    start_y: usize,
+    seed: u32,
+) {
+    let mut alpha = seed;
+    let mut x = start_x + 1;
+    let mut y = start_y + 1;
+    while x < scr_w && y < scr_h {
+        alpha = (alpha * factor_256) >> 8;
+        if alpha == 0 {
+            break;
+        }
+        let idx = y * scr_w + x;
+        let existing = (screen[idx] >> 24) & 0xFF;
+        if alpha > existing {
+            screen[idx] = alpha << 24;
+        }
+        x += 1;
+        y += 1;
+    }
+}
+
+/// Mirror of [`cast_ray_dr`]: casts a (-1, -1) ray from `(start_x - 1, start_y - 1)`. Bails immediately at the screen origin.
+#[inline]
+fn cast_ray_ul(
+    screen: &mut [u32],
+    scr_w: usize,
+    factor_256: u32,
+    start_x: usize,
+    start_y: usize,
+    seed: u32,
+) {
+    if start_x == 0 || start_y == 0 {
+        return;
+    }
+    let mut alpha = seed;
+    let mut x = start_x - 1;
+    let mut y = start_y - 1;
+    loop {
+        alpha = (alpha * factor_256) >> 8;
+        if alpha == 0 {
+            break;
+        }
+        let idx = y * scr_w + x;
+        let existing = (screen[idx] >> 24) & 0xFF;
+        if alpha > existing {
+            screen[idx] = alpha << 24;
+        }
+        if x == 0 || y == 0 {
+            break;
+        }
+        x -= 1;
+        y -= 1;
+    }
+}
+
 pub fn paint_shadow(
     screen: &mut [u32],
     scr_w: usize,
@@ -686,150 +762,88 @@ pub fn paint_shadow(
     let x_chrome_end = ((rx + rw).max(0) as usize).min(scr_w);
     let y_chrome_end = ((ry + rh).max(0) as usize).min(scr_h);
 
-    // Right edge: per row, find rightmost chrome pixel, cast diagonal ray (x+1, y+1).
+    // Right edge: per row, find rightmost chrome pixel, cast (+1, +1) ray. Track previous row's rightmost so we can fill phantom rays when the squircle curve makes the rightmost jump inward (BR curve) — each row's ray covers one anti-diagonal, and if the curve advances by more than 1 col per row, anti-diagonals get skipped (= visible gaps in the shadow fan). Phantom rays at the intermediate cols fill those skipped anti-diagonals.
+    let mut prev_cx: Option<usize> = None;
     for y in y_chrome_top..y_chrome_end {
         let row = y * scr_w;
         let mut cx: Option<usize> = None;
         for scan_x in (x_chrome_left..x_chrome_end).rev() {
             let p = screen[row + scan_x];
             if (p & 0x00FFFFFF) != 0 {
-                if (p >> 24) & 0xFF < 0xFF {
-                    screen[row + scan_x] = (p & 0x00FFFFFF) | 0xFF000000;
-                }
+                blend_aa_edge(screen, row + scan_x, 0x40);
                 cx = Some(scan_x);
                 break;
             }
         }
-        if let Some(start_x) = cx {
-            let mut alpha: u32 = 0x40;
-            let mut x = start_x + 1;
-            let mut yy = y + 1;
-            while x < scr_w && yy < scr_h {
-                alpha = (alpha * factor_256) >> 8;
-                if alpha == 0 {
-                    break;
+        if let (Some(prev), Some(curr)) = (prev_cx, cx) {
+            if prev > curr {
+                for fill_col in (curr + 1)..=prev {
+                    cast_ray_dr(screen, scr_w, scr_h, factor_256, fill_col, y, 0x40);
                 }
-                let idx = yy * scr_w + x;
-                let existing = (screen[idx] >> 24) & 0xFF;
-                if alpha > existing {
-                    screen[idx] = alpha << 24;
-                }
-                x += 1;
-                yy += 1;
             }
         }
+        if let Some(start_x) = cx {
+            cast_ray_dr(screen, scr_w, scr_h, factor_256, start_x, y, 0x40);
+        }
+        prev_cx = cx;
     }
 
-    // Bottom edge: per col, find bottommost chrome pixel, cast diagonal ray (x+1, y+1).
+    // Bottom edge: per col, find bottommost chrome pixel, cast (+1, +1) ray.
     for x in x_chrome_left..x_chrome_end {
         let mut cy: Option<usize> = None;
         for scan_y in (y_chrome_top..y_chrome_end).rev() {
             let p = screen[scan_y * scr_w + x];
             if (p & 0x00FFFFFF) != 0 {
-                if (p >> 24) & 0xFF < 0xFF {
-                    screen[scan_y * scr_w + x] = (p & 0x00FFFFFF) | 0xFF000000;
-                }
+                blend_aa_edge(screen, scan_y * scr_w + x, 0x40);
                 cy = Some(scan_y);
                 break;
             }
         }
         if let Some(start_y) = cy {
-            let mut alpha: u32 = 0x40;
-            let mut xx = x + 1;
-            let mut y = start_y + 1;
-            while xx < scr_w && y < scr_h {
-                alpha = (alpha * factor_256) >> 8;
-                if alpha == 0 {
-                    break;
-                }
-                let idx = y * scr_w + xx;
-                let existing = (screen[idx] >> 24) & 0xFF;
-                if alpha > existing {
-                    screen[idx] = alpha << 24;
-                }
-                xx += 1;
-                y += 1;
-            }
+            cast_ray_dr(screen, scr_w, scr_h, factor_256, x, start_y, 0x40);
         }
     }
 
-    // Upper-left pass: identical geometry mirrored, half intensity. Suggests a subtle ambient occlusion on the side of the window facing the light; combines with the bottom-right shadow to give the chrome a "raised card" feel rather than just a one-sided drop.
+    // Upper-left pass: identical geometry mirrored, quarter intensity. Subtle ambient occlusion on the side of the chrome facing the light; combines with the BR shadow to give a "raised card" feel.
     // Top edge: per col, find topmost chrome pixel, cast (-1, -1) ray.
     for x in x_chrome_left..x_chrome_end {
         let mut cy: Option<usize> = None;
         for scan_y in y_chrome_top..y_chrome_end {
             let p = screen[scan_y * scr_w + x];
             if (p & 0x00FFFFFF) != 0 {
-                if (p >> 24) & 0xFF < 0xFF {
-                    screen[scan_y * scr_w + x] = (p & 0x00FFFFFF) | 0xFF000000;
-                }
+                blend_aa_edge(screen, scan_y * scr_w + x, 0x20);
                 cy = Some(scan_y);
                 break;
             }
         }
         if let Some(start_y) = cy {
-            let mut alpha: u32 = 0x20;
-            if x == 0 || start_y == 0 {
-                continue;
-            }
-            let mut xx = x - 1;
-            let mut y = start_y - 1;
-            loop {
-                alpha = (alpha * factor_256) >> 8;
-                if alpha == 0 {
-                    break;
-                }
-                let idx = y * scr_w + xx;
-                let existing = (screen[idx] >> 24) & 0xFF;
-                if alpha > existing {
-                    screen[idx] = alpha << 24;
-                }
-                if xx == 0 || y == 0 {
-                    break;
-                }
-                xx -= 1;
-                y -= 1;
-            }
+            cast_ray_ul(screen, scr_w, factor_256, x, start_y, 0x20);
         }
     }
-    // Left edge: per row, find leftmost chrome pixel, cast (-1, -1) ray.
+    // Left edge: per row, find leftmost chrome pixel, cast (-1, -1) ray. Same phantom-ray gap fill as the right edge — mirrored — for the TL curve.
+    let mut prev_cx_left: Option<usize> = None;
     for y in y_chrome_top..y_chrome_end {
         let row = y * scr_w;
         let mut cx: Option<usize> = None;
         for scan_x in x_chrome_left..x_chrome_end {
             let p = screen[row + scan_x];
             if (p & 0x00FFFFFF) != 0 {
-                if (p >> 24) & 0xFF < 0xFF {
-                    screen[row + scan_x] = (p & 0x00FFFFFF) | 0xFF000000;
-                }
+                blend_aa_edge(screen, row + scan_x, 0x20);
                 cx = Some(scan_x);
                 break;
             }
         }
-        if let Some(start_x) = cx {
-            let mut alpha: u32 = 0x20;
-            if start_x == 0 || y == 0 {
-                continue;
-            }
-            let mut x = start_x - 1;
-            let mut yy = y - 1;
-            loop {
-                alpha = (alpha * factor_256) >> 8;
-                if alpha == 0 {
-                    break;
+        if let (Some(prev), Some(curr)) = (prev_cx_left, cx) {
+            if prev > curr {
+                for fill_col in (curr + 1)..=prev {
+                    cast_ray_ul(screen, scr_w, factor_256, fill_col, y, 0x20);
                 }
-                let idx = yy * scr_w + x;
-                let existing = (screen[idx] >> 24) & 0xFF;
-                if alpha > existing {
-                    screen[idx] = alpha << 24;
-                }
-                if x == 0 || yy == 0 {
-                    break;
-                }
-                x -= 1;
-                yy -= 1;
             }
         }
+        if let Some(start_x) = cx {
+            cast_ray_ul(screen, scr_w, factor_256, start_x, y, 0x20);
+        }
+        prev_cx_left = cx;
     }
 }
 
