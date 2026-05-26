@@ -680,7 +680,10 @@ fn blend_aa_edge(screen: &mut [u32], idx: usize, shadow_seed: u32) {
     screen[idx] = (p & 0x00FFFFFF) | (new_a << 24);
 }
 
-/// Cast a (+1, +1) shadow ray starting from `(start_x + 1, start_y + 1)` with α seeded at `seed` and decaying by `factor_256` per step. The ray stops when it hits the screen edge or α decays to 0. Writes only if the new α beats the existing (max compose).
+/// Debug: shadow cells get visible green (R=0, G=255, B=0). The screen buffer is already in OS visible-RGB format at this point (post-finalize), so this lands as bright green directly. Lets every shadow write be eyeballed against the chrome.
+const DEBUG_SHADOW_RGB: u32 = 0x0000FF00;
+
+/// Cast a (+1, +1) shadow ray starting from `(start_x + 1, start_y + 1)` with α seeded at `seed` and decaying by `factor_256` per step. Stops at screen edge or α == 0. Writes skipped when the ray pixel is inside `chrome_bbox` — corner rays start at the chrome curve and the first few steps land on chrome interior cells; the chrome owns those cells, so we step the α down (advancing along the diagonal) without writing.
 #[inline]
 fn cast_ray_dr(
     screen: &mut [u32],
@@ -690,7 +693,9 @@ fn cast_ray_dr(
     start_x: usize,
     start_y: usize,
     seed: u32,
+    chrome_bbox: (usize, usize, usize, usize),
 ) {
+    let (cx0, cy0, cx1, cy1) = chrome_bbox;
     let mut alpha = seed;
     let mut x = start_x + 1;
     let mut y = start_y + 1;
@@ -699,17 +704,16 @@ fn cast_ray_dr(
         if alpha == 0 {
             break;
         }
-        let idx = y * scr_w + x;
-        let existing = (screen[idx] >> 24) & 0xFF;
-        if alpha > existing {
-            screen[idx] = alpha << 24;
+        if !(x >= cx0 && x < cx1 && y >= cy0 && y < cy1) {
+            let idx = y * scr_w + x;
+            screen[idx] = (alpha << 24) | DEBUG_SHADOW_RGB;
         }
         x += 1;
         y += 1;
     }
 }
 
-/// Mirror of [`cast_ray_dr`]: casts a (-1, -1) ray from `(start_x - 1, start_y - 1)`. Bails immediately at the screen origin.
+/// Mirror of [`cast_ray_dr`]: casts a (-1, -1) ray from `(start_x - 1, start_y - 1)`. Bails immediately at the screen origin. Same bbox-guard semantics — writes skipped when the ray pixel is inside `chrome_bbox`.
 #[inline]
 fn cast_ray_ul(
     screen: &mut [u32],
@@ -718,10 +722,12 @@ fn cast_ray_ul(
     start_x: usize,
     start_y: usize,
     seed: u32,
+    chrome_bbox: (usize, usize, usize, usize),
 ) {
     if start_x == 0 || start_y == 0 {
         return;
     }
+    let (cx0, cy0, cx1, cy1) = chrome_bbox;
     let mut alpha = seed;
     let mut x = start_x - 1;
     let mut y = start_y - 1;
@@ -730,16 +736,161 @@ fn cast_ray_ul(
         if alpha == 0 {
             break;
         }
-        let idx = y * scr_w + x;
-        let existing = (screen[idx] >> 24) & 0xFF;
-        if alpha > existing {
-            screen[idx] = alpha << 24;
+        if !(x >= cx0 && x < cx1 && y >= cy0 && y < cy1) {
+            let idx = y * scr_w + x;
+            screen[idx] = (alpha << 24) | DEBUG_SHADOW_RGB;
         }
         if x == 0 || y == 0 {
             break;
         }
         x -= 1;
         y -= 1;
+    }
+}
+
+/// Precompute the per-step α decay table for a ray. `alphas[0] = seed`; `alphas[k] = (alphas[k-1] * factor_256) >> 8`. Returns the populated prefix length (where `alphas[len-1] > 0`). Replaces the per-step mul on the hot path with an array lookup. 1024 entries cover the worst case (seed 0x40, factor 254 → ~528 non-zero steps).
+#[inline]
+fn compute_alphas(seed: u32, factor_256: u32) -> ([u32; 1024], usize) {
+    let mut alphas = [0u32; 1024];
+    alphas[0] = seed;
+    let mut a = seed;
+    let mut len = 1;
+    while len < 1024 {
+        a = (a * factor_256) >> 8;
+        if a == 0 {
+            break;
+        }
+        alphas[len] = a;
+        len += 1;
+    }
+    (alphas, len)
+}
+
+/// Band fill for a straight right edge: source col = `source_col`, source rows `[y_start..y_end)`, rays going (+1,+1). Each output row r > y_start gets a horizontal run starting at column `source_col + k_min` going right. k = column offset from source_col; alpha = `alphas[k]`. Iterates output-row-major for cache locality.
+fn band_fill_right_dr(
+    screen: &mut [u32],
+    scr_w: usize,
+    scr_h: usize,
+    source_col: usize,
+    y_start: usize,
+    y_end: usize,
+    alphas: &[u32; 1024],
+    alphas_len: usize,
+) {
+    if y_end <= y_start || alphas_len <= 1 {
+        return;
+    }
+    let max_k = alphas_len - 1;
+    let r_end = (y_end + max_k).min(scr_h);
+    for r in (y_start + 1)..r_end {
+        let k_min = (r + 1).saturating_sub(y_end).max(1);
+        let k_max = (r - y_start).min(max_k);
+        if k_min > k_max {
+            continue;
+        }
+        let row = r * scr_w;
+        let c_start = source_col + k_min;
+        let c_end = (source_col + k_max + 1).min(scr_w);
+        for c in c_start..c_end {
+            let k = c - source_col;
+            let a = alphas[k];
+            let idx = row + c;
+            screen[idx] = (a << 24) | DEBUG_SHADOW_RGB;
+        }
+    }
+}
+
+/// Band fill for a straight bottom edge: source row = `source_row`, source cols `[x_start..x_end)`, rays going (+1,+1). At output row r = `source_row + k`, alpha is constant `alphas[k]` across cols `[x_start + k..x_end + k)`. Sequential writes within each row.
+fn band_fill_bottom_dr(
+    screen: &mut [u32],
+    scr_w: usize,
+    scr_h: usize,
+    source_row: usize,
+    x_start: usize,
+    x_end: usize,
+    alphas: &[u32; 1024],
+    alphas_len: usize,
+) {
+    if x_end <= x_start || alphas_len <= 1 {
+        return;
+    }
+    let max_k = alphas_len - 1;
+    let r_end = (source_row + max_k + 1).min(scr_h);
+    for r in (source_row + 1)..r_end {
+        let k = r - source_row;
+        let a = alphas[k];
+        let row = r * scr_w;
+        let c_start = x_start + k;
+        let c_end = (x_end + k).min(scr_w);
+        if c_start >= c_end {
+            continue;
+        }
+        for c in c_start..c_end {
+            let idx = row + c;
+            screen[idx] = (a << 24) | DEBUG_SHADOW_RGB;
+        }
+    }
+}
+
+/// Band fill for a straight top edge: source row = `source_row`, source cols `[x_start..x_end)`, rays going (-1,-1). At output row r = `source_row - k`, alpha is constant `alphas[k]` across cols `[x_start - k..x_end - k)` (clipped at 0).
+fn band_fill_top_ul(
+    screen: &mut [u32],
+    scr_w: usize,
+    source_row: usize,
+    x_start: usize,
+    x_end: usize,
+    alphas: &[u32; 1024],
+    alphas_len: usize,
+) {
+    if x_end <= x_start || alphas_len <= 1 {
+        return;
+    }
+    let max_k = (alphas_len - 1).min(source_row);
+    for k in 1..=max_k {
+        if x_end <= k {
+            continue;
+        }
+        let a = alphas[k];
+        let r = source_row - k;
+        let row = r * scr_w;
+        let c_start = x_start.saturating_sub(k);
+        let c_end = (x_end - k).min(scr_w);
+        if c_start >= c_end {
+            continue;
+        }
+        for c in c_start..c_end {
+            let idx = row + c;
+            screen[idx] = (a << 24) | DEBUG_SHADOW_RGB;
+        }
+    }
+}
+
+/// Band fill for a straight left edge: source col = `source_col`, source rows `[y_start..y_end)`, rays going (-1,-1). Each output row r in `[y_start - max_k..y_end - 1)` gets a horizontal run; column = `source_col - k`. Output rows are written via per-step k loop (column-major within k) but each step's writes are still sequential within their row.
+fn band_fill_left_ul(
+    screen: &mut [u32],
+    scr_w: usize,
+    source_col: usize,
+    y_start: usize,
+    y_end: usize,
+    alphas: &[u32; 1024],
+    alphas_len: usize,
+) {
+    if y_end <= y_start || alphas_len <= 1 {
+        return;
+    }
+    let max_k = (alphas_len - 1).min(source_col);
+    for k in 1..=max_k {
+        if y_end <= k {
+            continue;
+        }
+        let a = alphas[k];
+        let c = source_col - k;
+        let r_start = y_start.saturating_sub(k);
+        let r_end = y_end - k;
+        for r in r_start..r_end {
+            let idx = r * scr_w + c;
+            screen[idx] = (a << 24) | DEBUG_SHADOW_RGB;
+        }
     }
 }
 
@@ -761,89 +912,117 @@ pub fn paint_shadow(
     let y_chrome_top = ry.max(0) as usize;
     let x_chrome_end = ((rx + rw).max(0) as usize).min(scr_w);
     let y_chrome_end = ((ry + rh).max(0) as usize).min(scr_h);
-
-    // Right edge: per row, find rightmost chrome pixel, cast (+1, +1) ray. Track previous row's rightmost so we can fill phantom rays when the squircle curve makes the rightmost jump inward (BR curve) — each row's ray covers one anti-diagonal, and if the curve advances by more than 1 col per row, anti-diagonals get skipped (= visible gaps in the shadow fan). Phantom rays at the intermediate cols fill those skipped anti-diagonals.
-    let mut prev_cx: Option<usize> = None;
-    for y in y_chrome_top..y_chrome_end {
-        let row = y * scr_w;
-        let mut cx: Option<usize> = None;
-        for scan_x in (x_chrome_left..x_chrome_end).rev() {
-            let p = screen[row + scan_x];
-            if (p & 0x00FFFFFF) != 0 {
-                blend_aa_edge(screen, row + scan_x, 0x40);
-                cx = Some(scan_x);
-                break;
-            }
-        }
-        if let (Some(prev), Some(curr)) = (prev_cx, cx) {
-            if prev > curr {
-                for fill_col in (curr + 1)..=prev {
-                    cast_ray_dr(screen, scr_w, scr_h, factor_256, fill_col, y, 0x40);
-                }
-            }
-        }
-        if let Some(start_x) = cx {
-            cast_ray_dr(screen, scr_w, scr_h, factor_256, start_x, y, 0x40);
-        }
-        prev_cx = cx;
+    if x_chrome_left >= x_chrome_end || y_chrome_top >= y_chrome_end {
+        return;
     }
 
-    // Bottom edge: per col, find bottommost chrome pixel, cast (+1, +1) ray.
-    for x in x_chrome_left..x_chrome_end {
-        let mut cy: Option<usize> = None;
-        for scan_y in (y_chrome_top..y_chrome_end).rev() {
-            let p = screen[scan_y * scr_w + x];
-            if (p & 0x00FFFFFF) != 0 {
-                blend_aa_edge(screen, scan_y * scr_w + x, 0x40);
-                cy = Some(scan_y);
-                break;
-            }
+    // === SEEK + FAN OF DR RAYS ===
+    // Phase A: walk (-1, +1) from (right_col, y_chrome_top + 1) to find the first non-zero cell on the TR diagonal. Save (x0, y0).
+    // Phase B: cast Ray 0 from (x0, y0): walk (+1, +1), under-blend BLUE while α > 0, direct-assign RED once we cross into transparent.
+    // Phase C: for each subsequent ray with start (x0, y_start) where y_start = y0+1, y0+2, ..., y_center: walk (+1, +1):
+    //   - opaque (α == 0xFF) ⇒ direct-assign YELLOW (we drifted into chrome interior).
+    //   - first partial AA ⇒ flip to GREEN under-blend (stays until transparent).
+    //   - first transparent after that ⇒ flip to MAGENTA direct-assign (until taper runs out).
+    //   - decay shadow_alpha each step.
+    let right_col = x_chrome_end - 1;
+    if y_chrome_top + 1 >= y_chrome_end {
+        let _ = scr_h;
+        let _ = factor_256;
+        return;
+    }
+    let mut x0 = right_col;
+    let mut y0 = y_chrome_top + 1;
+    let mut found = false;
+    loop {
+        let a = (screen[y0 * scr_w + x0] >> 24) & 0xFF;
+        if a != 0 {
+            found = true;
+            break;
         }
-        if let Some(start_y) = cy {
-            cast_ray_dr(screen, scr_w, scr_h, factor_256, x, start_y, 0x40);
+        if x0 == x_chrome_left || y0 + 1 >= y_chrome_end {
+            break;
         }
+        x0 -= 1;
+        y0 += 1;
+    }
+    if !found {
+        let _ = scr_h;
+        let _ = factor_256;
+        return;
     }
 
-    // Upper-left pass: identical geometry mirrored, quarter intensity. Subtle ambient occlusion on the side of the chrome facing the light; combines with the BR shadow to give a "raised card" feel.
-    // Top edge: per col, find topmost chrome pixel, cast (-1, -1) ray.
-    for x in x_chrome_left..x_chrome_end {
-        let mut cy: Option<usize> = None;
-        for scan_y in y_chrome_top..y_chrome_end {
-            let p = screen[scan_y * scr_w + x];
-            if (p & 0x00FFFFFF) != 0 {
-                blend_aa_edge(screen, scan_y * scr_w + x, 0x20);
-                cy = Some(scan_y);
-                break;
+    // Cast Ray 0 from the seed cell.
+    cast_debug_ray(screen, scr_w, scr_h, factor_256, x0, y0, true);
+
+    // Each subsequent ray: y += 1, then walk diagonally past any opaque cells (chrome interior absorbed by the curve since the last ray). Cache (x, y) — we never need to revisit because the chrome curve doesn't cut inward, so x only stays or grows. Cast the ray from the first non-opaque landing. Stop when y reaches the chrome's vertical center.
+    let y_center = (y_chrome_top + y_chrome_end) / 2;
+    let mut x = x0;
+    let mut y = y0;
+    while y < y_center && y + 1 < y_chrome_end {
+        y += 1;
+        // Fully-opaque chrome cells land at α=0xFE after finalize (premult: (0xFF*0xFF)>>8 = 0xFE), so "opaque interior" is >= 0xFE.
+        while ((screen[y * scr_w + x] >> 24) & 0xFF) >= 0xFE {
+            // YELLOW direct-assign at full alpha — the opaque walk lives outside the ray's taper.
+            screen[y * scr_w + x] = 0xFFFFFF00;
+            if x + 1 >= scr_w || y + 1 >= scr_h {
+                let _ = scr_h;
+                return;
             }
+            x += 1;
+            y += 1;
         }
-        if let Some(start_y) = cy {
-            cast_ray_ul(screen, scr_w, factor_256, x, start_y, 0x20);
-        }
+        cast_debug_ray(screen, scr_w, scr_h, factor_256, x, y, false);
     }
-    // Left edge: per row, find leftmost chrome pixel, cast (-1, -1) ray. Same phantom-ray gap fill as the right edge — mirrored — for the TL curve.
-    let mut prev_cx_left: Option<usize> = None;
-    for y in y_chrome_top..y_chrome_end {
-        let row = y * scr_w;
-        let mut cx: Option<usize> = None;
-        for scan_x in x_chrome_left..x_chrome_end {
-            let p = screen[row + scan_x];
-            if (p & 0x00FFFFFF) != 0 {
-                blend_aa_edge(screen, row + scan_x, 0x20);
-                cx = Some(scan_x);
-                break;
-            }
+
+    let _ = scr_h;
+}
+
+/// Debug ray cast — flat loop, single zero check.
+/// Per cell: classify by current α.
+///   * α > 0 (AA) → under-blend BLUE (ray 0) or GREEN (rays 1+).
+///   * α == 0 (transparent) → direct-assign RED (ray 0) or MAGENTA (rays 1+).
+/// Decay shadow_alpha by factor_256 each step; stop on zero or screen edge.
+fn cast_debug_ray(
+    screen: &mut [u32],
+    scr_w: usize,
+    scr_h: usize,
+    factor_256: u32,
+    mut x: usize,
+    mut y: usize,
+    is_ray_zero: bool,
+) {
+    let mut shadow_alpha: u32 = 0xFF;
+    loop {
+        let idx = y * scr_w + x;
+        let p = screen[idx];
+        let a = (p >> 24) & 0xFF;
+        if a == 0 {
+            screen[idx] = if is_ray_zero {
+                (shadow_alpha << 24) | (shadow_alpha << 16)
+            } else {
+                (shadow_alpha << 24) | (shadow_alpha << 16) | shadow_alpha
+            };
+        } else {
+            let cr = (p >> 16) & 0xFF;
+            let cg = (p >> 8) & 0xFF;
+            let cb = p & 0xFF;
+            let cover = 256 - a;
+            let boost = (shadow_alpha * cover) >> 8;
+            let na = (a + boost).min(0xFF);
+            screen[idx] = if is_ray_zero {
+                let nb = (cb + boost).min(0xFF);
+                (na << 24) | (cr << 16) | (cg << 8) | nb
+            } else {
+                let ng = (cg + boost).min(0xFF);
+                (na << 24) | (cr << 16) | (ng << 8) | cb
+            };
         }
-        if let (Some(prev), Some(curr)) = (prev_cx_left, cx) {
-            if prev > curr {
-                for fill_col in (curr + 1)..=prev {
-                    cast_ray_ul(screen, scr_w, factor_256, fill_col, y, 0x20);
-                }
-            }
+        shadow_alpha = (shadow_alpha * factor_256) >> 8;
+        if shadow_alpha == 0 || x + 1 >= scr_w || y + 1 >= scr_h {
+            break;
         }
-        if let Some(start_x) = cx {
-            cast_ray_ul(screen, scr_w, factor_256, start_x, y, 0x20);
-        }
-        prev_cx_left = cx;
+        x += 1;
+        y += 1;
     }
 }
 
@@ -863,6 +1042,130 @@ pub fn blend_rgb_only(bg_colour: u32, fg_colour: u32, weight_bg: u8, weight_fg: 
     blended = (blended | (blended >> 16)) & 0x00FFFFFF;
     // α + darkness: force opaque (α=0xFF) by setting the top byte. RGB darkness is whatever the blend produced.
     (blended as u32) | 0xFF000000
+}
+
+/// Filled rectangle, anti-aliased, axis-aligned. Centered at `(cx, cy)` with fractional dimensions `(rect_w, rect_h)` — sub-pixel position + size both honoured. Color is α + darkness packed (build with [`pack_argb`]); the rect blends UNDER any existing pixel content in the buffer via [`Blend::under`].
+///
+/// AA: each pixel's coverage = `clamp(0.5 + distance_inside, 0, 1)` against the nearest rect edge. Interior pixels saturate to coverage = 1.0 (full color). Edge pixels get a fraction of the source α. Off-buffer pixels are clipped by the iteration bounds.
+///
+/// Rule 0: iteration bounds clamp `x_min/y_min ≥ 0` and `x_max/y_max ≤ buffer dim` because the rect can be partially or fully off-screen (caller passes arbitrary cx/cy); without the clamps an i32→usize cast on negative values wraps to a huge number → OOB panic. Coverage clamps to `[0, 1]` because pixels inside the rect have unbounded `d_inside`; without the cap, the `α × coverage` multiply would exceed the 0..255 byte range.
+pub fn draw_rect(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    cx: Coord,
+    cy: Coord,
+    rect_w: Coord,
+    rect_h: Coord,
+    color: u32,
+) {
+    if rect_w <= 0.0 || rect_h <= 0.0 || width == 0 || height == 0 {
+        return;
+    }
+    let hw = rect_w * 0.5;
+    let hh = rect_h * 0.5;
+    let x_min = crate::math::floor(cx - hw - 0.5) as i32;
+    let x_max = crate::math::ceil(cx + hw + 0.5) as i32;
+    let y_min = crate::math::floor(cy - hh - 0.5) as i32;
+    let y_max = crate::math::ceil(cy + hh + 0.5) as i32;
+    let x_start = x_min.max(0) as usize;
+    let y_start = y_min.max(0) as usize;
+    let x_end = (x_max.max(0) as usize).min(width);
+    let y_end = (y_max.max(0) as usize).min(height);
+    if x_start >= x_end || y_start >= y_end {
+        return;
+    }
+
+    let color_alpha = ((color >> 24) & 0xFF) as Coord;
+    let color_dark = color & 0x00FFFFFF;
+
+    for py in y_start..y_end {
+        let row = py * width;
+        let dy_abs = ((py as Coord + 0.5) - cy).abs();
+        let dy_inside = hh - dy_abs;
+        for px in x_start..x_end {
+            let dx_abs = ((px as Coord + 0.5) - cx).abs();
+            let dx_inside = hw - dx_abs;
+            let d_inside = dx_inside.min(dy_inside);
+            let coverage = (0.5 + d_inside).clamp(0.0, 1.0);
+            if coverage <= 0.0 {
+                continue;
+            }
+            let new_alpha = (color_alpha * coverage) as u32;
+            if new_alpha == 0 {
+                continue;
+            }
+            let top = (new_alpha << 24) | color_dark;
+            let idx = row + px;
+            // Paint rect ON TOP of existing content: rect is the new top, existing pixel goes underneath.
+            pixels[idx] = top.under(pixels[idx], BlendMode::Normal);
+        }
+    }
+}
+
+/// Filled rectangle, anti-aliased, rotated by `angle` radians around `(cx, cy)`. Positive angle rotates counter-clockwise (standard math convention). Other semantics match [`draw_rect`] — α + darkness colour, AA edges, UNDER-blend onto existing pixel content.
+///
+/// Per-pixel: translate to rect-local coords by inverse-rotating around the centre, then run the same `min(distance to nearest edge)` AA as the axis-aligned version. Bounding box is the rotated rect's circumscribed square (`half_diag = √(hw² + hh²)`) so we never miss a corner.
+///
+/// Cost: same per-pixel math as `draw_rect` plus 2 muls + 2 adds for the rotation (one per axis). Bbox is `~1.4×` larger than axis-aligned for a 45°-rotated rect of equal dims; for other angles it's between 1.0× and 1.4×. The angle == 0 case is mathematically identical to `draw_rect` but slower by a few ops per pixel — call `draw_rect` directly when angle is known to be zero.
+pub fn draw_rect_rotated(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    cx: Coord,
+    cy: Coord,
+    rect_w: Coord,
+    rect_h: Coord,
+    angle: Coord,
+    color: u32,
+) {
+    if rect_w <= 0.0 || rect_h <= 0.0 || width == 0 || height == 0 {
+        return;
+    }
+    let hw = rect_w * 0.5;
+    let hh = rect_h * 0.5;
+    let (sin_a, cos_a) = crate::math::sin_cos(angle);
+    let half_diag = libm::sqrtf(hw * hw + hh * hh);
+    let x_min = crate::math::floor(cx - half_diag - 0.5) as i32;
+    let x_max = crate::math::ceil(cx + half_diag + 0.5) as i32;
+    let y_min = crate::math::floor(cy - half_diag - 0.5) as i32;
+    let y_max = crate::math::ceil(cy + half_diag + 0.5) as i32;
+    let x_start = x_min.max(0) as usize;
+    let y_start = y_min.max(0) as usize;
+    let x_end = (x_max.max(0) as usize).min(width);
+    let y_end = (y_max.max(0) as usize).min(height);
+    if x_start >= x_end || y_start >= y_end {
+        return;
+    }
+
+    let color_alpha = ((color >> 24) & 0xFF) as Coord;
+    let color_dark = color & 0x00FFFFFF;
+
+    for py in y_start..y_end {
+        let row = py * width;
+        let dy = (py as Coord + 0.5) - cy;
+        for px in x_start..x_end {
+            let dx = (px as Coord + 0.5) - cx;
+            // Inverse rotation: rotate the screen-space delta by -angle to get rect-local coords.
+            let local_x = dx * cos_a + dy * sin_a;
+            let local_y = -dx * sin_a + dy * cos_a;
+            let dx_inside = hw - local_x.abs();
+            let dy_inside = hh - local_y.abs();
+            let d_inside = dx_inside.min(dy_inside);
+            let coverage = (0.5 + d_inside).clamp(0.0, 1.0);
+            if coverage <= 0.0 {
+                continue;
+            }
+            let new_alpha = (color_alpha * coverage) as u32;
+            if new_alpha == 0 {
+                continue;
+            }
+            let top = (new_alpha << 24) | color_dark;
+            let idx = row + px;
+            // Paint rect ON TOP of existing content: rect is the new top, existing pixel goes underneath.
+            pixels[idx] = top.under(pixels[idx], BlendMode::Normal);
+        }
+    }
 }
 
 /// Hard-pixel squircle pill with AA on both the X-axis curve (sides) and Y-axis curve (cap tops/bottoms). Photon's avatar-ring strategy in one call — render twice with different sizes/colors to get a stroke ring.
