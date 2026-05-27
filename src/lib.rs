@@ -9,6 +9,7 @@
 
 extern crate alloc;
 
+pub mod canvas;
 pub mod coord;
 pub mod geom;
 pub mod group;

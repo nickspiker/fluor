@@ -277,9 +277,7 @@ pub fn draw_window_edges_and_mask(
 
 /// Rasterize the window title text into the chrome layer, left-aligned in the area between the perimeter hairline (left edge) and the controls strip (right edge). Vertically centered in the strip-tall band. `left_extra` shifts the start position right to make room for the app-icon orb (pass `0` when no orb). `color` is darkness-packed (typically `theme::TEXT_COLOUR` when focused, `theme::LABEL_COLOUR` when unfocused). Bails on empty title or impractically small `button_size` (below readability — the text wouldn't be legible anyway). Clip rect prevents the title from painting over the controls strip even at long titles or narrow windows. Font is "Open Sans" regular at `button_size * 0.55` — proportional to the rest of the chrome under the current zoom (since button_size is derived from `effective_span`).
 pub fn draw_title_text(
-    pixels: &mut [u32],
-    width: usize,
-    height: usize,
+    canvas: &mut crate::canvas::Canvas,
     title: &str,
     text_renderer: &mut TextRenderer,
     button_size: usize,
@@ -301,9 +299,7 @@ pub fn draw_title_text(
     let y_center = button_size as Coord * 0.5;
     let clip = Clip::new(left_margin, 0, clip_x_end, button_size);
     text_renderer.draw_text_left_u32(
-        pixels,
-        width,
-        height,
+        canvas,
         title,
         left_margin as f32,
         y_center,
@@ -321,9 +317,7 @@ pub fn draw_title_text(
 ///
 /// The window perimeter's clip_mask carving handles the BL/BR squircle corners for free: chrome pixels in the corner cutout are written but masked off at the OS boundary, so the band's rectangular fill becomes a rounded bottom edge without per-pixel geometry here. Bails on `band_h == 0` or impractical `band_h` (>= height) so the rasterizer can be called unconditionally from a `chrome_widget` that always has a status field, with `band_h = 0` meaning "no status bar".
 pub fn draw_status_bar(
-    pixels: &mut [u32],
-    width: usize,
-    height: usize,
+    canvas: &mut crate::canvas::Canvas,
     band_h: usize,
     bg: u32,
     hairline_color: u32,
@@ -331,10 +325,15 @@ pub fn draw_status_bar(
     text_renderer: &mut TextRenderer,
     text_color: u32,
 ) {
+    let width = canvas.width;
+    let height = canvas.height;
     if band_h == 0 || band_h + 1 >= height || width == 0 {
         return;
     }
     let y_top = height - band_h;
+    // Damage = full-width band [y_top, height).
+    canvas.damage.add_bounds(0, y_top, width, height);
+    let pixels: &mut [u32] = canvas.pixels;
 
     // Top hairline (1 px) — claims y_top across the full width. The squircle perimeter's clip_mask handles rounding at BL/BR.
     let hairline = 0xFF000000 | (hairline_color & 0x00FFFFFF);
@@ -368,9 +367,7 @@ pub fn draw_status_bar(
     let y_center = y_top as Coord + band_h as Coord * 0.5;
     let clip = Clip::new(side_margin, y_top, clip_x_end, height);
     text_renderer.draw_text_center_u32(
-        pixels,
-        width,
-        height,
+        canvas,
         text,
         x_center,
         y_center,

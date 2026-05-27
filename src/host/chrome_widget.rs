@@ -270,17 +270,25 @@ impl DefaultChrome {
                     orb_brighten,
                 );
             }
-            chrome::draw_title_text(
-                chrome_buf,
-                buf_w,
-                buf_h,
-                &self.title,
-                text,
-                button_size,
-                strip_x,
-                title_left_extra,
-                title_color,
-            );
+            {
+                // Transitional Canvas wrapper — chrome's other rasterizers (perimeter, app icon, controls) haven't migrated yet; we construct a throwaway Canvas just for the text-bearing chrome fns. Phase 2 will plumb the chrome's per-layer damage up to the host.
+                let mut tt_damage = crate::canvas::Damage::new();
+                let mut canvas = crate::canvas::Canvas::new(
+                    chrome_buf,
+                    buf_w,
+                    buf_h,
+                    &mut tt_damage,
+                );
+                chrome::draw_title_text(
+                    &mut canvas,
+                    &self.title,
+                    text,
+                    button_size,
+                    strip_x,
+                    title_left_extra,
+                    title_color,
+                );
+            }
         }
 
         // Ctrl+Shift+D+X: skip ONLY the controls strip (perimeter + title stay).
@@ -368,10 +376,11 @@ impl DefaultChrome {
             _ => 0,
         };
         if status_band_h > 0 {
+            let mut sb_damage = crate::canvas::Damage::new();
+            let mut canvas =
+                crate::canvas::Canvas::new(chrome_buf, buf_w, buf_h, &mut sb_damage);
             chrome::draw_status_bar(
-                chrome_buf,
-                buf_w,
-                buf_h,
+                &mut canvas,
                 status_band_h,
                 theme::WINDOW_CONTROLS_BG,
                 edge_light,

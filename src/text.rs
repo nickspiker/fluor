@@ -2,11 +2,41 @@
 //!
 //! Photon's full version bundles Oxanium and Josefin Slab too; those are dropped here to keep the v0 crate small (~260 KB instead of ~2 MB). They'll be added back when a consumer needs them.
 
+use crate::canvas::{Canvas, Damage};
 use crate::paint::{AlphaMask, Clip, Transform};
 use crate::pixel::{Blend, BlendMode};
 use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
 use swash::scale::{Render, ScaleContext, Source, image::Image as SwashImage};
 use swash::zeno::Transform as ZenoTransform;
+
+/// Report the painted text bbox to the canvas damage accumulator. Bbox is the alignment-adjusted text rect clipped to buffer dimensions — slightly conservative versus the per-glyph union, but cheap and never under-reports. `alignment`: 0 = center, 1 = left, 2 = right (matching `render_buffer_u32`'s convention).
+#[inline]
+fn damage_text_bbox(
+    damage: &mut Damage,
+    buf_w: usize,
+    buf_h: usize,
+    anchor_x: f32,
+    anchor_y: f32,
+    text_width: f32,
+    text_height: f32,
+    alignment: u8,
+) {
+    let (lx, ty) = match alignment {
+        0 => (anchor_x - text_width * 0.5, anchor_y - text_height * 0.5),
+        1 => (anchor_x, anchor_y - text_height * 0.5),
+        2 => (anchor_x - text_width, anchor_y - text_height * 0.5),
+        _ => (anchor_x, anchor_y),
+    };
+    let rx = lx + text_width;
+    let by = ty + text_height;
+    let w = buf_w as f32;
+    let h = buf_h as f32;
+    let x0 = lx.max(0.0).min(w) as usize;
+    let y0 = ty.max(0.0).min(h) as usize;
+    let x1 = rx.max(0.0).min(w) as usize;
+    let y1 = by.max(0.0).min(h) as usize;
+    damage.add_bounds(x0, y0, x1, y1);
+}
 
 /// Cache key for rasterized transformed-glyph images. The full linear part (`a, b, c, d`) of the transform is included as bit-pattern equality so any unique linear transform — pure rotation, scale, skew, mirror, mix — gets its own cache entry. Translation is excluded because it doesn't affect the glyph bitmap, only where it gets composited. Callers that want cache hits across small angle changes should snap with [`crate::paint::snap_rotation`] before constructing the Transform.
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -89,9 +119,7 @@ impl TextRenderer {
 
     pub fn draw_text_center_u32(
         &mut self,
-        pixels: &mut [u32],
-        buf_w: usize,
-        buf_h: usize,
+        canvas: &mut Canvas,
         text: &str,
         x: f32,
         y: f32,
@@ -103,6 +131,8 @@ impl TextRenderer {
         mask: Option<&AlphaMask>,
         transform: Option<Transform>,
     ) -> f32 {
+        let buf_w = canvas.width;
+        let buf_h = canvas.height;
         let attrs = Attrs::new()
             .family(Family::Name(font))
             .weight(Weight(weight));
@@ -121,10 +151,10 @@ impl TextRenderer {
             }
             let text_width = max_x - min_x;
             let text_height = run.line_height;
-
+            damage_text_bbox(canvas.damage, buf_w, buf_h, x, y, text_width, text_height, 0);
             self.render_buffer_u32(
                 &mut buffer,
-                pixels,
+                canvas.pixels,
                 buf_w,
                 buf_h,
                 x,
@@ -145,9 +175,7 @@ impl TextRenderer {
 
     pub fn draw_text_left_u32(
         &mut self,
-        pixels: &mut [u32],
-        buf_w: usize,
-        buf_h: usize,
+        canvas: &mut Canvas,
         text: &str,
         x: f32,
         y: f32,
@@ -159,6 +187,8 @@ impl TextRenderer {
         mask: Option<&AlphaMask>,
         transform: Option<Transform>,
     ) -> f32 {
+        let buf_w = canvas.width;
+        let buf_h = canvas.height;
         let attrs = Attrs::new()
             .family(Family::Name(font))
             .weight(Weight(weight));
@@ -174,9 +204,10 @@ impl TextRenderer {
                 text_width = text_width.max(glyph.x + glyph.w);
             }
             let text_height = run.line_height;
+            damage_text_bbox(canvas.damage, buf_w, buf_h, x, y, text_width, text_height, 1);
             self.render_buffer_u32(
                 &mut buffer,
-                pixels,
+                canvas.pixels,
                 buf_w,
                 buf_h,
                 x,
@@ -197,9 +228,7 @@ impl TextRenderer {
 
     pub fn draw_text_right_u32(
         &mut self,
-        pixels: &mut [u32],
-        buf_w: usize,
-        buf_h: usize,
+        canvas: &mut Canvas,
         text: &str,
         x: f32,
         y: f32,
@@ -211,6 +240,8 @@ impl TextRenderer {
         mask: Option<&AlphaMask>,
         transform: Option<Transform>,
     ) -> f32 {
+        let buf_w = canvas.width;
+        let buf_h = canvas.height;
         let attrs = Attrs::new()
             .family(Family::Name(font))
             .weight(Weight(weight));
@@ -226,9 +257,10 @@ impl TextRenderer {
                 text_width = text_width.max(glyph.x + glyph.w);
             }
             let text_height = run.line_height;
+            damage_text_bbox(canvas.damage, buf_w, buf_h, x, y, text_width, text_height, 2);
             self.render_buffer_u32(
                 &mut buffer,
-                pixels,
+                canvas.pixels,
                 buf_w,
                 buf_h,
                 x,

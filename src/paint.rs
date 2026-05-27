@@ -6,6 +6,7 @@
 //!
 //! Every blending primitive accepts an optional [`Clip`] (defaults to full buffer when `None`) and an optional [`AlphaMask`] (full-frame, multiplies into per-pixel alpha for soft clipping — rounded textboxes, squircle pane corners, scroll fades). The clip is resolved once at entry into `(x_min, y_min, x_max, y_max)` loop bounds, so the inner loops carry **zero per-pixel bounds checks** — the math at the entry is the proof. AlphaMask dimensions must equal the buffer's `(buf_w, buf_h)`; mismatches panic per AGENT.md "fail loud."
 
+use crate::canvas::Canvas;
 use crate::coord::Coord;
 
 /// Clipping rectangle in buffer pixel coordinates. `x_end` and `y_end` are exclusive (matches Rust ranges). Construct via [`Clip::new`] or [`Clip::buffer`] for a full-buffer clip.
@@ -437,9 +438,7 @@ fn clip_rect(
 ///
 /// `mask: Some(&AlphaMask)` multiplies each pixel's mask alpha into `colour`'s opacity (`effective_opacity = colour_opacity * mask_alpha >> 8`) — used for shaped textbox interiors, scroll fades, etc. `mask: None` skips that math entirely.
 pub fn fill_rect(
-    pixels: &mut [u32],
-    buf_w: usize,
-    buf_h: usize,
+    canvas: &mut Canvas,
     x: isize,
     y: isize,
     rect_w: isize,
@@ -448,11 +447,15 @@ pub fn fill_rect(
     clip: Option<Clip>,
     mask: Option<&AlphaMask>,
 ) {
+    let buf_w = canvas.width;
+    let buf_h = canvas.height;
     let clip = Clip::resolve(clip, buf_w, buf_h);
     if let Some(m) = mask {
         assert_mask_matches_buffer(m, buf_w, buf_h);
     }
     let (x_min, y_min, x_max, y_max) = clip_rect(clip, x, y, rect_w, rect_h);
+    canvas.damage.add_bounds(x_min, y_min, x_max, y_max);
+    let pixels: &mut [u32] = canvas.pixels;
     match mask {
         None => {
             for row in y_min..y_max {
@@ -482,9 +485,7 @@ pub fn fill_rect(
 
 /// Stroke (outline) an axis-aligned rectangle. Draws four filled rect strips along the edges via [`fill_rect`]; corners are not joined separately because at 90° angles the strips meet cleanly.
 pub fn stroke_rect(
-    pixels: &mut [u32],
-    buf_w: usize,
-    buf_h: usize,
+    canvas: &mut Canvas,
     x: isize,
     y: isize,
     rect_w: isize,
@@ -504,8 +505,9 @@ pub fn stroke_rect(
         (x, y + stroke, stroke, inner_h),                   // left
         (x + rect_w - stroke, y + stroke, stroke, inner_h), // right
     ];
+    // Damage accumulates via the four fill_rect calls, each reporting its own clipped bbox.
     for &(ex, ey, ew, eh) in &edges {
-        fill_rect(pixels, buf_w, buf_h, ex, ey, ew, eh, colour, clip, mask);
+        fill_rect(canvas, ex, ey, ew, eh, colour, clip, mask);
     }
 }
 
@@ -515,14 +517,14 @@ pub fn stroke_rect(
 ///
 /// Clip restricts the row range. Mask isn't supported here (background is bg — masking it would mean "draw nothing where mask is zero" which is the same as just clearing afterward; if you need that, do it explicitly).
 pub fn background_noise(
-    pixels: &mut [u32],
-    buf_w: usize,
-    buf_h: usize,
+    canvas: &mut Canvas,
     speckle: usize,
     fullscreen: bool,
     scroll_offset: isize,
     clip: Option<Clip>,
 ) {
+    let buf_w = canvas.width;
+    let buf_h = canvas.height;
     if buf_w < 2 || buf_h < 2 {
         return;
     }
@@ -541,6 +543,8 @@ pub fn background_noise(
     if row_start >= row_end || x_start >= x_end {
         return;
     }
+    canvas.damage.add_bounds(x_start, row_start, x_end, row_end);
+    let pixels: &mut [u32] = canvas.pixels;
     crate::par::par_rows(pixels, buf_w, row_start, row_end, |row_idx, row_pixels| {
         let logical_row = row_idx as isize - scroll_offset;
         background_row(
@@ -703,14 +707,14 @@ impl DebugStats {
 /// (returns early in that case — diagnostic, not load-bearing).
 #[cfg(feature = "text")]
 pub fn draw_debug_strip(
-    pixels: &mut [u32],
-    width: usize,
-    height: usize,
+    canvas: &mut Canvas,
     text: &mut crate::text::TextRenderer,
     stats: &DebugStats,
 ) {
     const STRIP_H: usize = 24;
     const FONT_SIZE: f32 = 13.0;
+    let width = canvas.width;
+    let height = canvas.height;
     if width == 0 || height < STRIP_H * 2 {
         return;
     }
@@ -733,9 +737,7 @@ pub fn draw_debug_strip(
     let fg = pack_argb(80, 255, 120, 0xFF);
     let text_cy = strip_y as f32 + STRIP_H as f32 * 0.5;
     text.draw_text_center_u32(
-        pixels,
-        width,
-        height,
+        canvas,
         &stats_line,
         width as f32 * 0.5,
         text_cy,
@@ -751,9 +753,7 @@ pub fn draw_debug_strip(
     // Bar fills behind the glyphs (topmost-first: text rows already occupied, bar's under() only lands on the gaps).
     let bg = pack_argb(0, 0, 0, 0xE0);
     draw_rect(
-        pixels,
-        width,
-        height,
+        canvas,
         width as Coord * 0.5,
         strip_y as Coord + STRIP_H as Coord * 0.5,
         width as Coord,
@@ -1807,9 +1807,7 @@ pub fn blend_rgb_only(bg_colour: u32, fg_colour: u32, weight_bg: u8, weight_fg: 
 ///
 /// Rule 0: iteration bounds clamp `x_min/y_min ≥ 0` and `x_max/y_max ≤ buffer dim` because the rect can be partially or fully off-screen (caller passes arbitrary cx/cy); without the clamps an i32→usize cast on negative values wraps to a huge number → OOB panic. Coverage clamps to `[0, 1]` because pixels inside the rect have unbounded `d_inside`; without the cap, the `α × coverage` multiply would exceed the 0..255 byte range.
 pub fn draw_rect(
-    pixels: &mut [u32],
-    width: usize,
-    height: usize,
+    canvas: &mut Canvas,
     cx: Coord,
     cy: Coord,
     rect_w: Coord,
@@ -1817,16 +1815,14 @@ pub fn draw_rect(
     color: u32,
     clip: Option<Clip>,
 ) {
+    let width = canvas.width;
+    let height = canvas.height;
     if rect_w <= 0.0 || rect_h <= 0.0 || width == 0 || height == 0 {
         return;
     }
     let hw = rect_w * 0.5;
     let hh = rect_h * 0.5;
-    // Bbox via raw f32 → i32 cast (truncate-toward-zero). For positive floats this matches
-    // `floor`; for negative floats the `.max(0)` clamp inside `intersect_bbox` erases any
-    // off-by-one. The `+1.5` on the upper bounds replaces `ceil(x + 0.5)` — one extra-margin
-    // pixel at exact integer values is harmless (its coverage is 0). Avoids the GOT-indirect
-    // `libm::floorf/ceilf` calls that LLVM emits when the crate::math wrappers aren't inlined.
+    // Bbox via raw f32 → i32 cast (truncate-toward-zero). For positive floats this matches `floor`; for negative floats the `.max(0)` clamp inside `intersect_bbox` erases any off-by-one. The `+1.5` on the upper bounds replaces `ceil(x + 0.5)` — one extra-margin pixel at exact integer values is harmless (its coverage is 0). Avoids the GOT-indirect `libm::floorf/ceilf` calls that LLVM emits when the crate::math wrappers aren't inlined.
     let x_min = (cx - hw - 0.5) as i32;
     let x_max = (cx + hw + 1.5) as i32;
     let y_min = (cy - hh - 0.5) as i32;
@@ -1836,6 +1832,8 @@ pub fn draw_rect(
     else {
         return;
     };
+    canvas.damage.add_bounds(x_start, y_start, x_end, y_end);
+    let pixels: &mut [u32] = canvas.pixels;
 
     let color_alpha = ((color >> 24) & 0xFF) as Coord;
     let color_dark = color & 0x00FFFFFF;
@@ -1871,9 +1869,7 @@ pub fn draw_rect(
 ///
 /// Coverage at AA pixels: product of four `clamp(0.5 + signed_dist_inside, 0, 1)` terms, one per edge. This is the standard analytical AA approximation — exact for axis-aligned, slight over/under-estimate near corners at extreme angles, but visually clean and branch-free.
 pub fn draw_rect_rotated(
-    pixels: &mut [u32],
-    width: usize,
-    height: usize,
+    canvas: &mut crate::canvas::Canvas,
     cx: Coord,
     cy: Coord,
     rect_w: Coord,
@@ -1882,6 +1878,8 @@ pub fn draw_rect_rotated(
     color: u32,
     clip: Option<Clip>,
 ) {
+    let width = canvas.width;
+    let height = canvas.height;
     if rect_w <= 0.0 || rect_h <= 0.0 || width == 0 || height == 0 {
         return;
     }
@@ -1902,6 +1900,10 @@ pub fn draw_rect_rotated(
     else {
         return;
     };
+
+    // Damage report: the rasterizer never touches pixels outside this bbox, so this is the tight rect the host needs to compose / present. Reported before the par_rows borrow because damage and pixels both live on canvas; sequencing avoids a split-borrow dance.
+    canvas.damage.add_bounds(x_start, y_start, x_end, y_end);
+    let pixels: &mut [u32] = canvas.pixels;
 
     let color_alpha = ((color >> 24) & 0xFF) as Coord;
     let color_dark = color & 0x00FFFFFF;
@@ -2059,15 +2061,15 @@ fn fast_inv_sqrt(x: Coord) -> Coord {
 ///
 /// Sub-pixel radii (`r < ½`) clamp `r_in² = 0`, so the entire circle falls in the AA band — graceful degradation, no special case. Mirrors [`draw_app_icon`]'s orb AA topology.
 pub fn draw_circle(
-    pixels: &mut [u32],
-    width: usize,
-    height: usize,
+    canvas: &mut Canvas,
     cx: Coord,
     cy: Coord,
     r: Coord,
     color: u32,
     clip: Option<Clip>,
 ) {
+    let width = canvas.width;
+    let height = canvas.height;
     if r <= 0.0 || width == 0 || height == 0 {
         return;
     }
@@ -2075,13 +2077,9 @@ pub fn draw_circle(
     let r_out = r + 0.5;
     let r_in2 = r_in * r_in;
     let r_out2 = r_out * r_out;
-    // Per-pixel AA coverage needs `(r_out² − dist²) / diff` — divisor is constant per call, so
-    // we precompute the reciprocal once and multiply per pixel instead of dividing per pixel.
-    // FDIVSS ≈ 10–14 cycles, MULSS ≈ 3–4 — saves ~10 cycles per AA pixel.
+    // Per-pixel AA coverage needs `(r_out² − dist²) / diff` — divisor is constant per call, so we precompute the reciprocal once and multiply per pixel instead of dividing per pixel. FDIVSS ≈ 10–14 cycles, MULSS ≈ 3–4 — saves ~10 cycles per AA pixel.
     let inv_diff = 1.0 / (r_out2 - r_in2);
-    // See [`draw_rect`] for the cast-trick rationale. `r_out` already includes the half-pixel
-    // AA margin so the lower bound is `cx - r_out` (not `... - 0.5`); upper bound adds 1.0 to
-    // convert truncation to ceil.
+    // See [`draw_rect`] for the cast-trick rationale. `r_out` already includes the half-pixel AA margin so the lower bound is `cx - r_out` (not `... - 0.5`); upper bound adds 1.0 to convert truncation to ceil.
     let x_min = (cx - r_out) as i32;
     let x_max = (cx + r_out + 1.0) as i32;
     let y_min = (cy - r_out) as i32;
@@ -2091,6 +2089,8 @@ pub fn draw_circle(
     else {
         return;
     };
+    canvas.damage.add_bounds(x_start, y_start, x_end, y_end);
+    let pixels: &mut [u32] = canvas.pixels;
 
     let color_alpha = ((color >> 24) & 0xFF) as Coord;
     let color_dark = color & 0x00FFFFFF;
@@ -2125,9 +2125,7 @@ pub fn draw_circle(
 ///
 /// Sub-pixel ellipses (`rx < ½` or `ry < ½`) work without special-casing — every pixel falls in the AA band and gets the per-pixel coverage formula.
 pub fn draw_ellipse(
-    pixels: &mut [u32],
-    width: usize,
-    height: usize,
+    canvas: &mut Canvas,
     cx: Coord,
     cy: Coord,
     rx: Coord,
@@ -2135,6 +2133,8 @@ pub fn draw_ellipse(
     color: u32,
     clip: Option<Clip>,
 ) {
+    let width = canvas.width;
+    let height = canvas.height;
     if rx <= 0.0 || ry <= 0.0 || width == 0 || height == 0 {
         return;
     }
@@ -2150,6 +2150,8 @@ pub fn draw_ellipse(
     else {
         return;
     };
+    canvas.damage.add_bounds(x_start, y_start, x_end, y_end);
+    let pixels: &mut [u32] = canvas.pixels;
 
     let color_alpha = ((color >> 24) & 0xFF) as Coord;
     let color_dark = color & 0x00FFFFFF;
@@ -2192,9 +2194,7 @@ pub fn draw_ellipse(
 ///
 /// Bounding box uses the tight rotated extent `(rx|cos| + ry|sin|, rx|sin| + ry|cos|)` — same formula as [`draw_rect_rotated`].
 pub fn draw_ellipse_rotated(
-    pixels: &mut [u32],
-    width: usize,
-    height: usize,
+    canvas: &mut Canvas,
     cx: Coord,
     cy: Coord,
     rx: Coord,
@@ -2203,6 +2203,8 @@ pub fn draw_ellipse_rotated(
     color: u32,
     clip: Option<Clip>,
 ) {
+    let width = canvas.width;
+    let height = canvas.height;
     if rx <= 0. || ry <= 0. || width == 0 || height == 0 {
         return;
     }
@@ -2223,6 +2225,8 @@ pub fn draw_ellipse_rotated(
     else {
         return;
     };
+    canvas.damage.add_bounds(x_start, y_start, x_end, y_end);
+    let pixels: &mut [u32] = canvas.pixels;
 
     let color_alpha = ((color >> 24) & 0xFF) as Coord;
     let color_dark = color & 0x00FFFFFF;
@@ -2267,10 +2271,8 @@ pub fn draw_ellipse_rotated(
 ///
 /// `blend_aa_with_existing = true` (inner pass): AA pixels blend `color_rgb` into the current pixel's RGB by `h_aa`, keeping alpha=255 — produces the proper `fill·h + outside·(1-h)` transition when painted on top of an outer-pass stroke result.
 pub fn draw_squircle_pill(
-    pixels: &mut [u32],
+    canvas: &mut Canvas,
     mask: &mut [u8],
-    buf_w: usize,
-    buf_h: usize,
     pill_x: isize,
     pill_y: isize,
     pill_w: isize,
@@ -2279,6 +2281,8 @@ pub fn draw_squircle_pill(
     squirdleyness: i32,
     blend_aa_with_existing: bool,
 ) {
+    let buf_w = canvas.width;
+    let buf_h = canvas.height;
     if pill_w <= 0 || pill_h <= 0 {
         return;
     }
@@ -2288,6 +2292,14 @@ pub fn draw_squircle_pill(
     if pill_x + pill_w <= 0 || pill_y + pill_h <= 0 || pill_x >= buf_w_i || pill_y >= buf_h_i {
         return;
     }
+    // Damage = pill bbox clipped to buffer. Helpers use the same range internally for their per-row clips.
+    {
+        let dx0 = pill_x.max(0) as usize;
+        let dy0 = pill_y.max(0) as usize;
+        let dx1 = (pill_x + pill_w).min(buf_w_i).max(0) as usize;
+        let dy1 = (pill_y + pill_h).min(buf_h_i).max(0) as usize;
+        canvas.damage.add_bounds(dx0, dy0, dx1, dy1);
+    }
 
     let radius_f = pill_h as f32 * 0.5;
     let radius = (pill_h / 2) as isize;
@@ -2295,10 +2307,9 @@ pub fn draw_squircle_pill(
     let solid = (color & 0x00FF_FFFF) | 0xFF000000;
     let color_rgb = color & 0x00FF_FFFF;
     let crossings = squircle_crossings(radius_f, squirdleyness);
+    let pixels: &mut [u32] = canvas.pixels;
 
-    // Fast/slow split. Fast path: pill bbox fully inside the buffer → no per-pixel checks.
-    // Slow path: partial overhang (scroll/resize transitions) → range clips at the corner-block
-    // boundary so each AA write has its row already proven in-buffer.
+    // Fast/slow split. Fast path: pill bbox fully inside the buffer → no per-pixel checks. Slow path: partial overhang (scroll/resize transitions) → range clips at the corner-block boundary so each AA write has its row already proven in-buffer.
     let fully_inside =
         pill_x >= 0 && pill_y >= 0 && pill_x + pill_w <= buf_w_i && pill_y + pill_h <= buf_h_i;
 
@@ -2660,10 +2671,8 @@ pub fn squircle_inset(y_from_center: f32, radius: f32, squirdleyness: i32) -> f3
 ///
 /// **Rule 0 — WHY/PROOF/PREVENTS:** `center_y` is signed because scroll can push the textbox off-screen (negative Y). The function clips to `[0, buf_h)` using signed arithmetic. PREVENTS: out-of-bounds pixel access on partial visibility.
 pub fn draw_textbox_pill(
-    pixels: &mut [u32],
+    canvas: &mut Canvas,
     mask: &mut [u8],
-    buf_w: usize,
-    buf_h: usize,
     center_x: usize,
     center_y: isize,
     box_width: usize,
@@ -2671,6 +2680,8 @@ pub fn draw_textbox_pill(
 ) {
     use crate::theme;
 
+    let buf_w = canvas.width;
+    let buf_h = canvas.height;
     let height = buf_h;
     let height_signed = height as isize;
 
@@ -2688,6 +2699,17 @@ pub fn draw_textbox_pill(
     if box_bottom <= 0 || box_top >= height_signed {
         return;
     }
+    // Damage = textbox pill bbox clipped to buffer.
+    {
+        let buf_w_i = buf_w as isize;
+        let x_signed = center_x as isize - (box_width as isize / 2);
+        let dx0 = x_signed.max(0).min(buf_w_i) as usize;
+        let dy0 = box_top.max(0).min(height_signed) as usize;
+        let dx1 = (x_signed + box_width as isize).max(0).min(buf_w_i) as usize;
+        let dy1 = box_bottom.max(0).min(height_signed) as usize;
+        canvas.damage.add_bounds(dx0, dy0, dx1, dy1);
+    }
+    let pixels: &mut [u32] = canvas.pixels;
 
     let light = theme::TEXTBOX_LIGHT_EDGE;
     let shadow = theme::TEXTBOX_SHADOW_EDGE;
@@ -3035,13 +3057,18 @@ pub fn draw_textbox_pill(
 /// Caller must ensure the blinkey is within textbox bounds (which are inset from window edges).
 /// PREVENTS: out-of-bounds writes on the horizontal spread.
 pub fn draw_blinkey(
-    pixels: &mut [u32],
-    buf_w: usize,
+    canvas: &mut Canvas,
     bx: usize,
     by: usize,
     height: usize,
     top_bright: bool,
 ) {
+    let buf_w = canvas.width;
+    // Damage: ±7 horizontal spread × `height` vertical band. Caller's bounds invariant (bx ≥ 7, bx < buf_w-7) guarantees this stays in-buffer.
+    canvas
+        .damage
+        .add_bounds(bx - 7, by, bx + 8, by + height);
+    let pixels: &mut [u32] = canvas.pixels;
     let half = height / 2;
     for y in by..by + height {
         let idx = y * buf_w + bx;
@@ -3069,15 +3096,15 @@ pub fn draw_blinkey(
 ///
 /// The `add: bool` / "remove glow" path photon used is dropped — fluor's Group model fully re-rasterizes the layer each dirty cycle, so there's nothing to remove.
 pub fn apply_textbox_glow(
-    pixels: &mut [u32],
+    canvas: &mut Canvas,
     mask: &[u8],
-    buf_w: usize,
-    buf_h: usize,
     center_y: isize,
     box_width: usize,
     box_height: usize,
     glow_colour: u32,
 ) {
+    let buf_w = canvas.width;
+    let buf_h = canvas.height;
     let blur_h = 32usize;
     let blur_v = 16usize;
 
@@ -3089,6 +3116,16 @@ pub fn apply_textbox_glow(
 
     let y_top = cy - box_height / 2;
     let y_bot = cy + box_height / 2;
+    // Damage = glow halo bbox (box + lateral blur padding, vertical box + vertical blur).
+    {
+        let center_x = buf_w / 2;
+        let x0 = center_x.saturating_sub(box_width / 2 + blur_h);
+        let x1 = (center_x + box_width / 2 + blur_h).min(buf_w);
+        let y0 = y_top.saturating_sub(blur_v);
+        let y1 = (y_bot + blur_v).min(buf_h);
+        canvas.damage.add_bounds(x0, y0, x1, y1);
+    }
+    let pixels: &mut [u32] = canvas.pixels;
 
     // Find horizontal bounds by scanning mask at center row.
     let center_x = buf_w / 2;
@@ -3443,9 +3480,7 @@ pub mod glyph {
 ///
 /// AA via gradient-magnitude (no sqrt): for a pixel at squared distance `d²`, coverage is `(r_outer² - d²) / (r_outer² - r_inner²)` where `r_outer = radius` and `r_inner = radius - 1`. Gives a smooth 0→1 ramp across one pixel of edge.
 pub fn circle_filled(
-    pixels: &mut [u32],
-    buf_w: usize,
-    buf_h: usize,
+    canvas: &mut Canvas,
     cx: isize,
     cy: isize,
     radius: isize,
@@ -3453,9 +3488,27 @@ pub fn circle_filled(
     clip: Option<Clip>,
     mask: Option<&AlphaMask>,
 ) {
+    let buf_w = canvas.width;
+    let buf_h = canvas.height;
     if radius <= 0 {
         return;
     }
+    // Damage = bbox of the circle clipped to buffer + caller clip.
+    {
+        let c = Clip::resolve(clip, buf_w, buf_h);
+        let x0 = (cx - radius).max(c.x_start as isize).max(0) as usize;
+        let y0 = (cy - radius).max(c.y_start as isize).max(0) as usize;
+        let x1 = (cx + radius + 1)
+            .min(c.x_end as isize)
+            .min(buf_w as isize)
+            .max(0) as usize;
+        let y1 = (cy + radius + 1)
+            .min(c.y_end as isize)
+            .min(buf_h as isize)
+            .max(0) as usize;
+        canvas.damage.add_bounds(x0, y0, x1, y1);
+    }
+    let pixels: &mut [u32] = canvas.pixels;
     let clip = Clip::resolve(clip, buf_w, buf_h);
     if let Some(m) = mask {
         assert_mask_matches_buffer(m, buf_w, buf_h);
@@ -3558,10 +3611,10 @@ mod tests {
     fn stroke_rect_only_touches_edges() {
         // Buffer starts fully transparent (α=0, dark=0 → 0x00000000) — the canonical empty state for under-blend painting.
         let mut buf = vec![0u32; 10 * 10];
+        let mut damage = crate::canvas::Damage::new();
+        let mut canvas = crate::canvas::Canvas::new(&mut buf, 10, 10, &mut damage);
         stroke_rect(
-            &mut buf,
-            10,
-            10,
+            &mut canvas,
             2,
             2,
             6,
@@ -3582,10 +3635,10 @@ mod tests {
     #[test]
     fn circle_filled_center_is_colour() {
         let mut buf = vec![0u32; 16 * 16];
+        let mut damage = crate::canvas::Damage::new();
+        let mut canvas = crate::canvas::Canvas::new(&mut buf, 16, 16, &mut damage);
         circle_filled(
-            &mut buf,
-            16,
-            16,
+            &mut canvas,
             8,
             8,
             5,
@@ -3608,10 +3661,10 @@ mod tests {
     #[test]
     fn circle_filled_clips_partial_offscreen() {
         let mut buf = vec![0u32; 8 * 8];
+        let mut damage = crate::canvas::Damage::new();
+        let mut canvas = crate::canvas::Canvas::new(&mut buf, 8, 8, &mut damage);
         circle_filled(
-            &mut buf,
-            8,
-            8,
+            &mut canvas,
             -2,
             -2,
             4,
@@ -3640,11 +3693,11 @@ mod tests {
         // Buffer starts EMPTY (α=0, dark=0). Paint opaque visible RGB(0x11,0x22,0x33) under it.
         // Result: ~opaque colour (1-LSB drift per channel from the >>8 normalization).
         let mut buf = vec![0u32; 4 * 4];
+        let mut damage = crate::canvas::Damage::new();
+        let mut canvas = crate::canvas::Canvas::new(&mut buf, 4, 4, &mut damage);
         // Visible (0x11, 0x22, 0x33) with α=0xFF → α + darkness = α=0xFF, dark=(0xEE, 0xDD, 0xCC).
         fill_rect(
-            &mut buf,
-            4,
-            4,
+            &mut canvas,
             0,
             0,
             4,
@@ -3663,10 +3716,10 @@ mod tests {
     #[test]
     fn fill_rect_partial() {
         let mut buf = vec![0u32; 4 * 4];
+        let mut damage = crate::canvas::Damage::new();
+        let mut canvas = crate::canvas::Canvas::new(&mut buf, 4, 4, &mut damage);
         fill_rect(
-            &mut buf,
-            4,
-            4,
+            &mut canvas,
             1,
             1,
             2,
@@ -3695,10 +3748,10 @@ mod tests {
     #[test]
     fn fill_rect_clips_negative_origin() {
         let mut buf = vec![0u32; 4 * 4];
+        let mut damage = crate::canvas::Damage::new();
+        let mut canvas = crate::canvas::Canvas::new(&mut buf, 4, 4, &mut damage);
         fill_rect(
-            &mut buf,
-            4,
-            4,
+            &mut canvas,
             -2,
             -2,
             4,
@@ -3727,10 +3780,10 @@ mod tests {
     #[test]
     fn fill_rect_fully_offscreen_is_noop() {
         let mut buf = vec![0u32; 4 * 4];
+        let mut damage = crate::canvas::Damage::new();
+        let mut canvas = crate::canvas::Canvas::new(&mut buf, 4, 4, &mut damage);
         fill_rect(
-            &mut buf,
-            4,
-            4,
+            &mut canvas,
             100,
             100,
             5,
@@ -3740,10 +3793,10 @@ mod tests {
             None,
         );
         assert!(buf.iter().all(|&p| p == 0));
+        let mut damage2 = crate::canvas::Damage::new();
+        let mut canvas2 = crate::canvas::Canvas::new(&mut buf, 4, 4, &mut damage2);
         fill_rect(
-            &mut buf,
-            4,
-            4,
+            &mut canvas2,
             -10,
             -10,
             5,
@@ -3759,10 +3812,10 @@ mod tests {
     fn fill_rect_transparent_src_into_opaque_dst_is_noop() {
         // Dst is opaque (α=0xFF). Under doctrine: dst-opaque early-out fires for every pixel. Src never read.
         let mut buf = vec![pack_argb(50, 60, 70, 255); 4 * 4];
+        let mut damage = crate::canvas::Damage::new();
+        let mut canvas = crate::canvas::Canvas::new(&mut buf, 4, 4, &mut damage);
         fill_rect(
-            &mut buf,
-            4,
-            4,
+            &mut canvas,
             0,
             0,
             4,

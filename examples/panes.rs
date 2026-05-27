@@ -586,22 +586,23 @@ impl FluorApp for PanesDemo {
         let ellipse_angle = -self.rect_angle / 3.0;
         let bg_scroll = self.bg_scroll;
         self.chrome.rasterize_bg(move |buf, w, h| {
+            // Wrap the chrome's bg layer buffer in a Canvas so the migrated rasterizers can report painted bboxes. The bg layer has its own per-layer dirty flag at the chrome widget level; this damage is discarded for now (Phase 2 of the damage rollout will plumb it up to the host's per-frame accumulator).
+            let mut bg_damage = fluor::canvas::Damage::new();
+            let mut canvas = fluor::canvas::Canvas::new(buf, w, h, &mut bg_damage);
             paint::draw_rect_rotated(
-                buf, w, h, cx, cy, rect_w, rect_h, angle, rect_color, None,
+                &mut canvas, cx, cy, rect_w, rect_h, angle, rect_color, None,
             );
             paint::draw_rect(
-                buf, w, h, static_cx, static_cy, static_w, static_h, static_color, None,
+                &mut canvas, static_cx, static_cy, static_w, static_h, static_color, None,
             );
             paint::draw_circle(
-                buf, w, h, circle_cx, circle_cy, circle_r, circle_color, None,
+                &mut canvas, circle_cx, circle_cy, circle_r, circle_color, None,
             );
             paint::draw_ellipse(
-                buf, w, h, ellipse_cx, ellipse_cy, ellipse_rx, ellipse_ry, ellipse_color, None,
+                &mut canvas, ellipse_cx, ellipse_cy, ellipse_rx, ellipse_ry, ellipse_color, None,
             );
             paint::draw_ellipse_rotated(
-                buf,
-                w,
-                h,
+                &mut canvas,
                 rot_ellipse_cx,
                 rot_ellipse_cy,
                 rot_ellipse_rx,
@@ -610,7 +611,7 @@ impl FluorApp for PanesDemo {
                 rot_ellipse_color,
                 None,
             );
-            paint::background_noise(buf, w, h, 0, true, bg_scroll, None);
+            paint::background_noise(&mut canvas, 0, true, bg_scroll, None);
         });
         self.chrome.rasterize_chrome(ctx.text, ctx.clip_mask);
         self.chrome.rasterize_hover();
