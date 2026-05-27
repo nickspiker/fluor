@@ -318,8 +318,10 @@ impl FluorApp for PanesDemo {
                                     s ^= s >> 17;
                                     s ^= s << 5;
                                     let b = (s >> 16) & 0xFF;
-                                    // α + darkness: α=0xFF means opaque. RGB stored as darkness — the value here is debug-overlay color, used only by the hit-id visualization which OR's it directly into a presented buffer slot, so leave it in the host-facing convention (α=0 transparent doesn't matter; this isn't a fluor pixel).
-                                    self.debug_hit_colours.push((r << 16) | (g << 8) | b);
+                                    // Fluor-internal scratch format: α=0xFF opaque in storage, RGB in darkness convention (visible XOR 0x00FFFFFF). Previously this overlay wrote directly to the presented OS buffer with α=0 RGB-only, which worked because there was no finalize step. With the fullscreen-compositor architecture `target` is the window-sized scratch that goes through `finalize_into_screen` — α=0 there means fully transparent and the OS sees right through, which made the entire chrome vanish when the overlay toggled on.
+                                    let visible = (r << 16) | (g << 8) | b;
+                                    let dark = visible ^ 0x00FFFFFF;
+                                    self.debug_hit_colours.push(0xFF000000 | dark);
                                 }
                             }
                         } else if c == "p" || c == "P" {

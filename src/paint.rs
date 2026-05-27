@@ -549,17 +549,18 @@ pub fn finalize_for_os(pixels: &mut [u32], clip_mask: &[u8]) {
 ///
 /// Per-pixel cost: one read + one write, via `slice::copy_within` which lowers to platform `memmove`. No branches inside the inner copy loops — the direction (right/left, up/down) selects between two precomputed `(src_range, dst_offset, wrap_src_range, wrap_dst_range)` tuples, then the copies execute unconditionally.
 ///
-/// `dx` / `dy` are bounded by per-frame cursor motion (≪ screen dimensions in practice). debug_assert catches absurd deltas; release trusts the caller.
+/// `dx` / `dy` are typically bounded by per-frame cursor motion (≪ screen dimensions). For oversized deltas (cursor teleport, stalled frame, multi-monitor span) the signed remainder is used: a shift by exactly `scr_w` is a full wrap = no-op, so `dx = scr_w + 100` is equivalent to `dx = 100` (same wrapped result). Keeps the function panic-free for any input.
 pub fn shift_screen_wrap(screen: &mut [u32], scr_w: usize, scr_h: usize, dx: i32, dy: i32) {
-    let nx = dx.unsigned_abs() as usize;
-    let ny = dy.unsigned_abs() as usize;
-    debug_assert!(nx < scr_w, "dx must be less than screen width");
-    debug_assert!(ny < scr_h, "dy must be less than screen height");
+    // Normalize to the (-scr_w, +scr_w) range via signed remainder. Direction (sign) is preserved.
+    let signed_dx = if scr_w == 0 { 0 } else { dx % (scr_w as i32) };
+    let signed_dy = if scr_h == 0 { 0 } else { dy % (scr_h as i32) };
+    let nx = signed_dx.unsigned_abs() as usize;
+    let ny = signed_dy.unsigned_abs() as usize;
 
-    // X pass — per row. Direction picks the (wrap-source, body-source, body-destination, wrap-destination) tuple once; the per-row work is three unconditional copies. For dx == 0 the function never enters either branch and the X pass is skipped entirely (nx == 0 → tmp_x.len() == 0 → all three copies are 0-byte no-ops).
-    if dx != 0 {
+    // X pass — per row. Direction picks the (wrap-source, body-source, body-destination, wrap-destination) tuple once; the per-row work is three unconditional copies. For signed_dx == 0 the function never enters either branch and the X pass is skipped entirely.
+    if signed_dx != 0 {
         let mut tmp_x = alloc::vec![0u32; nx];
-        let (wrap_src, body_src, body_dst, wrap_dst) = if dx > 0 {
+        let (wrap_src, body_src, body_dst, wrap_dst) = if signed_dx > 0 {
             (scr_w - nx..scr_w, 0..scr_w - nx, nx, 0..nx)
         } else {
             (0..nx, nx..scr_w, 0, scr_w - nx..scr_w)
@@ -574,10 +575,10 @@ pub fn shift_screen_wrap(screen: &mut [u32], scr_w: usize, scr_h: usize, dx: i32
     }
 
     // Y pass — whole rows as a block. Same precomputed-direction pattern, applied to the buffer as a flat row-major slice (one body memmove of contiguous bytes, no per-row loop).
-    if dy != 0 {
+    if signed_dy != 0 {
         let mut tmp_y = alloc::vec![0u32; ny * scr_w];
         let split = (scr_h - ny) * scr_w;
-        let (wrap_src, body_src, body_dst, wrap_dst) = if dy > 0 {
+        let (wrap_src, body_src, body_dst, wrap_dst) = if signed_dy > 0 {
             (split..scr_h * scr_w, 0..split, ny * scr_w, 0..ny * scr_w)
         } else {
             (0..ny * scr_w, ny * scr_w..scr_h * scr_w, 0, split..scr_h * scr_w)

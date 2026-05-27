@@ -809,7 +809,8 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                         cursor_y: self.cursor_y - self.window_rect.y as Coord,
                     };
                     let response = self.app.on_event(&event, &mut ctx);
-                    let icon = self.app.cursor_for(self.cursor_x, self.cursor_y, &ctx);
+                    // Cursor coords must be window-relative — same translation as Context's cursor_x/y — so the consumer's hit_at sees the chrome at origin (0,0). Raw screen-space coords would miss every button when the window_rect isn't at (0,0).
+                    let icon = self.app.cursor_for(ctx.cursor_x, ctx.cursor_y, &ctx);
                     drop(ctx);
                     window.set_cursor(icon);
                     self.apply_response(response);
