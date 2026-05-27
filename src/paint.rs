@@ -985,12 +985,12 @@ pub fn paint_shadow(
             x -= 1;
             y -= 1;
         }
+        cast_shadow_ray(screen, scr_w, scr_h, factor_256, shadow_seed, x, y);
         let dx_left = right_col.saturating_sub(x);
         let dy_up = bot_row.saturating_sub(y);
         if dx_left > dy_up {
             break;
         }
-        cast_shadow_ray(screen, scr_w, scr_h, factor_256, shadow_seed, x, y);
     }
 
     // Phase E (continuation past BR midpoint — production black, gated): same algorithm structure as Phase D (outer y += 1, walk UL through transparent), silent walks. Loop bound is `x > x_center` so the trace can continue past `y == bot_row`. Y is clamped to bot_row once reached; if the walk isn't firing at bot_row (straight-bottom AA), advance x manually so the loop progresses.
@@ -1017,9 +1017,13 @@ pub fn paint_shadow(
         }
     }
 
-    // Phase F (BL mirror — production black, gated): start a fresh trace from the chrome's BL corner going RIGHT to x_center. Mirror of Phase A+B+C: seed via diagonal walk from bbox BL corner going UR (+1, -1) until first non-zero pixel. Then outer x += 1; when the new cell is opaque chrome interior (>= 0xFE — BL curve descends as x increases), walk DR (+1, +1) silently until we land on a non-opaque cell. Cast shadow ray from each landing. Stop at the horizontal midpoint, meeting Phase E.
+    // Phase F (BL mirror — production black, gated): start a fresh trace from the chrome's BL corner going RIGHT to x_center. Mirror of Phase A+B+C: seed via diagonal walk from `(x_chrome_left, bot_row - 1)` (one row up from the bbox BL corner, which is always transparent because the curve cuts it — mirrors Phase A's `(right_col, y_chrome_top + 1)` shift) stepping UR (+1, -1) until first non-zero pixel. Then outer x += 1; when the new cell is opaque chrome interior (>= 0xFE — BL curve descends as x increases), walk DR (+1, +1) silently until we land on a non-opaque cell. Cast shadow ray from each landing. Stop at the horizontal midpoint, meeting Phase E.
+    if bot_row == 0 {
+        let _ = scr_h;
+        return;
+    }
     let mut xf = x_chrome_left;
-    let mut yf = bot_row;
+    let mut yf = bot_row - 1;
     let mut found_f = false;
     loop {
         let a = (screen[yf * scr_w + xf] >> 24) & 0xFF;
@@ -1034,13 +1038,17 @@ pub fn paint_shadow(
         yf -= 1;
     }
     if found_f {
+        // Save the BL seed — Phase G (TL shadow) starts from the same cell.
+        let bl_seed_x = xf;
+        let bl_seed_y = yf;
         cast_shadow_ray(screen, scr_w, scr_h, factor_256, shadow_seed, xf, yf);
         while xf < x_center {
             xf += 1;
             if xf >= scr_w {
                 break;
             }
-            while ((screen[yf * scr_w + xf] >> 24) & 0xFF) >= 0xFE {
+            // Walk DR only while we're still above bot_row — past it we're in straight bottom AA territory where Phase E and Phase F should cast symmetrically at (x, bot_row), not one step past. Without the yf bound, the chrome bottom edge's solid α=0xFE cells would trigger the walk and shift Phase F's casts one cell DR, creating a 1-alpha-step diagonal seam at the Phase E/F meeting point.
+            while yf < bot_row && ((screen[yf * scr_w + xf] >> 24) & 0xFF) >= 0xFE {
                 if xf + 1 >= scr_w || yf + 1 >= scr_h {
                     let _ = scr_h;
                     return;
@@ -1049,6 +1057,30 @@ pub fn paint_shadow(
                 yf += 1;
             }
             cast_shadow_ray(screen, scr_w, scr_h, factor_256, shadow_seed, xf, yf);
+        }
+
+        // Phase G (TL shadow — bottom half of left edge, debug colors): mirror of Phase C+D, rotated 180°. Same BL seed as Phase F, but rays go UL (-1, -1) instead of DR (+1, +1). Outer y -= 1; when the new cell is opaque chrome interior (BL curve indenting leftward as y decreases), walk UL silently — wait, debug visibility — paint YELLOW. Cast UL debug ray (BLUE/GREEN AA + RED/MAGENTA transparent). Stop at the vertical midpoint.
+        let mut xg = bl_seed_x;
+        let mut yg = bl_seed_y;
+        cast_debug_ray_ul(screen, scr_w, factor_256, xg, yg, true);
+        let y_center = (y_chrome_top + y_chrome_end) / 2;
+        while yg > y_center {
+            if yg == 0 {
+                let _ = scr_h;
+                return;
+            }
+            yg -= 1;
+            while ((screen[yg * scr_w + xg] >> 24) & 0xFF) >= 0xFE {
+                // YELLOW direct-assign at full alpha.
+                screen[yg * scr_w + xg] = 0xFFFFFF00;
+                if xg == 0 || yg == 0 {
+                    let _ = scr_h;
+                    return;
+                }
+                xg -= 1;
+                yg -= 1;
+            }
+            cast_debug_ray_ul(screen, scr_w, factor_256, xg, yg, false);
         }
     }
 
@@ -1100,6 +1132,53 @@ fn cast_debug_ray(
         }
         x += 1;
         y += 1;
+    }
+}
+
+/// Mirror of [`cast_debug_ray`] — UL ray direction. Per cell:
+///   * α > 0 → under-blend BLUE (ray 0) or GREEN (rays 1+).
+///   * α == 0 → direct-assign RED (ray 0) or MAGENTA (rays 1+) premult.
+/// Decay shadow_alpha by factor_256 each step; stops at zero alpha or screen origin (x == 0 || y == 0).
+fn cast_debug_ray_ul(
+    screen: &mut [u32],
+    scr_w: usize,
+    factor_256: u32,
+    mut x: usize,
+    mut y: usize,
+    is_ray_zero: bool,
+) {
+    let mut shadow_alpha: u32 = 0xFF;
+    loop {
+        let idx = y * scr_w + x;
+        let p = screen[idx];
+        let a = (p >> 24) & 0xFF;
+        if a == 0 {
+            screen[idx] = if is_ray_zero {
+                (shadow_alpha << 24) | (shadow_alpha << 16)
+            } else {
+                (shadow_alpha << 24) | (shadow_alpha << 16) | shadow_alpha
+            };
+        } else {
+            let cr = (p >> 16) & 0xFF;
+            let cg = (p >> 8) & 0xFF;
+            let cb = p & 0xFF;
+            let cover = 256 - a;
+            let boost = (shadow_alpha * cover) >> 8;
+            let na = (a + boost).min(0xFF);
+            screen[idx] = if is_ray_zero {
+                let nb = (cb + boost).min(0xFF);
+                (na << 24) | (cr << 16) | (cg << 8) | nb
+            } else {
+                let ng = (cg + boost).min(0xFF);
+                (na << 24) | (cr << 16) | (ng << 8) | cb
+            };
+        }
+        shadow_alpha = (shadow_alpha * factor_256) >> 8;
+        if shadow_alpha == 0 || x == 0 || y == 0 {
+            break;
+        }
+        x -= 1;
+        y -= 1;
     }
 }
 
