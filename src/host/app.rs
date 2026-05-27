@@ -293,13 +293,14 @@ impl<A: FluorApp> DesktopShell<A> {
         #[cfg(feature = "text")]
         if crate::paint::DEBUG_SHOW_FPS.load(std::sync::atomic::Ordering::Relaxed) {
             if let Some(text) = self.text.as_mut() {
-                crate::paint::draw_debug_strip(
+                let mut strip_damage = crate::canvas::Damage::new();
+                let mut canvas = crate::canvas::Canvas::new(
                     &mut self.scratch,
                     win_w,
                     win_h,
-                    text,
-                    &self.debug_stats,
+                    &mut strip_damage,
                 );
+                crate::paint::draw_debug_strip(&mut canvas, text, &self.debug_stats);
             }
         }
 

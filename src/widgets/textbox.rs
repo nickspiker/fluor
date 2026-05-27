@@ -389,9 +389,7 @@ impl Textbox {
     /// `self.mask` (255 inside outer silhouette, AA values on outer curve) for downstream glow.
     pub fn render_content_into(
         &mut self,
-        pixels: &mut [u32],
-        buf_w: usize,
-        buf_h: usize,
+        canvas: &mut crate::canvas::Canvas,
         offset_x: Coord,
         offset_y: Coord,
         _text: &mut TextRenderer,
@@ -403,6 +401,8 @@ impl Textbox {
         let pill_w = self.width as isize;
         let pill_h = self.height as isize;
 
+        let buf_w = canvas.width;
+        let buf_h = canvas.height;
         let needed = buf_w * buf_h;
         if self.mask.len() != needed {
             self.mask.resize(needed, 0);
@@ -426,10 +426,8 @@ impl Textbox {
 
         // Outer pill — stroke colour, AA writes alpha=h so the layer composite blends to bg.
         paint::draw_squircle_pill(
-            pixels,
+            canvas,
             &mut self.mask,
-            buf_w,
-            buf_h,
             pill_x,
             pill_y,
             pill_w,
@@ -444,10 +442,8 @@ impl Textbox {
         let inner_h = pill_h - 2 * stroke_px;
         if inner_w > 0 && inner_h > 0 {
             paint::draw_squircle_pill(
-                pixels,
+                canvas,
                 &mut self.mask,
-                buf_w,
-                buf_h,
                 pill_x + stroke_px,
                 pill_y + stroke_px,
                 inner_w,
@@ -462,9 +458,7 @@ impl Textbox {
     /// Paint the focus glow into a buffer using the pill silhouette captured in `self.mask` by the last [`render_content_into`](Self::render_content_into) call. The glow goes into its OWN layer so AlphaOver in the textbox_group's Stack program produces the correct `glow_color × (1 - mask) + pill × mask` blend at AA edges — saturating-adding glow into the content layer would stain the pill's AA pixels with full glow_color.
     pub fn render_glow_into(
         &self,
-        pixels: &mut [u32],
-        buf_w: usize,
-        buf_h: usize,
+        canvas: &mut crate::canvas::Canvas,
         offset_x: Coord,
         offset_y: Coord,
     ) {
@@ -474,16 +468,7 @@ impl Textbox {
         let bw = self.width as usize;
         let bh = self.height as usize;
         let cy_l = (self.center_y - offset_y) as isize;
-        paint::apply_textbox_glow(
-            pixels,
-            &self.mask,
-            buf_w,
-            buf_h,
-            cy_l,
-            bw,
-            bh,
-            theme::GLOW_DEFAULT,
-        );
+        paint::apply_textbox_glow(canvas, &self.mask, cy_l, bw, bh, theme::GLOW_DEFAULT);
         // `offset_x` reserved for future use; the glow currently centers on the same x-axis as the pill so no x-offset math is required here.
         let _ = offset_x;
     }
@@ -491,15 +476,15 @@ impl Textbox {
     /// Render only the blinkey wave cursor into a buffer (typically a sub-viewport `cursor_group` buffer). `(offset_x, offset_y)` is the buffer's top-left in viewport coords. The buffer should be zeroed before calling — blinkey writes non-zero pixels for additive composition.
     pub fn render_blinkey_into(
         &self,
-        pixels: &mut [u32],
-        buf_w: usize,
-        buf_h: usize,
+        canvas: &mut crate::canvas::Canvas,
         offset_x: Coord,
         offset_y: Coord,
     ) {
         if !self.focused || self.has_selection() || !self.blinkey_visible {
             return;
         }
+        let buf_w = canvas.width;
+        let buf_h = canvas.height;
         let cpx_v = self.cursor_pixel_x();
         let blinkey_x_v = cpx_v as isize;
         let blinkey_x = (blinkey_x_v - offset_x as isize) as usize;
@@ -507,8 +492,7 @@ impl Textbox {
         let blinkey_h = self.font_size as usize;
         if blinkey_x >= 7 && blinkey_x + 7 < buf_w && blinkey_y + blinkey_h <= buf_h {
             paint::draw_blinkey(
-                pixels,
-                buf_w,
+                canvas,
                 blinkey_x,
                 blinkey_y,
                 blinkey_h,

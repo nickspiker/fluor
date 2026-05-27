@@ -243,7 +243,13 @@ impl DesktopApp {
             if layers[*chrome_layer_bg].dirty {
                 let bg = &mut layers[*chrome_layer_bg].pixels;
                 bg.fill(0);
-                paint::background_noise(bg, buf_w, buf_h, 0, false, 0, None); // fullscreen=false leaves a 1px transparent border so the chrome perimeter's partial-t outer edge passes through to the OS for soft AA against the desktop.
+                {
+                    // Transitional damage sink — desktop.rs renders into the chrome's bg layer which has its own per-layer dirty flag; the host's frame-level damage accumulator hasn't been wired yet (Phase 2).
+                    let mut bg_damage = crate::canvas::Damage::new();
+                    let mut canvas =
+                        crate::canvas::Canvas::new(bg, buf_w, buf_h, &mut bg_damage);
+                    paint::background_noise(&mut canvas, 0, false, 0, None); // fullscreen=false leaves a 1px transparent border so the chrome perimeter's partial-t outer edge passes through to the OS for soft AA against the desktop.
+                }
                 compositor.render(bg, buf_w, buf_h);
             }
 
@@ -310,7 +316,9 @@ impl DesktopApp {
                 let buf = &mut tg.rpn.layers[0].pixels;
                 buf.fill(0);
                 if let Some(t) = text.as_mut() {
-                    tb.render_content_into(buf, tw, th, bbox.x, bbox.y, t, None, None);
+                    let mut tb_damage = crate::canvas::Damage::new();
+                    let mut canvas = crate::canvas::Canvas::new(buf, tw, th, &mut tb_damage);
+                    tb.render_content_into(&mut canvas, bbox.x, bbox.y, t, None, None);
                 }
             }
         }
@@ -322,7 +330,9 @@ impl DesktopApp {
                 let cbox = tb.cursor_bbox();
                 let buf = &mut cg.rpn.layers[0].pixels;
                 buf.fill(0);
-                tb.render_blinkey_into(buf, cw, ch, cbox.x, cbox.y);
+                let mut cb_damage = crate::canvas::Damage::new();
+                let mut canvas = crate::canvas::Canvas::new(buf, cw, ch, &mut cb_damage);
+                tb.render_blinkey_into(&mut canvas, cbox.x, cbox.y);
             }
         }
 
