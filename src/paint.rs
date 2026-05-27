@@ -446,7 +446,9 @@ fn background_row(
     let ones = 0x0001_0101u32;
     let mut colour = rng as u32 & BG_MASK;
 
-    // Right half — left to right.
+    // Right half — left to right. Noise composes UNDER existing content (topmost-first):
+    // an empty pixel gets the noise; a non-empty pixel (e.g., a topmost rect already painted)
+    // has the noise blended behind it via [`Blend::under`].
     for x in (width / 2)..x_end {
         rng ^= rng.rotate_left(13).wrapping_add(12_345_678_942);
         let adder = rng as u32 & ones;
@@ -457,8 +459,9 @@ fn background_row(
             let subtractor = (rng >> 5) as u32 & ones;
             colour = colour.wrapping_sub(subtractor) & BG_MASK;
         }
-        row_pixels[x] =
+        let noise =
             ((colour.wrapping_add(BG_BASE) & RGB_MASK) ^ VISIBLE_TO_DARK_FLIP) | OPAQUE_ALPHA;
+        row_pixels[x] = row_pixels[x].under(noise, BlendMode::Normal);
     }
 
     // Left half — right to left, same RNG seed (mirror).
@@ -477,8 +480,9 @@ fn background_row(
             let subtractor = (rng >> 5) as u32 & ones;
             colour = colour.wrapping_sub(subtractor) & BG_MASK;
         }
-        row_pixels[x] =
+        let noise =
             ((colour.wrapping_add(BG_BASE) & RGB_MASK) ^ VISIBLE_TO_DARK_FLIP) | OPAQUE_ALPHA;
+        row_pixels[x] = row_pixels[x].under(noise, BlendMode::Normal);
     }
 }
 
@@ -1373,19 +1377,18 @@ pub fn draw_rect(
             if new_alpha == 0 {
                 continue;
             }
-            let top = (new_alpha << 24) | color_dark;
+            let rect_pixel = (new_alpha << 24) | color_dark;
             let idx = row + px;
-            // Paint rect ON TOP of existing content: rect is the new top, existing pixel goes underneath.
-            pixels[idx] = top.under(pixels[idx], BlendMode::Normal);
+            pixels[idx] = pixels[idx].under(rect_pixel, BlendMode::Normal);
         }
     }
 }
 
 /// Filled rectangle, anti-aliased, rotated by `angle` radians around `(cx, cy)`. Positive angle rotates counter-clockwise (standard math convention). Other semantics match [`draw_rect`] — α + darkness colour, AA edges, UNDER-blend onto existing pixel content.
 ///
-/// Per-pixel: translate to rect-local coords by inverse-rotating around the centre, then run the same `min(distance to nearest edge)` AA as the axis-aligned version. Bounding box is the rotated rect's circumscribed square (`half_diag = √(hw² + hh²)`) so we never miss a corner.
+/// Scanline + per-pixel edge AA. Per row we analytically solve the px range where each pixel's centre lies in the rect's local-coord interior (`|lx| ≤ hw − ½`, `|ly| ≤ hh − ½`, full coverage) vs the wider "any coverage" band (`|lx| ≤ hw + ½`, `|ly| ≤ hh + ½`, AA needed). The interior loop is a tight UNDER-blend with a precomputed `(α<<24)|RGB` value — no per-pixel rotation, no coverage math, no abs/clamp. Only the two AA strips at the row endpoints (and full-AA rows near top/bottom corners) pay for the 4-edge product coverage. Bounding box is the tight rotated extent `(hw|cos| + hh|sin|, hw|sin| + hh|cos|)`.
 ///
-/// Cost: same per-pixel math as `draw_rect` plus 2 muls + 2 adds for the rotation (one per axis). Bbox is `~1.4×` larger than axis-aligned for a 45°-rotated rect of equal dims; for other angles it's between 1.0× and 1.4×. The angle == 0 case is mathematically identical to `draw_rect` but slower by a few ops per pixel — call `draw_rect` directly when angle is known to be zero.
+/// Coverage at AA pixels: product of four `clamp(0.5 + signed_dist_inside, 0, 1)` terms, one per edge. This is the standard analytical AA approximation — exact for axis-aligned, slight over/under-estimate near corners at extreme angles, but visually clean and branch-free.
 pub fn draw_rect_rotated(
     pixels: &mut [u32],
     width: usize,
@@ -1403,11 +1406,14 @@ pub fn draw_rect_rotated(
     let hw = rect_w * 0.5;
     let hh = rect_h * 0.5;
     let (sin_a, cos_a) = crate::math::sin_cos(angle);
-    let half_diag = libm::sqrtf(hw * hw + hh * hh);
-    let x_min = crate::math::floor(cx - half_diag - 0.5) as i32;
-    let x_max = crate::math::ceil(cx + half_diag + 0.5) as i32;
-    let y_min = crate::math::floor(cy - half_diag - 0.5) as i32;
-    let y_max = crate::math::ceil(cy + half_diag + 0.5) as i32;
+    let abs_cos = cos_a.abs();
+    let abs_sin = sin_a.abs();
+    let bbox_hw = hw * abs_cos + hh * abs_sin;
+    let bbox_hh = hw * abs_sin + hh * abs_cos;
+    let x_min = crate::math::floor(cx - bbox_hw - 0.5) as i32;
+    let x_max = crate::math::ceil(cx + bbox_hw + 0.5) as i32;
+    let y_min = crate::math::floor(cy - bbox_hh - 0.5) as i32;
+    let y_max = crate::math::ceil(cy + bbox_hh + 0.5) as i32;
     let x_start = x_min.max(0) as usize;
     let y_start = y_min.max(0) as usize;
     let x_end = (x_max.max(0) as usize).min(width);
@@ -1418,31 +1424,121 @@ pub fn draw_rect_rotated(
 
     let color_alpha = ((color >> 24) & 0xFF) as Coord;
     let color_dark = color & 0x00FFFFFF;
+    let full_alpha = (color >> 24) & 0xFF;
+    let full_top = (full_alpha << 24) | color_dark;
 
+    // Per-pixel local-coord deltas (px += 1 → screen dx += 1).
+    let dlx = cos_a;
+    let dly = -sin_a;
+
+    // Any-coverage band: cov > 0 iff |lx| < hw+½ AND |ly| < hh+½.
+    let lx_outer = hw + 0.5;
+    let ly_outer = hh + 0.5;
+    // Full-coverage interior: cov == 1 iff |lx| ≤ hw−½ AND |ly| ≤ hh−½. Empty if sub-pixel.
+    let lx_inner = hw - 0.5;
+    let ly_inner = hh - 0.5;
+    let has_inner = lx_inner >= 0.0 && ly_inner >= 0.0;
+
+    let x_start_f = x_start as Coord + 0.5;
     for py in y_start..y_end {
         let row = py * width;
-        let dy = (py as Coord + 0.5) - cy;
-        for px in x_start..x_end {
-            let dx = (px as Coord + 0.5) - cx;
-            // Inverse rotation: rotate the screen-space delta by -angle to get rect-local coords.
-            let local_x = dx * cos_a + dy * sin_a;
-            let local_y = -dx * sin_a + dy * cos_a;
-            let dx_inside = hw - local_x.abs();
-            let dy_inside = hh - local_y.abs();
-            let d_inside = dx_inside.min(dy_inside);
-            let coverage = (0.5 + d_inside).clamp(0.0, 1.0);
-            if coverage <= 0.0 {
-                continue;
-            }
-            let new_alpha = (color_alpha * coverage) as u32;
-            if new_alpha == 0 {
-                continue;
-            }
-            let top = (new_alpha << 24) | color_dark;
-            let idx = row + px;
-            // Paint rect ON TOP of existing content: rect is the new top, existing pixel goes underneath.
-            pixels[idx] = top.under(pixels[idx], BlendMode::Normal);
+        let dy_row = (py as Coord + 0.5) - cy;
+        let dx0 = x_start_f - cx;
+        let lx0 = dx0 * cos_a + dy_row * sin_a;
+        let ly0 = -dx0 * sin_a + dy_row * cos_a;
+
+        // Outer band (pixels with any coverage at all).
+        let (ox_lo, ox_hi) = px_range(lx0, dlx, -lx_outer, lx_outer, x_start, x_end);
+        let (oy_lo, oy_hi) = px_range(ly0, dly, -ly_outer, ly_outer, x_start, x_end);
+        let outer_lo = ox_lo.max(oy_lo);
+        let outer_hi = ox_hi.min(oy_hi);
+        if outer_lo >= outer_hi {
+            continue;
         }
+
+        // Interior (full-coverage fast-path range). px_range must be called with the same
+        // (x_start, x_end) used for lx0/ly0 — i is computed relative to x_start, so passing
+        // outer_lo here would shift the interior off by (outer_lo − x_start) pixels.
+        let (inner_lo, inner_hi) = if has_inner {
+            let (ix_lo, ix_hi) = px_range(lx0, dlx, -lx_inner, lx_inner, x_start, x_end);
+            let (iy_lo, iy_hi) = px_range(ly0, dly, -ly_inner, ly_inner, x_start, x_end);
+            let lo = ix_lo.max(iy_lo).max(outer_lo);
+            let hi = ix_hi.min(iy_hi).min(outer_hi);
+            if lo >= hi { (outer_hi, outer_hi) } else { (lo, hi) }
+        } else {
+            (outer_hi, outer_hi)
+        };
+
+        // Left AA strip. Topmost-first: rect pixel goes as BOTTOM; the under formula scales
+        // it by `consumed = α` into the (initially-empty) buffer, satisfying the dark ≤ α
+        // invariant. Subsequent layers (noise, etc.) compose behind via the same call form.
+        let mut lx = lx0 + (outer_lo as Coord - x_start as Coord) * dlx;
+        let mut ly = ly0 + (outer_lo as Coord - x_start as Coord) * dly;
+        for px in outer_lo..inner_lo {
+            let cov_r = (0.5 + (hw - lx)).clamp(0.0, 1.0);
+            let cov_l = (0.5 + (lx + hw)).clamp(0.0, 1.0);
+            let cov_t = (0.5 + (hh - ly)).clamp(0.0, 1.0);
+            let cov_b = (0.5 + (ly + hh)).clamp(0.0, 1.0);
+            let coverage = cov_r * cov_l * cov_t * cov_b;
+            let na = (color_alpha * coverage) as u32;
+            if na > 0 {
+                let rect_pixel = (na << 24) | color_dark;
+                let idx = row + px;
+                pixels[idx] = pixels[idx].under(rect_pixel, BlendMode::Normal);
+            }
+            lx += dlx;
+            ly += dly;
+        }
+
+        // Interior fast path: full alpha, no coverage math.
+        for px in inner_lo..inner_hi {
+            let idx = row + px;
+            pixels[idx] = pixels[idx].under(full_top, BlendMode::Normal);
+        }
+
+        // Right AA strip.
+        let mut lx = lx0 + (inner_hi as Coord - x_start as Coord) * dlx;
+        let mut ly = ly0 + (inner_hi as Coord - x_start as Coord) * dly;
+        for px in inner_hi..outer_hi {
+            let cov_r = (0.5 + (hw - lx)).clamp(0.0, 1.0);
+            let cov_l = (0.5 + (lx + hw)).clamp(0.0, 1.0);
+            let cov_t = (0.5 + (hh - ly)).clamp(0.0, 1.0);
+            let cov_b = (0.5 + (ly + hh)).clamp(0.0, 1.0);
+            let coverage = cov_r * cov_l * cov_t * cov_b;
+            let na = (color_alpha * coverage) as u32;
+            if na > 0 {
+                let rect_pixel = (na << 24) | color_dark;
+                let idx = row + px;
+                pixels[idx] = pixels[idx].under(rect_pixel, BlendMode::Normal);
+            }
+            lx += dlx;
+            ly += dly;
+        }
+    }
+}
+
+/// Pixel-range solver for `lo ≤ v0 + (px − x_start)·dv ≤ hi`. Returns half-open `[px_lo, px_hi)` clamped to `[x_start, x_end]`. Empty range is returned as `(x_end, x_end)`.
+fn px_range(v0: Coord, dv: Coord, lo: Coord, hi: Coord, x_start: usize, x_end: usize) -> (usize, usize) {
+    if dv.abs() < 1e-6 {
+        if v0 >= lo && v0 <= hi {
+            return (x_start, x_end);
+        }
+        return (x_end, x_end);
+    }
+    let i_a = (lo - v0) / dv;
+    let i_b = (hi - v0) / dv;
+    let i_lo = i_a.min(i_b);
+    let i_hi = i_a.max(i_b);
+    let i_min = crate::math::ceil(i_lo) as i64;
+    let i_max = crate::math::floor(i_hi) as i64;
+    let start_i = x_start as i64;
+    let end_i = x_end as i64;
+    let lo_px = (start_i + i_min).clamp(start_i, end_i);
+    let hi_px = (start_i + i_max + 1).clamp(start_i, end_i);
+    if lo_px >= hi_px {
+        (x_end, x_end)
+    } else {
+        (lo_px as usize, hi_px as usize)
     }
 }
 
