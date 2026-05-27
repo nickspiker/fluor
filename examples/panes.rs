@@ -44,6 +44,8 @@ struct PanesDemo {
     debug_hit_colours: Vec<u32>,
     /// Demo rotation angle for the rotating rect — advanced by mouse-wheel scroll, used by [`paint::draw_rect_rotated`]. Shows off the rect primitive + RU-scaling: dimensions derive from `viewport.effective_span()` so the rect grows/shrinks with Ctrl+/Ctrl-/Ctrl+scroll.
     rect_angle: Coord,
+    /// Vertical scroll offset for the noise background — advanced by the same mouse-wheel events that rotate the rect. Passed straight to [`paint::background_noise`].
+    bg_scroll: isize,
 }
 
 impl PanesDemo {
@@ -120,6 +122,7 @@ impl PanesDemo {
             show_hitmask: false,
             debug_hit_colours: Vec::new(),
             rect_angle: 0.0,
+            bg_scroll: 0,
         }
     }
 
@@ -474,13 +477,14 @@ impl FluorApp for PanesDemo {
                 EventResponse::Pass
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                // Scroll-driven rotation: each notch rotates the demo rect by ~6°. Trackpad pixel deltas accumulate at ~30 px per notch to match the zoom shortcut's feel.
+                // Scroll-driven demo: each notch rotates the rect by ~6° (dimensionless, size-independent) AND shifts the noise background by 1/100th of `effective_span` (size-independent — same visual amount on tiny and 4K windows). Trackpad pixel deltas accumulate at ~30 raw-px per notch to match the zoom shortcut's feel.
                 let steps: Coord = match delta {
                     MouseScrollDelta::LineDelta(_, y) => *y,
                     MouseScrollDelta::PixelDelta(p) => (p.y as Coord) / 30.0,
                 };
                 if steps != 0.0 {
                     self.rect_angle += steps * 0.1;
+                    self.bg_scroll += (steps * ctx.viewport.effective_span() / 100.0) as isize;
                     self.chrome.invalidate_bg();
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
@@ -497,17 +501,24 @@ impl FluorApp for PanesDemo {
 
         // Hairline + background + hover overlay. Chrome's bg layer gets photon's background_noise; chrome layer gets the perimeter hairline + controls (or stays empty under Ctrl+Shift+D+C); hover layer gets a partial-α tint over the currently-hovered button (or stays empty if hover_state == HIT_NONE). The chrome group's Stack program (`Push hover, Push chrome, Under(Normal), Push bg, Under(Normal)`) front-to-back-composites them, then flattens under the target. Order matters: rasterize_chrome MUST run before rasterize_hover because hover reads `hit_test_map` which chrome populates.
         //
-        // Rotating rect demo: a cyan rect rotates over `self.rect_angle` (advanced in tick) and sizes from `viewport.effective_span()` so it grows/shrinks with the RU zoom. Painted into the bg layer on top of the noise so it composites under the chrome's perimeter + controls.
+        // Rect demos: a 50%-opacity cyan rect rotates over `self.rect_angle`, plus a 25%-opacity orange axis-aligned rect overlapping it for the non-rotated path. Both paint FIRST (topmost-first doctrine), then the noise composes behind via `under()` — scrolled vertically by `self.bg_scroll`. All sizes derive from `viewport.effective_span()` so they grow/shrink with the RU zoom.
         let span = ctx.viewport.effective_span();
         let cx = ctx.viewport.width_px as Coord * 0.5;
         let cy = ctx.viewport.height_px as Coord * 0.7;
         let rect_w = span / 8.0;
         let rect_h = span / 24.0;
-        let rect_color = pack_argb(80, 220, 220, 255);
+        let rect_color = pack_argb(80, 220, 220, 0x80);
+        let static_w = span / 10.0;
+        let static_h = span / 16.0;
+        let static_cx = cx + rect_w * 0.35;
+        let static_cy = cy - rect_h * 0.6;
+        let static_color = pack_argb(255, 180, 80, 0x40);
         let angle = self.rect_angle;
+        let bg_scroll = self.bg_scroll;
         self.chrome.rasterize_bg(move |buf, w, h| {
             paint::draw_rect_rotated(buf, w, h, cx, cy, rect_w, rect_h, angle, rect_color);
-            paint::background_noise(buf, w, h, 0, true, 0, None);
+            paint::draw_rect(buf, w, h, static_cx, static_cy, static_w, static_h, static_color);
+            paint::background_noise(buf, w, h, 0, true, bg_scroll, None);
         });
         self.chrome.rasterize_chrome(ctx.text, ctx.clip_mask);
         self.chrome.rasterize_hover();
