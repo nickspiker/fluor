@@ -62,6 +62,46 @@ pub trait Blend {
     fn under(self, bottom: Argb8, mode: BlendMode) -> Argb8;
 }
 
+/// 8-wide SIMD version of [`Blend::under`] for `BlendMode::Normal` only — the 99% case in
+/// real compositing workloads. Same math as the scalar kernel lane-by-lane, plus a SIMD
+/// version of the `dst >= 0xFF000000` early-out: lanes where `dst.α == 0xFF` keep their
+/// original value via a masked blend with the SIMD result.
+///
+/// Other blend modes (Multiply, Screen, Add, Subtract, Overlay, Darken, Lighten) are NOT
+/// covered here — they branch per lane on bot_dark thresholds (Overlay) or call
+/// `saturating_sub` per channel, which doesn't SIMD-vectorize cleanly. Those modes stay on
+/// the scalar [`Blend::under`] kernel; only Normal gets the wide path.
+#[cfg(feature = "simd")]
+#[inline]
+pub fn under_x8_normal(dst: wide::u32x8, src: wide::u32x8) -> wide::u32x8 {
+    use wide::u32x8;
+    let mask_ff = u32x8::splat(0xFF);
+    let const_256 = u32x8::splat(256);
+    let all_ones = u32x8::splat(0xFFFFFFFF);
+
+    let dst_a: u32x8 = (dst >> 24) & mask_ff;
+    let dst_r: u32x8 = (dst >> 16) & mask_ff;
+    let dst_g: u32x8 = (dst >> 8) & mask_ff;
+    let dst_b: u32x8 = dst & mask_ff;
+    let src_a: u32x8 = (src >> 24) & mask_ff;
+    let src_r: u32x8 = (src >> 16) & mask_ff;
+    let src_g: u32x8 = (src >> 8) & mask_ff;
+    let src_b: u32x8 = src & mask_ff;
+
+    let consumed = ((const_256 - dst_a) * src_a) >> 8;
+    let nr = dst_r + ((src_r * consumed) >> 8);
+    let ng = dst_g + ((src_g * consumed) >> 8);
+    let nb = dst_b + ((src_b * consumed) >> 8);
+    let na = dst_a + consumed;
+    let result: u32x8 = (na << 24) | (nr << 16) | (ng << 8) | nb;
+
+    // SIMD early-out: lanes where dst.α was 0xFF keep dst (top was already opaque, bot
+    // invisible). cmp_eq returns 0xFFFFFFFF for true lanes, 0 for false — bitwise blend.
+    let opaque_mask = dst_a.cmp_eq(mask_ff);
+    let not_mask = opaque_mask ^ all_ones;
+    (opaque_mask & dst) | (not_mask & result)
+}
+
 impl Blend for Argb8 {
     #[inline]
     fn under(self, bottom: Argb8, mode: BlendMode) -> Argb8 {

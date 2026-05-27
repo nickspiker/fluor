@@ -155,9 +155,10 @@ impl StackCompositor {
                 Op::Under(mode) => {
                     let b = self.stack.pop().expect("Stack underflow on Under");
                     let a = self.stack.last_mut().expect("Stack underflow on Under");
-                    for i in 0..a.len() {
-                        a[i] = a[i].under(b[i], mode);
-                    }
+                    // Full-buffer compose. Use [`crate::paint::flatten`] so the SIMD+Rayon
+                    // path for `Normal` mode (the 99% case) kicks in automatically; other
+                    // blend modes route through scalar with Rayon-only chunking.
+                    crate::paint::flatten(a, &b, mode);
                     self.release_buf(b);
                 }
             }

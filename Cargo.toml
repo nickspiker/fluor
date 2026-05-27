@@ -18,7 +18,7 @@ crate-type = ["rlib"]
 [features]
 # host-bare is the no_std path used by ferros and other bare-metal consumers.
 # host-winit / host-softbuffer / text imply std.
-default = ["std", "host-winit", "simd"]
+default = ["std", "host-winit", "simd", "rayon"]
 std = []
 # host-winit transitively requires text — desktop chrome wants real glyphs out of the box.
 # macOS uses wgpu/Metal for PostMultiplied alpha (transparent squircle corners);
@@ -27,7 +27,14 @@ host-winit = ["std", "text", "dep:winit", "dep:softbuffer", "dep:wgpu", "dep:pol
 host-softbuffer = ["std", "dep:softbuffer"]
 host-bare = []
 text = ["std", "dep:cosmic-text", "dep:swash"]
-simd = []
+# Portable SIMD via the `wide` crate. Widens inner loops in rasterizers / boundary passes /
+# the under() kernel to 4–8 pixels per iter. Scalar fallback path is preserved for builds
+# with `--no-default-features`.
+simd = ["dep:wide"]
+# Data-parallel outer loops via rayon. Each rasterizer's row loop and each full-buffer pass
+# (finalize, flatten, Op::Under) splits across the rayon thread pool. Requires std for the
+# OS thread pool — no_std builds (host-bare / ferros) stay sequential.
+rayon = ["std", "dep:rayon"]
 
 [dependencies]
 # spirix is kept as an opt-in dep for precision-critical rasterizer paths and a future
@@ -43,6 +50,12 @@ vsf = { version = "0.3", path = "../vsf" }
 rav1d = { version = "1.1", default-features = false, features = ["bitdepth_8"] }
 
 libm = "0.2"
+# Portable SIMD types (f32x4/x8, u32x4/x8, etc) with x86 SSE/AVX, ARM NEON, and WASM SIMD
+# backends. Stable Rust. Gated by the `simd` feature.
+wide = { version = "0.7", optional = true }
+# Work-stealing thread pool for data-parallel outer loops. Gated by the `rayon` feature
+# (which itself requires `std`).
+rayon = { version = "1", optional = true }
 arboard = { version = "3", optional = true }
 winit = { version = "0.30", optional = true }
 softbuffer = { version = "0.4", optional = true }
