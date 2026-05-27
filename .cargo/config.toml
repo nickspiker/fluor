@@ -1,0 +1,15 @@
+# Local build config for fluor's own development (examples, tests, benches).
+#
+# `target-cpu = "native"` lets LLVM use whatever SIMD instruction sets the host CPU exposes
+# (AVX2, AVX-512, FMA, BMI, etc.). This is necessary for the `simd` feature's `wide`-crate
+# vector types to actually lower to 256-bit (AVX2) ops — without it, the generic x86_64
+# baseline is SSE2-only and the 8-wide u32/f32 lanes fall back to scalar or two 128-bit ops.
+#
+# This config ONLY applies when running cargo from this directory (e.g., `cargo run --example
+# panes`). It does NOT propagate to downstream consumers — if `ferros` or another app depends
+# on fluor and wants the same speed, it needs its own `target-cpu = "native"` or runtime
+# feature detection via `std::is_x86_feature_detected!`. See Phase 5 / production hardening
+# in the SIMD plan for the runtime-dispatch story.
+
+[build]
+rustflags = ["-C", "target-cpu=native"]

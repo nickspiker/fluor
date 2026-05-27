@@ -16,8 +16,11 @@ pub mod host;
 pub(crate) mod math;
 pub mod paint;
 pub mod pane;
+pub(crate) mod par;
 pub mod pixel;
 pub mod region;
+#[cfg(feature = "simd")]
+pub(crate) mod simd;
 pub mod stack;
 pub mod theme;
 

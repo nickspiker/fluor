@@ -45,6 +45,33 @@ impl Clip {
             None => Self::buffer(buf_w, buf_h),
         }
     }
+
+    /// Intersect a primitive's `i32` bbox with `opt` (resolved against the buffer extent),
+    /// returning integer pixel bounds suitable for `for` loops. Returns `None` if the
+    /// intersection is empty (whole primitive is offscreen or fully clipped). Used by every
+    /// rasterizer's entry path so the clip story is one call: pass `clip` through, get back
+    /// either `(x_start, y_start, x_end, y_end)` to iterate or an early-return signal.
+    #[inline]
+    pub fn intersect_bbox(
+        opt: Option<Clip>,
+        buf_w: usize,
+        buf_h: usize,
+        x_min: i32,
+        x_max: i32,
+        y_min: i32,
+        y_max: i32,
+    ) -> Option<(usize, usize, usize, usize)> {
+        let c = Self::resolve(opt, buf_w, buf_h);
+        let x_start = (x_min.max(0) as usize).max(c.x_start);
+        let y_start = (y_min.max(0) as usize).max(c.y_start);
+        let x_end = (x_max.max(0) as usize).min(buf_w).min(c.x_end);
+        let y_end = (y_max.max(0) as usize).min(buf_h).min(c.y_end);
+        if x_start >= x_end || y_start >= y_end {
+            None
+        } else {
+            Some((x_start, y_start, x_end, y_end))
+        }
+    }
 }
 
 /// 2D affine transform — a 2×3 matrix laid out as `[a c tx; b d ty]`. Applied to a point `(x, y)` as `(a*x + c*y + tx, b*x + d*y + ty)`. Composes via [`then`](Self::then) (`a.then(b)` = "do `a` first, then `b`"). Used by the text path so glyph contours rotate / scale / skew *before* swash rasterizes them — proper hinting and AA on rotated glyphs, not a post-rotation pixel-shuffle.
@@ -257,10 +284,116 @@ use crate::pixel::Blend;
 pub use crate::pixel::BlendMode;
 
 /// Flatten `src` underneath `dst` across the whole slice, pixel-by-pixel, via [`Blend::under`]. `dst` is the partial composite already accumulated above (its α-byte = accumulated opacity); `src` is the new layer going behind. Per-pixel early-out fires when `dst.α == 0xFF`. Both slices must be the same length.
+///
+/// For `BlendMode::Normal` (the 99% case) the kernel uses 8-wide SIMD + Rayon parallelism.
+/// Other modes fall back to scalar per-pixel with Rayon row-chunking still applied — the math
+/// just stays in the scalar [`Blend::under`] kernel.
 #[inline]
 pub fn flatten(dst: &mut [u32], src: &[u32], mode: BlendMode) {
+    let n = dst.len().min(src.len());
+    if n == 0 {
+        return;
+    }
+    let dst = &mut dst[..n];
+    let src = &src[..n];
+    const CHUNK: usize = 4096;
+    if mode == BlendMode::Normal {
+        crate::par::par_chunks(dst, CHUNK, |off, chunk| {
+            let src_chunk = &src[off..off + chunk.len()];
+            under_chunk_normal_dispatch(chunk, src_chunk);
+        });
+    } else {
+        crate::par::par_chunks(dst, CHUNK, |off, chunk| {
+            let src_chunk = &src[off..off + chunk.len()];
+            for i in 0..chunk.len() {
+                chunk[i] = chunk[i].under(src_chunk[i], mode);
+            }
+        });
+    }
+}
+
+/// Per-chunk Normal-under dispatcher: SIMD with the `simd` feature, scalar fallback otherwise.
+/// Output is bit-identical between paths.
+#[inline]
+pub(crate) fn under_chunk_normal_dispatch(dst: &mut [u32], src: &[u32]) {
+    #[cfg(feature = "simd")]
+    {
+        under_chunk_normal_simd(dst, src);
+    }
+    #[cfg(not(feature = "simd"))]
+    {
+        under_chunk_normal_scalar(dst, src);
+    }
+}
+
+/// 8-wide SIMD chunk kernel for Normal-mode under. Tail (0..7 leftover pixels) runs scalar.
+#[cfg(feature = "simd")]
+fn under_chunk_normal_simd(dst: &mut [u32], src: &[u32]) {
+    use crate::simd::{LANES, u32x8};
+    let n = dst.len();
+    let mut i = 0;
+    while i + LANES <= n {
+        let d_arr: [u32; 8] = dst[i..i + LANES].try_into().unwrap();
+        let s_arr: [u32; 8] = src[i..i + LANES].try_into().unwrap();
+        let out = crate::pixel::under_x8_normal(u32x8::from(d_arr), u32x8::from(s_arr));
+        dst[i..i + LANES].copy_from_slice(out.as_array_ref());
+        i += LANES;
+    }
+    while i < n {
+        dst[i] = dst[i].under(src[i], BlendMode::Normal);
+        i += 1;
+    }
+}
+
+/// Scalar Normal-under chunk kernel for `--no-default-features` (no `simd`) builds.
+#[cfg(not(feature = "simd"))]
+fn under_chunk_normal_scalar(dst: &mut [u32], src: &[u32]) {
     for i in 0..dst.len() {
-        dst[i] = dst[i].under(src[i], mode);
+        dst[i] = dst[i].under(src[i], BlendMode::Normal);
+    }
+}
+
+/// Per-chunk Normal-under dispatcher for a CONSTANT src pixel — what the rasterizer interior
+/// fast paths need: every dst pixel composes the same `full_pixel` underneath. Saves the cost
+/// of materializing an 8-pixel src array when all lanes are the same value (the SIMD path uses
+/// `u32x8::splat` instead).
+#[inline]
+pub(crate) fn under_chunk_const_dispatch(dst: &mut [u32], src_const: u32) {
+    #[cfg(feature = "simd")]
+    {
+        under_chunk_const_simd(dst, src_const);
+    }
+    #[cfg(not(feature = "simd"))]
+    {
+        under_chunk_const_scalar(dst, src_const);
+    }
+}
+
+/// 8-wide SIMD constant-src under kernel. `src_const` is broadcast to all 8 lanes once outside
+/// the inner loop. Tail scalar.
+#[cfg(feature = "simd")]
+fn under_chunk_const_simd(dst: &mut [u32], src_const: u32) {
+    use crate::simd::{LANES, u32x8};
+    let src = u32x8::splat(src_const);
+    let n = dst.len();
+    let mut i = 0;
+    while i + LANES <= n {
+        let d_arr: [u32; 8] = dst[i..i + LANES].try_into().unwrap();
+        let out = crate::pixel::under_x8_normal(u32x8::from(d_arr), src);
+        dst[i..i + LANES].copy_from_slice(out.as_array_ref());
+        i += LANES;
+    }
+    while i < n {
+        dst[i] = dst[i].under(src_const, BlendMode::Normal);
+        i += 1;
+    }
+}
+
+/// Scalar constant-src under for `--no-default-features` (no `simd`) builds.
+#[cfg(not(feature = "simd"))]
+fn under_chunk_const_scalar(dst: &mut [u32], src_const: u32) {
+    for i in 0..dst.len() {
+        dst[i] = dst[i].under(src_const, BlendMode::Normal);
     }
 }
 
@@ -518,32 +651,134 @@ pub static DEBUG_SKIP_CONTROLS: std::sync::atomic::AtomicBool =
 pub fn finalize_for_os(pixels: &mut [u32], clip_mask: &[u8]) {
     let alpha_mode = DEBUG_SHOW_ALPHA.load(std::sync::atomic::Ordering::Relaxed);
     let n = pixels.len().min(clip_mask.len());
-    for i in 0..n {
-        let v = pixels[i] ^ 0x00FFFFFF;
-        let m = clip_mask[i] as u32;
-        let inner_alpha = (v >> 24) & 0xFF;
-        let final_alpha = (inner_alpha * m) >> 8;
-        if alpha_mode == DEBUG_SHOW_ALPHA_GRAYSCALE {
-            pixels[i] = 0xFF000000 | (final_alpha << 16) | (final_alpha << 8) | final_alpha;
-            continue;
-        }
-        if alpha_mode == DEBUG_SHOW_ALPHA_FORCE_OPAQUE {
-            // Force-opaque: keep the kernel's visible RGB exactly (no premultiply, no clip-mask trim), set α=255 so the OS displays it. Lets you see what landed in the buffer BEFORE the boundary trimmed/multiplied anything.
-            pixels[i] = 0xFF000000 | (v & 0x00FFFFFF);
-            continue;
-        }
-        #[cfg(target_os = "linux")]
-        let s = if DEBUG_SKIP_PREMULT.load(std::sync::atomic::Ordering::Relaxed) {
-            256u32
-        } else {
-            final_alpha
-        };
-        #[cfg(not(target_os = "linux"))]
-        let s = 256u32;
+    if n == 0 {
+        return;
+    }
+
+    // Debug-visualization paths stay scalar — they're rare (toggle-only) and not worth SIMD-izing.
+    if alpha_mode == DEBUG_SHOW_ALPHA_GRAYSCALE || alpha_mode == DEBUG_SHOW_ALPHA_FORCE_OPAQUE {
+        finalize_scalar_debug_inplace(&mut pixels[..n], &clip_mask[..n], alpha_mode);
+        return;
+    }
+
+    // On non-Linux the premult step is a no-op (s = 256 = identity multiply); we route through
+    // the same SIMD kernel with `skip_premult = true` so the hot loop is uniform across platforms.
+    #[cfg(target_os = "linux")]
+    let skip_premult = DEBUG_SKIP_PREMULT.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(target_os = "linux"))]
+    let skip_premult = true;
+
+    let pixels = &mut pixels[..n];
+    let clip = &clip_mask[..n];
+
+    // Chunk size of 4096 pixels (16 KiB of u32). Large enough to amortize Rayon's ~1 µs
+    // task-dispatch overhead against ~10 µs of SIMD work per chunk; small enough that a typical
+    // 8-core system pulls hundreds of tasks from a 4K (8M pixel) finalize and load-balances
+    // cleanly. On non-Rayon builds, this is just a sequential walk in 4096-pixel windows.
+    const CHUNK: usize = 4096;
+
+    crate::par::par_chunks(pixels, CHUNK, |off, chunk| {
+        let clip_chunk = &clip[off..off + chunk.len()];
+        finalize_chunk_dispatch(chunk, clip_chunk, skip_premult);
+    });
+}
+
+/// Per-chunk dispatcher: SIMD path when the `simd` feature is enabled, scalar fallback otherwise.
+/// Both branches produce bit-identical output (the SIMD path is a straight lane-wise translation
+/// of the scalar math, not an approximation).
+#[inline]
+fn finalize_chunk_dispatch(chunk: &mut [u32], clip: &[u8], skip_premult: bool) {
+    #[cfg(feature = "simd")]
+    {
+        finalize_chunk_simd(chunk, clip, skip_premult);
+    }
+    #[cfg(not(feature = "simd"))]
+    {
+        finalize_chunk_scalar(chunk, clip, skip_premult);
+    }
+}
+
+/// SIMD finalize kernel: 8 pixels per inner iter (u32x8), scalar tail for the leftover 0..7.
+/// Same math as [`finalize_chunk_scalar`] lane-by-lane.
+#[cfg(feature = "simd")]
+fn finalize_chunk_simd(chunk: &mut [u32], clip: &[u8], skip_premult: bool) {
+    use crate::simd::{LANES, u32x8};
+    let n = chunk.len();
+    let mask_ff = u32x8::splat(0xFF);
+    let xor_flip = u32x8::splat(0x00FFFFFF);
+    let const_256 = u32x8::splat(256);
+
+    let mut i = 0;
+    while i + LANES <= n {
+        let raw: [u32; 8] = chunk[i..i + LANES].try_into().unwrap();
+        let v = u32x8::from(raw) ^ xor_flip;
+        let m = u32x8::from([
+            clip[i] as u32,
+            clip[i + 1] as u32,
+            clip[i + 2] as u32,
+            clip[i + 3] as u32,
+            clip[i + 4] as u32,
+            clip[i + 5] as u32,
+            clip[i + 6] as u32,
+            clip[i + 7] as u32,
+        ]);
+        let inner_a = (v >> 24) & mask_ff;
+        let final_a = (inner_a * m) >> 8;
+        let s = if skip_premult { const_256 } else { final_a };
+        let r = (((v >> 16) & mask_ff) * s) >> 8;
+        let g = (((v >> 8) & mask_ff) * s) >> 8;
+        let b = ((v & mask_ff) * s) >> 8;
+        let out: u32x8 = (final_a << 24) | (r << 16) | (g << 8) | b;
+        chunk[i..i + LANES].copy_from_slice(out.as_array_ref());
+        i += LANES;
+    }
+    // Scalar tail (0..LANES-1 pixels).
+    while i < n {
+        let v = chunk[i] ^ 0x00FFFFFF;
+        let m = clip[i] as u32;
+        let inner_a = (v >> 24) & 0xFF;
+        let final_a = (inner_a * m) >> 8;
+        let s = if skip_premult { 256u32 } else { final_a };
         let r = (((v >> 16) & 0xFF) * s) >> 8;
         let g = (((v >> 8) & 0xFF) * s) >> 8;
         let b = ((v & 0xFF) * s) >> 8;
-        pixels[i] = (final_alpha << 24) | (r << 16) | (g << 8) | b;
+        chunk[i] = (final_a << 24) | (r << 16) | (g << 8) | b;
+        i += 1;
+    }
+}
+
+/// Scalar finalize kernel for `--no-default-features` (no `simd`) builds. Identical math.
+#[cfg(not(feature = "simd"))]
+fn finalize_chunk_scalar(chunk: &mut [u32], clip: &[u8], skip_premult: bool) {
+    for i in 0..chunk.len() {
+        let v = chunk[i] ^ 0x00FFFFFF;
+        let m = clip[i] as u32;
+        let inner_a = (v >> 24) & 0xFF;
+        let final_a = (inner_a * m) >> 8;
+        let s = if skip_premult { 256u32 } else { final_a };
+        let r = (((v >> 16) & 0xFF) * s) >> 8;
+        let g = (((v >> 8) & 0xFF) * s) >> 8;
+        let b = ((v & 0xFF) * s) >> 8;
+        chunk[i] = (final_a << 24) | (r << 16) | (g << 8) | b;
+    }
+}
+
+/// Debug-visualization fallback: GRAYSCALE replaces each pixel with `(final_α, final_α, final_α, 0xFF)`;
+/// FORCE_OPAQUE keeps the kernel's visible RGB exactly and sets α=255 (lets you see what the
+/// kernel produced BEFORE the clip mask + premult trimmed it). Both stay scalar — they're
+/// debug-toggle paths, not on the hot path.
+fn finalize_scalar_debug_inplace(pixels: &mut [u32], clip_mask: &[u8], alpha_mode: u8) {
+    for i in 0..pixels.len() {
+        let v = pixels[i] ^ 0x00FFFFFF;
+        let m = clip_mask[i] as u32;
+        let inner_a = (v >> 24) & 0xFF;
+        let final_a = (inner_a * m) >> 8;
+        if alpha_mode == DEBUG_SHOW_ALPHA_GRAYSCALE {
+            pixels[i] = 0xFF000000 | (final_a << 16) | (final_a << 8) | final_a;
+        } else {
+            // DEBUG_SHOW_ALPHA_FORCE_OPAQUE
+            pixels[i] = 0xFF000000 | (v & 0x00FFFFFF);
+        }
     }
 }
 
@@ -623,6 +858,132 @@ pub fn finalize_into_screen(
         return;
     }
 
+    // Screen-space dst-row range for the Rayon row-iter wrapper. dst_y_min/max are guaranteed
+    // ≥ 0 and < scr_h by the clipping above.
+    let dst_y_min = (rect_y + sy_min as i32) as usize;
+    let dst_y_max = (rect_y + sy_max as i32) as usize;
+    let dst_x_min = (rect_x + sx_min as i32) as usize;
+    let row_len = sx_max - sx_min;
+
+    // Debug-visualization paths stay scalar.
+    if alpha_mode == DEBUG_SHOW_ALPHA_GRAYSCALE || alpha_mode == DEBUG_SHOW_ALPHA_FORCE_OPAQUE {
+        finalize_into_scalar_debug(
+            scratch, clip_mask, screen, scr_w, win_w, alpha_mode, sy_min, sy_max, sx_min, sx_max,
+            rect_x, rect_y,
+        );
+        return;
+    }
+
+    #[cfg(target_os = "linux")]
+    let skip_premult = DEBUG_SKIP_PREMULT.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(target_os = "linux"))]
+    let skip_premult = true;
+
+    crate::par::par_rows(screen, scr_w, dst_y_min, dst_y_max, |dst_y, screen_row| {
+        let sy = (dst_y as i32 - rect_y) as usize;
+        let scratch_off = sy * win_w + sx_min;
+        let src_chunk = &scratch[scratch_off..scratch_off + row_len];
+        let clip_chunk = &clip_mask[scratch_off..scratch_off + row_len];
+        let dst_chunk = &mut screen_row[dst_x_min..dst_x_min + row_len];
+        finalize_into_chunk_dispatch(src_chunk, clip_chunk, dst_chunk, skip_premult);
+    });
+}
+
+/// Per-row src→dst dispatcher — same shape as [`finalize_chunk_dispatch`] but reading from a
+/// separate src buffer rather than in-place.
+#[inline]
+fn finalize_into_chunk_dispatch(src: &[u32], clip: &[u8], dst: &mut [u32], skip_premult: bool) {
+    #[cfg(feature = "simd")]
+    {
+        finalize_into_chunk_simd(src, clip, dst, skip_premult);
+    }
+    #[cfg(not(feature = "simd"))]
+    {
+        finalize_into_chunk_scalar(src, clip, dst, skip_premult);
+    }
+}
+
+/// SIMD finalize+blit kernel: reads from `src` + `clip`, writes to `dst`. Same math as the
+/// in-place [`finalize_chunk_simd`]; the only difference is the read/write split.
+#[cfg(feature = "simd")]
+fn finalize_into_chunk_simd(src: &[u32], clip: &[u8], dst: &mut [u32], skip_premult: bool) {
+    use crate::simd::{LANES, u32x8};
+    let n = src.len();
+    let mask_ff = u32x8::splat(0xFF);
+    let xor_flip = u32x8::splat(0x00FFFFFF);
+    let const_256 = u32x8::splat(256);
+
+    let mut i = 0;
+    while i + LANES <= n {
+        let raw: [u32; 8] = src[i..i + LANES].try_into().unwrap();
+        let v = u32x8::from(raw) ^ xor_flip;
+        let m = u32x8::from([
+            clip[i] as u32,
+            clip[i + 1] as u32,
+            clip[i + 2] as u32,
+            clip[i + 3] as u32,
+            clip[i + 4] as u32,
+            clip[i + 5] as u32,
+            clip[i + 6] as u32,
+            clip[i + 7] as u32,
+        ]);
+        let inner_a = (v >> 24) & mask_ff;
+        let final_a = (inner_a * m) >> 8;
+        let s = if skip_premult { const_256 } else { final_a };
+        let r = (((v >> 16) & mask_ff) * s) >> 8;
+        let g = (((v >> 8) & mask_ff) * s) >> 8;
+        let b = ((v & mask_ff) * s) >> 8;
+        let out: u32x8 = (final_a << 24) | (r << 16) | (g << 8) | b;
+        dst[i..i + LANES].copy_from_slice(out.as_array_ref());
+        i += LANES;
+    }
+    while i < n {
+        let v = src[i] ^ 0x00FFFFFF;
+        let m = clip[i] as u32;
+        let inner_a = (v >> 24) & 0xFF;
+        let final_a = (inner_a * m) >> 8;
+        let s = if skip_premult { 256u32 } else { final_a };
+        let r = (((v >> 16) & 0xFF) * s) >> 8;
+        let g = (((v >> 8) & 0xFF) * s) >> 8;
+        let b = ((v & 0xFF) * s) >> 8;
+        dst[i] = (final_a << 24) | (r << 16) | (g << 8) | b;
+        i += 1;
+    }
+}
+
+/// Scalar finalize+blit kernel for `--no-default-features` (no `simd`) builds.
+#[cfg(not(feature = "simd"))]
+fn finalize_into_chunk_scalar(src: &[u32], clip: &[u8], dst: &mut [u32], skip_premult: bool) {
+    for i in 0..src.len() {
+        let v = src[i] ^ 0x00FFFFFF;
+        let m = clip[i] as u32;
+        let inner_a = (v >> 24) & 0xFF;
+        let final_a = (inner_a * m) >> 8;
+        let s = if skip_premult { 256u32 } else { final_a };
+        let r = (((v >> 16) & 0xFF) * s) >> 8;
+        let g = (((v >> 8) & 0xFF) * s) >> 8;
+        let b = ((v & 0xFF) * s) >> 8;
+        dst[i] = (final_a << 24) | (r << 16) | (g << 8) | b;
+    }
+}
+
+/// Debug-visualization fallback for [`finalize_into_screen`]: GRAYSCALE / FORCE_OPAQUE paths
+/// stay scalar (debug-toggle, off the hot path). Sequential — Rayon adds no value here.
+#[allow(clippy::too_many_arguments)]
+fn finalize_into_scalar_debug(
+    scratch: &[u32],
+    clip_mask: &[u8],
+    screen: &mut [u32],
+    scr_w: usize,
+    win_w: usize,
+    alpha_mode: u8,
+    sy_min: usize,
+    sy_max: usize,
+    sx_min: usize,
+    sx_max: usize,
+    rect_x: i32,
+    rect_y: i32,
+) {
     for sy in sy_min..sy_max {
         let dst_y = (rect_y + sy as i32) as usize;
         let dst_row = dst_y * scr_w;
@@ -633,32 +994,16 @@ pub fn finalize_into_screen(
                 break;
             }
             let dst_idx = dst_row + (rect_x + sx as i32) as usize;
-
             let v = scratch[scratch_idx] ^ 0x00FFFFFF;
             let m = clip_mask[scratch_idx] as u32;
-            let inner_alpha = (v >> 24) & 0xFF;
-            let final_alpha = (inner_alpha * m) >> 8;
+            let inner_a = (v >> 24) & 0xFF;
+            let final_a = (inner_a * m) >> 8;
             if alpha_mode == DEBUG_SHOW_ALPHA_GRAYSCALE {
                 screen[dst_idx] =
-                    0xFF000000 | (final_alpha << 16) | (final_alpha << 8) | final_alpha;
-                continue;
-            }
-            if alpha_mode == DEBUG_SHOW_ALPHA_FORCE_OPAQUE {
-                screen[dst_idx] = 0xFF000000 | (v & 0x00FFFFFF);
-                continue;
-            }
-            #[cfg(target_os = "linux")]
-            let s = if DEBUG_SKIP_PREMULT.load(std::sync::atomic::Ordering::Relaxed) {
-                256u32
+                    0xFF000000 | (final_a << 16) | (final_a << 8) | final_a;
             } else {
-                final_alpha
-            };
-            #[cfg(not(target_os = "linux"))]
-            let s = 256u32;
-            let r = (((v >> 16) & 0xFF) * s) >> 8;
-            let g = (((v >> 8) & 0xFF) * s) >> 8;
-            let b = ((v & 0xFF) * s) >> 8;
-            screen[dst_idx] = (final_alpha << 24) | (r << 16) | (g << 8) | b;
+                screen[dst_idx] = 0xFF000000 | (v & 0x00FFFFFF);
+            }
         }
     }
 }
@@ -1340,29 +1685,36 @@ pub fn draw_rect(
     rect_w: Coord,
     rect_h: Coord,
     color: u32,
+    clip: Option<Clip>,
 ) {
     if rect_w <= 0.0 || rect_h <= 0.0 || width == 0 || height == 0 {
         return;
     }
     let hw = rect_w * 0.5;
     let hh = rect_h * 0.5;
-    let x_min = crate::math::floor(cx - hw - 0.5) as i32;
-    let x_max = crate::math::ceil(cx + hw + 0.5) as i32;
-    let y_min = crate::math::floor(cy - hh - 0.5) as i32;
-    let y_max = crate::math::ceil(cy + hh + 0.5) as i32;
-    let x_start = x_min.max(0) as usize;
-    let y_start = y_min.max(0) as usize;
-    let x_end = (x_max.max(0) as usize).min(width);
-    let y_end = (y_max.max(0) as usize).min(height);
-    if x_start >= x_end || y_start >= y_end {
+    // Bbox via raw f32 → i32 cast (truncate-toward-zero). For positive floats this matches
+    // `floor`; for negative floats the `.max(0)` clamp inside `intersect_bbox` erases any
+    // off-by-one. The `+1.5` on the upper bounds replaces `ceil(x + 0.5)` — one extra-margin
+    // pixel at exact integer values is harmless (its coverage is 0). Avoids the GOT-indirect
+    // `libm::floorf/ceilf` calls that LLVM emits when the crate::math wrappers aren't inlined.
+    let x_min = (cx - hw - 0.5) as i32;
+    let x_max = (cx + hw + 1.5) as i32;
+    let y_min = (cy - hh - 0.5) as i32;
+    let y_max = (cy + hh + 1.5) as i32;
+    let Some((x_start, y_start, x_end, y_end)) =
+        Clip::intersect_bbox(clip, width, height, x_min, x_max, y_min, y_max)
+    else {
         return;
-    }
+    };
 
     let color_alpha = ((color >> 24) & 0xFF) as Coord;
     let color_dark = color & 0x00FFFFFF;
 
-    for py in y_start..y_end {
-        let row = py * width;
+    // Row-parallel via Rayon when enabled; sequential walk otherwise. Each row is fully
+    // independent (no row-to-row data hazards), so this scales linearly with cores up to the
+    // memory-bandwidth ceiling. For tiny shapes the Rayon overhead of creating one task is
+    // still cheap (sub-microsecond on modern hardware), so no threshold guard needed.
+    crate::par::par_rows(pixels, width, y_start, y_end, |py, row| {
         let dy_abs = ((py as Coord + 0.5) - cy).abs();
         let dy_inside = hh - dy_abs;
         for px in x_start..x_end {
@@ -1378,10 +1730,9 @@ pub fn draw_rect(
                 continue;
             }
             let rect_pixel = (new_alpha << 24) | color_dark;
-            let idx = row + px;
-            pixels[idx] = pixels[idx].under(rect_pixel, BlendMode::Normal);
+            row[px] = row[px].under(rect_pixel, BlendMode::Normal);
         }
-    }
+    });
 }
 
 /// Filled rectangle, anti-aliased, rotated by `angle` radians around `(cx, cy)`. Positive angle rotates counter-clockwise (standard math convention). Other semantics match [`draw_rect`] — α + darkness colour, AA edges, UNDER-blend onto existing pixel content.
@@ -1399,6 +1750,7 @@ pub fn draw_rect_rotated(
     rect_h: Coord,
     angle: Coord,
     color: u32,
+    clip: Option<Clip>,
 ) {
     if rect_w <= 0.0 || rect_h <= 0.0 || width == 0 || height == 0 {
         return;
@@ -1410,17 +1762,16 @@ pub fn draw_rect_rotated(
     let abs_sin = sin_a.abs();
     let bbox_hw = hw * abs_cos + hh * abs_sin;
     let bbox_hh = hw * abs_sin + hh * abs_cos;
-    let x_min = crate::math::floor(cx - bbox_hw - 0.5) as i32;
-    let x_max = crate::math::ceil(cx + bbox_hw + 0.5) as i32;
-    let y_min = crate::math::floor(cy - bbox_hh - 0.5) as i32;
-    let y_max = crate::math::ceil(cy + bbox_hh + 0.5) as i32;
-    let x_start = x_min.max(0) as usize;
-    let y_start = y_min.max(0) as usize;
-    let x_end = (x_max.max(0) as usize).min(width);
-    let y_end = (y_max.max(0) as usize).min(height);
-    if x_start >= x_end || y_start >= y_end {
+    // See [`draw_rect`] for the cast-trick rationale.
+    let x_min = (cx - bbox_hw - 0.5) as i32;
+    let x_max = (cx + bbox_hw + 1.5) as i32;
+    let y_min = (cy - bbox_hh - 0.5) as i32;
+    let y_max = (cy + bbox_hh + 1.5) as i32;
+    let Some((x_start, y_start, x_end, y_end)) =
+        Clip::intersect_bbox(clip, width, height, x_min, x_max, y_min, y_max)
+    else {
         return;
-    }
+    };
 
     let color_alpha = ((color >> 24) & 0xFF) as Coord;
     let color_dark = color & 0x00FFFFFF;
@@ -1440,8 +1791,7 @@ pub fn draw_rect_rotated(
     let has_inner = lx_inner >= 0.0 && ly_inner >= 0.0;
 
     let x_start_f = x_start as Coord + 0.5;
-    for py in y_start..y_end {
-        let row = py * width;
+    crate::par::par_rows(pixels, width, y_start, y_end, |py, row| {
         let dy_row = (py as Coord + 0.5) - cy;
         let dx0 = x_start_f - cx;
         let lx0 = dx0 * cos_a + dy_row * sin_a;
@@ -1453,7 +1803,7 @@ pub fn draw_rect_rotated(
         let outer_lo = ox_lo.max(oy_lo);
         let outer_hi = ox_hi.min(oy_hi);
         if outer_lo >= outer_hi {
-            continue;
+            return; // exits this row's closure; next row's task continues.
         }
 
         // Interior (full-coverage fast-path range). px_range must be called with the same
@@ -1483,18 +1833,16 @@ pub fn draw_rect_rotated(
             let na = (color_alpha * coverage) as u32;
             if na > 0 {
                 let rect_pixel = (na << 24) | color_dark;
-                let idx = row + px;
-                pixels[idx] = pixels[idx].under(rect_pixel, BlendMode::Normal);
+                row[px] = row[px].under(rect_pixel, BlendMode::Normal);
             }
             lx += dlx;
             ly += dly;
         }
 
-        // Interior fast path: full alpha, no coverage math.
-        for px in inner_lo..inner_hi {
-            let idx = row + px;
-            pixels[idx] = pixels[idx].under(full_top, BlendMode::Normal);
-        }
+        // Interior fast path: full alpha, no coverage math. SIMD-blits the row segment via
+        // 8-wide under() with `full_top` splatted across all lanes — one `vpsrld + vpmulld +
+        // vpaddd` ymm pipeline per 8 pixels, dropping the per-pixel `under()` call overhead.
+        under_chunk_const_dispatch(&mut row[inner_lo..inner_hi], full_top);
 
         // Right AA strip.
         let mut lx = lx0 + (inner_hi as Coord - x_start as Coord) * dlx;
@@ -1508,13 +1856,12 @@ pub fn draw_rect_rotated(
             let na = (color_alpha * coverage) as u32;
             if na > 0 {
                 let rect_pixel = (na << 24) | color_dark;
-                let idx = row + px;
-                pixels[idx] = pixels[idx].under(rect_pixel, BlendMode::Normal);
+                row[px] = row[px].under(rect_pixel, BlendMode::Normal);
             }
             lx += dlx;
             ly += dly;
         }
-    }
+    });
 }
 
 /// Pixel-range solver for `lo ≤ v0 + (px − x_start)·dv ≤ hi`. Returns half-open `[px_lo, px_hi)` clamped to `[x_start, x_end]`. Empty range is returned as `(x_end, x_end)`.
@@ -1540,6 +1887,235 @@ fn px_range(v0: Coord, dv: Coord, lo: Coord, hi: Coord, x_start: usize, x_end: u
     } else {
         (lo_px as usize, hi_px as usize)
     }
+}
+
+/// Hardware fast reciprocal square root — `1/sqrt(x)` as ONE operation when the target supports it. LLVM won't lower `1.0/sqrtf(x)` to `rsqrtss` without `-ffast-math` (verified in asm: it emits `SQRTSS` + `DIVSS`, ~25 cycles), so we reach for the platform intrinsic explicitly. RSQRTSS gives ~12 bits of precision in ~5 cycles — far beyond what the 8-bit AA coverage byte needs. On non-x86_64 targets, fall back to the portable `1/sqrt` path; LLVM still picks the platform-best sqrt instruction underneath.
+///
+/// Why "fused": dividing by a square root is so common in graphics (vector normalize, distance ops, lighting) that hardware vendors gave it dedicated silicon — same philosophy as FMA. The unit uses a lookup-table seed + Newton iteration internally; the divide never happens explicitly.
+///
+/// Precondition: `x > 0`. Inputs that hit `x == 0` should be screened by the caller (we never call this on the AA path for an ellipse center pixel because the cheap `4·f² ≥ |∇f|²` classifier promotes it to the interior fast path first).
+#[inline(always)]
+fn fast_inv_sqrt(x: Coord) -> Coord {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::*;
+        let v = _mm_set_ss(x);
+        let r = _mm_rsqrt_ss(v);
+        _mm_cvtss_f32(r)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        1.0 / libm::sqrtf(x)
+    }
+}
+
+/// Filled circle, anti-aliased. Centered at `(cx, cy)` with fractional radius `r`. Colour is α + darkness packed (build with [`pack_argb`]); composes topmost-first via `pixels[idx].under(circle_pixel, Normal)`.
+///
+/// Stays in squared-distance space — no `sqrt` anywhere. Pre-squares the inner and outer AA thresholds (`(r−½)²`, `(r+½)²`); per pixel computes `dist² = dx² + dy²` (one mul + one add + one fma) and classifies:
+/// * `dist² ≤ r_in²` — full coverage, fast under-blend.
+/// * `dist² < r_out²` — AA: coverage `t = (r_out² − dist²) / (r_out² − r_in²)`, a linear ratio in dist² space that approximates the perpendicular-pixel-distance AA `clamp(0.5 + (r − dist), 0, 1)` to ≤ 1 LSB for `r ≥ 2`. Justification: Taylor expansion `dist² − r² ≈ 2r·(dist − r)` so "linear in dist²" ≡ "linear in dist, scaled by 2r" and the divide-by-`diff ≈ 2r` cancels the scaling.
+/// * `dist² ≥ r_out²` — outside, skip.
+///
+/// Sub-pixel radii (`r < ½`) clamp `r_in² = 0`, so the entire circle falls in the AA band — graceful degradation, no special case. Mirrors [`draw_app_icon`]'s orb AA topology.
+pub fn draw_circle(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    cx: Coord,
+    cy: Coord,
+    r: Coord,
+    color: u32,
+    clip: Option<Clip>,
+) {
+    if r <= 0.0 || width == 0 || height == 0 {
+        return;
+    }
+    let r_in = (r - 0.5).max(0.0);
+    let r_out = r + 0.5;
+    let r_in2 = r_in * r_in;
+    let r_out2 = r_out * r_out;
+    // Per-pixel AA coverage needs `(r_out² − dist²) / diff` — divisor is constant per call, so
+    // we precompute the reciprocal once and multiply per pixel instead of dividing per pixel.
+    // FDIVSS ≈ 10–14 cycles, MULSS ≈ 3–4 — saves ~10 cycles per AA pixel.
+    let inv_diff = 1.0 / (r_out2 - r_in2);
+    // See [`draw_rect`] for the cast-trick rationale. `r_out` already includes the half-pixel
+    // AA margin so the lower bound is `cx - r_out` (not `... - 0.5`); upper bound adds 1.0 to
+    // convert truncation to ceil.
+    let x_min = (cx - r_out) as i32;
+    let x_max = (cx + r_out + 1.0) as i32;
+    let y_min = (cy - r_out) as i32;
+    let y_max = (cy + r_out + 1.0) as i32;
+    let Some((x_start, y_start, x_end, y_end)) =
+        Clip::intersect_bbox(clip, width, height, x_min, x_max, y_min, y_max)
+    else {
+        return;
+    };
+
+    let color_alpha = ((color >> 24) & 0xFF) as Coord;
+    let color_dark = color & 0x00FFFFFF;
+    let full_alpha = (color >> 24) & 0xFF;
+    let full_pixel = (full_alpha << 24) | color_dark;
+
+    crate::par::par_rows(pixels, width, y_start, y_end, |py, row| {
+        let dy = (py as Coord + 0.5) - cy;
+        let dy2 = dy * dy;
+        for px in x_start..x_end {
+            let dx = (px as Coord + 0.5) - cx;
+            let dist2 = dx * dx + dy2;
+            if dist2 <= r_in2 {
+                row[px] = row[px].under(full_pixel, BlendMode::Normal);
+            } else if dist2 < r_out2 {
+                let t = (r_out2 - dist2) * inv_diff;
+                let na = (color_alpha * t) as u32;
+                if na > 0 {
+                    let circle_pixel = (na << 24) | color_dark;
+                    row[px] = row[px].under(circle_pixel, BlendMode::Normal);
+                }
+            }
+        }
+    });
+}
+
+/// Filled axis-aligned ellipse, anti-aliased. Centered at `(cx, cy)` with fractional radii `(rx, ry)`. Colour is α + darkness packed (build with [`pack_argb`]); composes topmost-first via `pixels[idx].under(ellipse_pixel, Normal)`.
+///
+/// Per-pixel implicit form `f = (dx/rx)² + (dy/ry)² − 1` (interior `f < 0`, boundary `f = 0`, exterior `f > 0`) plus its gradient-magnitude-squared `|∇f|² = 4·((dx/rx²)² + (dy/ry²)²)`. First-order perpendicular distance ≈ `−f / |∇f|`, so AA coverage = `clamp(½ − f / sqrt(|∇f|²), 0, 1)`.
+///
+/// The cheap classifier `4·f² > |∇f|²` (no sqrt) tells us whether the pixel is at least ½ unit from the boundary: `f < 0` → deep interior (full coverage, skip the sqrt); `f > 0` → fully outside (skip). The AA band pays one `sqrt` + one `div` per pixel — typically <5% of the bbox total. Pre-computed `1/rx²` and `1/ry²` keep the per-pixel work to four muls + two adds for `f` and another two muls + one add for `|∇f|²`.
+///
+/// Sub-pixel ellipses (`rx < ½` or `ry < ½`) work without special-casing — every pixel falls in the AA band and gets the per-pixel coverage formula.
+pub fn draw_ellipse(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    cx: Coord,
+    cy: Coord,
+    rx: Coord,
+    ry: Coord,
+    color: u32,
+    clip: Option<Clip>,
+) {
+    if rx <= 0.0 || ry <= 0.0 || width == 0 || height == 0 {
+        return;
+    }
+    let inv_rx2 = 1.0 / (rx * rx);
+    let inv_ry2 = 1.0 / (ry * ry);
+    // See [`draw_rect`] for the cast-trick rationale.
+    let x_min = (cx - rx - 0.5) as i32;
+    let x_max = (cx + rx + 1.5) as i32;
+    let y_min = (cy - ry - 0.5) as i32;
+    let y_max = (cy + ry + 1.5) as i32;
+    let Some((x_start, y_start, x_end, y_end)) =
+        Clip::intersect_bbox(clip, width, height, x_min, x_max, y_min, y_max)
+    else {
+        return;
+    };
+
+    let color_alpha = ((color >> 24) & 0xFF) as Coord;
+    let color_dark = color & 0x00FFFFFF;
+    let full_alpha = (color >> 24) & 0xFF;
+    let full_pixel = (full_alpha << 24) | color_dark;
+
+    crate::par::par_rows(pixels, width, y_start, y_end, |py, row| {
+        let dy = (py as Coord + 0.5) - cy;
+        let dy2 = dy * dy;
+        let dy2_b = dy2 * inv_ry2;
+        for px in x_start..x_end {
+            let dx = (px as Coord + 0.5) - cx;
+            let dx2 = dx * dx;
+            let dx2_a = dx2 * inv_rx2;
+            let f = dx2_a + dy2_b - 1.0;
+            let grad2 = 4.0 * (dx2_a * inv_rx2 + dy2_b * inv_ry2);
+            let f_sq_4 = 4.0 * f * f;
+            if f <= 0.0 && f_sq_4 >= grad2 {
+                row[px] = row[px].under(full_pixel, BlendMode::Normal);
+            } else if f < 0.0 || f_sq_4 < grad2 {
+                // AA: coverage = clamp(½ − f / sqrt(grad2), 0, 1). Sqrt-and-divide fuse into a
+                // single hardware reciprocal-sqrt (RSQRTSS on x86_64) via `fast_inv_sqrt` —
+                // ~5 cycles vs ~25 for separate SQRTSS+DIVSS. ~12-bit precision is well over
+                // the 8-bit coverage tolerance.
+                let inv_g = fast_inv_sqrt(grad2);
+                let coverage = (0.5 - f * inv_g).clamp(0.0, 1.0);
+                let na = (color_alpha * coverage) as u32;
+                if na > 0 {
+                    let ellipse_pixel = (na << 24) | color_dark;
+                    row[px] = row[px].under(ellipse_pixel, BlendMode::Normal);
+                }
+            }
+        }
+    });
+}
+
+/// Filled ellipse, anti-aliased, rotated by `angle` radians around `(cx, cy)`. Positive angle rotates counter-clockwise (standard math convention). Other semantics match [`draw_ellipse`] — α + darkness colour, AA edges, UNDER-blend onto existing pixel content.
+///
+/// Inverse-rotates each pixel's screen-delta into ellipse-local coords (`(lx, ly)`), then runs the same gradient-normalized implicit-form AA as [`draw_ellipse`]. Per-row incremental rotation: precompute `lx, ly` at the row's left pixel, then `lx += cos_a; ly -= sin_a` per pixel — only 2 adds per pixel for the rotation, no per-pixel trig.
+///
+/// Bounding box uses the tight rotated extent `(rx|cos| + ry|sin|, rx|sin| + ry|cos|)` — same formula as [`draw_rect_rotated`].
+pub fn draw_ellipse_rotated(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    cx: Coord,
+    cy: Coord,
+    rx: Coord,
+    ry: Coord,
+    angle: Coord,
+    color: u32,
+    clip: Option<Clip>,
+) {
+    if rx <= 0.0 || ry <= 0.0 || width == 0 || height == 0 {
+        return;
+    }
+    let inv_rx2 = 1.0 / (rx * rx);
+    let inv_ry2 = 1.0 / (ry * ry);
+    let (sin_a, cos_a) = crate::math::sin_cos(angle);
+    let abs_cos = cos_a.abs();
+    let abs_sin = sin_a.abs();
+    let bbox_hw = rx * abs_cos + ry * abs_sin;
+    let bbox_hh = rx * abs_sin + ry * abs_cos;
+    // See [`draw_rect`] for the cast-trick rationale.
+    let x_min = (cx - bbox_hw - 0.5) as i32;
+    let x_max = (cx + bbox_hw + 1.5) as i32;
+    let y_min = (cy - bbox_hh - 0.5) as i32;
+    let y_max = (cy + bbox_hh + 1.5) as i32;
+    let Some((x_start, y_start, x_end, y_end)) =
+        Clip::intersect_bbox(clip, width, height, x_min, x_max, y_min, y_max)
+    else {
+        return;
+    };
+
+    let color_alpha = ((color >> 24) & 0xFF) as Coord;
+    let color_dark = color & 0x00FFFFFF;
+    let full_alpha = (color >> 24) & 0xFF;
+    let full_pixel = (full_alpha << 24) | color_dark;
+
+    let x_start_f = x_start as Coord + 0.5;
+    crate::par::par_rows(pixels, width, y_start, y_end, |py, row| {
+        let dy_screen = (py as Coord + 0.5) - cy;
+        let dx_screen0 = x_start_f - cx;
+        let mut lx = dx_screen0 * cos_a + dy_screen * sin_a;
+        let mut ly = -dx_screen0 * sin_a + dy_screen * cos_a;
+        for px in x_start..x_end {
+            let lx2_a = lx * lx * inv_rx2;
+            let ly2_b = ly * ly * inv_ry2;
+            let f = lx2_a + ly2_b - 1.0;
+            let grad2 = 4.0 * (lx2_a * inv_rx2 + ly2_b * inv_ry2);
+            let f_sq_4 = 4.0 * f * f;
+            if f <= 0.0 && f_sq_4 >= grad2 {
+                row[px] = row[px].under(full_pixel, BlendMode::Normal);
+            } else if f < 0.0 || f_sq_4 < grad2 {
+                // AA via fused reciprocal-sqrt — see [`draw_ellipse`] for the rationale.
+                let inv_g = fast_inv_sqrt(grad2);
+                let coverage = (0.5 - f * inv_g).clamp(0.0, 1.0);
+                let na = (color_alpha * coverage) as u32;
+                if na > 0 {
+                    let ellipse_pixel = (na << 24) | color_dark;
+                    row[px] = row[px].under(ellipse_pixel, BlendMode::Normal);
+                }
+            }
+            lx += cos_a;
+            ly -= sin_a;
+        }
+    });
 }
 
 /// Hard-pixel squircle pill with AA on both the X-axis curve (sides) and Y-axis curve (cap tops/bottoms). Photon's avatar-ring strategy in one call — render twice with different sizes/colors to get a stroke ring.

@@ -501,10 +501,21 @@ impl FluorApp for PanesDemo {
 
         // Hairline + background + hover overlay. Chrome's bg layer gets photon's background_noise; chrome layer gets the perimeter hairline + controls (or stays empty under Ctrl+Shift+D+C); hover layer gets a partial-α tint over the currently-hovered button (or stays empty if hover_state == HIT_NONE). The chrome group's Stack program (`Push hover, Push chrome, Under(Normal), Push bg, Under(Normal)`) front-to-back-composites them, then flattens under the target. Order matters: rasterize_chrome MUST run before rasterize_hover because hover reads `hit_test_map` which chrome populates.
         //
-        // Rect demos: a 50%-opacity cyan rect rotates over `self.rect_angle`, plus a 25%-opacity orange axis-aligned rect overlapping it for the non-rotated path. Both paint FIRST (topmost-first doctrine), then the noise composes behind via `under()` — scrolled vertically by `self.bg_scroll`. All sizes derive from `viewport.effective_span()` so they grow/shrink with the RU zoom.
+        // Shape demos: each paint primitive gets a partial-transparency instance, all painted FIRST
+        // (topmost-first doctrine), then noise composes behind via `under()` — scrolled vertically
+        // by `self.bg_scroll`. All sizes/positions derive from `viewport.effective_span()` so they
+        // stay RU-coherent across window sizes.
+        //
+        // Rects: 50% cyan rotating + 25% orange aligned overlapping it.
+        // Ellipses: aligned magenta matching the window's aspect ratio, plus a 2:1 yellow rotated
+        // ellipse spinning OPPOSITE the rect at 1/3 speed.
+        // Circle: 50% pink, fixed.
         let span = ctx.viewport.effective_span();
-        let cx = ctx.viewport.width_px as Coord * 0.5;
-        let cy = ctx.viewport.height_px as Coord * 0.7;
+        let view_w = ctx.viewport.width_px as Coord;
+        let view_h = ctx.viewport.height_px as Coord;
+        let aspect = view_w / view_h;
+        let cx = view_w * 0.5;
+        let cy = view_h * 0.7;
         let rect_w = span / 8.0;
         let rect_h = span / 24.0;
         let rect_color = pack_argb(80, 220, 220, 0x80);
@@ -513,11 +524,51 @@ impl FluorApp for PanesDemo {
         let static_cx = cx + rect_w * 0.35;
         let static_cy = cy - rect_h * 0.6;
         let static_color = pack_argb(255, 180, 80, 0x40);
+        // Circle.
+        let circle_cx = view_w * 0.25;
+        let circle_cy = view_h * 0.3;
+        let circle_r = span / 20.0;
+        let circle_color = pack_argb(255, 120, 200, 0x80);
+        // Aligned ellipse — aspect matches the window.
+        let ellipse_cx = view_w * 0.5;
+        let ellipse_cy = view_h * 0.3;
+        let ellipse_ry = span / 24.0;
+        let ellipse_rx = ellipse_ry * aspect;
+        let ellipse_color = pack_argb(200, 120, 255, 0x80);
+        // Rotated ellipse — 2:1, opposite direction at 1/3 speed.
+        let rot_ellipse_cx = view_w * 0.75;
+        let rot_ellipse_cy = view_h * 0.3;
+        let rot_ellipse_rx = span / 14.0;
+        let rot_ellipse_ry = rot_ellipse_rx * 0.5;
+        let rot_ellipse_color = pack_argb(255, 230, 100, 0x80);
         let angle = self.rect_angle;
+        let ellipse_angle = -self.rect_angle / 3.0;
         let bg_scroll = self.bg_scroll;
         self.chrome.rasterize_bg(move |buf, w, h| {
-            paint::draw_rect_rotated(buf, w, h, cx, cy, rect_w, rect_h, angle, rect_color);
-            paint::draw_rect(buf, w, h, static_cx, static_cy, static_w, static_h, static_color);
+            paint::draw_rect_rotated(
+                buf, w, h, cx, cy, rect_w, rect_h, angle, rect_color, None,
+            );
+            paint::draw_rect(
+                buf, w, h, static_cx, static_cy, static_w, static_h, static_color, None,
+            );
+            paint::draw_circle(
+                buf, w, h, circle_cx, circle_cy, circle_r, circle_color, None,
+            );
+            paint::draw_ellipse(
+                buf, w, h, ellipse_cx, ellipse_cy, ellipse_rx, ellipse_ry, ellipse_color, None,
+            );
+            paint::draw_ellipse_rotated(
+                buf,
+                w,
+                h,
+                rot_ellipse_cx,
+                rot_ellipse_cy,
+                rot_ellipse_rx,
+                rot_ellipse_ry,
+                ellipse_angle,
+                rot_ellipse_color,
+                None,
+            );
             paint::background_noise(buf, w, h, 0, true, bg_scroll, None);
         });
         self.chrome.rasterize_chrome(ctx.text, ctx.clip_mask);
