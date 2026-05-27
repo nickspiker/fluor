@@ -20,7 +20,7 @@ use fluor::stack::Op;
 use fluor::theme;
 use fluor::widgets::{BlinkTimer, Textbox};
 use fluor::{Compositor, RuVec2};
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::CursorIcon;
 
@@ -42,7 +42,7 @@ struct PanesDemo {
     show_hitmask: bool,
     /// 256-entry random colour table indexed by hit_test_map byte; regenerated each time H toggles on so distinct IDs get visibly-distinct colours. Photon's debug-hit pattern.
     debug_hit_colours: Vec<u32>,
-    /// Demo rotation angle for the rotating rect — advanced every tick, used by [`paint::draw_rect_rotated`]. Shows off the rect primitive + RU-scaling: dimensions derive from `viewport.effective_span()` so the rect grows/shrinks with Ctrl+/Ctrl-/Ctrl+scroll.
+    /// Demo rotation angle for the rotating rect — advanced by mouse-wheel scroll, used by [`paint::draw_rect_rotated`]. Shows off the rect primitive + RU-scaling: dimensions derive from `viewport.effective_span()` so the rect grows/shrinks with Ctrl+/Ctrl-/Ctrl+scroll.
     rect_angle: Coord,
 }
 
@@ -473,6 +473,20 @@ impl FluorApp for PanesDemo {
                 }
                 EventResponse::Pass
             }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Scroll-driven rotation: each notch rotates the demo rect by ~6°. Trackpad pixel deltas accumulate at ~30 px per notch to match the zoom shortcut's feel.
+                let steps: Coord = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => *y,
+                    MouseScrollDelta::PixelDelta(p) => (p.y as Coord) / 30.0,
+                };
+                if steps != 0.0 {
+                    self.rect_angle += steps * 0.1;
+                    self.chrome.invalidate_bg();
+                    ctx.window.request_redraw();
+                    return EventResponse::Handled;
+                }
+                EventResponse::Pass
+            }
             _ => EventResponse::Pass,
         }
     }
@@ -492,8 +506,8 @@ impl FluorApp for PanesDemo {
         let rect_color = pack_argb(80, 220, 220, 255);
         let angle = self.rect_angle;
         self.chrome.rasterize_bg(move |buf, w, h| {
-            paint::background_noise(buf, w, h, 0, true, 0, None);
             paint::draw_rect_rotated(buf, w, h, cx, cy, rect_w, rect_h, angle, rect_color);
+            paint::background_noise(buf, w, h, 0, true, 0, None);
         });
         self.chrome.rasterize_chrome(ctx.text, ctx.clip_mask);
         self.chrome.rasterize_hover();
@@ -587,12 +601,7 @@ impl FluorApp for PanesDemo {
             }
         }
 
-        // Advance the rotating-rect demo. 0.03 rad/tick ≈ 1.8 rad/sec at 60 Hz vsync, ≈ 100°/sec — visible rotation, not dizzying. Invalidate the chrome bg so rasterize_bg re-runs and re-paints the rect at the new angle.
-        self.rect_angle += 0.03;
-        self.chrome.invalidate_bg();
         let _ = ctx;
-        needs_redraw = true;
-
         needs_redraw
     }
 }
