@@ -36,8 +36,10 @@ struct PanesDemo {
     blink: BlinkTimer,
     is_dragging_select: bool,
     selection_scroll_time: Option<Instant>,
-    /// True while D is physically held as part of the debug chord (was pressed with primary+shift modifiers). Cleared on D release. Pure event-driven, no timeout.
-    d_chord_held: bool,
+    /// Last D-with-mods press time. Paired with `chord_action_pending` so the D+action chord fires in either order: whichever key arrives second checks whether its partner was pressed within the grace window. X11 auto-repeat can inject spurious key releases when another key is pressed, so we never look at release events — only press timestamps.
+    chord_d_at: Option<Instant>,
+    /// Last action-key-with-mods press time (the char of the action). Mirror of `chord_d_at`: if D arrives later and finds this pending within the grace window, the chord fires for this action.
+    chord_action_pending: Option<(char, Instant)>,
     /// Toggle for the H chord action — paints the chrome's hit_test_map as an opaque tinted overlay.
     show_hitmask: bool,
     /// 256-entry random colour table indexed by hit_test_map byte; regenerated each time H toggles on so distinct IDs get visibly-distinct colours. Photon's debug-hit pattern.
@@ -118,7 +120,8 @@ impl PanesDemo {
             blink: BlinkTimer::new(),
             is_dragging_select: false,
             selection_scroll_time: None,
-            d_chord_held: false,
+            chord_d_at: None,
+            chord_action_pending: None,
             show_hitmask: false,
             debug_hit_colours: Vec::new(),
             rect_angle: 0.0,
@@ -275,31 +278,64 @@ impl FluorApp for PanesDemo {
                 let shift = ctx.modifiers.shift_key();
                 let ctrl = ctx.modifiers.super_key() || ctx.modifiers.control_key();
 
-                // --- Debug chord: Ctrl/Cmd + Shift + D held, then action key.
-                // Track D held state event-driven. D press with modifiers enters chord (swallowed
-                // as not-text); D release clears state. Other keys pressed while D is held with
-                // modifiers fire the matching action. No timer, no arming.
-                if let Key::Character(c) = &kev.logical_key {
-                    if c == "d" || c == "D" {
-                        if kev.state == ElementState::Pressed && ctrl && shift {
-                            self.d_chord_held = true;
-                            return EventResponse::Handled;
-                        }
-                        if kev.state == ElementState::Released && self.d_chord_held {
-                            self.d_chord_held = false;
-                            return EventResponse::Handled;
+                // --- Debug chord: Ctrl/Cmd + Shift + D + action_key, in either order.
+                // Timestamp-based pairing. On any chord-relevant key Press with Ctrl+Shift:
+                //   - If the partner key was pressed within CHORD_WINDOW, fire the action.
+                //   - Otherwise, record this key's timestamp and wait for the partner.
+                // We never look at Released events because X11 auto-repeat injects synthetic releases when another key is pressed even though the key is still physically held — tying chord state to "held" loses chord firings.
+                const CHORD_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+                let mut action_char: Option<char> = None;
+                if kev.state == ElementState::Pressed && ctrl && shift {
+                    if let Key::Character(c) = &kev.logical_key {
+                        let cl = c.to_ascii_lowercase();
+                        let first = cl.chars().next();
+                        let is_d = cl == "d";
+                        let is_action = matches!(cl.as_str(), "h" | "p" | "a" | "c" | "x" | "r" | "q");
+                        if is_d || is_action {
+                            let now = Instant::now();
+                            if is_d {
+                                // D pressed: complete the chord if an action key was pending.
+                                if let Some((ac, at)) = self.chord_action_pending {
+                                    if now.duration_since(at) < CHORD_WINDOW {
+                                        action_char = Some(ac);
+                                    }
+                                }
+                                if action_char.is_none() {
+                                    self.chord_d_at = Some(now);
+                                    self.chord_action_pending = None;
+                                } else {
+                                    self.chord_d_at = None;
+                                    self.chord_action_pending = None;
+                                }
+                            } else {
+                                // Action key pressed: complete the chord if D was pending.
+                                if let Some(dt) = self.chord_d_at {
+                                    if now.duration_since(dt) < CHORD_WINDOW {
+                                        action_char = first;
+                                    }
+                                }
+                                if action_char.is_none() {
+                                    self.chord_action_pending = first.map(|c| (c, now));
+                                    self.chord_d_at = None;
+                                } else {
+                                    self.chord_d_at = None;
+                                    self.chord_action_pending = None;
+                                }
+                            }
+                            // Swallow the keystroke either way: this key is part of the chord interaction, not text input.
+                            if action_char.is_none() {
+                                return EventResponse::Handled;
+                            }
                         }
                     }
                 }
-                if self.d_chord_held && ctrl && shift && kev.state == ElementState::Pressed {
-                    if let Key::Character(c) = &kev.logical_key {
+                if let Some(ac) = action_char {
+                    {
                         let mut acted = true;
-                        if c == "h" || c == "H" {
+                        if ac == 'h' {
                             self.show_hitmask = !self.show_hitmask;
                             if self.show_hitmask {
-                                // Fill the 256-entry colour table with distinct random RGBs each
-                                // toggle. xorshift32 seeded from process nanos — debug-quality, no
-                                // crypto needed. Each call to toggle = fresh palette.
+                                // Fill the 256-entry colour table with distinct random RGBs each toggle. xorshift32 seeded from process nanos — debug-quality, no crypto needed. Each call to toggle = fresh palette.
                                 let seed = (std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.subsec_nanos())
@@ -321,43 +357,48 @@ impl FluorApp for PanesDemo {
                                     s ^= s >> 17;
                                     s ^= s << 5;
                                     let b = (s >> 16) & 0xFF;
-                                    // Fluor-internal scratch format: α=0xFF opaque in storage, RGB in darkness convention (visible XOR 0x00FFFFFF). Previously this overlay wrote directly to the presented OS buffer with α=0 RGB-only, which worked because there was no finalize step. With the fullscreen-compositor architecture `target` is the window-sized scratch that goes through `finalize_into_screen` — α=0 there means fully transparent and the OS sees right through, which made the entire chrome vanish when the overlay toggled on.
                                     let visible = (r << 16) | (g << 8) | b;
                                     let dark = visible ^ 0x00FFFFFF;
                                     self.debug_hit_colours.push(0xFF000000 | dark);
                                 }
                             }
-                        } else if c == "p" || c == "P" {
+                        } else if ac == 'p' {
                             let cur = paint::DEBUG_SKIP_PREMULT
                                 .load(std::sync::atomic::Ordering::Relaxed);
                             paint::DEBUG_SKIP_PREMULT
                                 .store(!cur, std::sync::atomic::Ordering::Relaxed);
-                        } else if c == "a" || c == "A" {
+                        } else if ac == 'a' {
                             // Cycle: off (0) → grayscale (1) → force-opaque (2) → off.
                             let cur = paint::DEBUG_SHOW_ALPHA
                                 .load(std::sync::atomic::Ordering::Relaxed);
                             let next = (cur + 1) % 3;
                             paint::DEBUG_SHOW_ALPHA
                                 .store(next, std::sync::atomic::Ordering::Relaxed);
-                        } else if c == "c" || c == "C" {
+                        } else if ac == 'c' {
                             let cur = paint::DEBUG_SKIP_CHROME
                                 .load(std::sync::atomic::Ordering::Relaxed);
                             paint::DEBUG_SKIP_CHROME
                                 .store(!cur, std::sync::atomic::Ordering::Relaxed);
                             self.chrome.invalidate_chrome();
                             ctx.window.request_redraw();
-                        } else if c == "x" || c == "X" {
+                        } else if ac == 'x' {
                             let cur = paint::DEBUG_SKIP_CONTROLS
                                 .load(std::sync::atomic::Ordering::Relaxed);
                             paint::DEBUG_SKIP_CONTROLS
                                 .store(!cur, std::sync::atomic::Ordering::Relaxed);
                             self.chrome.invalidate_chrome();
                             ctx.window.request_redraw();
-                        } else if c == "r" || c == "R" {
+                        } else if ac == 'r' {
                             self.chrome.group.invalidate();
                             self.textbox_group.invalidate();
                             self.cursor_group.invalidate();
                             self.rotation_group.invalidate();
+                        } else if ac == 'q' {
+                            // Toggle the host's bottom-of-window diagnostic strip.
+                            let cur = paint::DEBUG_SHOW_FPS
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            paint::DEBUG_SHOW_FPS
+                                .store(!cur, std::sync::atomic::Ordering::Relaxed);
                         } else {
                             acted = false;
                         }

@@ -230,6 +230,11 @@ struct DesktopShell<A: FluorApp> {
 
     /// Tracks `WindowEvent::Focused` so the drop shadow can dim when the window is inactive — focused windows cast a stronger shadow (`SHADOW_SEED_FOCUSED`), unfocused ones use a quarter-strength shadow (`SHADOW_SEED_UNFOCUSED`).
     is_focused: bool,
+
+    /// Live render-pipeline counters. Updated every `render_frame` call (composite-time EMA +
+    /// frame counter); rendered to a bottom-of-window debug strip when [`paint::DEBUG_SHOW_FPS`]
+    /// is set via the `Ctrl/Cmd + Shift + D + F` chord.
+    debug_stats: crate::paint::DebugStats,
 }
 
 impl<A: FluorApp> DesktopShell<A> {
@@ -261,6 +266,7 @@ impl<A: FluorApp> DesktopShell<A> {
             last_painted_rect: WindowRect { x: 0, y: 0, w: 1, h: 1 },
             surface_ready: false,
             is_focused: true,
+            debug_stats: crate::paint::DebugStats::default(),
         }
     }
 
@@ -281,6 +287,22 @@ impl<A: FluorApp> DesktopShell<A> {
         if self.clip_mask.len() != win_px {
             self.clip_mask = vec![255u8; win_px];
         }
+
+        // Clear scratch first, then paint the debug strip on top (topmost-first: strip pixels occupy the bottom rows so the app's under() writes in those rows are rejected, keeping the strip visible above app content). Uses the previous frame's smoothed FPS — this frame's time isn't known until after render+finalize+shadow below.
+        self.scratch.fill(0);
+        #[cfg(feature = "text")]
+        if crate::paint::DEBUG_SHOW_FPS.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(text) = self.text.as_mut() {
+                crate::paint::draw_debug_strip(
+                    &mut self.scratch,
+                    win_w,
+                    win_h,
+                    text,
+                    &self.debug_stats,
+                );
+            }
+        }
+
         let Some(text) = self.text.as_mut() else {
             return;
         };
@@ -295,10 +317,16 @@ impl<A: FluorApp> DesktopShell<A> {
             cursor_y: self.cursor_y - self.window_rect.y as Coord,
         };
 
-        // Step 1: render consumer into the window-sized scratch (α + darkness convention, with clip_mask carving — UNCHANGED from the pre-fullscreen pipeline). Step 2: clear the screen buffer (so pixels outside window_rect are α=0 and the OS compositor sees through us). Step 3: finalize_into_screen reads scratch + clip_mask once per pixel and writes OS-ready ARGB into the screen buffer at window_rect offset — one pass over pixels, same per-pixel cost as the old in-place finalize_for_os.
-        self.scratch.fill(0);
+        // Per-stage stopwatches. Each Instant brackets one pipeline stage; the strip displays each as FPS so toggling SIMD/Rayon shows which stage actually moves. `buffer.present()` is excluded everywhere because it blocks for vsync, which would pin every reading to the display refresh rate.
+        let mut app_dt = 0.0f32;
+        let mut fill_dt = 0.0f32;
+        let mut finalize_dt = 0.0f32;
+        let mut shadow_dt = 0.0f32;
+
+        let app_start = Instant::now();
         self.app.render(&mut self.scratch, &mut ctx);
         drop(ctx);
+        app_dt = app_start.elapsed().as_secs_f32();
 
         let scr_w = self.screen_size.0 as usize;
         let rect_x = self.window_rect.x;
@@ -309,7 +337,10 @@ impl<A: FluorApp> DesktopShell<A> {
                 return;
             };
             let mut buffer = renderer.lock_buffer();
+            let t = Instant::now();
             buffer.fill(0);
+            fill_dt = t.elapsed().as_secs_f32();
+            let t = Instant::now();
             crate::paint::finalize_into_screen(
                 &self.scratch,
                 &self.clip_mask,
@@ -320,6 +351,7 @@ impl<A: FluorApp> DesktopShell<A> {
                 rect_x,
                 rect_y,
             );
+            finalize_dt = t.elapsed().as_secs_f32();
             // Drop shadow: 45-degree diagonal rays cast from each chrome right/bottom edge pixel. factor_256 derived from `effective_span` so ray length is RU-invariant: target ≈ effective_span / 16; `factor_256 ≈ 256 − 1240/r`. Seed is the starting shadow α: 0x80 when focused, 0x40 (quarter strength) when unfocused.
             let span = self.viewport.effective_span();
             let target_radius = (span / 16.0).max(8.0);
@@ -332,6 +364,7 @@ impl<A: FluorApp> DesktopShell<A> {
                 self.window_rect.w as i32,
                 self.window_rect.h as i32,
             );
+            let t = Instant::now();
             crate::paint::paint_shadow(
                 &mut buffer,
                 scr_w,
@@ -339,6 +372,7 @@ impl<A: FluorApp> DesktopShell<A> {
                 shadow_seed,
                 rect_for_shadow,
             );
+            shadow_dt = t.elapsed().as_secs_f32();
             let _ = buffer.present();
         }
         #[cfg(not(target_os = "macos"))]
@@ -347,7 +381,10 @@ impl<A: FluorApp> DesktopShell<A> {
                 return;
             };
             let mut buffer = surface.buffer_mut().expect("softbuffer buffer_mut");
+            let t = Instant::now();
             buffer.fill(0);
+            fill_dt = t.elapsed().as_secs_f32();
+            let t = Instant::now();
             crate::paint::finalize_into_screen(
                 &self.scratch,
                 &self.clip_mask,
@@ -358,6 +395,7 @@ impl<A: FluorApp> DesktopShell<A> {
                 rect_x,
                 rect_y,
             );
+            finalize_dt = t.elapsed().as_secs_f32();
             // Drop shadow: 45-degree diagonal rays cast from each chrome right/bottom edge pixel. factor_256 derived from `effective_span` so ray length is RU-invariant: target ≈ effective_span / 16; `factor_256 ≈ 256 − 1240/r`. Seed is the starting shadow α: 0x80 when focused, 0x40 (quarter strength) when unfocused.
             let span = self.viewport.effective_span();
             let target_radius = (span / 16.0).max(8.0);
@@ -370,6 +408,7 @@ impl<A: FluorApp> DesktopShell<A> {
                 self.window_rect.w as i32,
                 self.window_rect.h as i32,
             );
+            let t = Instant::now();
             crate::paint::paint_shadow(
                 &mut buffer,
                 scr_w,
@@ -377,10 +416,13 @@ impl<A: FluorApp> DesktopShell<A> {
                 shadow_seed,
                 rect_for_shadow,
             );
+            shadow_dt = t.elapsed().as_secs_f32();
             buffer.present().expect("softbuffer buffer.present");
         }
         // Record what we just painted so the next drag-tick can compute its delta.
         self.last_painted_rect = self.window_rect;
+
+        self.debug_stats.record_frame(app_dt, fill_dt, finalize_dt, shadow_dt);
     }
 
     /// Drag-tick fast path: shift the screen buffer in place by the delta since the last paint, push the input region update, and present. Skips consumer render, scratch fill, finalize, and shadow rasterization entirely — the existing chrome pixels just slide through the screen buffer, with anything that falls off any edge wrapping to the opposite side. On drag release, a normal `render_frame` overwrites the wrap artefacts in one clean frame.

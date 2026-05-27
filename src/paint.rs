@@ -264,10 +264,7 @@ pub(crate) fn assert_mask_matches_buffer(mask: &AlphaMask, buf_w: usize, buf_h: 
 /// Pack four 8-bit channels into a fluor internal pixel (`0xααRRGGBB`, α + darkness convention). The public API takes visible RGB and opacity α (`a = 255` means fully opaque) so consumer code reads naturally. Inside, RGB is stored as darkness (`255 − channel`); α is stored direct. This is the canonical external→internal boundary.
 #[inline]
 pub fn pack_argb(r: u8, g: u8, b: u8, a: u8) -> u32 {
-    ((a as u32) << 24)
-        | (((255 - r) as u32) << 16)
-        | (((255 - g) as u32) << 8)
-        | ((255 - b) as u32)
+    ((a as u32) << 24) | (((255 - r) as u32) << 16) | (((255 - g) as u32) << 8) | ((255 - b) as u32)
 }
 
 /// Unpack a fluor internal pixel into `(r, g, b, a)` with visible RGB and opacity α — the inverse of [`pack_argb`]. Flips darkness back to visible RGB; α passes through.
@@ -512,7 +509,9 @@ pub fn stroke_rect(
     }
 }
 
-/// Fill the buffer with photon's signature procedural background — symmetric organic noise plus speckle. Sequential (no rayon dep at this layer) but mirrored left/right halves like photon. Set `fullscreen=true` to fill the whole buffer; `false` leaves a 1px border for the window edge stroke. `speckle` is an animation counter (constant 0 for static); `scroll_offset` shifts the texture vertically (for content scroll integration).
+/// Fill the buffer with photon's signature procedural background — symmetric organic noise plus speckle. Rows are RNG-independent (each row reseeds from `logical_row`), so the outer loop parallelizes cleanly via [`crate::par::par_rows`]. Mirrored left/right halves like photon. Set `fullscreen=true` to fill the whole buffer; `false` leaves a 1px border for the window edge stroke. `speckle` is an animation counter (constant 0 for static); `scroll_offset` shifts the texture vertically (for content scroll integration).
+///
+/// SIMD inside a row is intentionally not done — the per-pixel RNG (`rng ^= rng.rotate_left(13).wrapping_add(const)`) is a serial dependency chain; vectorizing it would require N independent RNG streams per lane and would change photon's visual pattern. If profiling shows the per-row scalar work still dominating after Rayon, that's the next lever.
 ///
 /// Clip restricts the row range. Mask isn't supported here (background is bg — masking it would mean "draw nothing where mask is zero" which is the same as just clearing afterward; if you need that, do it explicitly).
 pub fn background_noise(
@@ -542,9 +541,8 @@ pub fn background_noise(
     if row_start >= row_end || x_start >= x_end {
         return;
     }
-    for row_idx in row_start..row_end {
+    crate::par::par_rows(pixels, buf_w, row_start, row_end, |row_idx, row_pixels| {
         let logical_row = row_idx as isize - scroll_offset;
-        let row_pixels = &mut pixels[row_idx * buf_w..(row_idx + 1) * buf_w];
         background_row(
             row_pixels,
             buf_w,
@@ -554,7 +552,7 @@ pub fn background_noise(
             x_end,
             speckle,
         );
-    }
+    });
 }
 
 #[inline]
@@ -572,50 +570,66 @@ fn background_row(
     const VISIBLE_TO_DARK_FLIP: u32 = 0x00FFFFFF;
     const RGB_MASK: u32 = 0x00FFFFFF;
     const OPAQUE_ALPHA: u32 = 0xFF000000;
-    let mut rng: usize = (0xDEAD_BEEF_0123_4567)
-        ^ ((logical_row as usize)
-            .wrapping_sub(height / 2)
-            .wrapping_mul(0x9E37_79B9_4517_B397));
+    // Hybrid 2-pass: pass 1 fills `noise_buf` with the row's chunk of noise values via the serial RNG/colour chain (branches stay scalar — predicating speckle would cost as much as it saves). Pass 2 hands the chunk to the 8-wide SIMD under-blend kernel (`under_chunk_normal_dispatch`), which composites it into row_pixels at ~1 cycle/pixel amortized. Output is bit-identical to the old straight-scalar version.
+    const CHUNK: usize = 64;
+    let mut noise_buf = [0u32; CHUNK];
     let ones = 0x0001_0101u32;
-    let mut colour = rng as u32 & BG_MASK;
+    let seed: usize = 0xDEAD_BEEF_0123_4567usize
+        ^ (logical_row as usize)
+            .wrapping_sub(height / 2)
+            .wrapping_mul(0x9E37_79B9_4517_B397);
 
-    // Right half — left to right. Noise composes UNDER existing content (topmost-first):
-    // an empty pixel gets the noise; a non-empty pixel (e.g., a topmost rect already painted)
-    // has the noise blended behind it via [`Blend::under`].
-    for x in (width / 2)..x_end {
-        rng ^= rng.rotate_left(13).wrapping_add(12_345_678_942);
-        let adder = rng as u32 & ones;
-        if rng.wrapping_add(speckle) < usize::MAX / 256 {
-            colour = (rng as u32 >> 8) & BG_SPECKLE;
-        } else {
-            colour = colour.wrapping_add(adder) & BG_MASK;
-            let subtractor = (rng >> 5) as u32 & ones;
-            colour = colour.wrapping_sub(subtractor) & BG_MASK;
+    // Right half — left to right. Noise composes UNDER existing content (topmost-first): an empty pixel gets the noise; a non-empty pixel (e.g. a topmost rect already painted) has the noise blended behind it.
+    let mut rng = seed;
+    let mut colour = rng as u32 & BG_MASK;
+    let mut x = width / 2;
+    while x < x_end {
+        let chunk_len = (x_end - x).min(CHUNK);
+        for i in 0..chunk_len {
+            rng ^= rng.rotate_left(13).wrapping_add(12_345_678_942);
+            let adder = rng as u32 & ones;
+            if rng.wrapping_add(speckle) < usize::MAX / 256 {
+                colour = (rng as u32 >> 8) & BG_SPECKLE;
+            } else {
+                colour = colour.wrapping_add(adder) & BG_MASK;
+                let subtractor = (rng >> 5) as u32 & ones;
+                colour = colour.wrapping_sub(subtractor) & BG_MASK;
+            }
+            noise_buf[i] =
+                ((colour.wrapping_add(BG_BASE) & RGB_MASK) ^ VISIBLE_TO_DARK_FLIP) | OPAQUE_ALPHA;
         }
-        let noise =
-            ((colour.wrapping_add(BG_BASE) & RGB_MASK) ^ VISIBLE_TO_DARK_FLIP) | OPAQUE_ALPHA;
-        row_pixels[x] = row_pixels[x].under(noise, BlendMode::Normal);
+        under_chunk_normal_dispatch(
+            &mut row_pixels[x..x + chunk_len],
+            &noise_buf[..chunk_len],
+        );
+        x += chunk_len;
     }
 
-    // Left half — right to left, same RNG seed (mirror).
-    rng = 0xDEAD_BEEF_0123_4567
-        ^ ((logical_row as usize)
-            .wrapping_sub(height / 2)
-            .wrapping_mul(0x9E37_79B9_4517_B397));
+    // Left half — right to left, same RNG seed (mirror), SUB instead of ADD on the rng step. Within each chunk the RNG iterates rightmost-pixel-first; we store into `noise_buf` in left-to-right order (`i = chunk_len-1` down to 0) so the chunk dispatch can scan the buffer sequentially.
+    rng = seed;
     colour = rng as u32 & BG_MASK;
-    for x in (x_start..(width / 2)).rev() {
-        rng ^= rng.rotate_left(13).wrapping_sub(12_345_678_942);
-        let adder = rng as u32 & ones;
-        if rng.wrapping_add(speckle) < usize::MAX / 256 {
-            colour = (rng as u32 >> 8) & BG_SPECKLE;
-        } else {
-            colour = colour.wrapping_add(adder) & BG_MASK;
-            let subtractor = (rng >> 5) as u32 & ones;
-            colour = colour.wrapping_sub(subtractor) & BG_MASK;
+    let mut x_hi = width / 2;
+    while x_hi > x_start {
+        let chunk_lo = x_hi.saturating_sub(CHUNK).max(x_start);
+        let chunk_len = x_hi - chunk_lo;
+        for i in (0..chunk_len).rev() {
+            rng ^= rng.rotate_left(13).wrapping_sub(12_345_678_942);
+            let adder = rng as u32 & ones;
+            if rng.wrapping_add(speckle) < usize::MAX / 256 {
+                colour = (rng as u32 >> 8) & BG_SPECKLE;
+            } else {
+                colour = colour.wrapping_add(adder) & BG_MASK;
+                let subtractor = (rng >> 5) as u32 & ones;
+                colour = colour.wrapping_sub(subtractor) & BG_MASK;
+            }
+            noise_buf[i] =
+                ((colour.wrapping_add(BG_BASE) & RGB_MASK) ^ VISIBLE_TO_DARK_FLIP) | OPAQUE_ALPHA;
         }
-        let noise =
-            ((colour.wrapping_add(BG_BASE) & RGB_MASK) ^ VISIBLE_TO_DARK_FLIP) | OPAQUE_ALPHA;
-        row_pixels[x] = row_pixels[x].under(noise, BlendMode::Normal);
+        under_chunk_normal_dispatch(
+            &mut row_pixels[chunk_lo..x_hi],
+            &noise_buf[..chunk_len],
+        );
+        x_hi = chunk_lo;
     }
 }
 
@@ -636,6 +650,118 @@ pub static DEBUG_SKIP_CHROME: std::sync::atomic::AtomicBool =
 /// Debug toggle that suppresses ONLY the controls strip (curves + hairlines + glyphs + dividers + strip-bg fill) while keeping the window perimeter intact. Bound to the `Ctrl/Cmd + Shift + D + X` chord. Useful for isolating perimeter rendering from controls rendering. Stays `false` by default.
 pub static DEBUG_SKIP_CONTROLS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Debug toggle that overlays a one-line diagnostic strip across the bottom of the window
+/// showing live render-pipeline stats: composite-FPS (= `1.0 / composite_time`, NOT the vsync-
+/// capped frame rate) and the cumulative frame counter. Bound to the `Ctrl/Cmd + Shift + D + Q`
+/// chord (F was the original choice but Linux window managers eat Ctrl+Shift+F as a system
+/// shortcut). The composite-FPS is the actual headroom — a 144 Hz display showing "1240 FPS"
+/// means each composite took ~0.8 ms, leaving 6.1 ms of slack against vsync. `false` by default.
+pub static DEBUG_SHOW_FPS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Live diagnostic counters owned by the host's render loop and read by [`draw_debug_strip`].
+/// All fields are simple POD; the host updates them every frame when [`DEBUG_SHOW_FPS`] is on
+/// and the helper renders them as a single line of text into the bottom-of-window scratch
+/// region before the boundary pass runs.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DebugStats {
+    /// Raw work time of the most recent frame, per stage, in seconds. NOT smoothed — each value is exactly the last measurement so SIMD/Rayon toggles produce immediately legible swings. FPS shown in the strip is `1.0 / stage_secs` per stage and `1.0 / sum` for total.
+    pub app_secs: f32,
+    pub fill_secs: f32,
+    pub finalize_secs: f32,
+    pub shadow_secs: f32,
+    /// Monotonic count of full frames rendered since the host started. Wraps at `u64::MAX`, effectively never.
+    pub frames_rendered: u64,
+}
+
+impl DebugStats {
+    /// Store this frame's per-stage times and bump the counter. No smoothing — displayed values are exactly what was just measured.
+    #[inline]
+    pub fn record_frame(&mut self, app: f32, fill: f32, finalize: f32, shadow: f32) {
+        self.app_secs = app;
+        self.fill_secs = fill;
+        self.finalize_secs = finalize;
+        self.shadow_secs = shadow;
+        self.frames_rendered = self.frames_rendered.wrapping_add(1);
+    }
+
+    #[inline]
+    pub fn total_secs(&self) -> f32 {
+        self.app_secs + self.fill_secs + self.finalize_secs + self.shadow_secs
+    }
+}
+
+/// Overlay a one-line diagnostic strip across the bottom of `pixels` showing the live stats
+/// in [`DebugStats`]. Gated by [`DEBUG_SHOW_FPS`] — the host should check that flag before
+/// calling. Paints into the α + darkness scratch buffer BEFORE the boundary pass so the strip
+/// flows through `finalize_*` like any other content (no special handling needed downstream).
+///
+/// The strip is `~24` pixels tall, semi-opaque black background, bright green monospace text
+/// (terminal-style for readability against any underlying content). Positioned at the very
+/// bottom of `pixels`; clipped to the buffer if the window is too short to fit the strip
+/// (returns early in that case — diagnostic, not load-bearing).
+#[cfg(feature = "text")]
+pub fn draw_debug_strip(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    text: &mut crate::text::TextRenderer,
+    stats: &DebugStats,
+) {
+    const STRIP_H: usize = 24;
+    const FONT_SIZE: f32 = 13.0;
+    if width == 0 || height < STRIP_H * 2 {
+        return;
+    }
+    // Position the strip centered inside the bottom 1/12th of the window — flush-bottom collided with chrome's bottom bar and the rounded-corner clip carved into the edges.
+    let band_top = (height * 11) / 12;
+    let strip_y = band_top + ((height - band_top).saturating_sub(STRIP_H)) / 2;
+
+    let app_ms = stats.app_secs * 1000.0;
+    let fill_ms = stats.fill_secs * 1000.0;
+    let fin_ms = stats.finalize_secs * 1000.0;
+    let shadow_ms = stats.shadow_secs * 1000.0;
+    let total_ms = stats.total_secs() * 1000.0;
+
+    let stats_line = alloc::format!(
+        "app {app_ms:>6.3} ms  fill {fill_ms:>6.3} ms  fin {fin_ms:>6.3} ms  shdw {shadow_ms:>6.3} ms    tot {total_ms:>6.3} ms    Frames {:>7}",
+        stats.frames_rendered,
+    );
+
+    // Topmost-first ordering: text glyphs paint FIRST so the bar's under() writes are rejected by the glyph pixels, leaving the green characters visible against the black. If the bar were painted first it would fill all strip pixels opaque and every glyph would be eaten.
+    let fg = pack_argb(80, 255, 120, 0xFF);
+    let text_cy = strip_y as f32 + STRIP_H as f32 * 0.5;
+    text.draw_text_center_u32(
+        pixels,
+        width,
+        height,
+        &stats_line,
+        width as f32 * 0.5,
+        text_cy,
+        FONT_SIZE,
+        400,
+        fg,
+        "monospace",
+        None,
+        None,
+        None,
+    );
+
+    // Bar fills behind the glyphs (topmost-first: text rows already occupied, bar's under() only lands on the gaps).
+    let bg = pack_argb(0, 0, 0, 0xE0);
+    draw_rect(
+        pixels,
+        width,
+        height,
+        width as Coord * 0.5,
+        strip_y as Coord + STRIP_H as Coord * 0.5,
+        width as Coord,
+        STRIP_H as Coord,
+        bg,
+        None,
+    );
+}
 
 /// Boundary step that finalizes the present buffer for the OS in a **single pass** per pixel — folds the darkness→visible flip, the window-shape clip-mask multiply, the Linux RGB premultiply, and the pack into one go. Walks `pixels` and `clip_mask` in lockstep; both slices must be the same length.
 ///
@@ -820,7 +946,12 @@ pub fn shift_screen_wrap(screen: &mut [u32], scr_w: usize, scr_h: usize, dx: i32
         let (wrap_src, body_src, body_dst, wrap_dst) = if signed_dy > 0 {
             (split..scr_h * scr_w, 0..split, ny * scr_w, 0..ny * scr_w)
         } else {
-            (0..ny * scr_w, ny * scr_w..scr_h * scr_w, 0, split..scr_h * scr_w)
+            (
+                0..ny * scr_w,
+                ny * scr_w..scr_h * scr_w,
+                0,
+                split..scr_h * scr_w,
+            )
         };
         tmp_y.copy_from_slice(&screen[wrap_src]);
         screen.copy_within(body_src, body_dst);
@@ -999,8 +1130,7 @@ fn finalize_into_scalar_debug(
             let inner_a = (v >> 24) & 0xFF;
             let final_a = (inner_a * m) >> 8;
             if alpha_mode == DEBUG_SHOW_ALPHA_GRAYSCALE {
-                screen[dst_idx] =
-                    0xFF000000 | (final_a << 16) | (final_a << 8) | final_a;
+                screen[dst_idx] = 0xFF000000 | (final_a << 16) | (final_a << 8) | final_a;
             } else {
                 screen[dst_idx] = 0xFF000000 | (v & 0x00FFFFFF);
             }
@@ -1814,7 +1944,11 @@ pub fn draw_rect_rotated(
             let (iy_lo, iy_hi) = px_range(ly0, dly, -ly_inner, ly_inner, x_start, x_end);
             let lo = ix_lo.max(iy_lo).max(outer_lo);
             let hi = ix_hi.min(iy_hi).min(outer_hi);
-            if lo >= hi { (outer_hi, outer_hi) } else { (lo, hi) }
+            if lo >= hi {
+                (outer_hi, outer_hi)
+            } else {
+                (lo, hi)
+            }
         } else {
             (outer_hi, outer_hi)
         };
@@ -1865,7 +1999,14 @@ pub fn draw_rect_rotated(
 }
 
 /// Pixel-range solver for `lo ≤ v0 + (px − x_start)·dv ≤ hi`. Returns half-open `[px_lo, px_hi)` clamped to `[x_start, x_end]`. Empty range is returned as `(x_end, x_end)`.
-fn px_range(v0: Coord, dv: Coord, lo: Coord, hi: Coord, x_start: usize, x_end: usize) -> (usize, usize) {
+fn px_range(
+    v0: Coord,
+    dv: Coord,
+    lo: Coord,
+    hi: Coord,
+    x_start: usize,
+    x_end: usize,
+) -> (usize, usize) {
     if dv.abs() < 1e-6 {
         if v0 >= lo && v0 <= hi {
             return (x_start, x_end);
@@ -2062,11 +2203,11 @@ pub fn draw_ellipse_rotated(
     color: u32,
     clip: Option<Clip>,
 ) {
-    if rx <= 0.0 || ry <= 0.0 || width == 0 || height == 0 {
+    if rx <= 0. || ry <= 0. || width == 0 || height == 0 {
         return;
     }
-    let inv_rx2 = 1.0 / (rx * rx);
-    let inv_ry2 = 1.0 / (ry * ry);
+    let inv_rx2 = 1. / (rx * rx);
+    let inv_ry2 = 1. / (ry * ry);
     let (sin_a, cos_a) = crate::math::sin_cos(angle);
     let abs_cos = cos_a.abs();
     let abs_sin = sin_a.abs();
@@ -2097,15 +2238,15 @@ pub fn draw_ellipse_rotated(
         for px in x_start..x_end {
             let lx2_a = lx * lx * inv_rx2;
             let ly2_b = ly * ly * inv_ry2;
-            let f = lx2_a + ly2_b - 1.0;
-            let grad2 = 4.0 * (lx2_a * inv_rx2 + ly2_b * inv_ry2);
-            let f_sq_4 = 4.0 * f * f;
-            if f <= 0.0 && f_sq_4 >= grad2 {
+            let f = lx2_a + ly2_b - 1.;
+            let grad2 = 4. * (lx2_a * inv_rx2 + ly2_b * inv_ry2);
+            let f_sq_4 = 4. * f * f;
+            if f <= 0. && f_sq_4 >= grad2 {
                 row[px] = row[px].under(full_pixel, BlendMode::Normal);
-            } else if f < 0.0 || f_sq_4 < grad2 {
+            } else if f < 0. || f_sq_4 < grad2 {
                 // AA via fused reciprocal-sqrt — see [`draw_ellipse`] for the rationale.
                 let inv_g = fast_inv_sqrt(grad2);
-                let coverage = (0.5 - f * inv_g).clamp(0.0, 1.0);
+                let coverage = (0.5 - f * inv_g).clamp(0., 1.);
                 let na = (color_alpha * coverage) as u32;
                 if na > 0 {
                     let ellipse_pixel = (na << 24) | color_dark;
@@ -3500,7 +3641,18 @@ mod tests {
         // Result: ~opaque colour (1-LSB drift per channel from the >>8 normalization).
         let mut buf = vec![0u32; 4 * 4];
         // Visible (0x11, 0x22, 0x33) with α=0xFF → α + darkness = α=0xFF, dark=(0xEE, 0xDD, 0xCC).
-        fill_rect(&mut buf, 4, 4, 0, 0, 4, 4, pack_argb(0x11, 0x22, 0x33, 0xFF), None, None);
+        fill_rect(
+            &mut buf,
+            4,
+            4,
+            0,
+            0,
+            4,
+            4,
+            pack_argb(0x11, 0x22, 0x33, 0xFF),
+            None,
+            None,
+        );
         for &p in &buf {
             assert_eq!(p >> 24, 0xFF, "pixel α should be 0xFF (opaque): {p:#x}");
             // Darkness of visible 0x11 is 0xEE; minus 1-LSB drift.
@@ -3511,7 +3663,18 @@ mod tests {
     #[test]
     fn fill_rect_partial() {
         let mut buf = vec![0u32; 4 * 4];
-        fill_rect(&mut buf, 4, 4, 1, 1, 2, 2, pack_argb(0xAA, 0xBB, 0xCC, 0xFF), None, None);
+        fill_rect(
+            &mut buf,
+            4,
+            4,
+            1,
+            1,
+            2,
+            2,
+            pack_argb(0xAA, 0xBB, 0xCC, 0xFF),
+            None,
+            None,
+        );
         for y in 0..4usize {
             for x in 0..4usize {
                 let p = buf[y * 4 + x];
@@ -3523,10 +3686,7 @@ mod tests {
                         "inside pixel ({x},{y}) should be opaque: {p:#x}"
                     );
                 } else {
-                    assert_eq!(
-                        p, 0,
-                        "outside pixel ({x},{y}) untouched, got {p:#x}"
-                    );
+                    assert_eq!(p, 0, "outside pixel ({x},{y}) untouched, got {p:#x}");
                 }
             }
         }
@@ -3535,7 +3695,18 @@ mod tests {
     #[test]
     fn fill_rect_clips_negative_origin() {
         let mut buf = vec![0u32; 4 * 4];
-        fill_rect(&mut buf, 4, 4, -2, -2, 4, 4, pack_argb(0xFF, 0xFF, 0xFE, 0xFF), None, None);
+        fill_rect(
+            &mut buf,
+            4,
+            4,
+            -2,
+            -2,
+            4,
+            4,
+            pack_argb(0xFF, 0xFF, 0xFE, 0xFF),
+            None,
+            None,
+        );
         for y in 0..4usize {
             for x in 0..4usize {
                 let p = buf[y * 4 + x];
@@ -3556,9 +3727,31 @@ mod tests {
     #[test]
     fn fill_rect_fully_offscreen_is_noop() {
         let mut buf = vec![0u32; 4 * 4];
-        fill_rect(&mut buf, 4, 4, 100, 100, 5, 5, pack_argb(0, 0, 0, 0xFF), None, None);
+        fill_rect(
+            &mut buf,
+            4,
+            4,
+            100,
+            100,
+            5,
+            5,
+            pack_argb(0, 0, 0, 0xFF),
+            None,
+            None,
+        );
         assert!(buf.iter().all(|&p| p == 0));
-        fill_rect(&mut buf, 4, 4, -10, -10, 5, 5, pack_argb(0, 0, 0, 0xFF), None, None);
+        fill_rect(
+            &mut buf,
+            4,
+            4,
+            -10,
+            -10,
+            5,
+            5,
+            pack_argb(0, 0, 0, 0xFF),
+            None,
+            None,
+        );
         assert!(buf.iter().all(|&p| p == 0));
     }
 
