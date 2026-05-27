@@ -3,6 +3,7 @@
 //! Photon's full version bundles Oxanium and Josefin Slab too; those are dropped here to keep the v0 crate small (~260 KB instead of ~2 MB). They'll be added back when a consumer needs them.
 
 use crate::paint::{AlphaMask, Clip, Transform};
+use crate::pixel::{Blend, BlendMode};
 use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
 use swash::scale::{Render, ScaleContext, Source, image::Image as SwashImage};
 use swash::zeno::Transform as ZenoTransform;
@@ -441,10 +442,9 @@ impl TextRenderer {
             _ => (anchor_x, anchor_y),
         };
 
-        // Widen colour to packed-channel u64 once.
-        let mut colour_wide = colour as u64;
-        colour_wide = (colour_wide | (colour_wide << 16)) & 0x0000FFFF0000FFFF;
-        colour_wide = (colour_wide | (colour_wide << 8)) & 0x00FF00FF00FF00FF;
+        // Topmost-first: split colour into its α channel (combined with per-pixel glyph coverage and optional mask to form the glyph pixel's effective α) and its RGB-darkness payload (passed straight through to under()). Replaces the legacy SWAR over-blend — text now composites with the same under() kernel as every other rasterizer.
+        let colour_alpha = (colour >> 24) & 0xFF;
+        let colour_dark = colour & 0x00FF_FFFF;
 
         // Identity-or-None: cosmic-text's SwashCache fast path. Non-identity transform splits two ways:
         //   1. **Contour transform** (linear part only — `a, b, c, d`, *no translation*) → fed to swash::scale to rotate/skew/scale the glyph outline in font space. Translation is intentionally stripped here because swash applies its transform to the contour in glyph-local coords (origin at 0,0 baseline-left); leaving translation in would translate the contour itself, blowing the placement bbox out into absolute pixel space. The linear part is *snapped* per-glyph to the 1-pixel-arc rotation grid via [`crate::paint::snap_rotation`], so consecutive frames within the same rotation bin reuse the same rasterized glyph (cache hit). Snapping the contour but **not** the position lets the run slide smoothly along its arc while each glyph's orientation steps in cache-friendly bins.
@@ -582,21 +582,17 @@ impl TextRenderer {
                         let final_x = (glyph_x + cx as i32) as usize;
                         let idx = row_offset_buf + final_x;
 
-                        let alpha_u64 = match mask {
-                            Some(m) => (alpha as u64 * m.pixels[idx] as u64) >> 8,
-                            None => alpha as u64,
+                        let mask_alpha = match mask {
+                            Some(m) => m.pixels[idx] as u32,
+                            None => 0xFF,
                         };
-                        let inv_alpha = 255 - alpha_u64;
-
-                        let mut bg = pixels[idx] as u64;
-                        bg = (bg | (bg << 16)) & 0x0000FFFF0000FFFF;
-                        bg = (bg | (bg << 8)) & 0x00FF00FF00FF00FF;
-
-                        let mut blended = bg * inv_alpha + colour_wide * alpha_u64;
-                        blended = (blended >> 8) & 0x00FF00FF00FF00FF;
-                        blended = (blended | (blended >> 8)) & 0x0000FFFF0000FFFF;
-                        blended = blended | (blended >> 16);
-                        pixels[idx] = blended as u32;
+                        let effective_alpha =
+                            (alpha as u32 * colour_alpha * mask_alpha) / (255 * 255);
+                        if effective_alpha == 0 {
+                            continue;
+                        }
+                        let glyph_pixel = (effective_alpha << 24) | colour_dark;
+                        pixels[idx] = pixels[idx].under(glyph_pixel, BlendMode::Normal);
                     }
                 }
             }
