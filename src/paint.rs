@@ -952,6 +952,10 @@ pub fn paint_shadow(
         return;
     }
 
+    // Save TR seed — Phase J (TL shadow's TR-side trace) reuses it.
+    let tr_seed_x = x0;
+    let tr_seed_y = y0;
+
     // Cast Ray 0 from the seed cell.
     cast_shadow_ray(screen, scr_w, scr_h, factor_256, shadow_seed, x0, y0);
 
@@ -964,8 +968,7 @@ pub fn paint_shadow(
         // Fully-opaque chrome cells land at α=0xFE after finalize (premult: (0xFF*0xFF)>>8 = 0xFE).
         while ((screen[y * scr_w + x] >> 24) & 0xFF) >= 0xFE {
             if x + 1 >= scr_w || y + 1 >= scr_h {
-                let _ = scr_h;
-                return;
+                break;
             }
             x += 1;
             y += 1;
@@ -979,8 +982,7 @@ pub fn paint_shadow(
         y += 1;
         while ((screen[y * scr_w + x] >> 24) & 0xFF) == 0 {
             if x == 0 || y == 0 {
-                let _ = scr_h;
-                return;
+                break;
             }
             x -= 1;
             y -= 1;
@@ -1001,8 +1003,7 @@ pub fn paint_shadow(
         }
         while ((screen[y * scr_w + x] >> 24) & 0xFF) == 0 {
             if x == 0 || y == 0 {
-                let _ = scr_h;
-                return;
+                break;
             }
             x -= 1;
             y -= 1;
@@ -1010,8 +1011,7 @@ pub fn paint_shadow(
         cast_shadow_ray(screen, scr_w, scr_h, factor_256, shadow_seed, x, y);
         if y >= bot_row && x > x_center {
             if x == 0 {
-                let _ = scr_h;
-                return;
+                break;
             }
             x -= 1;
         }
@@ -1050,8 +1050,7 @@ pub fn paint_shadow(
             // Walk DR only while we're still above bot_row — past it we're in straight bottom AA territory where Phase E and Phase F should cast symmetrically at (x, bot_row), not one step past. Without the yf bound, the chrome bottom edge's solid α=0xFE cells would trigger the walk and shift Phase F's casts one cell DR, creating a 1-alpha-step diagonal seam at the Phase E/F meeting point.
             while yf < bot_row && ((screen[yf * scr_w + xf] >> 24) & 0xFF) >= 0xFE {
                 if xf + 1 >= scr_w || yf + 1 >= scr_h {
-                    let _ = scr_h;
-                    return;
+                    break;
                 }
                 xf += 1;
                 yf += 1;
@@ -1059,29 +1058,85 @@ pub fn paint_shadow(
             cast_shadow_ray(screen, scr_w, scr_h, factor_256, shadow_seed, xf, yf);
         }
 
-        // Phase G (TL shadow — bottom half of left edge, debug colors): mirror of Phase C+D, rotated 180°. Same BL seed as Phase F, but rays go UL (-1, -1) instead of DR (+1, +1). Outer y -= 1; when the new cell is opaque chrome interior (BL curve indenting leftward as y decreases), walk UL silently — wait, debug visibility — paint YELLOW. Cast UL debug ray (BLUE/GREEN AA + RED/MAGENTA transparent). Stop at the vertical midpoint.
+        // Phase G (TL shadow — bottom half of left edge, production black at HALF the BR seed): same BL seed as Phase F (no fresh diagonal walk), but rays go UL (-1, -1) instead of DR (+1, +1) and start at half strength — the TL ambient occlusion is subtler than the BR drop shadow. Outer y -= 1; when the new cell is opaque chrome interior (BL curve indenting leftward as y decreases), walk UL silently. Cast UL shadow ray with `tl_seed`. Stop at the vertical midpoint.
+        let tl_seed = shadow_seed >> 1;
         let mut xg = bl_seed_x;
         let mut yg = bl_seed_y;
-        cast_debug_ray_ul(screen, scr_w, factor_256, xg, yg, true);
+        cast_shadow_ray_ul(screen, scr_w, factor_256, tl_seed, xg, yg);
         let y_center = (y_chrome_top + y_chrome_end) / 2;
         while yg > y_center {
             if yg == 0 {
-                let _ = scr_h;
-                return;
+                break;
             }
             yg -= 1;
             while ((screen[yg * scr_w + xg] >> 24) & 0xFF) >= 0xFE {
-                // YELLOW direct-assign at full alpha.
-                screen[yg * scr_w + xg] = 0xFFFFFF00;
                 if xg == 0 || yg == 0 {
-                    let _ = scr_h;
-                    return;
+                    break;
                 }
                 xg -= 1;
                 yg -= 1;
             }
-            cast_debug_ray_ul(screen, scr_w, factor_256, xg, yg, false);
+            cast_shadow_ray_ul(screen, scr_w, factor_256, tl_seed, xg, yg);
         }
+
+        // Phase H (TL shadow — top half of left edge, production black at tl_seed): continue from Phase G's end going UP past y_center toward the TL corner. Outer y -= 1; when the new cell is transparent (TL curve indents right as we ascend), walk DR (+1, +1) silently — symmetric mirror of Phase E's walk-UL-on-transparent (each step cancels the outer y -= 1 and advances xg right). Cast UL shadow ray, then check stop (cast-before-stop, like Phase D, to avoid skipping the stop-iter's diagonal). Stop at the TL corner's 45° midpoint: `(xg - x_chrome_left) > (yg - y_chrome_top)`.
+        while yg > y_chrome_top {
+            yg -= 1;
+            while ((screen[yg * scr_w + xg] >> 24) & 0xFF) == 0 {
+                if xg + 1 >= scr_w || yg + 1 >= scr_h {
+                    break;
+                }
+                xg += 1;
+                yg += 1;
+            }
+            cast_shadow_ray_ul(screen, scr_w, factor_256, tl_seed, xg, yg);
+            let dx_right = xg.saturating_sub(x_chrome_left);
+            let dy_down = yg.saturating_sub(y_chrome_top);
+            if dx_right > dy_down {
+                break;
+            }
+        }
+
+        // Phase I (TL shadow — top edge to x_center, production black at tl_seed): mirror of Phase E. Outer y -= 1 clamped at y_chrome_top; walk DR (+1, +1) on transparent (TL curve cells with chrome above-and-right); if walk doesn't fire at y_chrome_top (straight-top AA), advance x manually. Stop at xg >= x_center.
+        while xg < x_center {
+            if yg > y_chrome_top {
+                yg -= 1;
+            }
+            while ((screen[yg * scr_w + xg] >> 24) & 0xFF) == 0 {
+                if xg + 1 >= scr_w || yg + 1 >= scr_h {
+                    break;
+                }
+                xg += 1;
+                yg += 1;
+            }
+            cast_shadow_ray_ul(screen, scr_w, factor_256, tl_seed, xg, yg);
+            if yg <= y_chrome_top && xg < x_center {
+                if xg + 1 >= scr_w {
+                    break;
+                }
+                xg += 1;
+            }
+        }
+    }
+
+    // Phase J (TL shadow — TR mirror trace, production black at tl_seed): start at the TR seed (saved from Phase A — no fresh diagonal walk needed, it's the same cell) and trace LEFT to x_center via TR curve + top edge. Mirror of Phase F: outer xi -= 1; when the new cell is opaque chrome interior (TR curve descending leftward = topmost row decreasing), walk UL (-1, -1) — but only while we're still below y_chrome_top (analogous to Phase F's `yf < bot_row` guard) so we don't shift past the chrome top edge at the straight-top AA cells. Cast UL shadow ray from each landing. Stop at the horizontal midpoint, meeting Phase I.
+    let tl_seed = shadow_seed >> 1;
+    let mut xj = tr_seed_x;
+    let mut yj = tr_seed_y;
+    cast_shadow_ray_ul(screen, scr_w, factor_256, tl_seed, xj, yj);
+    while xj > x_center {
+        if xj == 0 {
+            break;
+        }
+        xj -= 1;
+        while yj > y_chrome_top && ((screen[yj * scr_w + xj] >> 24) & 0xFF) >= 0xFE {
+            if xj == 0 || yj == 0 {
+                break;
+            }
+            xj -= 1;
+            yj -= 1;
+        }
+        cast_shadow_ray_ul(screen, scr_w, factor_256, tl_seed, xj, yj);
     }
 
     let _ = scr_h;
@@ -1172,6 +1227,37 @@ fn cast_debug_ray_ul(
                 let ng = (cg + boost).min(0xFF);
                 (na << 24) | (cr << 16) | (ng << 8) | cb
             };
+        }
+        shadow_alpha = (shadow_alpha * factor_256) >> 8;
+        if shadow_alpha == 0 || x == 0 || y == 0 {
+            break;
+        }
+        x -= 1;
+        y -= 1;
+    }
+}
+
+/// Mirror of [`cast_shadow_ray`] — UL direction (-1, -1). Same alpha math; stops at zero alpha or screen origin (x == 0 || y == 0). Used by the TL ambient-occlusion pass which goes up-left from chrome's top + left boundaries.
+fn cast_shadow_ray_ul(
+    screen: &mut [u32],
+    scr_w: usize,
+    factor_256: u32,
+    shadow_seed: u32,
+    mut x: usize,
+    mut y: usize,
+) {
+    let mut shadow_alpha: u32 = shadow_seed;
+    loop {
+        let idx = y * scr_w + x;
+        let p = screen[idx];
+        let a = (p >> 24) & 0xFF;
+        if a == 0 {
+            screen[idx] = shadow_alpha << 24;
+        } else {
+            let cover = 256 - a;
+            let boost = (shadow_alpha * cover) >> 8;
+            let na = (a + boost).min(0xFF);
+            screen[idx] = (p & 0x00FFFFFF) | (na << 24);
         }
         shadow_alpha = (shadow_alpha * factor_256) >> 8;
         if shadow_alpha == 0 || x == 0 || y == 0 {
