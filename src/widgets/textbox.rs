@@ -422,7 +422,7 @@ impl Textbox {
         // Photon-matched squircle curve. Squirdleyness 3 is photon's default everywhere it draws textboxes.
         let squirdleyness = 3i32;
 
-        // Solid fill only for v0 — no stroke, no glow inside. The pill is the whole textbox right now; we'll layer stroke + text + cursor on top as we get the basics working.
+        // Topmost-first: fill first (lands cleanly into the buffer), then the SAME-size magenta stroke pill underneath. Interior fill pixels have α=255 → under() early-out → magenta invisible. AA-edge fill pixels have α=h_aa → under() composes magenta into the remaining (256−h_aa) α budget, producing an aliased magenta hairline exactly where the fill's coverage was partial.
         paint::draw_squircle_pill(
             canvas,
             &mut self.mask,
@@ -432,7 +432,17 @@ impl Textbox {
             pill_h,
             fill,
             squirdleyness,
-            false,
+        );
+        let stroke = paint::pack_argb(0xFF, 0x00, 0xFF, 0xFF);
+        paint::draw_squircle_pill(
+            canvas,
+            &mut self.mask,
+            pill_x,
+            pill_y,
+            pill_w,
+            pill_h,
+            stroke,
+            squirdleyness,
         );
     }
 

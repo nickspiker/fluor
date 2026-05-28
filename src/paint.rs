@@ -2392,9 +2392,7 @@ pub fn draw_ellipse_rotated(
 ///
 /// Photon-faithful: precompute squircle crossings once (`(inset_px, l_aa, h_aa)` per pixel-row offset into the cap), then walk pure integer indices per corner. Each crossing produces BOTH a vertical-edge AA pixel and a horizontal-edge AA pixel via the squircle's diagonal symmetry — no separate per-col walk needed. Photon's `compositing.rs` `draw_textbox` is the reference; this is the single-color silhouette adaptation (`draw_textbox_pill` keeps the two-tone hairline version photon uses for textboxes).
 ///
-/// `blend_aa_with_existing = false` (outer pass): AA pixels write `(alpha = h_aa, RGB = color)`. Conflicting writes at the diagonal pixel pick MAX h_aa.
-///
-/// `blend_aa_with_existing = true` (inner pass): AA pixels blend `color_rgb` into the current pixel's RGB by `h_aa`, keeping alpha=255 — produces the proper `fill·h + outside·(1-h)` transition when painted on top of an outer-pass stroke result.
+/// Every interior + AA-edge write composes the new pixel UNDERNEATH whatever's already in the buffer via [`Blend::under`] (`BlendMode::Normal`). Two stacked pills in the same buffer therefore behave like any other front-to-back composite: draw the topmost first (it lands cleanly into the empty buffer), then the underneath one (it fills only the remaining α budget the topmost left behind). No max-α tiebreaker, no inner/outer dual mode — one consistent kernel.
 pub fn draw_squircle_pill(
     canvas: &mut Canvas,
     mask: &mut [u8],
@@ -2404,7 +2402,6 @@ pub fn draw_squircle_pill(
     pill_h: isize,
     color: u32,
     squirdleyness: i32,
-    blend_aa_with_existing: bool,
 ) {
     let buf_w = canvas.width;
     let buf_h = canvas.height;
@@ -2451,7 +2448,6 @@ pub fn draw_squircle_pill(
             &crossings,
             color_rgb,
             solid,
-            blend_aa_with_existing,
         );
     } else {
         draw_squircle_pill_clipped(
@@ -2467,7 +2463,6 @@ pub fn draw_squircle_pill(
             &crossings,
             color_rgb,
             solid,
-            blend_aa_with_existing,
         );
     }
 
@@ -2484,7 +2479,7 @@ pub fn draw_squircle_pill(
             let row_base = fy * buf_w;
             for fx in cx_start..cx_end {
                 let idx = row_base + fx;
-                pixels[idx] = solid;
+                pixels[idx] = pixels[idx].under(solid, BlendMode::Normal);
                 mask[idx] = 255;
             }
         }
@@ -2517,7 +2512,6 @@ fn draw_squircle_pill_unclipped(
     crossings: &[(u16, u8, u8)],
     color_rgb: u32,
     solid: u32,
-    blend_aa_with_existing: bool,
 ) {
     for (i, &(inset, _l, h)) in crossings.iter().enumerate() {
         if inset as usize > i {
@@ -2543,14 +2537,7 @@ fn draw_squircle_pill_unclipped(
                 pill_x + radius - i
             };
             let row_base = v_row * buf_w;
-            write_aa(
-                pixels,
-                mask,
-                row_base + v_aa_col,
-                color_rgb,
-                h_u32,
-                blend_aa_with_existing,
-            );
+            write_aa(pixels, mask, row_base + v_aa_col, color_rgb, h_u32);
             let (fx_start, fx_end) = if flip_x {
                 (diag_col, v_aa_col)
             } else {
@@ -2558,7 +2545,7 @@ fn draw_squircle_pill_unclipped(
             };
             for fx in fx_start..fx_end {
                 let idx = row_base + fx;
-                pixels[idx] = solid;
+                pixels[idx] = pixels[idx].under(solid, BlendMode::Normal);
                 mask[idx] = 255;
             }
 
@@ -2578,14 +2565,7 @@ fn draw_squircle_pill_unclipped(
             } else {
                 pill_y + radius - i
             };
-            write_aa(
-                pixels,
-                mask,
-                h_aa_row * buf_w + h_col,
-                color_rgb,
-                h_u32,
-                blend_aa_with_existing,
-            );
+            write_aa(pixels, mask, h_aa_row * buf_w + h_col, color_rgb, h_u32);
             let (fy_start, fy_end) = if flip_y {
                 (diag_row, h_aa_row)
             } else {
@@ -2593,7 +2573,7 @@ fn draw_squircle_pill_unclipped(
             };
             for fy in fy_start..fy_end {
                 let idx = fy * buf_w + h_col;
-                pixels[idx] = solid;
+                pixels[idx] = pixels[idx].under(solid, BlendMode::Normal);
                 mask[idx] = 255;
             }
         }
@@ -2621,7 +2601,6 @@ fn draw_squircle_pill_clipped(
     crossings: &[(u16, u8, u8)],
     color_rgb: u32,
     solid: u32,
-    blend_aa_with_existing: bool,
 ) {
     let buf_w_i = buf_w as isize;
     let buf_h_i = buf_h as isize;
@@ -2655,14 +2634,7 @@ fn draw_squircle_pill_clipped(
                 let diag_col = h_col;
                 // AA pixel: inline col check (inset is nonlinear in i; can't pre-clip).
                 if v_aa_col >= 0 && v_aa_col < buf_w_i {
-                    write_aa(
-                        pixels,
-                        mask,
-                        row_base + v_aa_col as usize,
-                        color_rgb,
-                        h_u32,
-                        blend_aa_with_existing,
-                    );
+                    write_aa(pixels, mask, row_base + v_aa_col as usize, color_rgb, h_u32);
                 }
                 // Fill: range self-clips to [0, buf_w).
                 let (fx_start, fx_end) = if flip_x {
@@ -2674,7 +2646,7 @@ fn draw_squircle_pill_clipped(
                 let fe = fx_end.max(0).min(buf_w_i) as usize;
                 for fx in fs..fe {
                     let idx = row_base + fx;
-                    pixels[idx] = solid;
+                    pixels[idx] = pixels[idx].under(solid, BlendMode::Normal);
                     mask[idx] = 255;
                 }
             }
@@ -2689,14 +2661,7 @@ fn draw_squircle_pill_clipped(
                 };
                 let diag_row = v_row;
                 if h_aa_row >= 0 && h_aa_row < buf_h_i {
-                    write_aa(
-                        pixels,
-                        mask,
-                        h_aa_row as usize * buf_w + col_us,
-                        color_rgb,
-                        h_u32,
-                        blend_aa_with_existing,
-                    );
+                    write_aa(pixels, mask, h_aa_row as usize * buf_w + col_us, color_rgb, h_u32);
                 }
                 let (fy_start, fy_end) = if flip_y {
                     (diag_row, h_aa_row)
@@ -2707,7 +2672,7 @@ fn draw_squircle_pill_clipped(
                 let fe = fy_end.max(0).min(buf_h_i) as usize;
                 for fy in fs..fe {
                     let idx = fy * buf_w + col_us;
-                    pixels[idx] = solid;
+                    pixels[idx] = pixels[idx].under(solid, BlendMode::Normal);
                     mask[idx] = 255;
                 }
             }
@@ -2740,37 +2705,14 @@ pub fn squircle_crossings(radius: f32, squirdleyness: i32) -> alloc::vec::Vec<(u
     crossings
 }
 
-/// AA write at a proven-in-buffer index. Caller proves `idx < pixels.len() == mask.len()`; this function does no bounds checks. Outer pass MAX-combines alpha so the vertical-edge and horizontal-edge AA writes don't fight at the diagonal pixel — and the layer ends up storing STRAIGHT α (`α=h_aa, rgb=color_full_darkness`), which the group's `flatten_into` then premultiplies exactly once when composing onto the target. Going through `under()` here would premultiply at write time AND again at flatten, doubling the effect and brightening every AA pixel.
+/// AA write at a proven-in-buffer index. Caller proves `idx < pixels.len() == mask.len()`. Composes a partial-α pixel (`α=h_aa`, straight darkness=`color_rgb`) UNDERNEATH whatever's already in the buffer via [`Blend::under`] — same kernel as every other compositing op in fluor. The buffer is treated as the topmost-first composite (anything already painted there sits "above" this write). With `Normal` mode, an empty pixel (`0x00000000`) absorbs the new contribution fully; an already-opaque pixel takes the early-out and the new write is invisible. Mask tracks the per-pixel max α written so glow / text clip downstream still sees the full silhouette.
 #[inline]
-fn write_aa(
-    pixels: &mut [u32],
-    mask: &mut [u8],
-    idx: usize,
-    color_rgb: u32,
-    h_aa: u32,
-    blend_aa_with_existing: bool,
-) {
-    if blend_aa_with_existing {
-        let curr = pixels[idx];
-        let curr_r = (curr >> 16) & 0xFF;
-        let curr_g = (curr >> 8) & 0xFF;
-        let curr_b = curr & 0xFF;
-        let new_r = (color_rgb >> 16) & 0xFF;
-        let new_g = (color_rgb >> 8) & 0xFF;
-        let new_b = color_rgb & 0xFF;
-        let inv = 256 - h_aa;
-        let br = (curr_r * inv + new_r * h_aa) >> 8;
-        let bg = (curr_g * inv + new_g * h_aa) >> 8;
-        let bb = (curr_b * inv + new_b * h_aa) >> 8;
-        pixels[idx] = (curr & 0xFF00_0000) | (br << 16) | (bg << 8) | bb;
-        mask[idx] = 255;
-    } else {
-        let new_a = h_aa;
-        let existing_a = (pixels[idx] >> 24) & 0xFF;
-        if new_a > existing_a {
-            pixels[idx] = (new_a << 24) | color_rgb;
-            mask[idx] = h_aa as u8;
-        }
+fn write_aa(pixels: &mut [u32], mask: &mut [u8], idx: usize, color_rgb: u32, h_aa: u32) {
+    let new_pixel = (h_aa << 24) | color_rgb;
+    pixels[idx] = pixels[idx].under(new_pixel, BlendMode::Normal);
+    let m = h_aa as u8;
+    if m > mask[idx] {
+        mask[idx] = m;
     }
 }
 
