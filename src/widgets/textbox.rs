@@ -419,12 +419,10 @@ impl Textbox {
         } else {
             theme::TEXTBOX_FILL
         };
-        let stroke_color = theme::TEXTBOX_LIGHT_EDGE;
-
-        let stroke_px = (self.stroke_ru * self.font_size + 1.0) as isize;
+        // Photon-matched squircle curve. Squirdleyness 3 is photon's default everywhere it draws textboxes.
         let squirdleyness = 3i32;
 
-        // Outer pill — stroke colour, AA writes alpha=h so the layer composite blends to bg.
+        // Solid fill only for v0 — no stroke, no glow inside. The pill is the whole textbox right now; we'll layer stroke + text + cursor on top as we get the basics working.
         paint::draw_squircle_pill(
             canvas,
             &mut self.mask,
@@ -432,27 +430,10 @@ impl Textbox {
             pill_y,
             pill_w,
             pill_h,
-            stroke_color,
+            fill,
             squirdleyness,
             false,
         );
-
-        // Inner pill — fill colour, AA blends RGB with the outer-pass stroke at the inner curve.
-        let inner_w = pill_w - 2 * stroke_px;
-        let inner_h = pill_h - 2 * stroke_px;
-        if inner_w > 0 && inner_h > 0 {
-            paint::draw_squircle_pill(
-                canvas,
-                &mut self.mask,
-                pill_x + stroke_px,
-                pill_y + stroke_px,
-                inner_w,
-                inner_h,
-                fill,
-                squirdleyness,
-                true,
-            );
-        }
     }
 
     /// Paint the focus glow into a buffer using the pill silhouette captured in `self.mask` by the last [`render_content_into`](Self::render_content_into) call. The glow goes into its OWN layer so AlphaOver in the textbox_group's Stack program produces the correct `glow_color × (1 - mask) + pill × mask` blend at AA edges — saturating-adding glow into the content layer would stain the pill's AA pixels with full glow_color.

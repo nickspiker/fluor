@@ -100,20 +100,14 @@ impl PanesDemo {
         );
 
         // Placeholder textbox + groups — actual geometry computed in `init`/`on_resize`.
-        // textbox_group has two layers: content (under) + glow (on top, pre-knocked by (255-mask)).
-        // Stack (topmost-first): Push glow (topmost diffusion halo), Push content, Under(Normal).
-        // Glow's AA edge lightly tints whatever's behind via partial-t; content (the pill body + text + selection) sits under the glow.
+        // Solid-fill-only iteration: textbox_group has just the content layer in its program. We still allocate a glow layer slot so the existing rasterize loop can clear it without panicking, but we don't fold it into the composite — that avoids double premultiplication (an empty glow on top of content via under() premultiplies content once, then `flatten_into` to target premultiplies it again, brightening every AA edge). When we wire glow back in we'll choose a compose that does the math correctly.
         let mut textbox = Textbox::new(0.0, 0.0, 1.0, 1.0, 12.0);
         textbox.stroke_ru = 0.15; // a smidge of an RU so the inner/outer pills are visibly distinct
         let placeholder_region = Region::new(0.0, 0.0, 1.0, 1.0);
         let mut textbox_group = Group::new(placeholder_region, BlendMode::Normal);
         let content_layer = textbox_group.new_layer();
-        let glow_layer = textbox_group.new_layer();
-        textbox_group.set_program(vec![
-            Op::Push(glow_layer),
-            Op::Push(content_layer),
-            Op::Under(BlendMode::Normal),
-        ]);
+        let _glow_layer = textbox_group.new_layer();
+        textbox_group.set_program(vec![Op::Push(content_layer)]);
         let mut cursor_group = Group::new(placeholder_region, BlendMode::Add);
         let l = cursor_group.new_layer();
         cursor_group.set_program(vec![Op::Push(l)]);
@@ -646,13 +640,51 @@ impl FluorApp for PanesDemo {
             .rasterize_chrome(ctx.damage, ctx.text, ctx.clip_mask);
         self.chrome.rasterize_hover();
 
-        // Chord-hint overlay — visible while both brackets are held. Painted into `target` BEFORE `chrome.flatten_into` so the hint glyphs sit at the TOP of the under-blend chain; chrome layers compose UNDER them. Painting AFTER flatten_into would land the glyphs on already-opaque chrome pixels and under() would reject every write.
+        // Textbox content into the textbox_group's layer (only when dirty — typing, focus changes, and resize invalidate the group). The bbox offset translates the textbox's viewport-space center into the layer's local frame so it paints at (0, 0) relative to the layer. Glow layer is intentionally NOT painted yet — solid fill only for this iteration.
+        let textbox_dirty = self
+            .textbox_group
+            .rpn
+            .layers
+            .iter()
+            .any(|l| l.dirty);
+        if textbox_dirty {
+            let (tw, th) = self.textbox_group.dims();
+            let bbox = self.textbox.bbox();
+            {
+                let content = &mut self.textbox_group.rpn.layers[0];
+                content.pixels.fill(0);
+                let mut canvas =
+                    fluor::canvas::Canvas::new(&mut content.pixels, tw, th, ctx.damage);
+                self.textbox
+                    .render_content_into(&mut canvas, bbox.x, bbox.y, ctx.text, None, None);
+            }
+            // Glow layer stays cleared (we explicitly zero it so any prior frame's pixels don't linger). The textbox_group's Stack program still under-blends glow beneath content; with glow empty (α=0 everywhere), under() leaves content unchanged. We leave `dirty = true` on both layers so the group's composite cache busts and re-evaluates the stack from the freshly-cleared pixels — flatten_into clears the flag itself after recomputing.
+            let glow = &mut self.textbox_group.rpn.layers[1];
+            glow.pixels.fill(0);
+        }
+
+        // Cursor blinkey into the cursor_group's single layer (additive over the textbox).
+        if self.cursor_group.rpn.layers[0].dirty {
+            let (cw, ch) = self.cursor_group.dims();
+            let cbox = self.textbox.cursor_bbox();
+            let layer = &mut self.cursor_group.rpn.layers[0];
+            layer.pixels.fill(0);
+            let mut canvas =
+                fluor::canvas::Canvas::new(&mut layer.pixels, cw, ch, ctx.damage);
+            self.textbox.render_blinkey_into(&mut canvas, cbox.x, cbox.y);
+            layer.dirty = false;
+        }
+
+        // Chord-hint overlay — visible while both brackets are held. Painted into `target` BEFORE every flatten so the hint glyphs sit at the TOP of the under-blend chain; everything else composes UNDER them.
         if self.brackets_held(Instant::now()) {
             let span = ctx.viewport.effective_span();
             let mut canvas = fluor::canvas::Canvas::new(target, buf_w, buf_h, ctx.damage);
             paint::draw_chord_hint(&mut canvas, ctx.text, CHORD_HINTS, span);
         }
 
+        // Topmost-first flatten chain: cursor (additive on top of textbox), textbox (under cursor, over chrome), chrome (bottom). Each `flatten_into` composes UNDER whatever's already in target.
+        self.cursor_group.flatten_into(target, buf_w, buf_h);
+        self.textbox_group.flatten_into(target, buf_w, buf_h);
         self.chrome.flatten_into(target, buf_w, buf_h);
 
         // Debug overlay (photon-style): for every pixel, look up the hit_test_map's ID and paint its opaque random colour from `debug_hit_colours`. Fully replaces the underlying image — distinct hit zones are visually unmistakable. Drawn last over everything (including textbox + cursor) since hit testing is per-final-pixel anyway.
