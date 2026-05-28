@@ -2486,9 +2486,11 @@ pub fn draw_squircle_pill(
     }
 }
 
-/// Two-tone variant of [`draw_squircle_pill`] — full diagonal split. EVERY pixel in the pill (interior + AA edges) picks `light` vs `shadow` by an anti-diagonal half-plane test against the pill's bbox: `dy*pill_w + dx*pill_h ≤ pill_w*pill_h` → TL side = `light`, else `shadow`. The seam is the line from TR corner to BL corner of the bbox; TL corner is purely light, BR purely shadow.
+/// Two-tone variant of [`draw_squircle_pill`] — "football seam" split. EVERY pixel in the pill (interior + AA edges) picks `light` vs `shadow` by comparing its row against a piecewise seam anchored at TR and BL corners: 45° down-left from TR through the right cap (`seam_y = pill_w − 1 − dx` for `dx ≥ pill_w − 1 − pill_h/2`), flat along the centerline through the rectangular middle (`seam_y = pill_h/2`), then 45° down-left to BL through the left cap (`seam_y = pill_h − 1 − dx` for `dx ≤ pill_h − 1 − pill_h/2`). `dy ≤ seam_y` → light, else shadow. The light region encloses TL; the shadow region encloses BR. Pixel-aligned, symmetric, never slices the squircle curve at an off-angle.
 ///
-/// Why this geometry: scales with pill aspect — wide pills get a near-vertical seam (left=light, right=shadow), tall pills near-horizontal (top=light, bottom=shadow). At stroke widths of 1px the split degenerates to a 1-px per-edge color band; at wider strokes the whole ring gets the diagonal cut. No `fill` parameter — the pill is exactly two colors.
+/// For square pills (`pill_w == pill_h`) the flat middle collapses and the seam becomes the bbox anti-diagonal (TR→BL) — natural degenerate case.
+///
+/// No `fill` parameter — the pill is exactly two colors.
 ///
 /// Every pixel write composes UNDER the buffer via [`Blend::under`] (Normal) — same kernel as the single-color path.
 pub fn draw_squircle_pill_two_tone(
@@ -2526,18 +2528,23 @@ pub fn draw_squircle_pill_two_tone(
     let shadow_solid = (shadow & 0x00FF_FFFF) | 0xFF000000;
     let light_rgb = light & 0x00FF_FFFF;
     let shadow_rgb = shadow & 0x00FF_FFFF;
-    let pwh = pill_w * pill_h;
     let crossings = squircle_crossings(radius_f, squirdleyness);
     let pixels: &mut [u32] = canvas.pixels;
 
-    // Diagonal pick: TL side of anti-diagonal (passing through TR↔BL corners of bbox) → light.
-    // (dx, dy) are absolute_pos - (pill_x, pill_y). The relation `dy*pill_w + dx*pill_h ≤ pwh` is
-    // the anti-diagonal half-plane; ≤ keeps the seam pixels on the light side (arbitrary tiebreak).
+    // Football-seam pick: 45° from TR down-left into the right cap → flat across the centerline → 45° down-left to BL. dy ≤ seam_y(dx) → light, which puts TL inside the light region and BR inside the shadow region.
+    let half_h = pill_h / 2;
+    let a_left = pill_h - 1 - half_h;  // left-cap segment exits onto the flat at this dx (seam_y = half_h)
+    let a_right = pill_w - 1 - half_h; // right-cap segment enters from the flat at this dx
+    let seam_y = |dx: isize| -> isize {
+        if dx <= a_left { pill_h - 1 - dx }
+        else if dx >= a_right { pill_w - 1 - dx }
+        else { half_h }
+    };
     let pick_rgb = |dx: isize, dy: isize| -> u32 {
-        if dy * pill_w + dx * pill_h <= pwh { light_rgb } else { shadow_rgb }
+        if dy <= seam_y(dx) { light_rgb } else { shadow_rgb }
     };
     let pick_solid = |dx: isize, dy: isize| -> u32 {
-        if dy * pill_w + dx * pill_h <= pwh { light_solid } else { shadow_solid }
+        if dy <= seam_y(dx) { light_solid } else { shadow_solid }
     };
 
     for (i, &(inset, _l, h)) in crossings.iter().enumerate() {

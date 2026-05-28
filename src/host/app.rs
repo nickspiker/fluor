@@ -921,10 +921,14 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
             WindowEvent::MouseWheel { delta, .. }
                 if self.modifiers.control_key() || self.modifiers.super_key() =>
             {
-                // Ctrl/Cmd + scroll → zoom. 1 step per scroll notch (LineDelta). Trackpad PixelDelta accumulates many small events; ~30px per step matches typical trackpad density.
+                // Ctrl/Cmd + scroll → zoom. 1 step per scroll notch (LineDelta). Trackpad PixelDelta accumulates many small events; ~31 px per zoom-in step, ~32 px per zoom-out step matches typical trackpad density. The 31/32 split mirrors `adjust_zoom`'s 32/31 vs 32/33 asymmetry — in/out aren't exact inverses, so repeated in→out scrolling drifts by a small fraction per pair, giving subpixel positioning instead of clamping the user to a discrete lattice.
                 let steps: f32 = match delta {
                     MouseScrollDelta::LineDelta(_, y) => *y,
-                    MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 30.0,
+                    MouseScrollDelta::PixelDelta(p) => {
+                        let py = p.y as f32;
+                        let divisor = if py >= 0.0 { 31.0 } else { 32.0 };
+                        py / divisor
+                    }
                 };
                 if steps != 0.0 {
                     self.apply_zoom_change(Some(steps));
