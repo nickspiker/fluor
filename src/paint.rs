@@ -2486,6 +2486,165 @@ pub fn draw_squircle_pill(
     }
 }
 
+/// Two-tone variant of [`draw_squircle_pill`] — full diagonal split. EVERY pixel in the pill (interior + AA edges) picks `light` vs `shadow` by an anti-diagonal half-plane test against the pill's bbox: `dy*pill_w + dx*pill_h ≤ pill_w*pill_h` → TL side = `light`, else `shadow`. The seam is the line from TR corner to BL corner of the bbox; TL corner is purely light, BR purely shadow.
+///
+/// Why this geometry: scales with pill aspect — wide pills get a near-vertical seam (left=light, right=shadow), tall pills near-horizontal (top=light, bottom=shadow). At stroke widths of 1px the split degenerates to a 1-px per-edge color band; at wider strokes the whole ring gets the diagonal cut. No `fill` parameter — the pill is exactly two colors.
+///
+/// Every pixel write composes UNDER the buffer via [`Blend::under`] (Normal) — same kernel as the single-color path.
+pub fn draw_squircle_pill_two_tone(
+    canvas: &mut Canvas,
+    mask: &mut [u8],
+    pill_x: isize,
+    pill_y: isize,
+    pill_w: isize,
+    pill_h: isize,
+    light: u32,
+    shadow: u32,
+    squirdleyness: i32,
+) {
+    let buf_w = canvas.width;
+    let buf_h = canvas.height;
+    if pill_w <= 0 || pill_h <= 0 {
+        return;
+    }
+    let buf_w_i = buf_w as isize;
+    let buf_h_i = buf_h as isize;
+    if pill_x + pill_w <= 0 || pill_y + pill_h <= 0 || pill_x >= buf_w_i || pill_y >= buf_h_i {
+        return;
+    }
+    {
+        let dx0 = pill_x.max(0) as usize;
+        let dy0 = pill_y.max(0) as usize;
+        let dx1 = (pill_x + pill_w).min(buf_w_i).max(0) as usize;
+        let dy1 = (pill_y + pill_h).min(buf_h_i).max(0) as usize;
+        canvas.damage.add_bounds(dx0, dy0, dx1, dy1);
+    }
+
+    let radius_f = pill_h as f32 * 0.5;
+    let radius = (pill_h / 2) as isize;
+    let light_solid = (light & 0x00FF_FFFF) | 0xFF000000;
+    let shadow_solid = (shadow & 0x00FF_FFFF) | 0xFF000000;
+    let light_rgb = light & 0x00FF_FFFF;
+    let shadow_rgb = shadow & 0x00FF_FFFF;
+    let pwh = pill_w * pill_h;
+    let crossings = squircle_crossings(radius_f, squirdleyness);
+    let pixels: &mut [u32] = canvas.pixels;
+
+    // Diagonal pick: TL side of anti-diagonal (passing through TR↔BL corners of bbox) → light.
+    // (dx, dy) are absolute_pos - (pill_x, pill_y). The relation `dy*pill_w + dx*pill_h ≤ pwh` is
+    // the anti-diagonal half-plane; ≤ keeps the seam pixels on the light side (arbitrary tiebreak).
+    let pick_rgb = |dx: isize, dy: isize| -> u32 {
+        if dy * pill_w + dx * pill_h <= pwh { light_rgb } else { shadow_rgb }
+    };
+    let pick_solid = |dx: isize, dy: isize| -> u32 {
+        if dy * pill_w + dx * pill_h <= pwh { light_solid } else { shadow_solid }
+    };
+
+    for (i, &(inset, _l, h)) in crossings.iter().enumerate() {
+        if inset as usize > i {
+            break;
+        }
+        let i_iso = i as isize;
+        let inset_iso = inset as isize;
+        let h_u32 = h as u32;
+        for &(flip_x, flip_y) in &[(false, false), (true, false), (false, true), (true, true)] {
+            let v_row = if flip_y {
+                pill_y + pill_h - 1 - radius + i_iso
+            } else {
+                pill_y + radius - i_iso
+            };
+            let h_col = if flip_x {
+                pill_x + pill_w - 1 - radius + i_iso
+            } else {
+                pill_x + radius - i_iso
+            };
+
+            if v_row >= 0 && v_row < buf_h_i {
+                let row_base = v_row as usize * buf_w;
+                let v_aa_col = if flip_x {
+                    pill_x + pill_w - 1 - inset_iso
+                } else {
+                    pill_x + inset_iso
+                };
+                let diag_col = h_col;
+                if v_aa_col >= 0 && v_aa_col < buf_w_i {
+                    let dx = v_aa_col - pill_x;
+                    let dy = v_row - pill_y;
+                    write_aa(pixels, mask, row_base + v_aa_col as usize, pick_rgb(dx, dy), h_u32);
+                }
+                let (fx_start, fx_end) = if flip_x {
+                    (diag_col, v_aa_col)
+                } else {
+                    (v_aa_col + 1, diag_col + 1)
+                };
+                let fs = fx_start.max(0) as usize;
+                let fe = fx_end.max(0).min(buf_w_i) as usize;
+                let dy = v_row - pill_y;
+                for fx in fs..fe {
+                    let idx = row_base + fx;
+                    let dx = fx as isize - pill_x;
+                    pixels[idx] = pixels[idx].under(pick_solid(dx, dy), BlendMode::Normal);
+                    mask[idx] = 255;
+                }
+            }
+
+            if h_col >= 0 && h_col < buf_w_i {
+                let col_us = h_col as usize;
+                let h_aa_row = if flip_y {
+                    pill_y + pill_h - 1 - inset_iso
+                } else {
+                    pill_y + inset_iso
+                };
+                let diag_row = v_row;
+                if h_aa_row >= 0 && h_aa_row < buf_h_i {
+                    let dx = h_col - pill_x;
+                    let dy = h_aa_row - pill_y;
+                    write_aa(
+                        pixels,
+                        mask,
+                        h_aa_row as usize * buf_w + col_us,
+                        pick_rgb(dx, dy),
+                        h_u32,
+                    );
+                }
+                let (fy_start, fy_end) = if flip_y {
+                    (diag_row, h_aa_row)
+                } else {
+                    (h_aa_row + 1, diag_row + 1)
+                };
+                let fs = fy_start.max(0) as usize;
+                let fe = fy_end.max(0).min(buf_h_i) as usize;
+                let dx = h_col - pill_x;
+                for fy in fs..fe {
+                    let idx = fy * buf_w + col_us;
+                    let dy = fy as isize - pill_y;
+                    pixels[idx] = pixels[idx].under(pick_solid(dx, dy), BlendMode::Normal);
+                    mask[idx] = 255;
+                }
+            }
+        }
+    }
+
+    let center_x_start = pill_x + radius;
+    let center_x_end = pill_x + pill_w - radius;
+    if center_x_start < center_x_end {
+        let cy_start = pill_y.max(0) as usize;
+        let cy_end = (pill_y + pill_h).min(buf_h_i).max(0) as usize;
+        let cx_start = center_x_start.max(0) as usize;
+        let cx_end = center_x_end.min(buf_w_i).max(0) as usize;
+        for fy in cy_start..cy_end {
+            let row_base = fy * buf_w;
+            let dy = fy as isize - pill_y;
+            for fx in cx_start..cx_end {
+                let idx = row_base + fx;
+                let dx = fx as isize - pill_x;
+                pixels[idx] = pixels[idx].under(pick_solid(dx, dy), BlendMode::Normal);
+                mask[idx] = 255;
+            }
+        }
+    }
+}
+
 /// Fast-path squircle pill rasterizer. Bounds checks intentionally absent.
 ///
 /// **Rule 0 — WHY/PROOF/PREVENTS:**
