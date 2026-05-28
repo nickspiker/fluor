@@ -668,17 +668,57 @@ pub static DEBUG_SHOW_FPS: std::sync::atomic::AtomicBool =
 pub static DEBUG_SHOW_DAMAGE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Paint a 2-pixel magenta hairline outline around `bbox` into the canvas. Used by the host to visualize this frame's accumulated damage rect when [`DEBUG_SHOW_DAMAGE`] is on. Bbox must already be in canvas-pixel coordinates; caller is responsible for clipping to a non-empty rect. Outline goes ON TOP via under() — leaves underlying content visible inside the rect.
+/// Paint a 2-pixel magenta hairline outline around `bbox` into the canvas — debug visualization for the frame's accumulated damage rect. Writes pixels DIRECTLY (not via `under()`) because by the time this runs the underlying scratch is fully opaque from the consumer's render, and an under-blend would be rejected lane-by-lane by the opaque-top early-out. We intentionally overwrite content inside the stroke band; the rest of the bbox passes through untouched.
 pub fn draw_damage_outline(canvas: &mut Canvas, bbox: crate::canvas::PixelRect) {
-    if bbox.is_empty() {
+    const STROKE: usize = 2;
+    let w = canvas.width;
+    let h = canvas.height;
+    if bbox.is_empty() || w == 0 || h == 0 {
         return;
     }
+    let x0 = bbox.x0.min(w);
+    let y0 = bbox.y0.min(h);
+    let x1 = bbox.x1.min(w);
+    let y1 = bbox.y1.min(h);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    // α + darkness storage: pack_argb already produces darkness-encoded RGB, so a direct slot write lands as opaque magenta after the boundary's darkness → visible XOR.
     let magenta = pack_argb(255, 0, 255, 0xFF);
-    let w = bbox.width() as isize;
-    let h = bbox.height() as isize;
-    let x = bbox.x0 as isize;
-    let y = bbox.y0 as isize;
-    stroke_rect(canvas, x, y, w, h, 2, magenta, None, None);
+    let pixels = &mut canvas.pixels[..];
+
+    // Top stroke band.
+    let top_end = (y0 + STROKE).min(y1);
+    for py in y0..top_end {
+        let row = py * w;
+        for px in x0..x1 {
+            pixels[row + px] = magenta;
+        }
+    }
+    // Bottom stroke band — clamped to never overlap the top band on tiny rects.
+    let bot_start = y1.saturating_sub(STROKE).max(top_end);
+    for py in bot_start..y1 {
+        let row = py * w;
+        for px in x0..x1 {
+            pixels[row + px] = magenta;
+        }
+    }
+    // Left stroke column (interior rows only — corners are covered by top/bottom bands).
+    let left_end = (x0 + STROKE).min(x1);
+    for py in top_end..bot_start {
+        let row = py * w;
+        for px in x0..left_end {
+            pixels[row + px] = magenta;
+        }
+    }
+    // Right stroke column.
+    let right_start = x1.saturating_sub(STROKE).max(left_end);
+    for py in top_end..bot_start {
+        let row = py * w;
+        for px in right_start..x1 {
+            pixels[row + px] = magenta;
+        }
+    }
 }
 
 /// Overlay a chord-hint panel listing the consumer's debug shortcuts. Painted while the consumer's debug chord is armed so users discover bindings without consulting docs. `hints` is `(chord_label, description)` pairs. `span` is the viewport's effective span (`2wh/(w+h)`) — all sizes derive from it so the panel scales with the user's zoom.
@@ -2700,7 +2740,7 @@ pub fn squircle_crossings(radius: f32, squirdleyness: i32) -> alloc::vec::Vec<(u
     crossings
 }
 
-/// AA write at a proven-in-buffer index. Caller proves `idx < pixels.len() == mask.len()`; this function does no bounds checks. Outer pass MAX-combines alpha so the vertical-edge and horizontal-edge AA writes don't fight at the diagonal pixel. Inner pass blends RGB into the existing pixel.
+/// AA write at a proven-in-buffer index. Caller proves `idx < pixels.len() == mask.len()`; this function does no bounds checks. Outer pass MAX-combines alpha so the vertical-edge and horizontal-edge AA writes don't fight at the diagonal pixel — and the layer ends up storing STRAIGHT α (`α=h_aa, rgb=color_full_darkness`), which the group's `flatten_into` then premultiplies exactly once when composing onto the target. Going through `under()` here would premultiply at write time AND again at flatten, doubling the effect and brightening every AA pixel.
 #[inline]
 fn write_aa(
     pixels: &mut [u32],
@@ -2725,7 +2765,6 @@ fn write_aa(
         pixels[idx] = (curr & 0xFF00_0000) | (br << 16) | (bg << 8) | bb;
         mask[idx] = 255;
     } else {
-        // α + darkness: top byte is α (opacity). MORE OPAQUE write wins (higher α). h_aa is AA coverage (0..255, higher = more covered) which IS α in this convention.
         let new_a = h_aa;
         let existing_a = (pixels[idx] >> 24) & 0xFF;
         if new_a > existing_a {
