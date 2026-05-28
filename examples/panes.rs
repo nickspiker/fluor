@@ -24,6 +24,21 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::CursorIcon;
 
+/// Grace period after a `[` or `]` Release event before we consider the key actually released. X11 fires synthetic Release events for held keys when another key is pressed — without this grace, the chord disarms a millisecond before an action key fires and you'd never see one work. Long enough to absorb the synthetic release, short enough that real releases feel instant.
+const CHORD_RELEASE_GRACE: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// Debug chord bindings shown in the hint overlay while the chord is armed. Keep in sync with the action dispatch in the keyboard handler.
+const CHORD_HINTS: &[(&str, &str)] = &[
+    ("H", "Hit-mask overlay"),
+    ("P", "Skip premultiply"),
+    ("A", "Show alpha (cycle)"),
+    ("C", "Skip chrome"),
+    ("X", "Skip controls"),
+    ("R", "Force redraw"),
+    ("F", "FPS / per-stage timings strip"),
+    ("W", "Damage rect outline"),
+];
+
 struct PanesDemo {
     title: String,
     compositor: Compositor,
@@ -36,10 +51,14 @@ struct PanesDemo {
     blink: BlinkTimer,
     is_dragging_select: bool,
     selection_scroll_time: Option<Instant>,
-    /// Last D-with-mods press time. Paired with `chord_action_pending` so the D+action chord fires in either order: whichever key arrives second checks whether its partner was pressed within the grace window. X11 auto-repeat can inject spurious key releases when another key is pressed, so we never look at release events — only press timestamps.
-    chord_d_at: Option<Instant>,
-    /// Last action-key-with-mods press time (the char of the action). Mirror of `chord_d_at`: if D arrives later and finds this pending within the grace window, the chord fires for this action.
-    chord_action_pending: Option<(char, Instant)>,
+    /// Last `[` Press timestamp; refreshed by auto-repeat events too. `None` until first press.
+    chord_lb_press: Option<Instant>,
+    /// Last `[` Release timestamp. Combined with [`Self::chord_lb_press`] this determines whether `[` is currently held: held iff `press > release` OR the release was within [`CHORD_RELEASE_GRACE`].
+    chord_lb_release: Option<Instant>,
+    /// Mirror of [`Self::chord_lb_press`] for `]`.
+    chord_rb_press: Option<Instant>,
+    /// Mirror of [`Self::chord_lb_release`] for `]`.
+    chord_rb_release: Option<Instant>,
     /// Toggle for the H chord action — paints the chrome's hit_test_map as an opaque tinted overlay.
     show_hitmask: bool,
     /// 256-entry random colour table indexed by hit_test_map byte; regenerated each time H toggles on so distinct IDs get visibly-distinct colours. Photon's debug-hit pattern.
@@ -120,8 +139,10 @@ impl PanesDemo {
             blink: BlinkTimer::new(),
             is_dragging_select: false,
             selection_scroll_time: None,
-            chord_d_at: None,
-            chord_action_pending: None,
+            chord_lb_press: None,
+            chord_lb_release: None,
+            chord_rb_press: None,
+            chord_rb_release: None,
             show_hitmask: false,
             debug_hit_colours: Vec::new(),
             rect_angle: 0.0,
@@ -150,6 +171,24 @@ impl PanesDemo {
 
         let viewport_region = Region::new(0.0, 0.0, vp.width_px as Coord, vp.height_px as Coord);
         self.rotation_group.resize(viewport_region);
+    }
+
+    /// True iff both `[` and `]` are currently held. A bracket is "held" if its press timestamp is more recent than its release timestamp, OR the release was within [`CHORD_RELEASE_GRACE`] — that grace absorbs X11's habit of firing a synthetic Release for a held key the instant another key is pressed.
+    fn brackets_held(&self, now: Instant) -> bool {
+        fn key_held(
+            press: Option<Instant>,
+            release: Option<Instant>,
+            now: Instant,
+            grace: std::time::Duration,
+        ) -> bool {
+            match (press, release) {
+                (Some(p), Some(r)) => p > r || now.duration_since(r) < grace,
+                (Some(_), None) => true,
+                _ => false,
+            }
+        }
+        key_held(self.chord_lb_press, self.chord_lb_release, now, CHORD_RELEASE_GRACE)
+            && key_held(self.chord_rb_press, self.chord_rb_release, now, CHORD_RELEASE_GRACE)
     }
 }
 
@@ -278,58 +317,47 @@ impl FluorApp for PanesDemo {
                 let shift = ctx.modifiers.shift_key();
                 let ctrl = ctx.modifiers.super_key() || ctx.modifiers.control_key();
 
-                // --- Debug chord: Ctrl/Cmd + Shift + D + action_key, in either order.
-                // Timestamp-based pairing. On any chord-relevant key Press with Ctrl+Shift:
-                //   - If the partner key was pressed within CHORD_WINDOW, fire the action.
-                //   - Otherwise, record this key's timestamp and wait for the partner.
-                // We never look at Released events because X11 auto-repeat injects synthetic releases when another key is pressed even though the key is still physically held — tying chord state to "held" loses chord firings.
-                const CHORD_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+                // --- Debug chord: `[` AND `]` held simultaneously + action key. Track Press/Release per bracket and treat the bracket as currently held iff its press timestamp is more recent than its release timestamp OR the release was within [`CHORD_RELEASE_GRACE`] (absorbs X11 synthetic-release-on-other-keypress so an action key during the chord doesn't spuriously disarm). Bracket presses themselves type into focused text as normal — we don't swallow them, since the cost of using a typeable key as the chord arm is that it types. Auto-repeat is suppressed for action keys so holding F doesn't toggle the FPS strip on every repeat tick.
                 let mut action_char: Option<char> = None;
-                if kev.state == ElementState::Pressed && ctrl && shift {
-                    if let Key::Character(c) = &kev.logical_key {
-                        let cl = c.to_ascii_lowercase();
-                        let first = cl.chars().next();
-                        let is_d = cl == "d";
-                        let is_action = matches!(cl.as_str(), "h" | "p" | "a" | "c" | "x" | "r" | "q");
-                        if is_d || is_action {
-                            let now = Instant::now();
-                            if is_d {
-                                // D pressed: complete the chord if an action key was pending.
-                                if let Some((ac, at)) = self.chord_action_pending {
-                                    if now.duration_since(at) < CHORD_WINDOW {
-                                        action_char = Some(ac);
-                                    }
+                if let Key::Character(c) = &kev.logical_key {
+                    let cs = c.as_str();
+                    let now = Instant::now();
+                    match (cs, kev.state) {
+                        ("[", ElementState::Pressed) => {
+                            self.chord_lb_press = Some(now);
+                        }
+                        ("[", ElementState::Released) => {
+                            self.chord_lb_release = Some(now);
+                        }
+                        ("]", ElementState::Pressed) => {
+                            self.chord_rb_press = Some(now);
+                        }
+                        ("]", ElementState::Released) => {
+                            self.chord_rb_release = Some(now);
+                        }
+                        (_, ElementState::Pressed) if !kev.repeat => {
+                            // Only fire on the user's actual press, not on auto-repeat ticks.
+                            if self.brackets_held(now) {
+                                let cl = c.to_ascii_lowercase();
+                                if matches!(
+                                    cl.as_str(),
+                                    "h" | "p" | "a" | "c" | "x" | "r" | "f" | "w"
+                                ) {
+                                    action_char = cl.chars().next();
                                 }
-                                if action_char.is_none() {
-                                    self.chord_d_at = Some(now);
-                                    self.chord_action_pending = None;
-                                } else {
-                                    self.chord_d_at = None;
-                                    self.chord_action_pending = None;
-                                }
-                            } else {
-                                // Action key pressed: complete the chord if D was pending.
-                                if let Some(dt) = self.chord_d_at {
-                                    if now.duration_since(dt) < CHORD_WINDOW {
-                                        action_char = first;
-                                    }
-                                }
-                                if action_char.is_none() {
-                                    self.chord_action_pending = first.map(|c| (c, now));
-                                    self.chord_d_at = None;
-                                } else {
-                                    self.chord_d_at = None;
-                                    self.chord_action_pending = None;
-                                }
-                            }
-                            // Swallow the keystroke either way: this key is part of the chord interaction, not text input.
-                            if action_char.is_none() {
-                                return EventResponse::Handled;
                             }
                         }
+                        _ => {}
                     }
+                    let _ = (shift, ctrl);
+                }
+                // Request a redraw whenever bracket state changes so the hint panel appears/disappears in lockstep with the user's grip.
+                if matches!(&kev.logical_key, Key::Character(c) if c.as_str() == "[" || c.as_str() == "]")
+                {
+                    ctx.window.request_redraw();
                 }
                 if let Some(ac) = action_char {
+                    eprintln!("[panes] chord fired: [+]+{}", ac.to_ascii_uppercase());
                     {
                         let mut acted = true;
                         if ac == 'h' {
@@ -393,11 +421,17 @@ impl FluorApp for PanesDemo {
                             self.textbox_group.invalidate();
                             self.cursor_group.invalidate();
                             self.rotation_group.invalidate();
-                        } else if ac == 'q' {
+                        } else if ac == 'f' {
                             // Toggle the host's bottom-of-window diagnostic strip.
                             let cur = paint::DEBUG_SHOW_FPS
                                 .load(std::sync::atomic::Ordering::Relaxed);
                             paint::DEBUG_SHOW_FPS
+                                .store(!cur, std::sync::atomic::Ordering::Relaxed);
+                        } else if ac == 'w' {
+                            // Toggle the host's per-frame damage outline overlay (Where).
+                            let cur = paint::DEBUG_SHOW_DAMAGE
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            paint::DEBUG_SHOW_DAMAGE
                                 .store(!cur, std::sync::atomic::Ordering::Relaxed);
                         } else {
                             acted = false;
@@ -585,24 +619,19 @@ impl FluorApp for PanesDemo {
         let angle = self.rect_angle;
         let ellipse_angle = -self.rect_angle / 3.0;
         let bg_scroll = self.bg_scroll;
-        self.chrome.rasterize_bg(move |buf, w, h| {
-            // Wrap the chrome's bg layer buffer in a Canvas so the migrated rasterizers can report painted bboxes. The bg layer has its own per-layer dirty flag at the chrome widget level; this damage is discarded for now (Phase 2 of the damage rollout will plumb it up to the host's per-frame accumulator).
-            let mut bg_damage = fluor::canvas::Damage::new();
-            let mut canvas = fluor::canvas::Canvas::new(buf, w, h, &mut bg_damage);
+        self.chrome.rasterize_bg(ctx.damage, move |canvas| {
             paint::draw_rect_rotated(
-                &mut canvas, cx, cy, rect_w, rect_h, angle, rect_color, None,
+                canvas, cx, cy, rect_w, rect_h, angle, rect_color, None,
             );
             paint::draw_rect(
-                &mut canvas, static_cx, static_cy, static_w, static_h, static_color, None,
+                canvas, static_cx, static_cy, static_w, static_h, static_color, None,
             );
-            paint::draw_circle(
-                &mut canvas, circle_cx, circle_cy, circle_r, circle_color, None,
-            );
+            paint::draw_circle(canvas, circle_cx, circle_cy, circle_r, circle_color, None);
             paint::draw_ellipse(
-                &mut canvas, ellipse_cx, ellipse_cy, ellipse_rx, ellipse_ry, ellipse_color, None,
+                canvas, ellipse_cx, ellipse_cy, ellipse_rx, ellipse_ry, ellipse_color, None,
             );
             paint::draw_ellipse_rotated(
-                &mut canvas,
+                canvas,
                 rot_ellipse_cx,
                 rot_ellipse_cy,
                 rot_ellipse_rx,
@@ -611,16 +640,22 @@ impl FluorApp for PanesDemo {
                 rot_ellipse_color,
                 None,
             );
-            paint::background_noise(&mut canvas, 0, true, bg_scroll, None);
+            paint::background_noise(canvas, 0, true, bg_scroll, None);
         });
-        self.chrome.rasterize_chrome(ctx.text, ctx.clip_mask);
+        self.chrome
+            .rasterize_chrome(ctx.damage, ctx.text, ctx.clip_mask);
         self.chrome.rasterize_hover();
+
+        // Chord-hint overlay — visible while both brackets are held. Painted into `target` BEFORE `chrome.flatten_into` so the hint glyphs sit at the TOP of the under-blend chain; chrome layers compose UNDER them. Painting AFTER flatten_into would land the glyphs on already-opaque chrome pixels and under() would reject every write.
+        if self.brackets_held(Instant::now()) {
+            let span = ctx.viewport.effective_span();
+            let mut canvas = fluor::canvas::Canvas::new(target, buf_w, buf_h, ctx.damage);
+            paint::draw_chord_hint(&mut canvas, ctx.text, CHORD_HINTS, span);
+        }
+
         self.chrome.flatten_into(target, buf_w, buf_h);
 
-        // Debug overlay (photon-style): for every pixel, look up the hit_test_map's ID and paint
-        // its opaque random colour from `debug_hit_colours`. Fully replaces the underlying image —
-        // distinct hit zones are visually unmistakable. Drawn last over everything (including
-        // textbox + cursor) since hit testing is per-final-pixel anyway.
+        // Debug overlay (photon-style): for every pixel, look up the hit_test_map's ID and paint its opaque random colour from `debug_hit_colours`. Fully replaces the underlying image — distinct hit zones are visually unmistakable. Drawn last over everything (including textbox + cursor) since hit testing is per-final-pixel anyway.
         if self.show_hitmask && !self.debug_hit_colours.is_empty() {
             let map = &self.chrome.hit_test_map;
             let n = map.len().min(target.len());

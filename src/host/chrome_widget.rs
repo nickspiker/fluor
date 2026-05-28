@@ -125,8 +125,12 @@ impl DefaultChrome {
         self.group.dims()
     }
 
-    /// Paint the bg layer with consumer-supplied content. The closure receives `(pixels, width, height)` for the bg layer (full-viewport sized). No-op if the layer is clean — call [`invalidate_bg`](Self::invalidate_bg) to force a repaint (e.g., when pane content changes).
-    pub fn rasterize_bg(&mut self, paint: impl FnOnce(&mut [u32], usize, usize)) {
+    /// Paint the bg layer with consumer-supplied content. The closure receives a [`crate::canvas::Canvas`] backed by the bg layer's pixel buffer and the caller-supplied `damage` accumulator — so any rasterizer the consumer invokes reports its painted bbox into the frame-level damage automatically. No-op if the layer is clean.
+    pub fn rasterize_bg(
+        &mut self,
+        damage: &mut crate::canvas::Damage,
+        paint: impl FnOnce(&mut crate::canvas::Canvas),
+    ) {
         let (w, h) = self.dims();
         let layer = &mut self.group.rpn.layers[self.layer_bg];
         if !layer.dirty {
@@ -134,13 +138,19 @@ impl DefaultChrome {
         }
         // α + darkness: transparent init (α=0) so pixels the closure doesn't paint stay transparent rather than becoming spurious opaque content. The closure is expected to fully cover the bg, but defaulting to transparent is the safe failure mode. Zero-init is calloc-free.
         layer.pixels.fill(0);
-        paint(&mut layer.pixels, w, h);
+        let mut canvas = crate::canvas::Canvas::new(&mut layer.pixels, w, h, damage);
+        paint(&mut canvas);
     }
 
     /// **Scaffold step 1 (top of stack: AA rounded hairline only):** paint the squircle-cornered window-perimeter hairline into the chrome layer via [`chrome::draw_window_edges_and_mask`]. Chrome layer carries OPAQUE RGB only at the hairline; partial-α window-shape coverage (corner curve AA + outside-curve cutout) is written into `clip_mask` so the OS boundary can fold it into the final alpha in one pass.
     ///
-    /// `text` is used by the title text rasterization pass (Open Sans, span-relative font size, left-aligned in the area to the left of the controls strip).
-    pub fn rasterize_chrome(&mut self, text: &mut TextRenderer, clip_mask: &mut [u8]) {
+    /// `text` is used by the title text rasterization pass (Open Sans, span-relative font size, left-aligned in the area to the left of the controls strip). `damage` is the frame-level accumulator; chrome routes its migrated rasterizers (title text, status bar) through Canvas instances backed by it, so chrome's contribution to the damage rect flows to the host.
+    pub fn rasterize_chrome(
+        &mut self,
+        damage: &mut crate::canvas::Damage,
+        text: &mut TextRenderer,
+        clip_mask: &mut [u8],
+    ) {
         let (buf_w, buf_h) = self.dims();
         let vp_w = buf_w as u32;
         let vp_h = buf_h as u32;
@@ -271,14 +281,9 @@ impl DefaultChrome {
                 );
             }
             {
-                // Transitional Canvas wrapper — chrome's other rasterizers (perimeter, app icon, controls) haven't migrated yet; we construct a throwaway Canvas just for the text-bearing chrome fns. Phase 2 will plumb the chrome's per-layer damage up to the host.
-                let mut tt_damage = crate::canvas::Damage::new();
-                let mut canvas = crate::canvas::Canvas::new(
-                    chrome_buf,
-                    buf_w,
-                    buf_h,
-                    &mut tt_damage,
-                );
+                // Title-text rasterization through the frame-level damage accumulator. Other chrome rasterizers (perimeter, app icon, button glyphs) still write into `chrome_buf` directly without damage tracking — they'll migrate when the rest of the chrome surface gets the Canvas treatment.
+                let mut canvas =
+                    crate::canvas::Canvas::new(chrome_buf, buf_w, buf_h, damage);
                 chrome::draw_title_text(
                     &mut canvas,
                     &self.title,
@@ -376,9 +381,8 @@ impl DefaultChrome {
             _ => 0,
         };
         if status_band_h > 0 {
-            let mut sb_damage = crate::canvas::Damage::new();
             let mut canvas =
-                crate::canvas::Canvas::new(chrome_buf, buf_w, buf_h, &mut sb_damage);
+                crate::canvas::Canvas::new(chrome_buf, buf_w, buf_h, damage);
             chrome::draw_status_bar(
                 &mut canvas,
                 status_band_h,

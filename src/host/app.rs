@@ -108,6 +108,8 @@ pub struct Context<'a> {
     pub text: &'a mut TextRenderer,
     /// Window-shape clip mask, one byte per pixel, same dimensions as the present buffer. Default fill is `255` (fully visible — finalize_for_os multiplies by 255 ≈ no change). Consumers with a rounded window (e.g. `DefaultChrome`) carve the corner cutouts here once per resize; the boundary's [`crate::paint::finalize_for_os`] multiplies it into each pixel's α to trim the OS handoff. Decoupled from the present-buffer RGB so internal layer compositing stays opaque-or-empty and never deals with partial-α drift.
     pub clip_mask: &'a mut [u8],
+    /// Frame-level damage accumulator owned by the host. Consumers paint into Canvas instances backed by this accumulator (`Canvas::new(target, w, h, ctx.damage)`); every rasterizer reports its painted bbox into it. The host reads it after `app.render` to know exactly what changed this frame — drives the optional damage-rect outline overlay today and (eventually) damage-clipped composite + present.
+    pub damage: &'a mut crate::canvas::Damage,
     /// The host's winit window handle. Use for `set_cursor`, `set_minimized`, `set_maximized`, `request_redraw`, `drag_window`, `set_title`, `outer_position`.
     pub window: &'a Window,
     /// Latest tracked modifier state (shift / ctrl / alt / super).
@@ -235,6 +237,9 @@ struct DesktopShell<A: FluorApp> {
     /// frame counter); rendered to a bottom-of-window debug strip when [`paint::DEBUG_SHOW_FPS`]
     /// is set via the `Ctrl/Cmd + Shift + D + F` chord.
     debug_stats: crate::paint::DebugStats,
+
+    /// Frame-level damage accumulator. Reset at the top of each `render_frame`; passed to the consumer via [`Context::damage`]; read back after consumer render to drive damage-clipped composite and the [`paint::DEBUG_SHOW_DAMAGE`] outline overlay.
+    pending_damage: crate::canvas::Damage,
 }
 
 impl<A: FluorApp> DesktopShell<A> {
@@ -267,6 +272,7 @@ impl<A: FluorApp> DesktopShell<A> {
             surface_ready: false,
             is_focused: true,
             debug_stats: crate::paint::DebugStats::default(),
+            pending_damage: crate::canvas::Damage::new(),
         }
     }
 
@@ -308,10 +314,14 @@ impl<A: FluorApp> DesktopShell<A> {
             return;
         };
 
+        // Reset the frame's damage accumulator before the consumer paints. Every Canvas the consumer constructs against `ctx.damage` will union into this; after `app.render` returns we have the bounding rect of everything touched this frame.
+        self.pending_damage.clear();
+
         let mut ctx = Context {
             viewport: self.viewport,
             text,
             clip_mask: &mut self.clip_mask,
+            damage: &mut self.pending_damage,
             window: &window,
             modifiers: self.modifiers,
             cursor_x: self.cursor_x - self.window_rect.x as Coord,
@@ -328,6 +338,21 @@ impl<A: FluorApp> DesktopShell<A> {
         self.app.render(&mut self.scratch, &mut ctx);
         drop(ctx);
         app_dt = app_start.elapsed().as_secs_f32();
+
+        // Optional damage outline overlay (Ctrl+Shift+D+W). Paints a 2-px magenta hairline around the bounding rect of everything that reported damage this frame. Painted into scratch BEFORE finalize so it flows through the boundary like any other content. Outline drawing reports its own damage back into `pending_damage`, which is harmless because we've already snapshot the bbox.
+        if crate::paint::DEBUG_SHOW_DAMAGE.load(std::sync::atomic::Ordering::Relaxed) {
+            let bbox = self.pending_damage.bbox();
+            if !bbox.is_empty() {
+                let mut overlay_damage = crate::canvas::Damage::new();
+                let mut canvas = crate::canvas::Canvas::new(
+                    &mut self.scratch,
+                    win_w,
+                    win_h,
+                    &mut overlay_damage,
+                );
+                crate::paint::draw_damage_outline(&mut canvas, bbox);
+            }
+        }
 
         let scr_w = self.screen_size.0 as usize;
         let rect_x = self.window_rect.x;
@@ -586,6 +611,7 @@ impl<A: FluorApp> DesktopShell<A> {
                     viewport: self.viewport,
                     text,
                     clip_mask: &mut self.clip_mask,
+                    damage: &mut self.pending_damage,
                     window: &window,
                     modifiers: self.modifiers,
                     cursor_x: self.cursor_x - self.window_rect.x as Coord,
@@ -683,6 +709,7 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 viewport: self.viewport,
                 text,
                 clip_mask: &mut self.clip_mask,
+                damage: &mut self.pending_damage,
                 window: &window,
                 modifiers: self.modifiers,
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
@@ -716,6 +743,7 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 viewport: self.viewport,
                 text,
                 clip_mask: &mut self.clip_mask,
+                damage: &mut self.pending_damage,
                 window: &window,
                 modifiers: self.modifiers,
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
@@ -797,6 +825,7 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                                 viewport: self.viewport,
                                 text,
                                 clip_mask: &mut self.clip_mask,
+                                damage: &mut self.pending_damage,
                                 window: &window,
                                 modifiers: self.modifiers,
                                 cursor_x: self.cursor_x - new_x as Coord,
@@ -846,6 +875,7 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                         viewport: self.viewport,
                         text,
                         clip_mask: &mut self.clip_mask,
+                        damage: &mut self.pending_damage,
                         window: &window,
                         modifiers: self.modifiers,
                         cursor_x: self.cursor_x - self.window_rect.x as Coord,
@@ -966,6 +996,7 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
                 viewport: self.viewport,
                 text,
                 clip_mask: &mut self.clip_mask,
+                damage: &mut self.pending_damage,
                 window: &window,
                 modifiers: self.modifiers,
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
@@ -985,6 +1016,7 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
                 viewport: self.viewport,
                 text,
                 clip_mask: &mut self.clip_mask,
+                damage: &mut self.pending_damage,
                 window: &window,
                 modifiers: self.modifiers,
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
