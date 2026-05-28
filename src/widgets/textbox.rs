@@ -422,26 +422,35 @@ impl Textbox {
         // Photon-matched squircle curve. Squirdleyness 3 is photon's default everywhere it draws textboxes.
         let squirdleyness = 3i32;
 
-        // Topmost-first: fill first (lands cleanly into the buffer), then the SAME-size magenta stroke pill underneath. Interior fill pixels have α=255 → under() early-out → magenta invisible. AA-edge fill pixels have α=h_aa → under() composes magenta into the remaining (256−h_aa) α budget, producing an aliased magenta hairline exactly where the fill's coverage was partial.
-        paint::draw_squircle_pill(
+        // Inside-stroke convention: stroke occupies `stroke_px = stroke_ru × font_size + 1` pixels along every edge of the bbox. The "+1" is unconditional — `stroke_ru = 0` still produces a 1-px ring, larger values produce thicker rings (no max(), literal +1).
+        //
+        // Topmost-first: inner fill drawn FIRST at the inset size (lands cleanly into the buffer), then the SAME bbox-sized magenta stroke pill underneath. Interior fill pixels have α=255 → under() early-out → magenta invisible. The ring exposed by the inset, plus the fill's AA-edge pixels (α<255), let the magenta compose into the remaining α budget.
+        let stroke_px = (self.stroke_ru * self.font_size) as isize + 1;
+        let inner_x = pill_x + stroke_px;
+        let inner_y = pill_y + stroke_px;
+        let inner_w = (pill_w - 2 * stroke_px).max(0);
+        let inner_h = (pill_h - 2 * stroke_px).max(0);
+        if inner_w > 0 && inner_h > 0 {
+            paint::draw_squircle_pill(
+                canvas,
+                &mut self.mask,
+                inner_x,
+                inner_y,
+                inner_w,
+                inner_h,
+                fill,
+                squirdleyness,
+            );
+        }
+        paint::draw_squircle_pill_two_tone(
             canvas,
             &mut self.mask,
             pill_x,
             pill_y,
             pill_w,
             pill_h,
-            fill,
-            squirdleyness,
-        );
-        let stroke = paint::pack_argb(0xFF, 0x00, 0xFF, 0xFF);
-        paint::draw_squircle_pill(
-            canvas,
-            &mut self.mask,
-            pill_x,
-            pill_y,
-            pill_w,
-            pill_h,
-            stroke,
+            theme::TEXTBOX_LIGHT_EDGE,
+            theme::TEXTBOX_SHADOW_EDGE,
             squirdleyness,
         );
     }

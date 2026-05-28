@@ -102,7 +102,7 @@ impl PanesDemo {
         // Placeholder textbox + groups — actual geometry computed in `init`/`on_resize`.
         // Solid-fill-only iteration: textbox_group has just the content layer in its program. We still allocate a glow layer slot so the existing rasterize loop can clear it without panicking, but we don't fold it into the composite — that avoids double premultiplication (an empty glow on top of content via under() premultiplies content once, then `flatten_into` to target premultiplies it again, brightening every AA edge). When we wire glow back in we'll choose a compose that does the math correctly.
         let mut textbox = Textbox::new(0.0, 0.0, 1.0, 1.0, 12.0);
-        textbox.stroke_ru = 0.15; // a smidge of an RU so the inner/outer pills are visibly distinct
+        textbox.stroke_ru = 0.0; // → 1 px hairline via the unconditional +1 in render_content_into
         let placeholder_region = Region::new(0.0, 0.0, 1.0, 1.0);
         let mut textbox_group = Group::new(placeholder_region, BlendMode::Normal);
         let content_layer = textbox_group.new_layer();
