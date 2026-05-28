@@ -92,17 +92,13 @@ impl PanesDemo {
         // Decode the bundled app-icon orb (256×256 uncompressed VSF, hp+hb hashes). Bake-in via include_bytes! so the example is a single-file artefact at runtime — no on-disk asset lookup.
         let orb_bytes = include_bytes!("assets/example_orb.vsf");
         let app_icon = Icon::from_vsf_bytes(orb_bytes).ok();
-        let chrome = DefaultChrome::new(
-            viewport,
-            title.clone(),
-            app_icon,
-            Some("ready".to_string()),
-        );
+        let chrome =
+            DefaultChrome::new(viewport, title.clone(), app_icon, Some("ready".to_string()));
 
         // Placeholder textbox + groups — actual geometry computed in `init`/`on_resize`.
         // Solid-fill-only iteration: textbox_group has just the content layer in its program. We still allocate a glow layer slot so the existing rasterize loop can clear it without panicking, but we don't fold it into the composite — that avoids double premultiplication (an empty glow on top of content via under() premultiplies content once, then `flatten_into` to target premultiplies it again, brightening every AA edge). When we wire glow back in we'll choose a compose that does the math correctly.
         let mut textbox = Textbox::new(0.0, 0.0, 1.0, 1.0, 12.0);
-        textbox.stroke_ru = 0.0; // → 1 px hairline via the unconditional +1 in render_content_into
+        textbox.stroke_ru = 1. / 12.; // thin-but-non-zero so the diagonal two-tone reads as a visible band, not just a hairline
         let placeholder_region = Region::new(0.0, 0.0, 1.0, 1.0);
         let mut textbox_group = Group::new(placeholder_region, BlendMode::Normal);
         let content_layer = textbox_group.new_layer();
@@ -149,7 +145,7 @@ impl PanesDemo {
         let vp = ctx.viewport;
         // Use effective_span (= span * ru) so all derived sizes pick up the user's zoom — Ctrl+/Ctrl-/Ctrl+scroll grow/shrink the textbox + cursor + rotation regions together with chrome.
         let span = vp.effective_span();
-        let bw = (span / 32.0).ceil();
+        let bw = span / 32.0;
         // Aspect-driven horizontal shift: square window centers the textbox; wider pushes it right, taller pushes it left. Magnitude scales with span so the shift is visible but bounded.
         let aspect = vp.width_px as Coord / vp.height_px as Coord;
         let center_x = vp.width_px as Coord * 0.5 + (aspect - 1.0) * span * 0.25;
@@ -181,8 +177,17 @@ impl PanesDemo {
                 _ => false,
             }
         }
-        key_held(self.chord_lb_press, self.chord_lb_release, now, CHORD_RELEASE_GRACE)
-            && key_held(self.chord_rb_press, self.chord_rb_release, now, CHORD_RELEASE_GRACE)
+        key_held(
+            self.chord_lb_press,
+            self.chord_lb_release,
+            now,
+            CHORD_RELEASE_GRACE,
+        ) && key_held(
+            self.chord_rb_press,
+            self.chord_rb_release,
+            now,
+            CHORD_RELEASE_GRACE,
+        )
     }
 }
 
@@ -391,14 +396,14 @@ impl FluorApp for PanesDemo {
                                 .store(!cur, std::sync::atomic::Ordering::Relaxed);
                         } else if ac == 'a' {
                             // Cycle: off (0) → grayscale (1) → force-opaque (2) → off.
-                            let cur = paint::DEBUG_SHOW_ALPHA
-                                .load(std::sync::atomic::Ordering::Relaxed);
+                            let cur =
+                                paint::DEBUG_SHOW_ALPHA.load(std::sync::atomic::Ordering::Relaxed);
                             let next = (cur + 1) % 3;
                             paint::DEBUG_SHOW_ALPHA
                                 .store(next, std::sync::atomic::Ordering::Relaxed);
                         } else if ac == 'c' {
-                            let cur = paint::DEBUG_SKIP_CHROME
-                                .load(std::sync::atomic::Ordering::Relaxed);
+                            let cur =
+                                paint::DEBUG_SKIP_CHROME.load(std::sync::atomic::Ordering::Relaxed);
                             paint::DEBUG_SKIP_CHROME
                                 .store(!cur, std::sync::atomic::Ordering::Relaxed);
                             self.chrome.invalidate_chrome();
@@ -417,14 +422,13 @@ impl FluorApp for PanesDemo {
                             self.rotation_group.invalidate();
                         } else if ac == 'f' {
                             // Toggle the host's bottom-of-window diagnostic strip.
-                            let cur = paint::DEBUG_SHOW_FPS
-                                .load(std::sync::atomic::Ordering::Relaxed);
-                            paint::DEBUG_SHOW_FPS
-                                .store(!cur, std::sync::atomic::Ordering::Relaxed);
+                            let cur =
+                                paint::DEBUG_SHOW_FPS.load(std::sync::atomic::Ordering::Relaxed);
+                            paint::DEBUG_SHOW_FPS.store(!cur, std::sync::atomic::Ordering::Relaxed);
                         } else if ac == 'w' {
                             // Toggle the host's per-frame damage outline overlay (Where).
-                            let cur = paint::DEBUG_SHOW_DAMAGE
-                                .load(std::sync::atomic::Ordering::Relaxed);
+                            let cur =
+                                paint::DEBUG_SHOW_DAMAGE.load(std::sync::atomic::Ordering::Relaxed);
                             paint::DEBUG_SHOW_DAMAGE
                                 .store(!cur, std::sync::atomic::Ordering::Relaxed);
                         } else {
@@ -614,15 +618,25 @@ impl FluorApp for PanesDemo {
         let ellipse_angle = -self.rect_angle / 3.0;
         let bg_scroll = self.bg_scroll;
         self.chrome.rasterize_bg(ctx.damage, move |canvas| {
-            paint::draw_rect_rotated(
-                canvas, cx, cy, rect_w, rect_h, angle, rect_color, None,
-            );
+            paint::draw_rect_rotated(canvas, cx, cy, rect_w, rect_h, angle, rect_color, None);
             paint::draw_rect(
-                canvas, static_cx, static_cy, static_w, static_h, static_color, None,
+                canvas,
+                static_cx,
+                static_cy,
+                static_w,
+                static_h,
+                static_color,
+                None,
             );
             paint::draw_circle(canvas, circle_cx, circle_cy, circle_r, circle_color, None);
             paint::draw_ellipse(
-                canvas, ellipse_cx, ellipse_cy, ellipse_rx, ellipse_ry, ellipse_color, None,
+                canvas,
+                ellipse_cx,
+                ellipse_cy,
+                ellipse_rx,
+                ellipse_ry,
+                ellipse_color,
+                None,
             );
             paint::draw_ellipse_rotated(
                 canvas,
@@ -646,9 +660,9 @@ impl FluorApp for PanesDemo {
             let cbox = self.textbox.cursor_bbox();
             let layer = &mut self.cursor_group.rpn.layers[0];
             layer.pixels.fill(0);
-            let mut canvas =
-                fluor::canvas::Canvas::new(&mut layer.pixels, cw, ch, ctx.damage);
-            self.textbox.render_blinkey_into(&mut canvas, cbox.x, cbox.y);
+            let mut canvas = fluor::canvas::Canvas::new(&mut layer.pixels, cw, ch, ctx.damage);
+            self.textbox
+                .render_blinkey_into(&mut canvas, cbox.x, cbox.y);
             layer.dirty = false;
         }
 
