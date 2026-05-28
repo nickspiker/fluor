@@ -664,6 +664,91 @@ pub static DEBUG_SKIP_CONTROLS: std::sync::atomic::AtomicBool =
 pub static DEBUG_SHOW_FPS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Debug toggle that overlays a 2-px magenta hairline around the bounding rect of everything painted into the consumer's Canvas this frame. Bound to the `Ctrl/Cmd + Shift + D + W` chord ("Where"). Drawn into scratch by the host AFTER `app.render` but BEFORE finalize, using a throwaway damage accumulator so the outline itself doesn't grow the visualized bbox. Useful for verifying damage tracking is correct (does the bbox match what changed?) and for spotting over-invalidation. `false` by default.
+pub static DEBUG_SHOW_DAMAGE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Paint a 2-pixel magenta hairline outline around `bbox` into the canvas. Used by the host to visualize this frame's accumulated damage rect when [`DEBUG_SHOW_DAMAGE`] is on. Bbox must already be in canvas-pixel coordinates; caller is responsible for clipping to a non-empty rect. Outline goes ON TOP via under() — leaves underlying content visible inside the rect.
+pub fn draw_damage_outline(canvas: &mut Canvas, bbox: crate::canvas::PixelRect) {
+    if bbox.is_empty() {
+        return;
+    }
+    let magenta = pack_argb(255, 0, 255, 0xFF);
+    let w = bbox.width() as isize;
+    let h = bbox.height() as isize;
+    let x = bbox.x0 as isize;
+    let y = bbox.y0 as isize;
+    stroke_rect(canvas, x, y, w, h, 2, magenta, None, None);
+}
+
+/// Overlay a chord-hint panel listing the consumer's debug shortcuts. Painted while the consumer's debug chord is armed so users discover bindings without consulting docs. `hints` is `(chord_label, description)` pairs. `span` is the viewport's effective span (`2wh/(w+h)`) — all sizes derive from it so the panel scales with the user's zoom.
+///
+/// Topmost-first: text glyphs paint first; the semi-opaque panel background fills the gaps behind them.
+#[cfg(feature = "text")]
+pub fn draw_chord_hint(
+    canvas: &mut Canvas,
+    text: &mut crate::text::TextRenderer,
+    hints: &[(&str, &str)],
+    span: Coord,
+) {
+    if hints.is_empty() || canvas.width < 200 || canvas.height < 120 {
+        return;
+    }
+    // RU-coherent typography. `font_size = span × 0.014` lands at ~14 px at span ≈ 1000, ~28 px at 2000, etc. Vertical rhythm + padding follow as ratios of the font size so the panel scales as one unit.
+    let font_size = (span * 0.014).max(11.0);
+    let header_size = font_size * 1.18;
+    let line_h = font_size * 1.55;
+    let pad = font_size * 1.25;
+
+    let line_count = hints.len() as f32 + 1.5;
+    let panel_h = line_count * line_h + pad * 2.0;
+    // Width clamped against the font_size so the panel never gets narrower than a long binding line. Upper clamp keeps it from spanning the whole viewport on wide windows.
+    let panel_w = (span * 0.45).clamp(font_size * 22.0, font_size * 36.0);
+
+    let cx = canvas.width as f32 * 0.5;
+    let cy = canvas.height as f32 * 0.4;
+    let panel_y = cy - panel_h * 0.5;
+
+    let title_color = pack_argb(255, 255, 255, 0xFF);
+    let body_color = pack_argb(220, 220, 220, 0xFF);
+
+    text.draw_text_center_u32(
+        canvas,
+        "Debug chord — [ + ] then …",
+        cx,
+        panel_y + pad + header_size * 0.5,
+        header_size,
+        500,
+        title_color,
+        "Open Sans",
+        None,
+        None,
+        None,
+    );
+
+    for (i, (chord, desc)) in hints.iter().enumerate() {
+        let line_y = panel_y + pad + header_size + line_h * (i as f32 + 0.5) + font_size * 0.5;
+        let line = alloc::format!("{}  —  {}", chord, desc);
+        text.draw_text_center_u32(
+            canvas,
+            &line,
+            cx,
+            line_y,
+            font_size,
+            400,
+            body_color,
+            "Open Sans",
+            None,
+            None,
+            None,
+        );
+    }
+
+    // Panel background fills behind the glyphs (text rows already occupied; bar's under() only lands on the gaps).
+    let bg = pack_argb(0, 0, 0, 0xD8);
+    draw_rect(canvas, cx, cy, panel_w, panel_h, bg, None);
+}
+
 /// Live diagnostic counters owned by the host's render loop and read by [`draw_debug_strip`].
 /// All fields are simple POD; the host updates them every frame when [`DEBUG_SHOW_FPS`] is on
 /// and the helper renders them as a single line of text into the bottom-of-window scratch
