@@ -158,10 +158,14 @@ impl DefaultChrome {
 
         let chrome_dirty = self.group.rpn.layers[self.layer_chrome].dirty;
 
-        // Differential hover path: chrome layer is clean (perimeter, orb, title, glyphs all unchanged) but the hover state shifted. Wrap-subtract the last-baked hover colour from its hit-mask region, wrap-add the new one. ~`hit_test_map.len()` byte reads + a few muls and pixel writes; no squircle math, no glyph rasterization. Mark the chrome layer dirty so the parent Group's cached composite invalidates and `flatten_into` re-composites with the updated chrome.
+        // Differential hover path: chrome layer is clean (perimeter, orb, title, glyphs all unchanged) but the hover state shifted. Wrap-subtract the last-baked hover colour from its hit-mask region, wrap-add the new one. ~`hit_test_map.len()` byte reads + a few muls and pixel writes; no squircle math, no glyph rasterization. Only mark the chrome layer dirty when the bake actually changed pixels (at least one of the hover states has a non-`None` `hover_color_for`); transitions where both sides are colorless (HIT_TEXTBOX, HIT_APP_ICON, HIT_NONE) leave chrome_buf untouched and shouldn't propagate a fake damage signal.
         if !chrome_dirty && self.hover_dirty {
+            let bake_has_effect = hover_color_for(self.hover_state).is_some()
+                || hover_color_for(self.last_baked_hover).is_some();
             self.differential_hover_rebake();
-            self.group.rpn.layers[self.layer_chrome].dirty = true;
+            if bake_has_effect {
+                self.group.rpn.layers[self.layer_chrome].dirty = true;
+            }
             self.hover_dirty = false;
             return;
         }
@@ -488,9 +492,11 @@ impl DefaultChrome {
 
     /// Damage region this chrome contributes to the host's per-frame clip rect.
     ///
-    /// Returns `None` if no chrome state has changed since the last rasterize (host can persist the previous frame's pixels in scratch).
+    /// Returns `None` if no chrome state has changed since the last rasterize.
     ///
-    /// Returns `Some(rect)` when any layer is dirty (bg scroll, perimeter re-rasterize, hover differential). Conservative: returns the full viewport on bg/chrome dirty. For `hover_dirty`, only reports damage when at least one of `hover_state` / `last_baked_hover` maps to a non-`None` `hover_color_for` — IDs without a hover color (HIT_TEXTBOX, HIT_NONE, HIT_APP_ICON) produce no visual delta so they shouldn't dirty chrome. Per-button hover damage bbox is a follow-up (walk `hit_test_map` for the affected ID to compute its tight bbox).
+    /// Returns `Some(viewport)` when the chrome layers genuinely need a full rasterize (bg scroll, perimeter/orb/title/glyph re-rasterize triggered by focus / chord / resize).
+    ///
+    /// Returns `Some(button_bbox)` when only the hover changed — the union of bboxes for `hover_state` and `last_baked_hover` pixels in `hit_test_map`. Walks the map row-by-row to compute it. This keeps hover-only frames bbox-clipped (small finalize, no shadow) instead of dragging the whole viewport.
     pub fn damage_rect(&self) -> Option<crate::canvas::PixelRect> {
         let (w, h) = self.dims();
         let bg_dirty = self.group.rpn.layers[self.layer_bg].dirty;
@@ -498,8 +504,55 @@ impl DefaultChrome {
         let hover_has_color = self.hover_dirty
             && (hover_color_for(self.hover_state).is_some()
                 || hover_color_for(self.last_baked_hover).is_some());
-        if bg_dirty || chrome_dirty || hover_has_color {
-            Some(crate::canvas::PixelRect::new(0, 0, w, h))
+        if bg_dirty {
+            return Some(crate::canvas::PixelRect::new(0, 0, w, h));
+        }
+        if chrome_dirty || hover_has_color {
+            // Walk hit_test_map once for the union of hover_state and last_baked_hover bboxes — the only pixels the bake or unbake touches.
+            let combined = self
+                .hit_bbox(self.hover_state)
+                .map_or(self.hit_bbox(self.last_baked_hover), |a| {
+                    Some(match self.hit_bbox(self.last_baked_hover) {
+                        Some(b) => a.union(b),
+                        None => a,
+                    })
+                });
+            return combined.or_else(|| {
+                if chrome_dirty {
+                    Some(crate::canvas::PixelRect::new(0, 0, w, h))
+                } else {
+                    None
+                }
+            });
+        }
+        None
+    }
+
+    /// Compute the bounding rectangle of all `hit_test_map` cells equal to `id`. `None` if `id == HIT_NONE` or no cells match. Single pass over the map; called from `damage_rect` on hover transitions so we damage just the affected button area instead of the whole viewport.
+    fn hit_bbox(&self, id: u8) -> Option<crate::canvas::PixelRect> {
+        if id == HIT_NONE {
+            return None;
+        }
+        let (w, h) = self.dims();
+        let mut x_min = w;
+        let mut y_min = h;
+        let mut x_max = 0usize;
+        let mut y_max = 0usize;
+        let mut found = false;
+        for y in 0..h {
+            let row = y * w;
+            for x in 0..w {
+                if self.hit_test_map[row + x] == id {
+                    if x < x_min { x_min = x; }
+                    if y < y_min { y_min = y; }
+                    if x + 1 > x_max { x_max = x + 1; }
+                    if y + 1 > y_max { y_max = y + 1; }
+                    found = true;
+                }
+            }
+        }
+        if found {
+            Some(crate::canvas::PixelRect::new(x_min, y_min, x_max, y_max))
         } else {
             None
         }

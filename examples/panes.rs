@@ -583,16 +583,20 @@ impl FluorApp for PanesDemo {
         };
         union_in(self.chrome.damage_rect());
         union_in(self.textbox.damage_rect(vw, vh));
-        // cursor_group: track its own dirty-bbox in the future; conservative for now — if its layer is dirty, damage = cursor_bbox.
-        if self.cursor_group.rpn.layers[0].dirty {
-            let r = self.textbox.cursor_bbox();
-            let x0 = r.x.max(0.0).min(vw as f32) as usize;
-            let y0 = r.y.max(0.0).min(vh as f32) as usize;
-            let x1 = (r.x + r.w).max(0.0).min(vw as f32) as usize;
-            let y1 = (r.y + r.h).max(0.0).min(vh as f32) as usize;
-            union_in(Some(fluor::canvas::PixelRect::new(x0, y0, x1, y1)));
-        }
+        // Blinkey doesn't contribute scratch damage — it lives on persistent_screen via paint_screen_overlay.
         combined
+    }
+
+    fn paint_screen_overlay(
+        &mut self,
+        screen: &mut [u32],
+        scr_w: usize,
+        scr_h: usize,
+        window_origin_x: i32,
+        window_origin_y: i32,
+    ) {
+        // Blinkey is the only screen-buffer-overlay element. Hover / focus tints flow through normal damage path (bbox-clipped scratch + finalize) since they depend on the chrome composite math.
+        self.textbox.paint_blinkey_into_screen(screen, scr_w, scr_h, window_origin_x, window_origin_y);
     }
 
     fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
@@ -681,17 +685,7 @@ impl FluorApp for PanesDemo {
             .rasterize_chrome(ctx.damage, ctx.text, ctx.clip_mask);
         self.chrome.rasterize_hover();
 
-        // Cursor blinkey into the cursor_group's single layer (additive over the textbox).
-        if self.cursor_group.rpn.layers[0].dirty {
-            let (cw, ch) = self.cursor_group.dims();
-            let cbox = self.textbox.cursor_bbox();
-            let layer = &mut self.cursor_group.rpn.layers[0];
-            layer.pixels.fill(0);
-            let mut canvas = fluor::canvas::Canvas::new(&mut layer.pixels, cw, ch, ctx.damage);
-            self.textbox
-                .render_blinkey_into(&mut canvas, cbox.x, cbox.y);
-            layer.dirty = false;
-        }
+        // Blinkey is no longer rasterized into a scratch-side cursor_group. It now lives entirely on the host's persistent_screen buffer, painted post-finalize via `FluorApp::paint_screen_overlay` → `Textbox::paint_blinkey_into_screen`. Wrap-add on / wrap-sub off, ~hundreds of bytes touched per blink — no scratch fill, no flatten, no chrome re-composite.
 
         // Chord-hint overlay — visible while both brackets are held. Painted into `target` BEFORE every flatten so the hint glyphs sit at the TOP of the under-blend chain; everything else composes UNDER them.
         if self.brackets_held(Instant::now()) {
@@ -700,11 +694,10 @@ impl FluorApp for PanesDemo {
             paint::draw_chord_hint(&mut canvas, ctx.text, CHORD_HINTS, span);
         }
 
-        // Topmost-first chain. The textbox is painted DIRECTLY into target (no intermediate layer) so the squircle's per-pixel `under()` writes compose against the final under-chain accumulator — one premult, not two. Order: cursor (additive, topmost) → textbox squircle (composed underneath cursor) → chrome (under both).
+        // Topmost-first chain. The textbox is painted DIRECTLY into target (no intermediate layer) so the squircle's per-pixel `under()` writes compose against the final under-chain accumulator — one premult, not two. Order: textbox squircle (topmost) → chrome (under). Blinkey lives entirely on the host's persistent_screen post-finalize; the cursor_group flatten is gone.
         //
         // Every step is clipped to `ctx.damage_clip` so only the damaged region gets touched — outside the clip, scratch persists from the previous frame.
         let clip = pixelrect_to_clip(ctx.damage_clip);
-        self.cursor_group.flatten_into(target, buf_w, buf_h, clip);
         {
             let mut canvas = fluor::canvas::Canvas::new(target, buf_w, buf_h, ctx.damage);
             self.textbox.render_content_into(
