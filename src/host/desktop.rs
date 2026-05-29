@@ -318,7 +318,7 @@ impl DesktopApp {
                 if let Some(t) = text.as_mut() {
                     let mut tb_damage = crate::canvas::Damage::new();
                     let mut canvas = crate::canvas::Canvas::new(buf, tw, th, &mut tb_damage);
-                    tb.render_content_into(&mut canvas, bbox.x, bbox.y, t, None, None);
+                    tb.render_content_into(&mut canvas, bbox.x, bbox.y, t, None, None, None, 0);
                 }
             }
         }
@@ -352,13 +352,13 @@ impl DesktopApp {
                 *px = 0;
             }
             if let Some(g) = self.cursor_group.as_mut() {
-                g.flatten_into(&mut buffer, buf_w, buf_h);
+                g.flatten_into(&mut buffer, buf_w, buf_h, None);
             }
             if let Some(g) = self.textbox_group.as_mut() {
-                g.flatten_into(&mut buffer, buf_w, buf_h);
+                g.flatten_into(&mut buffer, buf_w, buf_h, None);
             }
             if let Some(g) = self.chrome_group.as_mut() {
-                g.flatten_into(&mut buffer, buf_w, buf_h);
+                g.flatten_into(&mut buffer, buf_w, buf_h, None);
             }
             paint::finalize_for_os(&mut buffer, &self.clip_mask);
             let _ = buffer.present();
@@ -373,13 +373,13 @@ impl DesktopApp {
                 *px = 0;
             }
             if let Some(g) = self.cursor_group.as_mut() {
-                g.flatten_into(&mut buffer, buf_w, buf_h);
+                g.flatten_into(&mut buffer, buf_w, buf_h, None);
             }
             if let Some(g) = self.textbox_group.as_mut() {
-                g.flatten_into(&mut buffer, buf_w, buf_h);
+                g.flatten_into(&mut buffer, buf_w, buf_h, None);
             }
             if let Some(g) = self.chrome_group.as_mut() {
-                g.flatten_into(&mut buffer, buf_w, buf_h);
+                g.flatten_into(&mut buffer, buf_w, buf_h, None);
             }
             paint::finalize_for_os(&mut buffer, &self.clip_mask);
             buffer.present().expect("softbuffer buffer.present");

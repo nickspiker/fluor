@@ -22,6 +22,7 @@ pub const HIT_MINIMIZE_BUTTON: u8 = 1;
 pub const HIT_MAXIMIZE_BUTTON: u8 = 2;
 pub const HIT_CLOSE_BUTTON: u8 = 3;
 pub const HIT_APP_ICON: u8 = 4;
+pub const HIT_TEXTBOX: u8 = 5;
 
 /// Orb visual state. The app sets this to give the orb a meaning beyond window-focus (network indicator, recording badge, presence light). Layered defaults: `FollowFocus` means "ring matches the perimeter, image dims when the window is unfocused" with zero app code; `Custom` lets the app dictate ring colour + brightness regardless of window state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

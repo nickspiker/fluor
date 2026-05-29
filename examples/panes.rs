@@ -9,7 +9,8 @@ use fluor::geom::Viewport;
 use fluor::group::Group;
 use fluor::host::app::{Context, EventResponse, FluorApp};
 use fluor::host::chrome::{
-    self, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE, ResizeEdge,
+    self, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE, HIT_TEXTBOX,
+    ResizeEdge,
 };
 use fluor::host::chrome_widget::DefaultChrome;
 use fluor::host::icon::Icon;
@@ -38,6 +39,11 @@ const CHORD_HINTS: &[(&str, &str)] = &[
     ("F", "FPS / per-stage timings strip"),
     ("W", "Damage rect outline"),
 ];
+
+/// Convert a host-provided damage `PixelRect` into the `Option<Clip>` shape every paint primitive accepts. `None` skips the conversion when the rect already covers the full viewport (a small optimization — `Clip::buffer(w, h)` would resolve identically but adds a struct copy per call). Today we always pass `Some(clip)` for explicit damage; the host's rect is the union the app declared in `damage_rect`.
+fn pixelrect_to_clip(rect: fluor::canvas::PixelRect) -> Option<paint::Clip> {
+    Some(paint::Clip::new(rect.x0, rect.y0, rect.x1, rect.y1))
+}
 
 struct PanesDemo {
     title: String,
@@ -226,11 +232,9 @@ impl FluorApp for PanesDemo {
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
                 }
-                let chrome_changed = {
-                    let new_hit = self.chrome.hit_at(ctx.cursor_x, ctx.cursor_y);
-                    self.chrome.set_hover(new_hit)
-                };
-                let new_textbox_hover = self.textbox.contains(ctx.cursor_x, ctx.cursor_y);
+                let new_hit = self.chrome.hit_at(ctx.cursor_x, ctx.cursor_y);
+                let chrome_changed = self.chrome.set_hover(new_hit);
+                let new_textbox_hover = new_hit == HIT_TEXTBOX;
                 let textbox_changed = self.textbox.hovered != new_textbox_hover;
                 if textbox_changed {
                     self.textbox.hovered = new_textbox_hover;
@@ -568,6 +572,29 @@ impl FluorApp for PanesDemo {
         }
     }
 
+    fn damage_rect(&self, viewport: fluor::geom::Viewport) -> Option<fluor::canvas::PixelRect> {
+        let vw = viewport.width_px as usize;
+        let vh = viewport.height_px as usize;
+        let mut combined: Option<fluor::canvas::PixelRect> = None;
+        let mut union_in = |r: Option<fluor::canvas::PixelRect>| {
+            if let Some(r) = r {
+                combined = Some(combined.map_or(r, |c| c.union(r)));
+            }
+        };
+        union_in(self.chrome.damage_rect());
+        union_in(self.textbox.damage_rect(vw, vh));
+        // cursor_group: track its own dirty-bbox in the future; conservative for now — if its layer is dirty, damage = cursor_bbox.
+        if self.cursor_group.rpn.layers[0].dirty {
+            let r = self.textbox.cursor_bbox();
+            let x0 = r.x.max(0.0).min(vw as f32) as usize;
+            let y0 = r.y.max(0.0).min(vh as f32) as usize;
+            let x1 = (r.x + r.w).max(0.0).min(vw as f32) as usize;
+            let y1 = (r.y + r.h).max(0.0).min(vh as f32) as usize;
+            union_in(Some(fluor::canvas::PixelRect::new(x0, y0, x1, y1)));
+        }
+        combined
+    }
+
     fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
         let buf_w = ctx.viewport.width_px as usize;
         let buf_h = ctx.viewport.height_px as usize;
@@ -674,13 +701,25 @@ impl FluorApp for PanesDemo {
         }
 
         // Topmost-first chain. The textbox is painted DIRECTLY into target (no intermediate layer) so the squircle's per-pixel `under()` writes compose against the final under-chain accumulator — one premult, not two. Order: cursor (additive, topmost) → textbox squircle (composed underneath cursor) → chrome (under both).
-        self.cursor_group.flatten_into(target, buf_w, buf_h);
+        //
+        // Every step is clipped to `ctx.damage_clip` so only the damaged region gets touched — outside the clip, scratch persists from the previous frame.
+        let clip = pixelrect_to_clip(ctx.damage_clip);
+        self.cursor_group.flatten_into(target, buf_w, buf_h, clip);
         {
             let mut canvas = fluor::canvas::Canvas::new(target, buf_w, buf_h, ctx.damage);
-            self.textbox
-                .render_content_into(&mut canvas, 0.0, 0.0, ctx.text, None, None);
+            self.textbox.render_content_into(
+                &mut canvas,
+                0.0,
+                0.0,
+                ctx.text,
+                clip,
+                None,
+                Some(&mut self.chrome.hit_test_map),
+                HIT_TEXTBOX,
+            );
         }
-        self.chrome.flatten_into(target, buf_w, buf_h);
+        // Textbox tint is now baked into its own cache by `render_content_into` (Photon-style differential) — no per-frame walk over `hit_test_map` needed here.
+        self.chrome.flatten_into(target, buf_w, buf_h, clip);
 
         // Debug overlay (photon-style): for every pixel, look up the hit_test_map's ID and paint its opaque random colour from `debug_hit_colours`. Fully replaces the underlying image — distinct hit zones are visually unmistakable. Drawn last over everything (including textbox + cursor) since hit testing is per-final-pixel anyway.
         if self.show_hitmask && !self.debug_hit_colours.is_empty() {
@@ -706,7 +745,7 @@ impl FluorApp for PanesDemo {
             ResizeEdge::TopLeft | ResizeEdge::BottomRight => CursorIcon::NwseResize,
             ResizeEdge::TopRight | ResizeEdge::BottomLeft => CursorIcon::NeswResize,
             ResizeEdge::None => {
-                if self.textbox.contains(x, y) {
+                if hit == HIT_TEXTBOX {
                     CursorIcon::Text
                 } else {
                     CursorIcon::Default

@@ -136,6 +136,7 @@ impl DefaultChrome {
         if !layer.dirty {
             return;
         }
+        crate::paint::RASTERIZE_OPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // α + darkness: transparent init (α=0) so pixels the closure doesn't paint stay transparent rather than becoming spurious opaque content. The closure is expected to fully cover the bg, but defaulting to transparent is the safe failure mode. Zero-init is calloc-free.
         layer.pixels.fill(0);
         let mut canvas = crate::canvas::Canvas::new(&mut layer.pixels, w, h, damage);
@@ -168,6 +169,7 @@ impl DefaultChrome {
         if !chrome_dirty {
             return;
         }
+        crate::paint::RASTERIZE_OPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
         // Reset clip_mask to 255 (fully visible) BEFORE re-carving. The corner cutout is a side effect of `chrome::draw_window_edges_and_mask`, so it MUST run on the same dirty-cycle that resets the mask — otherwise the old (larger or smaller) carving persists. Done here (inside the dirty check) rather than in the host's render_frame, because a per-frame reset there would wipe the carving on frames where chrome is clean and never re-carve, producing rectangular windows whenever the cursor is idle for a tick.
         clip_mask.fill(255);
@@ -458,8 +460,16 @@ impl DefaultChrome {
     pub fn rasterize_hover(&mut self) {}
 
     /// Composite the chrome group (bg + chrome layers via internal Stack `Push chrome, Push bg, Under(Normal)`) and flatten under the present buffer. Front-to-back: chrome's composited result is blended `under` whatever's already in target, so chrome wins where opaque and bg shows through where chrome is transparent.
-    pub fn flatten_into(&mut self, target: &mut [u32], target_w: usize, target_h: usize) {
-        self.group.flatten_into(target, target_w, target_h);
+    ///
+    /// `clip`: optional damage-clip in target pixel coords; passed straight through to [`Group::flatten_into`]. `None` = full target (current behavior).
+    pub fn flatten_into(
+        &mut self,
+        target: &mut [u32],
+        target_w: usize,
+        target_h: usize,
+        clip: Option<crate::paint::Clip>,
+    ) {
+        self.group.flatten_into(target, target_w, target_h, clip);
     }
 
     /// Hit query at `(x, y)` in viewport pixel coordinates. Returns the chrome button id (HIT_NONE / HIT_MINIMIZE_BUTTON / HIT_MAXIMIZE_BUTTON / HIT_CLOSE_BUTTON). `(x, y)` outside the viewport returns HIT_NONE.
@@ -473,6 +483,25 @@ impl DefaultChrome {
             self.hit_test_map[(my as usize) * w + (mx as usize)]
         } else {
             HIT_NONE
+        }
+    }
+
+    /// Damage region this chrome contributes to the host's per-frame clip rect.
+    ///
+    /// Returns `None` if no chrome state has changed since the last rasterize (host can persist the previous frame's pixels in scratch).
+    ///
+    /// Returns `Some(rect)` when any layer is dirty (bg scroll, perimeter re-rasterize, hover differential). Conservative: returns the full viewport on bg/chrome dirty. For `hover_dirty`, only reports damage when at least one of `hover_state` / `last_baked_hover` maps to a non-`None` `hover_color_for` — IDs without a hover color (HIT_TEXTBOX, HIT_NONE, HIT_APP_ICON) produce no visual delta so they shouldn't dirty chrome. Per-button hover damage bbox is a follow-up (walk `hit_test_map` for the affected ID to compute its tight bbox).
+    pub fn damage_rect(&self) -> Option<crate::canvas::PixelRect> {
+        let (w, h) = self.dims();
+        let bg_dirty = self.group.rpn.layers[self.layer_bg].dirty;
+        let chrome_dirty = self.group.rpn.layers[self.layer_chrome].dirty;
+        let hover_has_color = self.hover_dirty
+            && (hover_color_for(self.hover_state).is_some()
+                || hover_color_for(self.last_baked_hover).is_some());
+        if bg_dirty || chrome_dirty || hover_has_color {
+            Some(crate::canvas::PixelRect::new(0, 0, w, h))
+        } else {
+            None
         }
     }
 
@@ -601,7 +630,7 @@ mod tests {
         let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "", None, None);
         // Run a flatten cycle so StackCompositor::evaluate clears all initial-dirty flags.
         let mut target = alloc::vec![0u32; 100 * 100];
-        chrome.flatten_into(&mut target, 100, 100);
+        chrome.flatten_into(&mut target, 100, 100, None);
         assert!(!chrome.group.rpn.layers[chrome.layer_chrome].dirty);
         assert!(!chrome.hover_dirty);
         chrome.set_hover(chrome::HIT_CLOSE_BUTTON);
@@ -614,7 +643,7 @@ mod tests {
     fn resize_marks_layers_dirty_and_resizes_hit_map() {
         let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "", None, None);
         let mut target = alloc::vec![0u32; 100 * 100];
-        chrome.flatten_into(&mut target, 100, 100);
+        chrome.flatten_into(&mut target, 100, 100, None);
         chrome.resize(Viewport::new(200, 150));
         assert_eq!(chrome.dims(), (200, 150));
         assert_eq!(chrome.hit_test_map.len(), 200 * 150);
