@@ -135,10 +135,16 @@ impl Group {
 
     /// Flatten the internal Stack onto `target` at `region.x, region.y` using `self.blend`. Always blits — the host's present buffer may be double-buffered, and downstream groups composited above this one may have overwritten our pixels last frame. The internal `StackCompositor::evaluate` cheaply returns a cached composite when no layer is dirty, so the per-frame cost when nothing changed is just the blit (one pass over the bbox area, not over the viewport).
     ///
-    /// Per-pixel transparent shortcut (`pixel >= 0xFF000000`) inside each blend kernel skips contribution-less pixels for free — no sub-region damage tracking needed at this layer.
+    /// `clip`: optional damage-clip in target pixel coords; rows/cols outside the clip are skipped entirely (no flatten work). `None` = full target bounds (current behavior). The clip is intersected with the target buffer bounds and with the group's region, so an external clip narrowed to a small damage rect causes only that sub-rectangle of the group to land on target.
     ///
-    /// Pixels that would land outside the target's bounds are clipped row-by-row before the per-row blend kernel runs; the blend kernel itself sees only in-bounds slices.
-    pub fn flatten_into(&mut self, target: &mut [u32], target_w: usize, target_h: usize) {
+    /// Per-pixel transparent shortcut (`pixel >= 0xFF000000`) inside each blend kernel skips contribution-less pixels for free — no sub-region damage tracking needed at this layer.
+    pub fn flatten_into(
+        &mut self,
+        target: &mut [u32],
+        target_w: usize,
+        target_h: usize,
+        clip: Option<paint::Clip>,
+    ) {
         let composite = self.rpn.evaluate();
         if composite.is_empty() {
             return;
@@ -148,21 +154,33 @@ impl Group {
         let gx = self.region.x as isize;
         let gy = self.region.y as isize;
 
+        // Resolve external clip; intersect with target bounds. `None` → full target buffer.
+        let clip_rect = paint::Clip::resolve(clip, target_w, target_h);
+
         for row in 0..gh {
             let ty = gy + row as isize;
             if ty < 0 || (ty as usize) >= target_h {
                 continue;
             }
-            let src_row_start = row * gw;
-            let dst_row_start = (ty as usize) * target_w;
-
-            // Horizontal clip: intersect [gx, gx+gw) with [0, target_w).
-            let dst_x_start = gx.max(0) as usize;
-            let dst_x_end_isize = (gx + gw as isize).min(target_w as isize);
-            if dst_x_end_isize <= dst_x_start as isize {
+            let ty_us = ty as usize;
+            if ty_us < clip_rect.y_start || ty_us >= clip_rect.y_end {
                 continue;
             }
-            let dst_x_end = dst_x_end_isize as usize;
+            let src_row_start = row * gw;
+            let dst_row_start = ty_us * target_w;
+
+            // Horizontal clip: intersect [gx, gx+gw) with [0, target_w) with clip [x_start, x_end).
+            let raw_start = gx.max(0) as usize;
+            let raw_end_isize = (gx + gw as isize).min(target_w as isize);
+            if raw_end_isize <= raw_start as isize {
+                continue;
+            }
+            let raw_end = raw_end_isize as usize;
+            let dst_x_start = raw_start.max(clip_rect.x_start);
+            let dst_x_end = raw_end.min(clip_rect.x_end);
+            if dst_x_end <= dst_x_start {
+                continue;
+            }
             let src_clip_left = (dst_x_start as isize - gx) as usize;
             let count = dst_x_end - dst_x_start;
 
@@ -214,7 +232,7 @@ mod tests {
         g.set_program(alloc::vec![Op::Push(l)]);
 
         let mut target = alloc::vec![TRANSPARENT; 4 * 4];
-        g.flatten_into(&mut target, 4, 4);
+        g.flatten_into(&mut target, 4, 4, None);
 
         // Opaque red is stored darkness (α=0xFF, R_dark=0, G_dark=0xFF, B_dark=0xFF). Under empty top: new α=0xFF, R_dark stays near 0 (visible red ≈ 0xFF), G/B_dark near 0xFE.
         for &(x, y) in &[(1, 1), (2, 1), (1, 2), (2, 2)] {
@@ -238,7 +256,7 @@ mod tests {
         g.set_program(alloc::vec![Op::Push(l)]);
 
         let mut target = alloc::vec![TRANSPARENT; 4 * 4];
-        g.flatten_into(&mut target, 4, 4);
+        g.flatten_into(&mut target, 4, 4, None);
 
         // Group's (1, 1) lands at target (0, 0); its (3, 3) lands at target (2, 2). target (3, 3) untouched.
         // Opaque green: α=0xFF, dark=(0xFF, 0, 0xFF). After under from empty: G-darkness near 0 (visible G ≈ 0xFF).
@@ -262,14 +280,14 @@ mod tests {
         g.set_program(alloc::vec![Op::Push(l)]);
 
         let mut target = alloc::vec![TRANSPARENT; 4];
-        g.flatten_into(&mut target, 2, 2);
+        g.flatten_into(&mut target, 2, 2, None);
         let first = target[0];
         assert_eq!(first >> 24, 0xFF, "first blit should make pixel opaque (α=0xFF)");
 
         // Simulate a back-buffer swap: target is now TRANSPARENT again (the OTHER frame buffer).
         target.fill(TRANSPARENT);
         // Flatten must still write our content even though no layer is dirty.
-        g.flatten_into(&mut target, 2, 2);
+        g.flatten_into(&mut target, 2, 2, None);
         let second = target[0];
         assert_eq!(
             second >> 24,

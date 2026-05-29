@@ -110,6 +110,8 @@ pub struct Context<'a> {
     pub clip_mask: &'a mut [u8],
     /// Frame-level damage accumulator owned by the host. Consumers paint into Canvas instances backed by this accumulator (`Canvas::new(target, w, h, ctx.damage)`); every rasterizer reports its painted bbox into it. The host reads it after `app.render` to know exactly what changed this frame — drives the optional damage-rect outline overlay today and (eventually) damage-clipped composite + present.
     pub damage: &'a mut crate::canvas::Damage,
+    /// The damage clip the host computed for THIS frame, derived from `app.damage_rect(...)` before render. Consumers should thread this through every flatten / blit / glow call as the `clip` parameter so they only touch pixels inside the dirty region. Defaults to the full viewport (legacy apps that don't override `FluorApp::damage_rect` get the current full-redraw behavior).
+    pub damage_clip: crate::canvas::PixelRect,
     /// The host's winit window handle. Use for `set_cursor`, `set_minimized`, `set_maximized`, `request_redraw`, `drag_window`, `set_title`, `outer_position`.
     pub window: &'a Window,
     /// Latest tracked modifier state (shift / ctrl / alt / super).
@@ -150,7 +152,18 @@ pub trait FluorApp {
     /// Window event from winit. Consumer returns an [`EventResponse`] telling the host what to do next.
     fn on_event(&mut self, event: &WindowEvent, ctx: &mut Context) -> EventResponse;
 
-    /// Per-frame paint into the host's CPU present buffer. Flatten owned Groups onto `target`.
+    /// Damage region this app will repaint this frame. Returns `None` if no widget state changed since the last frame — host can persist scratch as-is and skip render entirely. Returns `Some(rect)` to declare the union of all dirty widget bboxes (each widget's `prev ∪ current` from `widget.damage_rect(...)`); host clears scratch in that rect and threads it through `ctx.damage_clip` so the consumer's render call clips every flatten / blit to it.
+    ///
+    /// Default impl returns `Some(full viewport)` — safe fallback that preserves today's full-redraw behavior. Apps opt into differential rendering by overriding this to union their widget damage rects.
+    ///
+    /// Takes `Viewport` directly (not `Context`) so the host can call it without holding the text-renderer borrow that `Context` carries.
+    fn damage_rect(&self, viewport: Viewport) -> Option<crate::canvas::PixelRect> {
+        let w = viewport.width_px as usize;
+        let h = viewport.height_px as usize;
+        Some(crate::canvas::PixelRect::new(0, 0, w, h))
+    }
+
+    /// Per-frame paint into the host's CPU present buffer. Flatten owned Groups onto `target`. The damage clip computed pre-render is in `ctx.damage_clip`; thread it through every flatten / blit / glow call to skip pixels outside the dirty region.
     fn render(&mut self, target: &mut [u32], ctx: &mut Context);
 
     /// Cursor icon at `(x, y)` in viewport pixel coords. Called whenever the cursor moves.
@@ -182,6 +195,25 @@ struct WindowRect {
     y: i32,
     w: u32,
     h: u32,
+}
+
+/// Damage-clipped fill(0) — wipes only the `rect` sub-region of `scratch` (viewport-flat slice, row-major width `win_w`). Replaces a full-buffer `fill(0)` so pixels outside the damage rect persist between frames. Each row inside the rect uses the SIMD-friendly slice `fill(0)` so the per-row cost is the same as the full-buffer call, just over fewer rows.
+fn clear_scratch_rect(scratch: &mut [u32], win_w: usize, rect: crate::canvas::PixelRect) {
+    if rect.is_empty() {
+        return;
+    }
+    let win_h = scratch.len() / win_w.max(1);
+    let y0 = rect.y0.min(win_h);
+    let y1 = rect.y1.min(win_h);
+    let x0 = rect.x0.min(win_w);
+    let x1 = rect.x1.min(win_w);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    for y in y0..y1 {
+        let row_base = y * win_w;
+        scratch[row_base + x0..row_base + x1].fill(0);
+    }
 }
 
 /// The host's adapter — owns platform handles + the consumer's `App`, dispatches events through the trait. Not user-facing; constructed by [`run_app`].
@@ -240,6 +272,8 @@ struct DesktopShell<A: FluorApp> {
 
     /// Frame-level damage accumulator. Reset at the top of each `render_frame`; passed to the consumer via [`Context::damage`]; read back after consumer render to drive damage-clipped composite and the [`paint::DEBUG_SHOW_DAMAGE`] outline overlay.
     pending_damage: crate::canvas::Damage,
+    /// Damage rect that was cleared + repainted in the PREVIOUS frame. Unioned into THIS frame's clear region so any host-side overlay (FPS strip, damage outline) painted in the prior frame gets wiped even when this frame's app-side damage shrinks. Without this, a shrinking damage rect leaves stale outline / strip pixels outside the new clip.
+    prev_damage_clip: crate::canvas::PixelRect,
 }
 
 impl<A: FluorApp> DesktopShell<A> {
@@ -273,6 +307,7 @@ impl<A: FluorApp> DesktopShell<A> {
             is_focused: true,
             debug_stats: crate::paint::DebugStats::default(),
             pending_damage: crate::canvas::Damage::new(),
+            prev_damage_clip: crate::canvas::PixelRect::empty(),
         }
     }
 
@@ -294,10 +329,29 @@ impl<A: FluorApp> DesktopShell<A> {
             self.clip_mask = vec![255u8; win_px];
         }
 
-        // Clear scratch first, then paint the debug strip on top (topmost-first: strip pixels occupy the bottom rows so the app's under() writes in those rows are rejected, keeping the strip visible above app content). Uses the previous frame's smoothed FPS — this frame's time isn't known until after render+finalize+shadow below.
-        self.scratch.fill(0);
+        // Reset the frame's damage accumulator before the consumer paints. Every Canvas the consumer constructs against `ctx.damage` will union into this; after `app.render` returns we have the bounding rect of everything touched this frame.
+        self.pending_damage.clear();
+
+        // Pre-render damage query. App returns the union of its dirty widget bboxes; `None` would mean nothing changed (skip-render path; not yet implemented — treat as conservative full-viewport for now). FPS strip bbox is unioned in when active so the strip's stats refresh each frame.
+        let viewport_rect = crate::canvas::PixelRect::new(0, 0, win_w, win_h);
+        let mut damage_clip = self.app.damage_rect(self.viewport).unwrap_or(viewport_rect);
         #[cfg(feature = "text")]
-        if crate::paint::DEBUG_SHOW_FPS.load(std::sync::atomic::Ordering::Relaxed) {
+        let strip_active = crate::paint::DEBUG_SHOW_FPS.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "text"))]
+        let strip_active = false;
+        if strip_active {
+            let strip_y_start = (win_h * 11) / 12;
+            let strip_rect = crate::canvas::PixelRect::new(0, strip_y_start, win_w, win_h);
+            damage_clip = damage_clip.union(strip_rect);
+        }
+
+        // Clear region AND app render clip = current damage ∪ previous frame's damage. The previous-frame union ensures shrinking damage doesn't leave stale outline / strip pixels outside the new clip — both the clear and the app repaint cover the union so any pixels cleared get refilled with current content. Slight over-repaint when damage shrinks, but always correct (no transparent gaps).
+        damage_clip = damage_clip.union(self.prev_damage_clip);
+        clear_scratch_rect(&mut self.scratch, win_w, damage_clip);
+
+        // Paint the FPS strip first (topmost-first inside `damage_clip`). Uses the previous frame's stats — this frame's time isn't known until after render+finalize+shadow below.
+        #[cfg(feature = "text")]
+        if strip_active {
             if let Some(text) = self.text.as_mut() {
                 let mut strip_damage = crate::canvas::Damage::new();
                 let mut canvas = crate::canvas::Canvas::new(
@@ -314,9 +368,6 @@ impl<A: FluorApp> DesktopShell<A> {
             return;
         };
 
-        // Reset the frame's damage accumulator before the consumer paints. Every Canvas the consumer constructs against `ctx.damage` will union into this; after `app.render` returns we have the bounding rect of everything touched this frame.
-        self.pending_damage.clear();
-
         let mut ctx = Context {
             viewport: self.viewport,
             text,
@@ -326,6 +377,7 @@ impl<A: FluorApp> DesktopShell<A> {
             modifiers: self.modifiers,
             cursor_x: self.cursor_x - self.window_rect.x as Coord,
             cursor_y: self.cursor_y - self.window_rect.y as Coord,
+            damage_clip,
         };
 
         // Per-stage stopwatches. Each Instant brackets one pipeline stage; the strip displays each as FPS so toggling SIMD/Rayon shows which stage actually moves. `buffer.present()` is excluded everywhere because it blocks for vsync, which would pin every reading to the display refresh rate.
@@ -338,6 +390,9 @@ impl<A: FluorApp> DesktopShell<A> {
         self.app.render(&mut self.scratch, &mut ctx);
         drop(ctx);
         app_dt = app_start.elapsed().as_secs_f32();
+
+        // Save this frame's clip as next frame's prev — host-side overlays (damage outline, FPS strip) painted within this clip need to be cleared next frame even if the app's damage shrinks.
+        self.prev_damage_clip = damage_clip;
 
         // Optional damage outline overlay (Ctrl+Shift+D+W). Paints a 2-px magenta hairline around the bounding rect of everything that reported damage this frame. Painted into scratch BEFORE finalize so it flows through the boundary like any other content. Outline drawing reports its own damage back into `pending_damage`, which is harmless because we've already snapshot the bbox.
         if crate::paint::DEBUG_SHOW_DAMAGE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -448,7 +503,15 @@ impl<A: FluorApp> DesktopShell<A> {
         // Record what we just painted so the next drag-tick can compute its delta.
         self.last_painted_rect = self.window_rect;
 
-        self.debug_stats.record_frame(app_dt, fill_dt, finalize_dt, shadow_dt);
+        // Differential stats: F (frame) bumps every present; R (rasterize) only when a primitive actually did geometric paint work this frame (via the RASTERIZE_OPS atomic). On hover-only updates the atomic stays at 0 and R sticks. `damage_pct` reflects how much of the viewport this frame actually touched — drops to a small fraction on bbox-only updates.
+        let ras_ops = crate::paint::RASTERIZE_OPS.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let viewport_area = (win_w * win_h) as f32;
+        let damage_area = (damage_clip.width() * damage_clip.height()) as f32;
+        let damage_pct = if viewport_area > 0.0 { damage_area / viewport_area } else { 0.0 };
+        if ras_ops > 0 {
+            self.debug_stats.record_rasterize(app_dt, fill_dt, finalize_dt, shadow_dt, damage_pct);
+        }
+        self.debug_stats.record_present(damage_pct);
     }
 
     /// Drag-tick fast path: shift the screen buffer in place by the delta since the last paint, push the input region update, and present. Skips consumer render, scratch fill, finalize, and shadow rasterization entirely — the existing chrome pixels just slide through the screen buffer, with anything that falls off any edge wrapping to the opposite side. On drag release, a normal `render_frame` overwrites the wrap artefacts in one clean frame.
@@ -616,6 +679,7 @@ impl<A: FluorApp> DesktopShell<A> {
                     modifiers: self.modifiers,
                     cursor_x: self.cursor_x - self.window_rect.x as Coord,
                     cursor_y: self.cursor_y - self.window_rect.y as Coord,
+                    damage_clip: crate::canvas::PixelRect::new(0, 0, self.viewport.width_px as usize, self.viewport.height_px as usize),
                 };
                 self.app.on_resize(new_w, new_h, &mut ctx);
             }
@@ -714,6 +778,7 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 modifiers: self.modifiers,
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
                 cursor_y: self.cursor_y - self.window_rect.y as Coord,
+                damage_clip: crate::canvas::PixelRect::new(0, 0, self.viewport.width_px as usize, self.viewport.height_px as usize),
             };
             self.app.init(&mut ctx);
         }
@@ -748,6 +813,7 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 modifiers: self.modifiers,
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
                 cursor_y: self.cursor_y - self.window_rect.y as Coord,
+                damage_clip: crate::canvas::PixelRect::new(0, 0, self.viewport.width_px as usize, self.viewport.height_px as usize),
             };
             self.app.tick(&mut ctx)
         } else {
@@ -830,6 +896,7 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                                 modifiers: self.modifiers,
                                 cursor_x: self.cursor_x - new_x as Coord,
                                 cursor_y: self.cursor_y - new_y as Coord,
+                                damage_clip: crate::canvas::PixelRect::new(0, 0, self.viewport.width_px as usize, self.viewport.height_px as usize),
                             };
                             self.app.on_resize(new_w, new_h, &mut ctx);
                         }
@@ -880,6 +947,7 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                         modifiers: self.modifiers,
                         cursor_x: self.cursor_x - self.window_rect.x as Coord,
                         cursor_y: self.cursor_y - self.window_rect.y as Coord,
+                        damage_clip: crate::canvas::PixelRect::new(0, 0, self.viewport.width_px as usize, self.viewport.height_px as usize),
                     };
                     let response = self.app.on_event(&event, &mut ctx);
                     // Cursor coords must be window-relative — same translation as Context's cursor_x/y — so the consumer's hit_at sees the chrome at origin (0,0). Raw screen-space coords would miss every button when the window_rect isn't at (0,0).
@@ -1005,6 +1073,7 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
                 modifiers: self.modifiers,
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
                 cursor_y: self.cursor_y - self.window_rect.y as Coord,
+                damage_clip: crate::canvas::PixelRect::new(0, 0, self.viewport.width_px as usize, self.viewport.height_px as usize),
             };
             self.app
                 .on_resize(self.viewport.width_px, self.viewport.height_px, &mut ctx);
@@ -1025,6 +1094,7 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
                 modifiers: self.modifiers,
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
                 cursor_y: self.cursor_y - self.window_rect.y as Coord,
+                damage_clip: crate::canvas::PixelRect::new(0, 0, self.viewport.width_px as usize, self.viewport.height_px as usize),
             };
             let response = self.app.on_event(&event, &mut ctx);
             drop(ctx);

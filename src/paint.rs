@@ -268,6 +268,64 @@ pub fn pack_argb(r: u8, g: u8, b: u8, a: u8) -> u32 {
     ((a as u32) << 24) | (((255 - r) as u32) << 16) | (((255 - g) as u32) << 8) | ((255 - b) as u32)
 }
 
+/// Wrap-add the RGB bytes of `delta_rgb` into `pixels[i]` for every `i` where `hit_map[i] == target_id`. The α byte is preserved. Used to apply a "tint" effect (hover, focus, etc.) on top of an already-painted region whose pixels were stamped with a known hit ID — mirrors the chrome's bake_hover pattern but generic over any hit ID. `wrapping_sub` of the same delta exactly reverses the add, so callers maintain old_delta/new_delta state and unbake/bake atomically.
+pub fn wrap_add_rgb_where(pixels: &mut [u32], hit_map: &[u8], target_id: u8, delta_rgb: u32) {
+    let dr = ((delta_rgb >> 16) & 0xFF) as u8;
+    let dg = ((delta_rgb >> 8) & 0xFF) as u8;
+    let db = (delta_rgb & 0xFF) as u8;
+    let n = pixels.len().min(hit_map.len());
+    for i in 0..n {
+        if hit_map[i] == target_id {
+            let p = pixels[i];
+            let a = p & 0xFF00_0000;
+            let r = (((p >> 16) & 0xFF) as u8).wrapping_add(dr) as u32;
+            let g = (((p >> 8) & 0xFF) as u8).wrapping_add(dg) as u32;
+            let b = ((p & 0xFF) as u8).wrapping_add(db) as u32;
+            pixels[i] = a | (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
+/// Compose `src` underneath `dst` where `src` is in *pre-composed* α + darkness form (the result of a chain of `under()` writes starting from empty — so `src.dark` is already attenuated by `src.α`). Unlike [`flatten`] with `BlendMode::Normal`, this kernel scales src's contribution by `(256 − dst.α)` only, NOT by `(256 − dst.α) × src.α`, avoiding the second premult that would dim every AA pixel.
+///
+/// Use case: blit a cached widget layer (built by repeated `under()` from empty) onto a target buffer.
+pub fn flatten_premult(dst: &mut [u32], src: &[u32]) {
+    let n = dst.len().min(src.len());
+    for i in 0..n {
+        let d = dst[i];
+        if d >= 0xFF000000 { continue; }
+        let s = src[i];
+        let d_a = d >> 24;
+        let factor = 256 - d_a;
+        let s_a = (s >> 24) & 0xFF;
+        let s_r = (s >> 16) & 0xFF;
+        let s_g = (s >> 8) & 0xFF;
+        let s_b = s & 0xFF;
+        let d_r = (d >> 16) & 0xFF;
+        let d_g = (d >> 8) & 0xFF;
+        let d_b = d & 0xFF;
+        let new_a = d_a + ((factor * s_a) >> 8);
+        let new_r = d_r + ((factor * s_r) >> 8);
+        let new_g = d_g + ((factor * s_g) >> 8);
+        let new_b = d_b + ((factor * s_b) >> 8);
+        dst[i] = (new_a << 24) | (new_r << 16) | (new_g << 8) | new_b;
+    }
+}
+
+/// Per-byte wrap-subtract of `b` from `a`'s RGB bytes, returning a packed RGB delta suitable for [`wrap_add_rgb_where`]. The α byte is zeroed in the result. Used to derive a tint delta from two theme colors at runtime (e.g. `wrap_sub_rgb(TEXTBOX_HOVER, TEXTBOX_FILL)` → the per-channel offset that, wrap-added to a `TEXTBOX_FILL` pixel, lands at `TEXTBOX_HOVER`).
+#[inline]
+pub fn wrap_sub_rgb(a: u32, b: u32) -> u32 {
+    let ar = (a >> 16) & 0xFF;
+    let ag = (a >> 8) & 0xFF;
+    let ab = a & 0xFF;
+    let br = (b >> 16) & 0xFF;
+    let bg = (b >> 8) & 0xFF;
+    let bb = b & 0xFF;
+    ((ar.wrapping_sub(br) & 0xFF) << 16)
+        | ((ag.wrapping_sub(bg) & 0xFF) << 8)
+        | (ab.wrapping_sub(bb) & 0xFF)
+}
+
 /// Unpack a fluor internal pixel into `(r, g, b, a)` with visible RGB and opacity α — the inverse of [`pack_argb`]. Flips darkness back to visible RGB; α passes through.
 #[inline]
 pub fn unpack_argb(packed: u32) -> (u8, u8, u8, u8) {
@@ -661,6 +719,10 @@ pub static DEBUG_SKIP_CONTROLS: std::sync::atomic::AtomicBool =
 /// chord (F was the original choice but Linux window managers eat Ctrl+Shift+F as a system
 /// shortcut). The composite-FPS is the actual headroom — a 144 Hz display showing "1240 FPS"
 /// means each composite took ~0.8 ms, leaving 6.1 ms of slack against vsync. `false` by default.
+/// Counter bumped by primitives that perform genuine *rasterize* work (geometric paint, glyph shaping, etc.) — NOT by blits/copies/tint applications. The host reads-and-resets this with `.swap(0, ...)` after `app.render` to decide whether to call `DebugStats::record_rasterize` or only `record_present`. Lets the F (frame) counter climb on hover-only frames while R (rasterize) stays put.
+pub static RASTERIZE_OPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub static DEBUG_SHOW_FPS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -800,19 +862,40 @@ pub struct DebugStats {
     pub fill_secs: f32,
     pub finalize_secs: f32,
     pub shadow_secs: f32,
-    /// Monotonic count of full frames rendered since the host started. Wraps at `u64::MAX`, effectively never.
-    pub frames_rendered: u64,
+    /// Frames presented to the OS since start — includes "frame-only" updates (tint diff, cursor blink) that did no rasterization. Wraps at `u64::MAX`.
+    pub frame_count: u64,
+    /// Frames where actual rasterization work happened. Diverges from `frame_count` once dirty-tracking lands and lets the host skip rasterize on hover-only / tint-only updates.
+    pub rasterize_count: u64,
+    /// Fraction (`0.0..=1.0`) of the rasterizable area touched by the most recent rasterize. `1.0` = full repaint; smaller values appear once damage-clipped partial rasterization is wired. Held verbatim from the last `record_rasterize` call.
+    pub last_rasterize_pct: f32,
+    /// Fraction (`0.0..=1.0`) of the viewport area covered by this frame's `damage_clip` — what the host actually cleared + asked the app to repaint. Updated EVERY frame (on present), so it reflects the live per-frame damage even when `last_rasterize_pct` is sticky from the last full rasterize. Drops on hover/focus frames where damage is just the textbox bbox.
+    pub last_damage_pct: f32,
 }
 
 impl DebugStats {
-    /// Store this frame's per-stage times and bump the counter. No smoothing — displayed values are exactly what was just measured.
+    /// Bump `frame_count` only — for frames that present without rasterizing (cursor blink off-frame, tint-diff-only hover update once dirty tracking lands). No stage timings updated; the strip continues to show whatever the last rasterize recorded. `damage_pct` updates every present so the live damage area shows even when no rasterize fired.
     #[inline]
-    pub fn record_frame(&mut self, app: f32, fill: f32, finalize: f32, shadow: f32) {
+    pub fn record_present(&mut self, damage_pct: f32) {
+        self.frame_count = self.frame_count.wrapping_add(1);
+        self.last_damage_pct = damage_pct;
+    }
+
+    /// Store this rasterize's stage times, bump `rasterize_count`, and record the fraction of the rasterizable area that was touched. Pass `pct = 1.0` for a full repaint; once damage-clipped rasterization is wired, pass `damage_area / full_area`.
+    #[inline]
+    pub fn record_rasterize(&mut self, app: f32, fill: f32, finalize: f32, shadow: f32, pct: f32) {
         self.app_secs = app;
         self.fill_secs = fill;
         self.finalize_secs = finalize;
         self.shadow_secs = shadow;
-        self.frames_rendered = self.frames_rendered.wrapping_add(1);
+        self.rasterize_count = self.rasterize_count.wrapping_add(1);
+        self.last_rasterize_pct = pct;
+    }
+
+    /// Shorthand for the current "every frame is a full rasterize" world — bumps both counters and stores timings with `pct = 1.0`. Replace per-call with `record_rasterize` + `record_present` once dirty tracking can drop the rasterize on tint-only updates.
+    #[inline]
+    pub fn record_frame(&mut self, app: f32, fill: f32, finalize: f32, shadow: f32) {
+        self.record_rasterize(app, fill, finalize, shadow, 1.0);
+        self.record_present(1.0);
     }
 
     #[inline]
@@ -853,9 +936,11 @@ pub fn draw_debug_strip(
     let shadow_ms = stats.shadow_secs * 1000.0;
     let total_ms = stats.total_secs() * 1000.0;
 
+    let damage_pct = (stats.last_damage_pct * 100.0).clamp(0.0, 100.0);
     let stats_line = alloc::format!(
-        "app {app_ms:>6.3} ms  fill {fill_ms:>6.3} ms  fin {fin_ms:>6.3} ms  shdw {shadow_ms:>6.3} ms    tot {total_ms:>6.3} ms    Frames {:>7}",
-        stats.frames_rendered,
+        "app {app_ms:>6.3} ms  fill {fill_ms:>6.3} ms  fin {fin_ms:>6.3} ms  shdw {shadow_ms:>6.3} ms    tot {total_ms:>6.3} ms    F {:>7} R {:>7} ({damage_pct:>5.1}%)",
+        stats.frame_count,
+        stats.rasterize_count,
     );
 
     // Topmost-first ordering: text glyphs paint FIRST so the bar's under() writes are rejected by the glyph pixels, leaving the green characters visible against the black. If the bar were painted first it would fill all strip pixels opaque and every glyph would be eaten.
@@ -2395,7 +2480,6 @@ pub fn draw_ellipse_rotated(
 /// Every interior + AA-edge write composes the new pixel UNDERNEATH whatever's already in the buffer via [`Blend::under`] (`BlendMode::Normal`). Two stacked pills in the same buffer therefore behave like any other front-to-back composite: draw the topmost first (it lands cleanly into the empty buffer), then the underneath one (it fills only the remaining α budget the topmost left behind). No max-α tiebreaker, no inner/outer dual mode — one consistent kernel.
 pub fn draw_squircle_pill(
     canvas: &mut Canvas,
-    mask: &mut [u8],
     pill_x: isize,
     pill_y: isize,
     pill_w: isize,
@@ -2438,7 +2522,6 @@ pub fn draw_squircle_pill(
     if fully_inside {
         draw_squircle_pill_unclipped(
             pixels,
-            mask,
             buf_w,
             pill_x as usize,
             pill_y as usize,
@@ -2452,7 +2535,6 @@ pub fn draw_squircle_pill(
     } else {
         draw_squircle_pill_clipped(
             pixels,
-            mask,
             buf_w,
             buf_h,
             pill_x,
@@ -2480,7 +2562,6 @@ pub fn draw_squircle_pill(
             for fx in cx_start..cx_end {
                 let idx = row_base + fx;
                 pixels[idx] = pixels[idx].under(solid, BlendMode::Normal);
-                mask[idx] = 255;
             }
         }
     }
@@ -2495,7 +2576,6 @@ pub fn draw_squircle_pill(
 /// Every pixel write composes UNDER the buffer via [`Blend::under`] (Normal) — same kernel as the single-color path.
 pub fn draw_squircle_pill_two_tone(
     canvas: &mut Canvas,
-    mask: &mut [u8],
     pill_x: isize,
     pill_y: isize,
     pill_w: isize,
@@ -2503,6 +2583,8 @@ pub fn draw_squircle_pill_two_tone(
     light: u32,
     shadow: u32,
     squirdleyness: i32,
+    hit_map: Option<&mut [u8]>,
+    hit_id: u8,
 ) {
     let buf_w = canvas.width;
     let buf_h = canvas.height;
@@ -2530,6 +2612,7 @@ pub fn draw_squircle_pill_two_tone(
     let shadow_rgb = shadow & 0x00FF_FFFF;
     let crossings = squircle_crossings(radius_f, squirdleyness);
     let pixels: &mut [u32] = canvas.pixels;
+    let mut hit_map = hit_map;
 
     // Football-seam pick: 45° from TR down-left into the right cap → flat across the centerline → 45° down-left to BL. dy ≤ seam_y(dx) → light, which puts TL inside the light region and BR inside the shadow region.
     let half_h = pill_h / 2;
@@ -2577,7 +2660,7 @@ pub fn draw_squircle_pill_two_tone(
                 if v_aa_col >= 0 && v_aa_col < buf_w_i {
                     let dx = v_aa_col - pill_x;
                     let dy = v_row - pill_y;
-                    write_aa(pixels, mask, row_base + v_aa_col as usize, pick_rgb(dx, dy), h_u32);
+                    write_aa(pixels, row_base + v_aa_col as usize, pick_rgb(dx, dy), h_u32);
                 }
                 let (fx_start, fx_end) = if flip_x {
                     (diag_col, v_aa_col)
@@ -2591,7 +2674,9 @@ pub fn draw_squircle_pill_two_tone(
                     let idx = row_base + fx;
                     let dx = fx as isize - pill_x;
                     pixels[idx] = pixels[idx].under(pick_solid(dx, dy), BlendMode::Normal);
-                    mask[idx] = 255;
+                    if let Some(hm) = hit_map.as_deref_mut() {
+                        hm[idx] = hit_id;
+                    }
                 }
             }
 
@@ -2608,7 +2693,6 @@ pub fn draw_squircle_pill_two_tone(
                     let dy = h_aa_row - pill_y;
                     write_aa(
                         pixels,
-                        mask,
                         h_aa_row as usize * buf_w + col_us,
                         pick_rgb(dx, dy),
                         h_u32,
@@ -2626,7 +2710,9 @@ pub fn draw_squircle_pill_two_tone(
                     let idx = fy * buf_w + col_us;
                     let dy = fy as isize - pill_y;
                     pixels[idx] = pixels[idx].under(pick_solid(dx, dy), BlendMode::Normal);
-                    mask[idx] = 255;
+                    if let Some(hm) = hit_map.as_deref_mut() {
+                        hm[idx] = hit_id;
+                    }
                 }
             }
         }
@@ -2646,7 +2732,9 @@ pub fn draw_squircle_pill_two_tone(
                 let idx = row_base + fx;
                 let dx = fx as isize - pill_x;
                 pixels[idx] = pixels[idx].under(pick_solid(dx, dy), BlendMode::Normal);
-                mask[idx] = 255;
+                if let Some(hm) = hit_map.as_deref_mut() {
+                    hm[idx] = hit_id;
+                }
             }
         }
     }
@@ -2668,7 +2756,6 @@ pub fn draw_squircle_pill_two_tone(
 /// PREVENTS: nothing — this path runs only when the proof holds. Bounds-check elision lets the compiler emit unchecked stores.
 fn draw_squircle_pill_unclipped(
     pixels: &mut [u32],
-    mask: &mut [u8],
     buf_w: usize,
     pill_x: usize,
     pill_y: usize,
@@ -2703,7 +2790,7 @@ fn draw_squircle_pill_unclipped(
                 pill_x + radius - i
             };
             let row_base = v_row * buf_w;
-            write_aa(pixels, mask, row_base + v_aa_col, color_rgb, h_u32);
+            write_aa(pixels, row_base + v_aa_col, color_rgb, h_u32);
             let (fx_start, fx_end) = if flip_x {
                 (diag_col, v_aa_col)
             } else {
@@ -2712,7 +2799,6 @@ fn draw_squircle_pill_unclipped(
             for fx in fx_start..fx_end {
                 let idx = row_base + fx;
                 pixels[idx] = pixels[idx].under(solid, BlendMode::Normal);
-                mask[idx] = 255;
             }
 
             // --- horizontal edge: AA pixel + vertical fill to the diagonal ---
@@ -2731,7 +2817,7 @@ fn draw_squircle_pill_unclipped(
             } else {
                 pill_y + radius - i
             };
-            write_aa(pixels, mask, h_aa_row * buf_w + h_col, color_rgb, h_u32);
+            write_aa(pixels, h_aa_row * buf_w + h_col, color_rgb, h_u32);
             let (fy_start, fy_end) = if flip_y {
                 (diag_row, h_aa_row)
             } else {
@@ -2740,7 +2826,6 @@ fn draw_squircle_pill_unclipped(
             for fy in fy_start..fy_end {
                 let idx = fy * buf_w + h_col;
                 pixels[idx] = pixels[idx].under(solid, BlendMode::Normal);
-                mask[idx] = 255;
             }
         }
     }
@@ -2756,7 +2841,6 @@ fn draw_squircle_pill_unclipped(
 /// PREVENTS: OOB pixel write / slice panic at the math↔buffer boundary when the pill's geometric corner falls outside the buffer.
 fn draw_squircle_pill_clipped(
     pixels: &mut [u32],
-    mask: &mut [u8],
     buf_w: usize,
     buf_h: usize,
     pill_x: isize,
@@ -2798,11 +2882,9 @@ fn draw_squircle_pill_clipped(
                     pill_x + inset_iso
                 };
                 let diag_col = h_col;
-                // AA pixel: inline col check (inset is nonlinear in i; can't pre-clip).
                 if v_aa_col >= 0 && v_aa_col < buf_w_i {
-                    write_aa(pixels, mask, row_base + v_aa_col as usize, color_rgb, h_u32);
+                    write_aa(pixels, row_base + v_aa_col as usize, color_rgb, h_u32);
                 }
-                // Fill: range self-clips to [0, buf_w).
                 let (fx_start, fx_end) = if flip_x {
                     (diag_col, v_aa_col)
                 } else {
@@ -2813,7 +2895,6 @@ fn draw_squircle_pill_clipped(
                 for fx in fs..fe {
                     let idx = row_base + fx;
                     pixels[idx] = pixels[idx].under(solid, BlendMode::Normal);
-                    mask[idx] = 255;
                 }
             }
 
@@ -2827,7 +2908,7 @@ fn draw_squircle_pill_clipped(
                 };
                 let diag_row = v_row;
                 if h_aa_row >= 0 && h_aa_row < buf_h_i {
-                    write_aa(pixels, mask, h_aa_row as usize * buf_w + col_us, color_rgb, h_u32);
+                    write_aa(pixels, h_aa_row as usize * buf_w + col_us, color_rgb, h_u32);
                 }
                 let (fy_start, fy_end) = if flip_y {
                     (diag_row, h_aa_row)
@@ -2839,7 +2920,6 @@ fn draw_squircle_pill_clipped(
                 for fy in fs..fe {
                     let idx = fy * buf_w + col_us;
                     pixels[idx] = pixels[idx].under(solid, BlendMode::Normal);
-                    mask[idx] = 255;
                 }
             }
         }
@@ -2871,15 +2951,11 @@ pub fn squircle_crossings(radius: f32, squirdleyness: i32) -> alloc::vec::Vec<(u
     crossings
 }
 
-/// AA write at a proven-in-buffer index. Caller proves `idx < pixels.len() == mask.len()`. Composes a partial-α pixel (`α=h_aa`, straight darkness=`color_rgb`) UNDERNEATH whatever's already in the buffer via [`Blend::under`] — same kernel as every other compositing op in fluor. The buffer is treated as the topmost-first composite (anything already painted there sits "above" this write). With `Normal` mode, an empty pixel (`0x00000000`) absorbs the new contribution fully; an already-opaque pixel takes the early-out and the new write is invisible. Mask tracks the per-pixel max α written so glow / text clip downstream still sees the full silhouette.
+/// AA write at a proven-in-buffer index. Composes a partial-α pixel (`α=h_aa`, straight darkness=`color_rgb`) UNDERNEATH whatever's already in the buffer via [`Blend::under`] — same kernel as every other compositing op in fluor. The buffer is treated as the topmost-first composite (anything already painted there sits "above" this write). With `Normal` mode, an empty pixel (`0x00000000`) absorbs the new contribution fully; an already-opaque pixel takes the early-out and the new write is invisible.
 #[inline]
-fn write_aa(pixels: &mut [u32], mask: &mut [u8], idx: usize, color_rgb: u32, h_aa: u32) {
+fn write_aa(pixels: &mut [u32], idx: usize, color_rgb: u32, h_aa: u32) {
     let new_pixel = (h_aa << 24) | color_rgb;
     pixels[idx] = pixels[idx].under(new_pixel, BlendMode::Normal);
-    let m = h_aa as u8;
-    if m > mask[idx] {
-        mask[idx] = m;
-    }
 }
 
 /// Photon's squircle inset formula — single row, parameterized by `squirdleyness`. Returns the curve's inset (distance from the bbox edge to the leftmost / rightmost inside pixel) for a row at `y_from_center` rows above or below the squircle's vertical center.
@@ -3318,18 +3394,136 @@ pub fn draw_blinkey(
     }
 }
 
+/// Right-edge glow ray pass. Per row in the pill's vertical span, scans the buffer's α byte from the right end of the bbox leftward to find that row's first fully-opaque pixel (α=0xFF — the pill's interior, set by the squircle's writes), then walks outward `reach_px` steps writing a glow pixel each step whose α tapers linearly from `seed` (at the edge) down toward 0. Each write composes UNDER the existing target via [`Blend::under`] (Normal) — the opaque interior takes the α=0xFF early-out so the squircle is untouched.
+pub fn apply_textbox_glow_right(
+    canvas: &mut Canvas,
+    pill_x: isize,
+    pill_y: isize,
+    pill_w: isize,
+    pill_h: isize,
+    glow_colour: u32,
+    seed: u32,
+    reach_px: usize,
+    clip: Option<Clip>,
+) {
+    let buf_w = canvas.width;
+    let buf_h = canvas.height;
+    if pill_w <= 0 || pill_h <= 0 || seed == 0 || reach_px == 0 {
+        return;
+    }
+    let buf_w_i = buf_w as isize;
+    let buf_h_i = buf_h as isize;
+    let clip_rect = Clip::resolve(clip, buf_w, buf_h);
+    let y0 = (pill_y.max(0) as usize).max(clip_rect.y_start);
+    let y1 = ((pill_y + pill_h).min(buf_h_i).max(0) as usize).min(clip_rect.y_end);
+    if y0 >= y1 { return; }
+    let scan_left = (pill_x.max(0) as usize).max(clip_rect.x_start);
+    let scan_right = ((pill_x + pill_w).min(buf_w_i).max(0) as usize).min(clip_rect.x_end);
+    if scan_left >= scan_right { return; }
+
+    {
+        let dx0 = scan_left;
+        let dx1 = (scan_right + reach_px).min(buf_w).min(clip_rect.x_end);
+        canvas.damage.add_bounds(dx0, y0, dx1, y1);
+    }
+
+    let glow_rgb = glow_colour & 0x00FF_FFFF;
+    let pixels: &mut [u32] = canvas.pixels;
+    let reach_u32 = reach_px as u32;
+    let ray_x_end = clip_rect.x_end.min(buf_w);
+
+    for y in y0..y1 {
+        let row_base = y * buf_w;
+        // Scan from right going left; stop at the first fully-opaque pixel (α=0xFF). Start the glow ray at the column immediately right of it — i.e., the last AA-edge pixel just outside the opaque interior.
+        let mut opaque_x: Option<usize> = None;
+        for x in (scan_left..scan_right).rev() {
+            if (pixels[row_base + x] >> 24) == 0xFF {
+                opaque_x = Some(x);
+                break;
+            }
+        }
+        let Some(ox) = opaque_x else { continue; };
+        let ray_start = ox + 1;
+        for k in 0..reach_px {
+            let bx = ray_start + k;
+            if bx >= ray_x_end { break; }
+            let alpha = seed * (reach_u32 - k as u32) / reach_u32;
+            let new_pixel = (alpha << 24) | glow_rgb;
+            let idx = row_base + bx;
+            pixels[idx] = pixels[idx].under(new_pixel, BlendMode::Normal);
+        }
+    }
+}
+
+/// Left-edge glow ray pass. Mirror of [`apply_textbox_glow_right`]: per row in the pill's vertical span, scans the buffer's α byte from the LEFT end of the bbox rightward to find the first fully-opaque pixel, then walks `reach_px` steps LEFT writing a linearly-tapered glow underneath. Each write composes UNDER the existing target via [`Blend::under`] (Normal).
+pub fn apply_textbox_glow_left(
+    canvas: &mut Canvas,
+    pill_x: isize,
+    pill_y: isize,
+    pill_w: isize,
+    pill_h: isize,
+    glow_colour: u32,
+    seed: u32,
+    reach_px: usize,
+    clip: Option<Clip>,
+) {
+    let buf_w = canvas.width;
+    let buf_h = canvas.height;
+    if pill_w <= 0 || pill_h <= 0 || seed == 0 || reach_px == 0 {
+        return;
+    }
+    let buf_w_i = buf_w as isize;
+    let buf_h_i = buf_h as isize;
+    let clip_rect = Clip::resolve(clip, buf_w, buf_h);
+    let y0 = (pill_y.max(0) as usize).max(clip_rect.y_start);
+    let y1 = ((pill_y + pill_h).min(buf_h_i).max(0) as usize).min(clip_rect.y_end);
+    if y0 >= y1 { return; }
+    let scan_left = (pill_x.max(0) as usize).max(clip_rect.x_start);
+    let scan_right = ((pill_x + pill_w).min(buf_w_i).max(0) as usize).min(clip_rect.x_end);
+    if scan_left >= scan_right { return; }
+
+    {
+        let dx0 = scan_left.saturating_sub(reach_px).max(clip_rect.x_start);
+        let dx1 = scan_right;
+        canvas.damage.add_bounds(dx0, y0, dx1, y1);
+    }
+
+    let glow_rgb = glow_colour & 0x00FF_FFFF;
+    let pixels: &mut [u32] = canvas.pixels;
+    let reach_u32 = reach_px as u32;
+    let ray_x_start = clip_rect.x_start;
+
+    for y in y0..y1 {
+        let row_base = y * buf_w;
+        let mut opaque_x: Option<usize> = None;
+        for x in scan_left..scan_right {
+            if (pixels[row_base + x] >> 24) == 0xFF {
+                opaque_x = Some(x);
+                break;
+            }
+        }
+        let Some(ox) = opaque_x else { continue; };
+        if ox == 0 { continue; }
+        let ray_start = ox - 1;
+        for k in 0..reach_px {
+            if ray_start < k { break; }
+            let bx = ray_start - k;
+            if bx < ray_x_start { break; }
+            let alpha = seed * (reach_u32 - k as u32) / reach_u32;
+            let new_pixel = (alpha << 24) | glow_rgb;
+            let idx = row_base + bx;
+            pixels[idx] = pixels[idx].under(new_pixel, BlendMode::Normal);
+        }
+    }
+}
+
 /// Paint a 4-directional blur glow around a textbox pill silhouette.
 ///
-/// Loop structure + adder/intensity math are ported verbatim from photon's `apply_textbox_glow` (`compositing.rs:4479`). The pixel-write step diverges in three ways for fluor's layered model:
-///
-/// 1. **Constant glow_colour RGB + per-pass alpha** (instead of photon's intensity-scaled RGB additive blend onto opaque bg). Each pass writes `(intensity << 24) | (glow_colour & 0x00FFFFFF)` and saturating-adds onto the current pixel. The downstream textbox_group's `AlphaOver` flatten then produces `glow_colour × α/256 + chrome × (1 - α/256)` — exactly equivalent to photon's perceived appearance on opaque backgrounds, but also correct on bright or transparent ones (the layered-model equivalent of photon's additive paint).
-/// 2. **Saturating per-byte add** instead of wrapping `+=` — the textbox_group's layer starts at zero, so multi-direction accumulation would byte-wrap and produce dark stripes where the glow should be brightest. Each byte caps at 0xFF.
-/// 3. **Gated on `intensity > 0`** — photon's `pixels[idx] += 0 = no-op` was implicit; here we'd otherwise saturating-add `glow_rgb` (with alpha=0) into the pill interior every pass, staining it with the glow color. Explicit skip preserves photon's behaviour.
-///
-/// The `add: bool` / "remove glow" path photon used is dropped — fluor's Group model fully re-rasterizes the layer each dirty cycle, so there's nothing to remove.
+/// Loop structure + adder/intensity math ported from photon's `apply_textbox_glow` (`compositing.rs:4479`). Pixel writes compose UNDER whatever's already in the buffer via [`Blend::under`] (Normal) — same kernel as every other fluor primitive. Caller paints squircle FIRST (topmost), then this; the squircle's opaque interior takes the under() early-out so glow stays outside the silhouette, AA-edge pixels (α<255) let glow bleed through the soft transition.
 pub fn apply_textbox_glow(
     canvas: &mut Canvas,
     mask: &[u8],
+    center_x: isize,
     center_y: isize,
     box_width: usize,
     box_height: usize,
@@ -3341,37 +3535,39 @@ pub fn apply_textbox_glow(
     let blur_v = 16usize;
 
     let half_h = (box_height / 2) as isize;
-    if (center_y - half_h) as usize >= buf_h || (center_y + half_h) as usize >= buf_h {
+    if center_y < half_h || (center_y + half_h) as usize >= buf_h {
+        return;
+    }
+    if center_x < 0 || (center_x as usize) >= buf_w {
         return;
     }
     let cy = center_y as usize;
+    let cx = center_x as usize;
 
     let y_top = cy - box_height / 2;
     let y_bot = cy + box_height / 2;
     // Damage = glow halo bbox (box + lateral blur padding, vertical box + vertical blur).
     {
-        let center_x = buf_w / 2;
-        let x0 = center_x.saturating_sub(box_width / 2 + blur_h);
-        let x1 = (center_x + box_width / 2 + blur_h).min(buf_w);
+        let x0 = cx.saturating_sub(box_width / 2 + blur_h);
+        let x1 = (cx + box_width / 2 + blur_h).min(buf_w);
         let y0 = y_top.saturating_sub(blur_v);
         let y1 = (y_bot + blur_v).min(buf_h);
         canvas.damage.add_bounds(x0, y0, x1, y1);
     }
     let pixels: &mut [u32] = canvas.pixels;
 
-    // Find horizontal bounds by scanning mask at center row.
-    let center_x = buf_w / 2;
-    let mut x_left = center_x;
-    let mut x_right = center_x;
+    // Find horizontal bounds by scanning mask at center row, starting at the pill center.
+    let mut x_left = cx;
+    let mut x_right = cx;
     let scan = cy * buf_w;
-    for lx in (0..center_x).rev() {
+    for lx in (0..cx).rev() {
         if mask[scan + lx] > 0 {
             x_left = lx;
         } else {
             break;
         }
     }
-    for rx in center_x..buf_w {
+    for rx in cx..buf_w {
         if mask[scan + rx] > 0 {
             x_right = rx;
         } else {
@@ -3386,22 +3582,6 @@ pub fn apply_textbox_glow(
     let yhe = y_bot - corner_r;
 
     let glow_rgb = glow_colour & 0x00FF_FFFF;
-
-    /// Glow accumulation under fluor's α + darkness convention. The 4-direction passes accumulate opacity (α) and darkness (RGB) into a pixel that starts at empty (`0x00000000` — α=0, dark=0). Top byte: saturating-add intensity (drives α toward 0xFF/opaque). RGB: saturating-add per-channel darkness from `glow_dark`. Corner pixels touched by multiple directions get extra accumulated darkness, matching photon's brighter-at-corners effect. Caller must initialize the pixel buffer to `0x00000000` (calloc-free) before invoking.
-    #[inline]
-    fn glow_accumulate(dst: u32, intensity: u32, glow_dark: u32) -> u32 {
-        let a = ((dst >> 24) & 0xFF).saturating_add(intensity);
-        let dr = (dst >> 16) & 0xFF;
-        let dg = (dst >> 8) & 0xFF;
-        let db = dst & 0xFF;
-        let sr = (glow_dark >> 16) & 0xFF;
-        let sg = (glow_dark >> 8) & 0xFF;
-        let sb = glow_dark & 0xFF;
-        let nr = (dr + sr).min(0xFF);
-        let ng = (dg + sg).min(0xFF);
-        let nb = (db + sb).min(0xFF);
-        (a << 24) | (nr << 16) | (ng << 8) | nb
-    }
 
     // Right blur.
     for y in y_top..y_bot {
@@ -3420,7 +3600,8 @@ pub fn apply_textbox_glow(
             adder = (adder * 15 >> 4).min(71);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
             if intensity > 0 {
-                pixels[idx] = glow_accumulate(pixels[idx], intensity, glow_rgb);
+                let new_pixel = (intensity << 24) | glow_rgb;
+                pixels[idx] = pixels[idx].under(new_pixel, BlendMode::Normal);
             }
         }
     }
@@ -3438,7 +3619,8 @@ pub fn apply_textbox_glow(
             adder = (adder * 15 >> 4).min(71);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
             if intensity > 0 {
-                pixels[idx] = glow_accumulate(pixels[idx], intensity, glow_rgb);
+                let new_pixel = (intensity << 24) | glow_rgb;
+                pixels[idx] = pixels[idx].under(new_pixel, BlendMode::Normal);
             }
         }
     }
@@ -3462,7 +3644,8 @@ pub fn apply_textbox_glow(
             adder = (adder * 3 >> 2).min(70);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
             if intensity > 0 {
-                pixels[idx] = glow_accumulate(pixels[idx], intensity, glow_rgb);
+                let new_pixel = (intensity << 24) | glow_rgb;
+                pixels[idx] = pixels[idx].under(new_pixel, BlendMode::Normal);
             }
         }
     }
@@ -3489,7 +3672,8 @@ pub fn apply_textbox_glow(
             adder = (adder * 3 >> 2).min(70);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
             if intensity > 0 {
-                pixels[idx] = glow_accumulate(pixels[idx], intensity, glow_rgb);
+                let new_pixel = (intensity << 24) | glow_rgb;
+                pixels[idx] = pixels[idx].under(new_pixel, BlendMode::Normal);
             }
         }
     }
