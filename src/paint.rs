@@ -3394,7 +3394,9 @@ pub fn draw_blinkey(
     }
 }
 
-/// Right-edge glow ray pass. Per row in the pill's vertical span, scans the buffer's α byte from the right end of the bbox leftward to find that row's first fully-opaque pixel (α=0xFF — the pill's interior, set by the squircle's writes), then walks outward `reach_px` steps writing a glow pixel each step whose α tapers linearly from `seed` (at the edge) down toward 0. Each write composes UNDER the existing target via [`Blend::under`] (Normal) — the opaque interior takes the α=0xFF early-out so the squircle is untouched.
+/// Right-edge glow ray pass. Per row in the pill's vertical span, scans the buffer's α byte from the right end of the bbox leftward to find that row's first fully-opaque pixel (α=0xFF — the pill's interior, set by the squircle's writes), then walks rightward writing a glow pixel each step whose α decays exponentially from `seed` via `factor_256` — same curve as [`paint_shadow`], just emitting white at 0°/180° instead of black at 45°. Each write composes UNDER the existing target via [`Blend::under`] (Normal).
+///
+/// `factor_256 ∈ [1, 255]`: 240 ≈ ×0.9375 per step (~60-pixel reach at seed=0x80), 250 ≈ ×0.9766 (~150-pixel). Caller derives this from `effective_span` (or font_size) so glow reach is RU-invariant. Uses [`compute_alphas`] to precompute the decay table — hot loop is a table lookup.
 pub fn apply_textbox_glow_right(
     canvas: &mut Canvas,
     pill_x: isize,
@@ -3403,12 +3405,12 @@ pub fn apply_textbox_glow_right(
     pill_h: isize,
     glow_colour: u32,
     seed: u32,
-    reach_px: usize,
+    factor_256: u32,
     clip: Option<Clip>,
 ) {
     let buf_w = canvas.width;
     let buf_h = canvas.height;
-    if pill_w <= 0 || pill_h <= 0 || seed == 0 || reach_px == 0 {
+    if pill_w <= 0 || pill_h <= 0 || seed == 0 || factor_256 == 0 || factor_256 >= 256 {
         return;
     }
     let buf_w_i = buf_w as isize;
@@ -3421,20 +3423,19 @@ pub fn apply_textbox_glow_right(
     let scan_right = ((pill_x + pill_w).min(buf_w_i).max(0) as usize).min(clip_rect.x_end);
     if scan_left >= scan_right { return; }
 
+    let (alphas, alpha_len) = compute_alphas(seed, factor_256);
     {
         let dx0 = scan_left;
-        let dx1 = (scan_right + reach_px).min(buf_w).min(clip_rect.x_end);
+        let dx1 = (scan_right + alpha_len).min(buf_w).min(clip_rect.x_end);
         canvas.damage.add_bounds(dx0, y0, dx1, y1);
     }
 
     let glow_rgb = glow_colour & 0x00FF_FFFF;
     let pixels: &mut [u32] = canvas.pixels;
-    let reach_u32 = reach_px as u32;
     let ray_x_end = clip_rect.x_end.min(buf_w);
 
     for y in y0..y1 {
         let row_base = y * buf_w;
-        // Scan from right going left; stop at the first fully-opaque pixel (α=0xFF). Start the glow ray at the column immediately right of it — i.e., the last AA-edge pixel just outside the opaque interior.
         let mut opaque_x: Option<usize> = None;
         for x in (scan_left..scan_right).rev() {
             if (pixels[row_base + x] >> 24) == 0xFF {
@@ -3444,11 +3445,10 @@ pub fn apply_textbox_glow_right(
         }
         let Some(ox) = opaque_x else { continue; };
         let ray_start = ox + 1;
-        for k in 0..reach_px {
+        for k in 0..alpha_len {
             let bx = ray_start + k;
             if bx >= ray_x_end { break; }
-            let alpha = seed * (reach_u32 - k as u32) / reach_u32;
-            let new_pixel = (alpha << 24) | glow_rgb;
+            let new_pixel = (alphas[k] << 24) | glow_rgb;
             let idx = row_base + bx;
             pixels[idx] = pixels[idx].under(new_pixel, BlendMode::Normal);
         }
@@ -3464,12 +3464,12 @@ pub fn apply_textbox_glow_left(
     pill_h: isize,
     glow_colour: u32,
     seed: u32,
-    reach_px: usize,
+    factor_256: u32,
     clip: Option<Clip>,
 ) {
     let buf_w = canvas.width;
     let buf_h = canvas.height;
-    if pill_w <= 0 || pill_h <= 0 || seed == 0 || reach_px == 0 {
+    if pill_w <= 0 || pill_h <= 0 || seed == 0 || factor_256 == 0 || factor_256 >= 256 {
         return;
     }
     let buf_w_i = buf_w as isize;
@@ -3482,15 +3482,15 @@ pub fn apply_textbox_glow_left(
     let scan_right = ((pill_x + pill_w).min(buf_w_i).max(0) as usize).min(clip_rect.x_end);
     if scan_left >= scan_right { return; }
 
+    let (alphas, alpha_len) = compute_alphas(seed, factor_256);
     {
-        let dx0 = scan_left.saturating_sub(reach_px).max(clip_rect.x_start);
+        let dx0 = scan_left.saturating_sub(alpha_len).max(clip_rect.x_start);
         let dx1 = scan_right;
         canvas.damage.add_bounds(dx0, y0, dx1, y1);
     }
 
     let glow_rgb = glow_colour & 0x00FF_FFFF;
     let pixels: &mut [u32] = canvas.pixels;
-    let reach_u32 = reach_px as u32;
     let ray_x_start = clip_rect.x_start;
 
     for y in y0..y1 {
@@ -3505,13 +3505,132 @@ pub fn apply_textbox_glow_left(
         let Some(ox) = opaque_x else { continue; };
         if ox == 0 { continue; }
         let ray_start = ox - 1;
-        for k in 0..reach_px {
+        for k in 0..alpha_len {
             if ray_start < k { break; }
             let bx = ray_start - k;
             if bx < ray_x_start { break; }
-            let alpha = seed * (reach_u32 - k as u32) / reach_u32;
-            let new_pixel = (alpha << 24) | glow_rgb;
+            let new_pixel = (alphas[k] << 24) | glow_rgb;
             let idx = row_base + bx;
+            pixels[idx] = pixels[idx].under(new_pixel, BlendMode::Normal);
+        }
+    }
+}
+
+/// Top-edge glow ray pass. Per column in the pill's horizontal span, scans the buffer's α byte from the TOP of the bbox downward to find the first fully-opaque pixel (α=0xFF — the squircle's interior), then walks `reach_px` steps UP writing a glow pixel each step whose α tapers linearly from `seed` down toward 0. Each write composes UNDER existing target via [`Blend::under`] (Normal).
+///
+/// Why the scan only catches squircle pixels: the horizontal glow passes (left/right) write α ≤ `seed_horizontal` (typically 0x80) which is well below 0xFF, so they don't trigger the "fully opaque" scan condition — the vertical pass cleanly walks past horizontal glow pixels until it reaches the silhouette's actual α=0xFF interior.
+pub fn apply_textbox_glow_top(
+    canvas: &mut Canvas,
+    pill_x: isize,
+    pill_y: isize,
+    pill_w: isize,
+    pill_h: isize,
+    glow_colour: u32,
+    seed: u32,
+    factor_256: u32,
+    clip: Option<Clip>,
+) {
+    let buf_w = canvas.width;
+    let buf_h = canvas.height;
+    if pill_w <= 0 || pill_h <= 0 || seed == 0 || factor_256 == 0 || factor_256 >= 256 {
+        return;
+    }
+    let buf_w_i = buf_w as isize;
+    let buf_h_i = buf_h as isize;
+    let clip_rect = Clip::resolve(clip, buf_w, buf_h);
+    let x0 = (pill_x.max(0) as usize).max(clip_rect.x_start);
+    let x1 = ((pill_x + pill_w).min(buf_w_i).max(0) as usize).min(clip_rect.x_end);
+    if x0 >= x1 { return; }
+    let scan_top = (pill_y.max(0) as usize).max(clip_rect.y_start);
+    let scan_bot = ((pill_y + pill_h).min(buf_h_i).max(0) as usize).min(clip_rect.y_end);
+    if scan_top >= scan_bot { return; }
+
+    let (alphas, alpha_len) = compute_alphas(seed, factor_256);
+    {
+        let dy0 = scan_top.saturating_sub(alpha_len).max(clip_rect.y_start);
+        let dy1 = scan_bot;
+        canvas.damage.add_bounds(x0, dy0, x1, dy1);
+    }
+
+    let glow_rgb = glow_colour & 0x00FF_FFFF;
+    let pixels: &mut [u32] = canvas.pixels;
+    let ray_y_start = clip_rect.y_start;
+
+    for x in x0..x1 {
+        let mut opaque_y: Option<usize> = None;
+        for y in scan_top..scan_bot {
+            if (pixels[y * buf_w + x] >> 24) == 0xFF {
+                opaque_y = Some(y);
+                break;
+            }
+        }
+        let Some(oy) = opaque_y else { continue; };
+        if oy == 0 { continue; }
+        let ray_start = oy - 1;
+        for k in 0..alpha_len {
+            if ray_start < k { break; }
+            let by = ray_start - k;
+            if by < ray_y_start { break; }
+            let new_pixel = (alphas[k] << 24) | glow_rgb;
+            let idx = by * buf_w + x;
+            pixels[idx] = pixels[idx].under(new_pixel, BlendMode::Normal);
+        }
+    }
+}
+
+/// Bottom-edge glow ray pass. Mirror of [`apply_textbox_glow_top`]: per column in the pill's horizontal span, scans the buffer's α byte from the BOTTOM of the bbox upward to find the first fully-opaque pixel, then walks `reach_px` steps DOWN writing a linearly-tapered glow underneath.
+pub fn apply_textbox_glow_bottom(
+    canvas: &mut Canvas,
+    pill_x: isize,
+    pill_y: isize,
+    pill_w: isize,
+    pill_h: isize,
+    glow_colour: u32,
+    seed: u32,
+    factor_256: u32,
+    clip: Option<Clip>,
+) {
+    let buf_w = canvas.width;
+    let buf_h = canvas.height;
+    if pill_w <= 0 || pill_h <= 0 || seed == 0 || factor_256 == 0 || factor_256 >= 256 {
+        return;
+    }
+    let buf_w_i = buf_w as isize;
+    let buf_h_i = buf_h as isize;
+    let clip_rect = Clip::resolve(clip, buf_w, buf_h);
+    let x0 = (pill_x.max(0) as usize).max(clip_rect.x_start);
+    let x1 = ((pill_x + pill_w).min(buf_w_i).max(0) as usize).min(clip_rect.x_end);
+    if x0 >= x1 { return; }
+    let scan_top = (pill_y.max(0) as usize).max(clip_rect.y_start);
+    let scan_bot = ((pill_y + pill_h).min(buf_h_i).max(0) as usize).min(clip_rect.y_end);
+    if scan_top >= scan_bot { return; }
+
+    let (alphas, alpha_len) = compute_alphas(seed, factor_256);
+    {
+        let dy0 = scan_top;
+        let dy1 = (scan_bot + alpha_len).min(buf_h).min(clip_rect.y_end);
+        canvas.damage.add_bounds(x0, dy0, x1, dy1);
+    }
+
+    let glow_rgb = glow_colour & 0x00FF_FFFF;
+    let pixels: &mut [u32] = canvas.pixels;
+    let ray_y_end = clip_rect.y_end.min(buf_h);
+
+    for x in x0..x1 {
+        let mut opaque_y: Option<usize> = None;
+        for y in (scan_top..scan_bot).rev() {
+            if (pixels[y * buf_w + x] >> 24) == 0xFF {
+                opaque_y = Some(y);
+                break;
+            }
+        }
+        let Some(oy) = opaque_y else { continue; };
+        let ray_start = oy + 1;
+        for k in 0..alpha_len {
+            let by = ray_start + k;
+            if by >= ray_y_end { break; }
+            let new_pixel = (alphas[k] << 24) | glow_rgb;
+            let idx = by * buf_w + x;
             pixels[idx] = pixels[idx].under(new_pixel, BlendMode::Normal);
         }
     }
