@@ -673,8 +673,12 @@ impl Textbox {
         );
 
         // --- Focus glow on target (NOT cached — paints fresh each frame against current chrome) ---
+        //
+        // RU-invariant exponential falloff matching the chrome shadow: target_radius derived from font_size (3× font_size as the half-life-ish reach), factor_256 = 256 − 1240/target_radius clamped to [96, 254]. Same curve as paint_shadow; just emitted at 0°/180° (left/right) and 90°/270° (top/bottom) instead of 45° diagonals, and white instead of black. Vertical passes use half-density seed (0x40 vs horizontal 0x80) so the top/bottom halo reads softer.
         if self.focused {
-            let reach_px = (self.font_size * 3.0) as usize;
+            let target_radius = (self.font_size * 3.0).max(8.0);
+            let drop = (1240.0 / target_radius) as u32;
+            let factor_256 = (256u32.saturating_sub(drop)).clamp(96, 254);
             paint::apply_textbox_glow_right(
                 canvas,
                 pill_x_target,
@@ -683,7 +687,7 @@ impl Textbox {
                 pill_h,
                 theme::GLOW_DEFAULT,
                 0x80,
-                reach_px,
+                factor_256,
                 clip,
             );
             paint::apply_textbox_glow_left(
@@ -694,7 +698,29 @@ impl Textbox {
                 pill_h,
                 theme::GLOW_DEFAULT,
                 0x80,
-                reach_px,
+                factor_256,
+                clip,
+            );
+            paint::apply_textbox_glow_top(
+                canvas,
+                pill_x_target,
+                pill_y_target,
+                pill_w,
+                pill_h,
+                theme::GLOW_DEFAULT,
+                0x40,
+                factor_256,
+                clip,
+            );
+            paint::apply_textbox_glow_bottom(
+                canvas,
+                pill_x_target,
+                pill_y_target,
+                pill_w,
+                pill_h,
+                theme::GLOW_DEFAULT,
+                0x40,
+                factor_256,
                 clip,
             );
         }
