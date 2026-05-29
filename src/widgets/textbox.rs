@@ -58,6 +58,17 @@ pub struct Textbox {
     /// `true` → squircle needs full re-rasterize on the next render. Set by `set_rect` / `set_font_size`. Cleared at end of cache rasterize. The cache stores the BASE-color (TEXTBOX_FILL) squircle; hover / focus tints are applied in-flight during blit, never baked into the cache.
     cache_dirty: bool,
 
+    // --- Blinkey screen-overlay state (lives on the host's persistent_screen buffer post-finalize) ---
+    /// Was the blinkey wave painted onto persistent_screen last frame? Used by [`paint_blinkey_into_screen`] to decide whether to wrap-subtract the prior wave before wrap-adding the new one.
+    last_painted_blinkey_on: bool,
+    /// Screen-space position of the prior frame's blinkey (left of the ±7 spread, top of the wave band). `None` until the first paint.
+    last_painted_blinkey_screen_x: i32,
+    last_painted_blinkey_screen_y: i32,
+    /// Wave variant baked into persistent_screen last frame (top-bright vs bottom-bright). The unbake must use the same polynomial that the bake used.
+    last_painted_blinkey_wave_top: bool,
+    /// Height in pixels of the wave baked last frame.
+    last_painted_blinkey_height: i32,
+
     // --- Damage protocol (persistent-scratch differential rendering) ---
     /// Where the textbox painted into target last frame (in target pixel coords, clipped to viewport). `None` = no prior paint (first frame or just resized). Used by [`Textbox::damage_rect`] to union with the current bbox so moves are covered.
     last_painted_bbox: Option<PixelRect>,
@@ -65,6 +76,60 @@ pub struct Textbox {
     last_painted_focused: bool,
     /// `hovered` value at the time of the last paint — diff against `self.hovered` tells `damage_rect` to flag hover-only changes (`bbox`, not `glow_bbox`).
     last_painted_hovered: bool,
+}
+
+/// Photon's blinkey wave polynomial, wrap-added (or wrap-subtracted) per-channel into a visible-RGB screen buffer. The wave is `±7` pixels of horizontal spread centered on `bx`, `height` pixels tall vertically with intensity falling off via `wave >> |dx|`. `top_bright` picks the upper-half-bright vs lower-half-bright variant.
+///
+/// Operates in visible-RGB space (post-finalize boundary) — adding to each channel brightens the displayed color directly. Wrap arithmetic: `wrapping_add` of value `x` is exactly reversed by `wrapping_sub` of the same `x`, regardless of starting byte, so painting on then off restores the underlying pixel bit-for-bit. Out-of-screen pixels are skipped (no panic on edge cases).
+fn wrap_blinkey_into_screen(
+    screen: &mut [u32],
+    scr_w: usize,
+    scr_h: usize,
+    bx: i32,
+    by: i32,
+    height: i32,
+    top_bright: bool,
+    subtract: bool,
+) {
+    if height <= 0 || scr_w == 0 || scr_h == 0 {
+        return;
+    }
+    let half = (height / 2) as f32;
+    if half == 0.0 {
+        return;
+    }
+    let cursor_brightness = crate::theme::CURSOR_BRIGHTNESS;
+    for dy in 0..height {
+        let py = by + dy;
+        if py < 0 || (py as usize) >= scr_h {
+            continue;
+        }
+        let row_base = (py as usize) * scr_w;
+        let t = ((dy as f32) - half) / half;
+        let wave = if top_bright {
+            (1.0 - t * t) * (1.0 - t) * (1.0 - t) * cursor_brightness
+        } else {
+            (1.0 - t * t) * (1.0 + t) * (1.0 + t) * cursor_brightness
+        };
+        let w_base = wave as u32;
+        for dx in -7i32..=7i32 {
+            let px = bx + dx;
+            if px < 0 || (px as usize) >= scr_w {
+                continue;
+            }
+            let w = w_base >> (dx.unsigned_abs());
+            if w == 0 {
+                continue;
+            }
+            let pixel_delta = 0x0001_0101u32 * w;
+            let idx = row_base + (px as usize);
+            screen[idx] = if subtract {
+                screen[idx].wrapping_sub(pixel_delta)
+            } else {
+                screen[idx].wrapping_add(pixel_delta)
+            };
+        }
+    }
 }
 
 /// Convert a viewport-coord `Region` (Coord f32 rectangle, possibly negative or off-buffer) into a `PixelRect` (usize half-open rect) clamped to the viewport bounds. Used by [`Textbox::damage_rect`] / [`Textbox::record_painted`] to express widget bboxes in the host's pixel-rect language for damage union.
@@ -211,7 +276,71 @@ impl Textbox {
             last_painted_bbox: None,
             last_painted_focused: false,
             last_painted_hovered: false,
+            last_painted_blinkey_on: false,
+            last_painted_blinkey_screen_x: 0,
+            last_painted_blinkey_screen_y: 0,
+            last_painted_blinkey_wave_top: true,
+            last_painted_blinkey_height: 0,
         }
+    }
+
+    /// Paint the blinkey wave directly into the host's `persistent_screen` buffer (visible-RGB, post-finalize, post-shadow). Wrap-subtracts the prior frame's wave (if any) before wrap-adding the new one — `wrapping_sub` of a `wrapping_add` returns the original byte exactly, so the operation is reversible regardless of the underlying pixel value. The persistent_screen survives across frames, so the only work per blink tick is the diff: a couple hundred bytes of wrap-add + wrap-sub.
+    ///
+    /// `(window_origin_x, window_origin_y)` translates viewport-space cursor coords into screen-space.
+    ///
+    /// Mirrors [`paint::draw_blinkey`]'s polynomial wave + `0x00010101 × w` per-channel write but in visible-RGB space (the persistent_screen is past the darkness → visible XOR boundary), so wrap-add brightens directly.
+    pub fn paint_blinkey_into_screen(
+        &mut self,
+        screen: &mut [u32],
+        scr_w: usize,
+        scr_h: usize,
+        window_origin_x: i32,
+        window_origin_y: i32,
+    ) {
+        let want_on = self.focused && !self.has_selection() && self.blinkey_visible;
+
+        // Compute current target position in screen-space.
+        let cursor_view_x = self.cursor_pixel_x() as i32;
+        let cursor_view_y = (self.center_y - self.font_size * 0.5) as i32;
+        let cur_x = cursor_view_x + window_origin_x;
+        let cur_y = cursor_view_y + window_origin_y;
+        let cur_h = self.font_size as i32;
+        let cur_wave_top = self.blinkey_wave_top;
+
+        // Unbake the prior frame's wave (if it was on) — wrap-sub at last position with last wave params.
+        if self.last_painted_blinkey_on {
+            wrap_blinkey_into_screen(
+                screen,
+                scr_w,
+                scr_h,
+                self.last_painted_blinkey_screen_x,
+                self.last_painted_blinkey_screen_y,
+                self.last_painted_blinkey_height,
+                self.last_painted_blinkey_wave_top,
+                /*subtract=*/ true,
+            );
+        }
+
+        // Bake the current frame's wave (if it should be on) at the new position.
+        if want_on {
+            wrap_blinkey_into_screen(
+                screen,
+                scr_w,
+                scr_h,
+                cur_x,
+                cur_y,
+                cur_h,
+                cur_wave_top,
+                /*subtract=*/ false,
+            );
+        }
+
+        // Record current state for next frame's unbake.
+        self.last_painted_blinkey_on = want_on;
+        self.last_painted_blinkey_screen_x = cur_x;
+        self.last_painted_blinkey_screen_y = cur_y;
+        self.last_painted_blinkey_wave_top = cur_wave_top;
+        self.last_painted_blinkey_height = cur_h;
     }
 
     /// Damage region this widget contributes to the host's per-frame clip rect.
@@ -658,7 +787,6 @@ impl Textbox {
             0
         };
 
-        // --- Blit cache → target via flatten_premult, tinted in-flight + stamps hit_id on opaque pixels ---
         blit_cache_to_target(
             &self.cache,
             self.cache_w,
