@@ -2,6 +2,8 @@
 
 **CPU softbuffer GUI compositor. Front to back rendering. α + darkness pixel format. Harmonic mean relative units. ARM viable down to no_std bare metal.**
 
+![Liquid stone](liquid-stone.webp)
+
 fluor draws windows in the natural order. Front to back, like stacking sheets of glass. The top sheet (a button, a menu, a tooltip) lands on the buffer first. When it covers a pixel completely, the buffer's job at that pixel is finished. Nothing behind it gets drawn.
 
 Every other GUI compositor paints back to front. Background, then content, then chrome, then overlays. Most of that paint gets covered up by the next pass. It works. It's also mostly busywork. On a desktop you don't notice. On a watch, a phone, or anything battery bound, it's the difference between fluid and stuttering.
