@@ -292,8 +292,8 @@ struct DesktopShell<A: FluorApp> {
     persistent_screen: Vec<u32>,
     /// Set by any event that destroys the chrome perimeter + shadow band content in [`Self::persistent_screen`]: drag release, resize, zoom, focus change. Consumed once per `render_frame` to switch from incremental mode to full-repaint mode (wipe `persistent_screen`, finalize copies every pixel, paint_shadow runs once into the fresh band). Replaces every prior geometric-equality check on `damage_clip`.
     pending_full_repaint: bool,
-    /// Last per-hit-id overlay delta applied to [`Self::persistent_screen`] (visible-RGB wrap-arithmetic). The host runs one generic walk over the consumer's `hit_test_map` each frame: for each pixel, if `current[id] != last_applied_delta[id]`, wrap-add the prior delta back and wrap-sub the current one. Reset to `[0; 256]` whenever `persistent_screen` is wiped (full repaint path) so the overlay starts from a known-clean state.
-    last_applied_delta: [u32; 256],
+    /// Which hit-ids the overlay wrote to persistent_screen LAST frame. Used so a transition (an id that was tinted, no longer is) still gets its pixels rewritten from scratch this frame to clear the prior tint. No tint magnitude is kept — the overlay just reads scratch and conditionally subtracts the current frame's delta. Reset to all-false whenever persistent_screen is wiped (full repaint path).
+    last_overlay_active: [bool; 256],
     /// Last-seen value of `paint::DEBUG_SHOW_HITMASK`. When this differs from the current atomic value at the top of `render_frame`, we promote to a full repaint so the new finalize behavior (FORCE_OPAQUE-style scalar debug path / no shadow) lands across the whole window in one frame.
     last_hitmask: bool,
     /// Last-seen value of `paint::DEBUG_SHOW_ALPHA`. Same transition logic as `last_hitmask` — toggling alpha-viz changes finalize's debug branch, which requires a full repaint to refresh persistent_screen.
@@ -338,10 +338,10 @@ impl<A: FluorApp> DesktopShell<A> {
             last_outline_bbox: crate::canvas::PixelRect::empty(),
             persistent_screen: Vec::new(),
             pending_full_repaint: true,
-            last_applied_delta: [0u32; 256],
             last_hitmask: false,
             last_alpha_mode: 0,
             strip_buf: Vec::new(),
+            last_overlay_active: [false; 256],
         }
     }
 
@@ -387,7 +387,7 @@ impl<A: FluorApp> DesktopShell<A> {
         if full_repaint {
             self.pending_full_repaint = false;
             self.persistent_screen.fill(0);
-            self.last_applied_delta = [0u32; 256];
+            self.last_overlay_active = [false; 256];
         }
         let mut damage_clip = if full_repaint {
             viewport_rect
@@ -517,10 +517,11 @@ impl<A: FluorApp> DesktopShell<A> {
         }
         shadow_dt = t.elapsed().as_secs_f32();
 
-        // Post-finalize, post-shadow overlay diff pass. Walks the consumer's hit_test_map once and applies per-id tint deltas to persistent_screen via wrap-arithmetic. Skipped if the consumer doesn't provide a hit_test_map. Runs every frame regardless of damage_clip so hover tints follow the cursor even on frames where finalize/shadow didn't run.
+        // Post-finalize, post-shadow overlay pass. For each pixel whose hit id is currently tinted OR was tinted last frame, copy the scratch pixel → XOR to visible → optionally wrap-sub the per-id delta → write to persistent_screen. Restores the scratch baseline on unhover and applies the tint on hover — no diff math, no accumulation, just "copy and conditionally adjust." Runs every frame regardless of damage_clip so hover tints follow the cursor even when nothing else dirtied scratch.
         if let Some((map, hw, hh)) = self.app.hit_test_map() {
             let current = self.app.overlay_deltas();
-            crate::paint::apply_overlay_diff(
+            crate::paint::apply_overlay(
+                &self.scratch,
                 &mut self.persistent_screen,
                 scr_w,
                 self.window_rect.x,
@@ -528,8 +529,8 @@ impl<A: FluorApp> DesktopShell<A> {
                 map,
                 hw,
                 hh,
-                &mut self.last_applied_delta,
                 &current,
+                &mut self.last_overlay_active,
             );
         }
 
