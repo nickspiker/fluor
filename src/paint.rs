@@ -812,59 +812,66 @@ pub static RASTERIZE_OPS: std::sync::atomic::AtomicU64 =
 pub static DEBUG_SHOW_FPS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Debug toggle that overlays a 2-px magenta hairline around the bounding rect of everything painted into the consumer's Canvas this frame. Bound to the `Ctrl/Cmd + Shift + D + W` chord ("Where"). Drawn into scratch by the host AFTER `app.render` but BEFORE finalize, using a throwaway damage accumulator so the outline itself doesn't grow the visualized bbox. Useful for verifying damage tracking is correct (does the bbox match what changed?) and for spotting over-invalidation. `false` by default.
+/// Debug toggle that overlays a 2-px magenta hairline around the damage rect the host repaints this frame. Bound to the `Ctrl/Cmd + Shift + D + W` chord ("Where"). Drawn directly into the platform back buffer AFTER `persistent_screen` has been copied in, BEFORE `present()`. The outline never enters `persistent_screen`, never flows through finalize, and never survives more than one frame — so toggling it on/off needs no full-repaint promotion and there is no stale-bbox state to carry between frames. `false` by default.
 pub static DEBUG_SHOW_DAMAGE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Paint a 2-pixel magenta hairline outline around `bbox` into the canvas — debug visualization for the frame's accumulated damage rect. Writes pixels DIRECTLY (not via `under()`) because by the time this runs the underlying scratch is fully opaque from the consumer's render, and an under-blend would be rejected lane-by-lane by the opaque-top early-out. We intentionally overwrite content inside the stroke band; the rest of the bbox passes through untouched.
-pub fn draw_damage_outline(canvas: &mut Canvas, bbox: crate::canvas::PixelRect) {
+/// Stamp a 2-pixel magenta hairline around `bbox` directly into the screen-sized, visible-RGB back buffer. `bbox` is window-local; `offset_x` / `offset_y` are the window's top-left in screen space. Pure overwrite — no blending, no `under` path, no damage tracking. Caller invokes between `copy_from_slice(&persistent_screen)` and `buffer.present()` so the magenta lives for exactly one frame.
+pub fn stamp_damage_outline_visible(
+    buf: &mut [u32],
+    scr_w: usize,
+    scr_h: usize,
+    bbox: crate::canvas::PixelRect,
+    offset_x: i32,
+    offset_y: i32,
+) {
     const STROKE: usize = 2;
-    let w = canvas.width;
-    let h = canvas.height;
-    if bbox.is_empty() || w == 0 || h == 0 {
+    const MAGENTA: u32 = 0xFFFF_00FF;
+    if bbox.is_empty() || scr_w == 0 || scr_h == 0 {
         return;
     }
-    let x0 = bbox.x0.min(w);
-    let y0 = bbox.y0.min(h);
-    let x1 = bbox.x1.min(w);
-    let y1 = bbox.y1.min(h);
+    let sx0_i = offset_x + bbox.x0 as i32;
+    let sy0_i = offset_y + bbox.y0 as i32;
+    let sx1_i = offset_x + bbox.x1 as i32;
+    let sy1_i = offset_y + bbox.y1 as i32;
+    let x0 = sx0_i.max(0) as usize;
+    let y0 = sy0_i.max(0) as usize;
+    let x1 = (sx1_i.max(0) as usize).min(scr_w);
+    let y1 = (sy1_i.max(0) as usize).min(scr_h);
     if x0 >= x1 || y0 >= y1 {
         return;
     }
-    // α + darkness storage: pack_argb already produces darkness-encoded RGB, so a direct slot write lands as opaque magenta after the boundary's darkness → visible XOR.
-    let magenta = pack_argb(255, 0, 255, 0xFF);
-    let pixels = &mut canvas.pixels[..];
 
-    // Top stroke band.
+    // Top band.
     let top_end = (y0 + STROKE).min(y1);
     for py in y0..top_end {
-        let row = py * w;
+        let row = py * scr_w;
         for px in x0..x1 {
-            pixels[row + px] = magenta;
+            buf[row + px] = MAGENTA;
         }
     }
-    // Bottom stroke band — clamped to never overlap the top band on tiny rects.
+    // Bottom band — clamped so it never overlaps the top on a < 2·STROKE tall rect.
     let bot_start = y1.saturating_sub(STROKE).max(top_end);
     for py in bot_start..y1 {
-        let row = py * w;
+        let row = py * scr_w;
         for px in x0..x1 {
-            pixels[row + px] = magenta;
+            buf[row + px] = MAGENTA;
         }
     }
-    // Left stroke column (interior rows only — corners are covered by top/bottom bands).
+    // Left column (interior rows only).
     let left_end = (x0 + STROKE).min(x1);
     for py in top_end..bot_start {
-        let row = py * w;
+        let row = py * scr_w;
         for px in x0..left_end {
-            pixels[row + px] = magenta;
+            buf[row + px] = MAGENTA;
         }
     }
-    // Right stroke column.
+    // Right column.
     let right_start = x1.saturating_sub(STROKE).max(left_end);
     for py in top_end..bot_start {
-        let row = py * w;
+        let row = py * scr_w;
         for px in right_start..x1 {
-            pixels[row + px] = magenta;
+            buf[row + px] = MAGENTA;
         }
     }
 }

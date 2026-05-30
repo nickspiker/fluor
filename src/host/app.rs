@@ -284,10 +284,6 @@ struct DesktopShell<A: FluorApp> {
     pending_damage: crate::canvas::Damage,
     /// FPS strip active state from the previous frame. When it toggles `true → false`, this frame's damage_clip must include the strip bbox so the just-vanished strip pixels get cleared from scratch (and propagated into persistent_screen via finalize). Tracked instead of a generic `prev_damage_clip` union to avoid sticky viewport-sized damage on hover frames after any prior full repaint.
     last_strip_active: bool,
-    /// Damage outline overlay state from the previous frame; same toggle-off-clearing logic as `last_strip_active`. When the outline was on last frame and is off this frame, union its bbox into damage_clip so the magenta border gets wiped.
-    last_outline_active: bool,
-    /// The bbox the damage outline was drawn around last frame (pending_damage.bbox at the time it painted). Used by the toggle-off case so we know which pixels to clear.
-    last_outline_bbox: crate::canvas::PixelRect,
     /// Persistent screen-sized pixel buffer, owned by us. Survives across frames so post-finalize overlays (hover/focus tint diffs, blinkey) can mutate just a few pixels each frame without re-running finalize for the whole window. The platform's softbuffer / wgpu back buffer may rotate or arrive stale; we always memcpy `persistent_screen` over it just before `present()` so the platform buffer's prior state doesn't matter. Resized when `screen_size` changes.
     persistent_screen: Vec<u32>,
     /// Set by any event that destroys the chrome perimeter + shadow band content in [`Self::persistent_screen`]: drag release, resize, zoom, focus change. Consumed once per `render_frame` to switch from incremental mode to full-repaint mode (wipe `persistent_screen`, finalize copies every pixel, paint_shadow runs once into the fresh band). Replaces every prior geometric-equality check on `damage_clip`.
@@ -334,8 +330,6 @@ impl<A: FluorApp> DesktopShell<A> {
             debug_stats: crate::paint::DebugStats::default(),
             pending_damage: crate::canvas::Damage::new(),
             last_strip_active: false,
-            last_outline_active: false,
-            last_outline_bbox: crate::canvas::PixelRect::empty(),
             persistent_screen: Vec::new(),
             pending_full_repaint: true,
             last_hitmask: false,
@@ -389,18 +383,15 @@ impl<A: FluorApp> DesktopShell<A> {
             self.persistent_screen.fill(0);
             self.last_overlay_active = [false; 256];
         }
-        let mut damage_clip = if full_repaint {
+        let damage_clip = if full_repaint {
             viewport_rect
         } else {
             self.app.damage_rect(self.viewport).unwrap_or(crate::canvas::PixelRect::empty())
         };
         // Strip is painted in a clobber pass AFTER finalize + overlay — it does NOT contribute to damage_clip and does NOT bump damage_pct.
 
-        // Damage outline overlay: any time an outline was drawn last frame, this frame's damage_clip must subsume that bbox so the stale magenta hairline gets cleared and re-finalized away. Covers both toggle-off (no new outline) and continuing-active-but-bbox-moved (outline jumps to a new region of the viewport on the next hover change). Without this, the previous frame's outline strands on persistent_screen since finalize is now damage-clip-narrowed and doesn't repaint outside the new clip.
+        // Damage outline overlay (Ctrl+Shift+D+W). Sampled once here so the post-finalize stamp uses a stable value for this frame. The outline is stamped DIRECTLY into the platform back buffer between the persistent_screen copy and `present()`, so it never enters persistent_screen, never flows through finalize, and never carries state between frames.
         let outline_active = crate::paint::DEBUG_SHOW_DAMAGE.load(std::sync::atomic::Ordering::Relaxed);
-        if self.last_outline_active {
-            damage_clip = damage_clip.union(self.last_outline_bbox);
-        }
 
         clear_scratch_rect(&mut self.scratch, win_w, damage_clip);
 
@@ -430,24 +421,6 @@ impl<A: FluorApp> DesktopShell<A> {
         self.app.render(&mut self.scratch, &mut ctx);
         drop(ctx);
         app_dt = app_start.elapsed().as_secs_f32();
-
-        // Outline state for next frame's toggle-off check. Record only when active so a toggle-off can union the rect.
-        self.last_outline_active = outline_active;
-        if outline_active {
-            self.last_outline_bbox = damage_clip;
-        }
-
-        // Optional damage outline overlay (Ctrl+Shift+D+W). Paints a 2-px magenta hairline around `damage_clip` — the actual sub-rect the host decided to repaint this frame. We use damage_clip rather than `pending_damage.bbox()` because not every primitive reports through a Canvas: chrome's bake_hover and the flatten path mutate buffers directly, so `pending_damage` under-reports on hover-only frames. damage_clip is the ground truth for "what got repainted." Painted into scratch BEFORE finalize so it flows through the boundary like any other content.
-        if outline_active && !damage_clip.is_empty() {
-            let mut overlay_damage = crate::canvas::Damage::new();
-            let mut canvas = crate::canvas::Canvas::new(
-                &mut self.scratch,
-                win_w,
-                win_h,
-                &mut overlay_damage,
-            );
-            crate::paint::draw_damage_outline(&mut canvas, damage_clip);
-        }
 
         let scr_w = self.screen_size.0 as usize;
         let scr_h = self.screen_size.1 as usize;
@@ -584,7 +557,7 @@ impl<A: FluorApp> DesktopShell<A> {
             }
         }
 
-        // Copy persistent_screen → platform back buffer (whichever softbuffer/wgpu hands us this frame; it may be stale or rotated, but we always overwrite the whole thing from our owned persistent_screen).
+        // Copy persistent_screen → platform back buffer (whichever softbuffer/wgpu hands us this frame; it may be stale or rotated, but we always overwrite the whole thing from our owned persistent_screen). The damage outline overlay is stamped AFTER this copy and BEFORE present so it lives for exactly one frame and never touches persistent_screen.
         #[cfg(target_os = "macos")]
         {
             let Some(renderer) = self.renderer.as_mut() else {
@@ -592,6 +565,16 @@ impl<A: FluorApp> DesktopShell<A> {
             };
             let mut buffer = renderer.lock_buffer();
             buffer.copy_from_slice(&self.persistent_screen);
+            if outline_active && !damage_clip.is_empty() {
+                crate::paint::stamp_damage_outline_visible(
+                    &mut buffer,
+                    scr_w,
+                    scr_h,
+                    damage_clip,
+                    rect_x,
+                    rect_y,
+                );
+            }
             let _ = buffer.present();
         }
         #[cfg(not(target_os = "macos"))]
@@ -601,6 +584,16 @@ impl<A: FluorApp> DesktopShell<A> {
             };
             let mut buffer = surface.buffer_mut().expect("softbuffer buffer_mut");
             buffer.copy_from_slice(&self.persistent_screen);
+            if outline_active && !damage_clip.is_empty() {
+                crate::paint::stamp_damage_outline_visible(
+                    &mut buffer,
+                    scr_w,
+                    scr_h,
+                    damage_clip,
+                    rect_x,
+                    rect_y,
+                );
+            }
             buffer.present().expect("softbuffer buffer.present");
         }
         // Record what we just painted so the next drag-tick can compute its delta.
