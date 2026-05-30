@@ -286,6 +286,65 @@ pub fn wrap_add_rgb_where(pixels: &mut [u32], hit_map: &[u8], target_id: u8, del
     }
 }
 
+/// Generic per-hit-id overlay diff pass against a screen-space buffer. One walk over `hit_test_map` (window-sized, one byte per pixel). For each pixel `i`: compares the per-id deltas `current[id]` vs `last_applied[id]`. If they differ, wrap-ADDS the prior delta back to the persistent screen pixel (reverts the prior frame's tint) and wrap-SUBs the current delta (applies this frame's tint). Wrap arithmetic is exact-reversible — a wrap-sub of N exactly undoes a wrap-add of N — so chains of unbake/bake never accumulate drift. After the walk, `last_applied` is updated to `current` so the next frame can diff against it.
+///
+/// Why wrap-sub when applying: chrome's hover colour constants and `wrap_sub_rgb(THEME_HOVER, THEME_FILL)` are stored in α + darkness space. The persistent screen is visible-RGB (post-finalize XOR). Since `visible = 255 - darkness` per channel, adding `delta` in darkness storage = subtracting `delta` in visible storage. So the same delta constants from the widget-internal bake path apply here with a flipped operator. The α byte is preserved (overlay only tints visible RGB).
+///
+/// `win_ox / win_oy` are the screen-space offset of the window's top-left. `hit_test_map` is in window-space; for each pixel `(x, y)` in the map, the screen index is `(y + win_oy) * scr_w + (x + win_ox)`. Pixels whose translated screen coord falls outside the screen are skipped (bounds-clamped).
+pub fn apply_overlay_diff(
+    screen: &mut [u32],
+    scr_w: usize,
+    win_ox: i32,
+    win_oy: i32,
+    hit_test_map: &[u8],
+    win_w: usize,
+    win_h: usize,
+    last_applied: &mut [u32; 256],
+    current: &[u32; 256],
+) {
+    if scr_w == 0 || win_w == 0 || win_h == 0 || hit_test_map.len() < win_w * win_h {
+        return;
+    }
+    let scr_h = screen.len() / scr_w;
+    // Compute the window-space y/x range whose screen coords land inside [0, scr_h) / [0, scr_w).
+    let y_lo = ((-win_oy).max(0) as usize).min(win_h);
+    let y_hi = win_h.min(((scr_h as i32) - win_oy).max(0) as usize);
+    let x_lo = ((-win_ox).max(0) as usize).min(win_w);
+    let x_hi = win_w.min(((scr_w as i32) - win_ox).max(0) as usize);
+    if y_lo >= y_hi || x_lo >= x_hi {
+        // After updating last_applied, still no work to do — but the diff state is owed.
+        *last_applied = *current;
+        return;
+    }
+    for y in y_lo..y_hi {
+        let scr_y = (y as i32 + win_oy) as usize;
+        let map_row = y * win_w;
+        let scr_row = scr_y * scr_w;
+        for x in x_lo..x_hi {
+            let id = hit_test_map[map_row + x] as usize;
+            let cur = current[id];
+            let last = last_applied[id];
+            if cur == last {
+                continue;
+            }
+            // Revert prior tint: wrap-ADD last (visible-space inverse of wrap-sub).
+            // Apply new tint: wrap-SUB cur.
+            // Combined per-channel: pixel += last - cur (mod 256).
+            let dr = (((last >> 16) & 0xFF) as u8).wrapping_sub(((cur >> 16) & 0xFF) as u8);
+            let dg = (((last >> 8) & 0xFF) as u8).wrapping_sub(((cur >> 8) & 0xFF) as u8);
+            let db = ((last & 0xFF) as u8).wrapping_sub((cur & 0xFF) as u8);
+            let idx = scr_row + (x as i32 + win_ox) as usize;
+            let p = screen[idx];
+            let a = p & 0xFF00_0000;
+            let r = (((p >> 16) & 0xFF) as u8).wrapping_add(dr) as u32;
+            let g = (((p >> 8) & 0xFF) as u8).wrapping_add(dg) as u32;
+            let b = ((p & 0xFF) as u8).wrapping_add(db) as u32;
+            screen[idx] = a | (r << 16) | (g << 8) | b;
+        }
+    }
+    *last_applied = *current;
+}
+
 /// Compose `src` underneath `dst` where `src` is in *pre-composed* α + darkness form (the result of a chain of `under()` writes starting from empty — so `src.dark` is already attenuated by `src.α`). Unlike [`flatten`] with `BlendMode::Normal`, this kernel scales src's contribution by `(256 − dst.α)` only, NOT by `(256 − dst.α) × src.α`, avoiding the second premult that would dim every AA pixel.
 ///
 /// Use case: blit a cached widget layer (built by repeated `under()` from empty) onto a target buffer.
@@ -705,6 +764,14 @@ pub const DEBUG_SHOW_ALPHA_OFF: u8 = 0;
 pub const DEBUG_SHOW_ALPHA_GRAYSCALE: u8 = 1;
 pub const DEBUG_SHOW_ALPHA_FORCE_OPAQUE: u8 = 2;
 
+/// Debug toggle bound to the `Ctrl/Cmd + Shift + D + H` chord. When set, `finalize_into_screen` routes through the FORCE_OPAQUE debug branch (XOR darkness → visible RGB, ignore clip_mask trim, force α=0xFF, skip premult) so the per-id colours the consumer paints into scratch land in `persistent_screen` exactly as written — no AA edges, no corner cutouts, no shadow boost on the perimeter. The host additionally skips `paint_shadow` while this is on so the band outside the window doesn't disturb the hit-id view at the chrome edge.
+pub static DEBUG_SHOW_HITMASK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Debug toggle bound to the `Ctrl/Cmd + Shift + D + S` chord. When set, the host saturating-subtracts 1 from every persistent_screen pixel's RGB at the top of each frame (before finalize) and self-requests a continuous redraw chain. Fresh pixels written by finalize / overlay land at full brightness; pixels that aren't repainted fade visibly toward black. Used to verify the incremental left/right opaque-scan finalize is actually copying the regions it should — anything that doesn't get touched on a given frame visibly decays.
+pub static DEBUG_SHOW_FADE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Debug toggle that suppresses chrome layer rasterization (perimeter hairline + future controls + title) so consumers can see the background / panes / textbox underneath without chrome on top. Bound to the `Ctrl/Cmd + Shift + D + C` chord. The clip_mask is still carved at the boundary, so the window-shape trim remains visible. Stays `false` by default.
 pub static DEBUG_SKIP_CHROME: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -913,22 +980,21 @@ impl DebugStats {
 /// (terminal-style for readability against any underlying content). Positioned at the very
 /// bottom of `pixels`; clipped to the buffer if the window is too short to fit the strip
 /// (returns early in that case — diagnostic, not load-bearing).
+///
+/// `strip_y` is the canvas-relative row where the strip's top edge lands. Callers can pass any value that fits inside the canvas (`strip_y + DEBUG_STRIP_H ≤ canvas.height`); the host typically points the canvas at a dedicated `DEBUG_STRIP_H`-tall staging buffer with `strip_y = 0` so the strip never touches the app's scratch.
 #[cfg(feature = "text")]
 pub fn draw_debug_strip(
     canvas: &mut Canvas,
     text: &mut crate::text::TextRenderer,
     stats: &DebugStats,
+    strip_y: usize,
 ) {
-    const STRIP_H: usize = 24;
     const FONT_SIZE: f32 = 13.0;
     let width = canvas.width;
     let height = canvas.height;
-    if width == 0 || height < STRIP_H * 2 {
+    if width == 0 || height < strip_y + DEBUG_STRIP_H {
         return;
     }
-    // Position the strip centered inside the bottom 1/12th of the window — flush-bottom collided with chrome's bottom bar and the rounded-corner clip carved into the edges.
-    let band_top = (height * 11) / 12;
-    let strip_y = band_top + ((height - band_top).saturating_sub(STRIP_H)) / 2;
 
     let app_ms = stats.app_secs * 1000.0;
     let fill_ms = stats.fill_secs * 1000.0;
@@ -945,7 +1011,7 @@ pub fn draw_debug_strip(
 
     // Topmost-first ordering: text glyphs paint FIRST so the bar's under() writes are rejected by the glyph pixels, leaving the green characters visible against the black. If the bar were painted first it would fill all strip pixels opaque and every glyph would be eaten.
     let fg = pack_argb(80, 255, 120, 0xFF);
-    let text_cy = strip_y as f32 + STRIP_H as f32 * 0.5;
+    let text_cy = strip_y as f32 + DEBUG_STRIP_H as f32 * 0.5;
     text.draw_text_center_u32(
         canvas,
         &stats_line,
@@ -965,13 +1031,17 @@ pub fn draw_debug_strip(
     draw_rect(
         canvas,
         width as Coord * 0.5,
-        strip_y as Coord + STRIP_H as Coord * 0.5,
+        strip_y as Coord + DEBUG_STRIP_H as Coord * 0.5,
         width as Coord,
-        STRIP_H as Coord,
+        DEBUG_STRIP_H as Coord,
         bg,
         None,
     );
 }
+
+/// Height in pixels of the [`draw_debug_strip`] band — the consumer / host uses it to size the staging buffer and pick the screen-space y position.
+#[cfg(feature = "text")]
+pub const DEBUG_STRIP_H: usize = 24;
 
 /// Boundary step that finalizes the present buffer for the OS in a **single pass** per pixel — folds the darkness→visible flip, the window-shape clip-mask multiply, the Linux RGB premultiply, and the pack into one go. Walks `pixels` and `clip_mask` in lockstep; both slices must be the same length.
 ///
@@ -991,9 +1061,11 @@ pub fn finalize_for_os(pixels: &mut [u32], clip_mask: &[u8]) {
         return;
     }
 
-    // Debug-visualization paths stay scalar — they're rare (toggle-only) and not worth SIMD-izing.
-    if alpha_mode == DEBUG_SHOW_ALPHA_GRAYSCALE || alpha_mode == DEBUG_SHOW_ALPHA_FORCE_OPAQUE {
-        finalize_scalar_debug_inplace(&mut pixels[..n], &clip_mask[..n], alpha_mode);
+    // Debug-visualization paths stay scalar — they're rare (toggle-only) and not worth SIMD-izing. Hitmask piggybacks on FORCE_OPAQUE here too.
+    let hitmask = DEBUG_SHOW_HITMASK.load(std::sync::atomic::Ordering::Relaxed);
+    let effective_alpha_mode = if hitmask { DEBUG_SHOW_ALPHA_FORCE_OPAQUE } else { alpha_mode };
+    if effective_alpha_mode == DEBUG_SHOW_ALPHA_GRAYSCALE || effective_alpha_mode == DEBUG_SHOW_ALPHA_FORCE_OPAQUE {
+        finalize_scalar_debug_inplace(&mut pixels[..n], &clip_mask[..n], effective_alpha_mode);
         return;
     }
 
@@ -1183,18 +1255,24 @@ pub fn finalize_into_screen(
     scr_w: usize,
     rect_x: i32,
     rect_y: i32,
+    damage_clip: crate::canvas::PixelRect,
+    full_repaint: bool,
 ) {
     let alpha_mode = DEBUG_SHOW_ALPHA.load(std::sync::atomic::Ordering::Relaxed);
-    if scr_w == 0 {
+    if scr_w == 0 || damage_clip.is_empty() {
         return;
     }
     let scr_h = screen.len() / scr_w;
 
-    // Clip iteration to the rect ∩ screen. WHY: rect_x/y are screen-space coords that can be negative (window partially off-screen left/top) or push past the right/bottom edge when the surface is smaller than expected (initial size mismatch before the first Resized event, monitor change, etc.). PROOF: sy_min/sx_min skip rows/cols above/left of the screen origin; sy_max/sx_max stop at the screen edge. PREVENTS: i32 → usize wrap on negative offsets + writes past `screen.len()`.
-    let sy_min = (-rect_y).max(0) as usize;
-    let sx_min = (-rect_x).max(0) as usize;
-    let sy_max = win_h.min(((scr_h as i32) - rect_y).max(0) as usize);
-    let sx_max = win_w.min(((scr_w as i32) - rect_x).max(0) as usize);
+    // Clip iteration to (rect ∩ screen) ∩ damage_clip. The rect ∩ screen part handles window partially off-screen left/top (rect_x/y can be negative) and the right/bottom edge when the surface is smaller than expected (initial size mismatch before first Resized, monitor change, etc.). The damage_clip narrows further to the dirty sub-region — pixels outside it stay at whatever persistent_screen held from prior frames. Rule 0: negative `-rect_x/y` clamped via `.max(0)`; usize casts of clamped non-negative i32s are safe. PREVENTS: i32 → usize wrap on negative offsets + writes past `screen.len()`.
+    let rect_sy_min = (-rect_y).max(0) as usize;
+    let rect_sx_min = (-rect_x).max(0) as usize;
+    let rect_sy_max = win_h.min(((scr_h as i32) - rect_y).max(0) as usize);
+    let rect_sx_max = win_w.min(((scr_w as i32) - rect_x).max(0) as usize);
+    let sy_min = rect_sy_min.max(damage_clip.y0);
+    let sx_min = rect_sx_min.max(damage_clip.x0);
+    let sy_max = rect_sy_max.min(damage_clip.y1);
+    let sx_max = rect_sx_max.min(damage_clip.x1);
     if sy_min >= sy_max || sx_min >= sx_max {
         return;
     }
@@ -1206,10 +1284,12 @@ pub fn finalize_into_screen(
     let dst_x_min = (rect_x + sx_min as i32) as usize;
     let row_len = sx_max - sx_min;
 
-    // Debug-visualization paths stay scalar.
-    if alpha_mode == DEBUG_SHOW_ALPHA_GRAYSCALE || alpha_mode == DEBUG_SHOW_ALPHA_FORCE_OPAQUE {
+    // Debug-visualization paths stay scalar. Hitmask piggybacks on the FORCE_OPAQUE branch — same semantics (XOR to visible, ignore clip_mask, force α=0xFF, skip premult) so the consumer's per-id colours land in `persistent_screen` unmodified.
+    let hitmask = DEBUG_SHOW_HITMASK.load(std::sync::atomic::Ordering::Relaxed);
+    let effective_alpha_mode = if hitmask { DEBUG_SHOW_ALPHA_FORCE_OPAQUE } else { alpha_mode };
+    if effective_alpha_mode == DEBUG_SHOW_ALPHA_GRAYSCALE || effective_alpha_mode == DEBUG_SHOW_ALPHA_FORCE_OPAQUE {
         finalize_into_scalar_debug(
-            scratch, clip_mask, screen, scr_w, win_w, alpha_mode, sy_min, sy_max, sx_min, sx_max,
+            scratch, clip_mask, screen, scr_w, win_w, effective_alpha_mode, sy_min, sy_max, sx_min, sx_max,
             rect_x, rect_y,
         );
         return;
@@ -1220,14 +1300,42 @@ pub fn finalize_into_screen(
     #[cfg(not(target_os = "linux"))]
     let skip_premult = true;
 
-    crate::par::par_rows(screen, scr_w, dst_y_min, dst_y_max, |dst_y, screen_row| {
-        let sy = (dst_y as i32 - rect_y) as usize;
-        let scratch_off = sy * win_w + sx_min;
-        let src_chunk = &scratch[scratch_off..scratch_off + row_len];
-        let clip_chunk = &clip_mask[scratch_off..scratch_off + row_len];
-        let dst_chunk = &mut screen_row[dst_x_min..dst_x_min + row_len];
-        finalize_into_chunk_dispatch(src_chunk, clip_chunk, dst_chunk, skip_premult);
-    });
+    if full_repaint {
+        // Full-repaint path: copy every pixel in the damage_clip rect, AA and opaque alike. Same SIMD inner kernel as before.
+        crate::par::par_rows(screen, scr_w, dst_y_min, dst_y_max, |dst_y, screen_row| {
+            let sy = (dst_y as i32 - rect_y) as usize;
+            let scratch_off = sy * win_w + sx_min;
+            let src_chunk = &scratch[scratch_off..scratch_off + row_len];
+            let clip_chunk = &clip_mask[scratch_off..scratch_off + row_len];
+            let dst_chunk = &mut screen_row[dst_x_min..dst_x_min + row_len];
+            finalize_into_chunk_dispatch(src_chunk, clip_chunk, dst_chunk, skip_premult);
+        });
+    } else {
+        // Incremental path: per row, scan inward from the left until we hit an opaque pixel (α byte == 0xFF in scratch's α + darkness storage), then inward from the right. The window has no holes, so everything between is also opaque. Skip pixels outside [l, r) — those are the AA hairline at the window perimeter and were correctly finalized + shadow-integrated during the last full repaint; preserving them lets us skip paint_shadow entirely on incremental frames. SIMD still applies to the bounded range since interior rows are wholly opaque.
+        crate::par::par_rows(screen, scr_w, dst_y_min, dst_y_max, |dst_y, screen_row| {
+            let sy = (dst_y as i32 - rect_y) as usize;
+            let scratch_off = sy * win_w + sx_min;
+            let src_row = &scratch[scratch_off..scratch_off + row_len];
+            // Left scan: first index where α byte == 0xFF.
+            let mut l = 0;
+            while l < row_len && (src_row[l] >> 24) != 0xFF {
+                l += 1;
+            }
+            if l == row_len {
+                return; // Whole row is non-opaque (e.g. above the chrome perimeter) → nothing to copy.
+            }
+            // Right scan: last index where α byte == 0xFF, +1 for half-open.
+            let mut r = row_len;
+            while r > l && (src_row[r - 1] >> 24) != 0xFF {
+                r -= 1;
+            }
+            let len = r - l;
+            let clip_chunk = &clip_mask[scratch_off + l..scratch_off + l + len];
+            let src_chunk = &src_row[l..l + len];
+            let dst_chunk = &mut screen_row[dst_x_min + l..dst_x_min + l + len];
+            finalize_into_chunk_dispatch(src_chunk, clip_chunk, dst_chunk, skip_premult);
+        });
+    }
 }
 
 /// Per-row src→dst dispatcher — same shape as [`finalize_chunk_dispatch`] but reading from a
