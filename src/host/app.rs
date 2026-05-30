@@ -277,7 +277,7 @@ struct DesktopShell<A: FluorApp> {
 
     /// Live render-pipeline counters. Updated every `render_frame` call (composite-time EMA +
     /// frame counter); rendered to a bottom-of-window debug strip when [`paint::DEBUG_SHOW_FPS`]
-    /// is set via the `Ctrl/Cmd + Shift + D + F` chord.
+    /// is set via the `[]f` chord.
     debug_stats: crate::paint::DebugStats,
 
     /// Frame-level damage accumulator. Reset at the top of each `render_frame`; passed to the consumer via [`Context::damage`]; read back after consumer render to drive damage-clipped composite and the [`paint::DEBUG_SHOW_DAMAGE`] outline overlay.
@@ -294,6 +294,8 @@ struct DesktopShell<A: FluorApp> {
     last_hitmask: bool,
     /// Last-seen value of `paint::DEBUG_SHOW_ALPHA`. Same transition logic as `last_hitmask` — toggling alpha-viz changes finalize's debug branch, which requires a full repaint to refresh persistent_screen.
     last_alpha_mode: u8,
+    /// Last-seen value of `paint::DEBUG_SHOW_OPAQUE_SCAN`. Same transition logic as `last_hitmask` — toggling the opaque-scan tint changes what finalize stamps into persistent_screen (every interior pixel gains +16 blue while on; goes back to clean copy while off), so the next frame must be a full_repaint to wash the entire silhouette interior in one shot rather than only the next incidentally-damaged sub-rect.
+    last_opaque_scan: bool,
     /// Dedicated staging buffer for the FPS strip (debug). Sized to `win_w × DEBUG_STRIP_H` lazily on first use; the strip rasterizes here in α + darkness and then gets converted + clobbered into persistent_screen. Kept entirely separate from the app's scratch so the strip never contaminates the consumer's render path.
     strip_buf: Vec<u32>,
 }
@@ -334,6 +336,7 @@ impl<A: FluorApp> DesktopShell<A> {
             pending_full_repaint: true,
             last_hitmask: false,
             last_alpha_mode: 0,
+            last_opaque_scan: false,
             strip_buf: Vec::new(),
             last_overlay_active: [false; 256],
         }
@@ -363,6 +366,7 @@ impl<A: FluorApp> DesktopShell<A> {
         // Two render modes, chosen by an explicit host flag (NOT by comparing damage_clip's geometry to viewport_rect). `pending_full_repaint` is set by events that destroy the chrome perimeter + shadow band in persistent_screen — drag release, resize, zoom, focus change. Debug-toggle transitions (hitmask / alpha mode / FPS strip) also promote to a full repaint here because those flags change either finalize's branch or what's overlaid post-finalize, and need a clean window to flow through. On those frames we wipe persistent_screen, reset overlay state, set damage_clip = viewport, and finalize copies every pixel (including AA edges); paint_shadow then casts ONCE into the freshly-zero band (and only when hitmask is off). On every other frame, damage_clip is whatever app.damage_rect returns (typically a small interior region or empty); finalize is narrowed AND skips non-opaque source pixels so the AA hairline pixels at the window perimeter stay untouched, and paint_shadow is NOT called so it never compounds.
         let hitmask_now = crate::paint::DEBUG_SHOW_HITMASK.load(std::sync::atomic::Ordering::Relaxed);
         let alpha_mode_now = crate::paint::DEBUG_SHOW_ALPHA.load(std::sync::atomic::Ordering::Relaxed);
+        let opaque_scan_now = crate::paint::DEBUG_SHOW_OPAQUE_SCAN.load(std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "text")]
         let strip_active = crate::paint::DEBUG_SHOW_FPS.load(std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(feature = "text"))]
@@ -370,11 +374,13 @@ impl<A: FluorApp> DesktopShell<A> {
         if hitmask_now != self.last_hitmask
             || alpha_mode_now != self.last_alpha_mode
             || strip_active != self.last_strip_active
+            || opaque_scan_now != self.last_opaque_scan
         {
             self.pending_full_repaint = true;
             self.last_hitmask = hitmask_now;
             self.last_alpha_mode = alpha_mode_now;
             self.last_strip_active = strip_active;
+            self.last_opaque_scan = opaque_scan_now;
         }
         let viewport_rect = crate::canvas::PixelRect::new(0, 0, win_w, win_h);
         let full_repaint = self.pending_full_repaint;
@@ -390,7 +396,7 @@ impl<A: FluorApp> DesktopShell<A> {
         };
         // Strip is painted in a clobber pass AFTER finalize + overlay — it does NOT contribute to damage_clip and does NOT bump damage_pct.
 
-        // Damage outline overlay (Ctrl+Shift+D+W). Sampled once here so the post-finalize stamp uses a stable value for this frame. The outline is stamped DIRECTLY into the platform back buffer between the persistent_screen copy and `present()`, so it never enters persistent_screen, never flows through finalize, and never carries state between frames.
+        // Damage outline overlay (`[]w`). Sampled once here so the post-finalize stamp uses a stable value for this frame. The outline is stamped DIRECTLY into the platform back buffer between the persistent_screen copy and `present()`, so it never enters persistent_screen, never flows through finalize, and never carries state between frames.
         let outline_active = crate::paint::DEBUG_SHOW_DAMAGE.load(std::sync::atomic::Ordering::Relaxed);
 
         clear_scratch_rect(&mut self.scratch, win_w, damage_clip);

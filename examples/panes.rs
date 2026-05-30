@@ -34,11 +34,12 @@ const CHORD_HINTS: &[(&str, &str)] = &[
     ("P", "Skip premultiply"),
     ("A", "Show alpha (cycle)"),
     ("C", "Skip chrome"),
-    ("X", "Skip controls"),
+    ("L", "Skip controls"),
     ("R", "Force redraw"),
     ("F", "FPS / per-stage timings strip"),
-    ("W", "Damage rect outline"),
-    ("J", "Screen-buffer fade"),
+    ("W", "Damage rect outline (Where)"),
+    ("D", "Screen-buffer decay (fade)"),
+    ("B", "Finalize copy-pass blue tint"),
 ];
 
 /// Compute the bbox the chord hint panel covers — matches `paint::draw_chord_hint`'s positioning math so `panes.damage_rect` can include it when both brackets are held.
@@ -361,15 +362,9 @@ impl FluorApp for PanesDemo {
                             self.chord_rb_release = Some(now);
                         }
                         (_, ElementState::Pressed) if !kev.repeat => {
-                            // Only fire on the user's actual press, not on auto-repeat ticks.
+                            // Only fire on the user's actual press, not on auto-repeat ticks. brackets_held is the only gate — the dispatch chain below decides what each letter does, and unknown letters fall through to `else { acted = false; }` as a no-op. No whitelist here: a second gating layer would just mean every new chord has to be added in two places, which silently breaks bindings when one is missed.
                             if self.brackets_held(now) {
-                                let cl = c.to_ascii_lowercase();
-                                if matches!(
-                                    cl.as_str(),
-                                    "h" | "p" | "a" | "c" | "x" | "r" | "f" | "w" | "j"
-                                ) {
-                                    action_char = cl.chars().next();
-                                }
+                                action_char = c.to_ascii_lowercase().chars().next();
                             }
                         }
                         _ => {}
@@ -390,6 +385,7 @@ impl FluorApp for PanesDemo {
                             // Sync the global atomic so finalize switches to the FORCE_OPAQUE debug branch and the host gates paint_shadow off while the hitmask viz is up. Promotes the next frame to a full repaint via the host's transition detector.
                             paint::DEBUG_SHOW_HITMASK
                                 .store(self.show_hitmask, std::sync::atomic::Ordering::Relaxed);
+                            eprintln!("[]h hitmask = {}", self.show_hitmask);
                             if self.show_hitmask {
                                 // Fill the 256-entry colour table with distinct random RGBs each toggle. xorshift32 seeded from process nanos — debug-quality, no crypto needed. Each call to toggle = fresh palette.
                                 let seed = (std::time::SystemTime::now()
@@ -423,6 +419,7 @@ impl FluorApp for PanesDemo {
                                 .load(std::sync::atomic::Ordering::Relaxed);
                             paint::DEBUG_SKIP_PREMULT
                                 .store(!cur, std::sync::atomic::Ordering::Relaxed);
+                            eprintln!("[]p skip-premult = {}", !cur);
                         } else if ac == 'a' {
                             // Cycle: off (0) → grayscale (1) → force-opaque (2) → off.
                             let cur =
@@ -430,6 +427,8 @@ impl FluorApp for PanesDemo {
                             let next = (cur + 1) % 3;
                             paint::DEBUG_SHOW_ALPHA
                                 .store(next, std::sync::atomic::Ordering::Relaxed);
+                            let label = match next { 0 => "off", 1 => "grayscale", _ => "force-opaque" };
+                            eprintln!("[]a show-alpha = {} ({})", next, label);
                         } else if ac == 'c' {
                             let cur =
                                 paint::DEBUG_SKIP_CHROME.load(std::sync::atomic::Ordering::Relaxed);
@@ -437,35 +436,48 @@ impl FluorApp for PanesDemo {
                                 .store(!cur, std::sync::atomic::Ordering::Relaxed);
                             self.chrome.invalidate_chrome();
                             ctx.window.request_redraw();
-                        } else if ac == 'x' {
+                            eprintln!("[]c skip-chrome = {}", !cur);
+                        } else if ac == 'l' {
                             let cur = paint::DEBUG_SKIP_CONTROLS
                                 .load(std::sync::atomic::Ordering::Relaxed);
                             paint::DEBUG_SKIP_CONTROLS
                                 .store(!cur, std::sync::atomic::Ordering::Relaxed);
                             self.chrome.invalidate_chrome();
                             ctx.window.request_redraw();
+                            eprintln!("[]l skip-controls = {}", !cur);
                         } else if ac == 'r' {
                             self.chrome.group.invalidate();
                             self.textbox_group.invalidate();
                             self.cursor_group.invalidate();
                             self.rotation_group.invalidate();
+                            eprintln!("[]r force-redraw");
                         } else if ac == 'f' {
                             // Toggle the host's bottom-of-window diagnostic strip.
                             let cur =
                                 paint::DEBUG_SHOW_FPS.load(std::sync::atomic::Ordering::Relaxed);
                             paint::DEBUG_SHOW_FPS.store(!cur, std::sync::atomic::Ordering::Relaxed);
+                            eprintln!("[]f fps-strip = {}", !cur);
                         } else if ac == 'w' {
                             // Toggle the host's per-frame damage outline overlay (Where).
                             let cur =
                                 paint::DEBUG_SHOW_DAMAGE.load(std::sync::atomic::Ordering::Relaxed);
                             paint::DEBUG_SHOW_DAMAGE
                                 .store(!cur, std::sync::atomic::Ordering::Relaxed);
-                        } else if ac == 'j' {
-                            // Toggle the host's screen-buffer fade. Each frame the host saturating-subtracts 8 from every persistent_screen RGB byte, so unrefreshed pixels visibly decay toward black while fresh writes from finalize / overlay stay bright. Diagnoses whether the incremental opaque-scan finalize is actually covering everything it should. (Bound to J rather than S because S collided with something in the user's environment.)
+                            eprintln!("[]w damage-outline = {}", !cur);
+                        } else if ac == 'd' {
+                            // Toggle the host's screen-buffer decay. Each frame the host saturating-subtracts 8 from every persistent_screen RGB byte, so unrefreshed pixels visibly decay toward black while fresh writes from finalize / overlay stay bright. Diagnoses whether the incremental opaque-scan finalize is actually covering everything it should.
                             let cur =
                                 paint::DEBUG_SHOW_FADE.load(std::sync::atomic::Ordering::Relaxed);
                             paint::DEBUG_SHOW_FADE
                                 .store(!cur, std::sync::atomic::Ordering::Relaxed);
+                            eprintln!("[]d screen-decay = {}", !cur);
+                        } else if ac == 'b' {
+                            // Toggle the finalize's opaque-scan blue-tint visualization. Each finalize-written pixel (clip_mask == 255) gets +16 to its blue byte (saturating). On []b transition the host promotes the next frame to a full_repaint, so toggling visibly washes the entire silhouette interior in one shot.
+                            let cur =
+                                paint::DEBUG_SHOW_OPAQUE_SCAN.load(std::sync::atomic::Ordering::Relaxed);
+                            paint::DEBUG_SHOW_OPAQUE_SCAN
+                                .store(!cur, std::sync::atomic::Ordering::Relaxed);
+                            eprintln!("[]b opaque-scan tint = {}", !cur);
                         } else {
                             acted = false;
                         }
@@ -648,7 +660,7 @@ impl FluorApp for PanesDemo {
         let buf_w = ctx.viewport.width_px as usize;
         let buf_h = ctx.viewport.height_px as usize;
 
-        // Hairline + background + hover overlay. Chrome's bg layer gets photon's background_noise; chrome layer gets the perimeter hairline + controls (or stays empty under Ctrl+Shift+D+C); hover layer gets a partial-α tint over the currently-hovered button (or stays empty if hover_state == HIT_NONE). The chrome group's Stack program (`Push hover, Push chrome, Under(Normal), Push bg, Under(Normal)`) front-to-back-composites them, then flattens under the target. Order matters: rasterize_chrome MUST run before rasterize_hover because hover reads `hit_test_map` which chrome populates.
+        // Hairline + background + hover overlay. Chrome's bg layer gets photon's background_noise; chrome layer gets the perimeter hairline + controls (or stays empty under `[]c`); hover layer gets a partial-α tint over the currently-hovered button (or stays empty if hover_state == HIT_NONE). The chrome group's Stack program (`Push hover, Push chrome, Under(Normal), Push bg, Under(Normal)`) front-to-back-composites them, then flattens under the target. Order matters: rasterize_chrome MUST run before rasterize_hover because hover reads `hit_test_map` which chrome populates.
         //
         // Shape demos: each paint primitive gets a partial-transparency instance, all painted FIRST
         // (topmost-first doctrine), then noise composes behind via `under()` — scrolled vertically
