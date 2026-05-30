@@ -791,7 +791,7 @@ pub static DEBUG_SHOW_HITMASK: std::sync::atomic::AtomicBool =
 pub static DEBUG_SHOW_FADE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Debug toggle bound to the `[]b` chord. When set, the finalize path saturating-adds 16 to the blue byte of every pixel where `clip_mask == 255` (the silhouette interior), AFTER the chunk dispatch writes the post-XOR visible-RGB pixel. Makes the exact region finalize touches this frame glow blue — incremental frames trace the consumer's damage rect inside the silhouette; full_repaint frames glow the entire interior. Pairs naturally with `DEBUG_SHOW_FADE` (the blue stack reaches equilibrium where finalize hits often, decays elsewhere). On the incremental path the scan invariant already restricts writes to `clip_mask == 255` so the tint is unconditional inside `[l, r)`; on the full_repaint path the chunk runs over the whole damage_clip including cutout corners (clip_mask == 0), so the tint filters per-pixel to avoid glowing cutouts.
+/// Debug toggle bound to the `[]b` chord. When set, the **incremental** finalize path saturating-adds 16 to the blue byte of every pixel inside the per-row `[l, r)` opaque-scan range, AFTER the chunk dispatch writes the post-XOR visible-RGB pixel. Makes exactly the pixels the incremental scan touches each frame glow blue — full_repaint frames are deliberately NOT tinted because a uniform interior wash on every focus change / resize / drag release would drown out the actual diagnostic signal (which is "what does the incremental scan land on?"). Pairs naturally with `DEBUG_SHOW_FADE` (the blue stack reaches equilibrium where incremental finalize hits often, decays elsewhere).
 pub static DEBUG_SHOW_OPAQUE_SCAN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -1327,7 +1327,7 @@ pub fn finalize_into_screen(
 
     let tint_scan = DEBUG_SHOW_OPAQUE_SCAN.load(std::sync::atomic::Ordering::Relaxed);
     if full_repaint {
-        // Full-repaint path: copy every pixel in the damage_clip rect, AA and opaque alike. Same SIMD inner kernel as before.
+        // Full-repaint path: copy every pixel in the damage_clip rect, AA and opaque alike. Same SIMD inner kernel as before. NOT tinted by `DEBUG_SHOW_OPAQUE_SCAN` — the diagnostic is specifically "what does the incremental scan touch?" and washing the entire interior on every full_repaint would drown out the answer. The `last_opaque_scan` transition detector still promotes the toggle to a full_repaint so the prior tint gets wiped from persistent_screen; that wipe-frame itself just lays down clean content.
         crate::par::par_rows(screen, scr_w, dst_y_min, dst_y_max, |dst_y, screen_row| {
             let sy = (dst_y as i32 - rect_y) as usize;
             let scratch_off = sy * win_w + sx_min;
@@ -1335,15 +1335,6 @@ pub fn finalize_into_screen(
             let clip_chunk = &clip_mask[scratch_off..scratch_off + row_len];
             let dst_chunk = &mut screen_row[dst_x_min..dst_x_min + row_len];
             finalize_into_chunk_dispatch(src_chunk, clip_chunk, dst_chunk, skip_premult);
-            if tint_scan {
-                // Per-pixel mask filter: the full-repaint chunk runs over the whole damage_clip rect including cutout corners (clip_mask == 0), so an unconditional tint would glow the cutouts. Restricting to `clip_mask == 255` matches the incremental path's scan invariant — both paths now visualize "fully-interior pixels finalize wrote this frame."
-                for (i, px) in dst_chunk.iter_mut().enumerate() {
-                    if clip_chunk[i] == 255 {
-                        let b = ((*px & 0xFF) as u8).saturating_add(16) as u32;
-                        *px = (*px & 0xFFFF_FF00) | b;
-                    }
-                }
-            }
         });
     } else {
         // Incremental path: per row, scan `clip_mask` (the silhouette alpha map, already baked into the window by chrome) inward from both ends, walking past anything < 255 — fully-transparent cutout cells (rows above/below the curve), and the squircle's outer-AA cells where the mask carries `h_cov < 255`. Stop at the first cell where `clip_mask == 255`: that's the fully-inside-silhouette interior, the only region the incremental finalize is allowed to touch. Pixels outside [l, r) are the AA hairline at the perimeter; they were correctly finalized + shadow-integrated during the last full repaint, and skipping them preserves the shadow boost frame-over-frame. The window tapers per row (the squircle curve insets the interior at the four corner row bands), so the scan runs every row rather than once. Inside [l, r) the chunk dispatch copies whatever the consumer painted into scratch — solid or translucent — through XOR + clip_mask × scratch α (here clip_mask == 255 by construction) + optional premult. SIMD applies to the bounded range.
