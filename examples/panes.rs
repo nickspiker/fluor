@@ -38,7 +38,26 @@ const CHORD_HINTS: &[(&str, &str)] = &[
     ("R", "Force redraw"),
     ("F", "FPS / per-stage timings strip"),
     ("W", "Damage rect outline"),
+    ("J", "Screen-buffer fade"),
 ];
+
+/// Compute the bbox the chord hint panel covers — matches `paint::draw_chord_hint`'s positioning math so `panes.damage_rect` can include it when both brackets are held.
+fn chord_hint_bbox(viewport: fluor::geom::Viewport, vw: usize, vh: usize) -> fluor::canvas::PixelRect {
+    let span = viewport.effective_span();
+    let font_size = (span * 0.014).max(11.0);
+    let line_h = font_size * 1.55;
+    let pad = font_size * 1.25;
+    let line_count = CHORD_HINTS.len() as f32 + 1.5;
+    let panel_h = line_count * line_h + pad * 2.0;
+    let panel_w = (span * 0.45).clamp(font_size * 22.0, font_size * 36.0);
+    let cx = vw as f32 * 0.5;
+    let cy = vh as f32 * 0.4;
+    let x0 = (cx - panel_w * 0.5).max(0.0) as usize;
+    let y0 = (cy - panel_h * 0.5).max(0.0) as usize;
+    let x1 = ((cx + panel_w * 0.5).max(0.0) as usize).min(vw);
+    let y1 = ((cy + panel_h * 0.5).max(0.0) as usize).min(vh);
+    fluor::canvas::PixelRect::new(x0, y0, x1, y1)
+}
 
 /// Convert a host-provided damage `PixelRect` into the `Option<Clip>` shape every paint primitive accepts. `None` skips the conversion when the rect already covers the full viewport (a small optimization — `Clip::buffer(w, h)` would resolve identically but adds a struct copy per call). Today we always pass `Some(clip)` for explicit damage; the host's rect is the union the app declared in `damage_rect`.
 fn pixelrect_to_clip(rect: fluor::canvas::PixelRect) -> Option<paint::Clip> {
@@ -69,6 +88,8 @@ struct PanesDemo {
     show_hitmask: bool,
     /// 256-entry random colour table indexed by hit_test_map byte; regenerated each time H toggles on so distinct IDs get visibly-distinct colours. Photon's debug-hit pattern.
     debug_hit_colours: Vec<u32>,
+    /// Chord-hint "was held last frame" toggle tracker so the panel area gets one frame of damage to clear stale pixels when both brackets release.
+    last_chord_held: bool,
     /// Demo rotation angle for the rotating rect — advanced by mouse-wheel scroll, used by [`paint::draw_rect_rotated`]. Shows off the rect primitive + RU-scaling: dimensions derive from `viewport.effective_span()` so the rect grows/shrinks with Ctrl+/Ctrl-/Ctrl+scroll.
     rect_angle: Coord,
     /// Vertical scroll offset for the noise background — advanced by the same mouse-wheel events that rotate the rect. Passed straight to [`paint::background_noise`].
@@ -139,6 +160,7 @@ impl PanesDemo {
             chord_lb_release: None,
             chord_rb_press: None,
             chord_rb_release: None,
+            last_chord_held: false,
             show_hitmask: false,
             debug_hit_colours: Vec::new(),
             rect_angle: 0.0,
@@ -344,7 +366,7 @@ impl FluorApp for PanesDemo {
                                 let cl = c.to_ascii_lowercase();
                                 if matches!(
                                     cl.as_str(),
-                                    "h" | "p" | "a" | "c" | "x" | "r" | "f" | "w"
+                                    "h" | "p" | "a" | "c" | "x" | "r" | "f" | "w" | "j"
                                 ) {
                                     action_char = cl.chars().next();
                                 }
@@ -365,6 +387,9 @@ impl FluorApp for PanesDemo {
                         let mut acted = true;
                         if ac == 'h' {
                             self.show_hitmask = !self.show_hitmask;
+                            // Sync the global atomic so finalize switches to the FORCE_OPAQUE debug branch and the host gates paint_shadow off while the hitmask viz is up. Promotes the next frame to a full repaint via the host's transition detector.
+                            paint::DEBUG_SHOW_HITMASK
+                                .store(self.show_hitmask, std::sync::atomic::Ordering::Relaxed);
                             if self.show_hitmask {
                                 // Fill the 256-entry colour table with distinct random RGBs each toggle. xorshift32 seeded from process nanos — debug-quality, no crypto needed. Each call to toggle = fresh palette.
                                 let seed = (std::time::SystemTime::now()
@@ -434,6 +459,12 @@ impl FluorApp for PanesDemo {
                             let cur =
                                 paint::DEBUG_SHOW_DAMAGE.load(std::sync::atomic::Ordering::Relaxed);
                             paint::DEBUG_SHOW_DAMAGE
+                                .store(!cur, std::sync::atomic::Ordering::Relaxed);
+                        } else if ac == 'j' {
+                            // Toggle the host's screen-buffer fade. Each frame the host saturating-subtracts 8 from every persistent_screen RGB byte, so unrefreshed pixels visibly decay toward black while fresh writes from finalize / overlay stay bright. Diagnoses whether the incremental opaque-scan finalize is actually covering everything it should. (Bound to J rather than S because S collided with something in the user's environment.)
+                            let cur =
+                                paint::DEBUG_SHOW_FADE.load(std::sync::atomic::Ordering::Relaxed);
+                            paint::DEBUG_SHOW_FADE
                                 .store(!cur, std::sync::atomic::Ordering::Relaxed);
                         } else {
                             acted = false;
@@ -583,21 +614,35 @@ impl FluorApp for PanesDemo {
         };
         union_in(self.chrome.damage_rect());
         union_in(self.textbox.damage_rect(vw, vh));
-        // Blinkey doesn't contribute scratch damage — it lives on persistent_screen via paint_screen_overlay.
+        // Chord hint overlay — when both `[` and `]` are held the hint panel paints into the viewport center. Union its bbox so the host's damage_clip + finalize cover it. Also covers the "was held last frame" case (toggle off) by checking last_chord_held — clears stale hint pixels in one frame.
+        let held_now = self.brackets_held(Instant::now());
+        if held_now || self.last_chord_held {
+            union_in(Some(chord_hint_bbox(viewport, vw, vh)));
+        }
         combined
     }
 
-    fn paint_screen_overlay(
-        &mut self,
-        screen: &mut [u32],
-        scr_w: usize,
-        scr_h: usize,
-        window_origin_x: i32,
-        window_origin_y: i32,
-    ) {
-        // Blinkey is the only screen-buffer-overlay element. Hover / focus tints flow through normal damage path (bbox-clipped scratch + finalize) since they depend on the chrome composite math.
-        self.textbox.paint_blinkey_into_screen(screen, scr_w, scr_h, window_origin_x, window_origin_y);
+    fn hit_test_map(&self) -> Option<(&[u8], usize, usize)> {
+        let (w, h) = self.chrome.dims();
+        Some((self.chrome.hit_test_map(), w, h))
     }
+
+    fn overlay_deltas(&self) -> [u32; 256] {
+        // Per-hit-id tint deltas applied to persistent_screen by the host's overlay pass. Empty by default; only the currently-hovered button (chrome side) and the textbox's hovered/focused state contribute non-zero entries. Wrap-arithmetic semantics in visible RGB (host wraps these into wrap-sub at apply time).
+        let mut t = [0u32; 256];
+        if let Some(c) = fluor::host::chrome_widget::hover_color_for(self.chrome.hover_state) {
+            t[self.chrome.hover_state as usize] = c;
+        }
+        t[HIT_TEXTBOX as usize] = if self.textbox.focused {
+            paint::wrap_sub_rgb(fluor::theme::TEXTBOX_ACTIVE, fluor::theme::TEXTBOX_FILL)
+        } else if self.textbox.hovered {
+            paint::wrap_sub_rgb(fluor::theme::TEXTBOX_HOVER, fluor::theme::TEXTBOX_FILL)
+        } else {
+            0
+        };
+        t
+    }
+
 
     fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
         let buf_w = ctx.viewport.width_px as usize;
@@ -687,8 +732,10 @@ impl FluorApp for PanesDemo {
 
         // Blinkey is no longer rasterized into a scratch-side cursor_group. It now lives entirely on the host's persistent_screen buffer, painted post-finalize via `FluorApp::paint_screen_overlay` → `Textbox::paint_blinkey_into_screen`. Wrap-add on / wrap-sub off, ~hundreds of bytes touched per blink — no scratch fill, no flatten, no chrome re-composite.
 
-        // Chord-hint overlay — visible while both brackets are held. Painted into `target` BEFORE every flatten so the hint glyphs sit at the TOP of the under-blend chain; everything else composes UNDER them.
-        if self.brackets_held(Instant::now()) {
+        // Chord-hint overlay — visible while both brackets are held. Painted into `target` BEFORE every flatten so the hint glyphs sit at the TOP of the under-blend chain; everything else composes UNDER them. Track held state for next frame's `damage_rect` (need a one-frame clear when released).
+        let held_now = self.brackets_held(Instant::now());
+        self.last_chord_held = held_now;
+        if held_now {
             let span = ctx.viewport.effective_span();
             let mut canvas = fluor::canvas::Canvas::new(target, buf_w, buf_h, ctx.damage);
             paint::draw_chord_hint(&mut canvas, ctx.text, CHORD_HINTS, span);

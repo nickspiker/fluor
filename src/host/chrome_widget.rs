@@ -18,8 +18,8 @@ use crate::theme;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// Map a hit-test ID to the wrap-add hover colour the chrome paints when that button is hovered. Returns `None` for IDs that don't have a hover colour (e.g. `HIT_APP_ICON`, `HIT_NONE`) so the bake/unbake paths can no-op cleanly.
-fn hover_color_for(hit: u8) -> Option<u32> {
+/// Map a hit-test ID to the wrap-add hover colour the chrome paints when that button is hovered. Returns `None` for IDs that don't have a hover colour (e.g. `HIT_APP_ICON`, `HIT_NONE`) so the bake/unbake paths can no-op cleanly. Public so consumers can build per-hit overlay delta tables from the same single source of truth.
+pub fn hover_color_for(hit: u8) -> Option<u32> {
     let c = match hit {
         chrome::HIT_CLOSE_BUTTON => theme::CLOSE_HOVER,
         chrome::HIT_MAXIMIZE_BUTTON => theme::MAXIMIZE_HOVER,
@@ -45,14 +45,8 @@ pub struct DefaultChrome {
     pub focused: bool,
     /// Orb visual state. Default `OrbTint::FollowFocus` makes the orb a window-state indicator; `OrbTint::Custom` lets the app turn it into a network/recording/presence badge. Mutate via [`set_orb_tint`](Self::set_orb_tint) to mark the chrome layer dirty automatically.
     pub orb_tint: chrome::OrbTint,
-    /// Currently-hovered button id (HIT_NONE if none). Rasterized as a colour delta on the hover layer.
+    /// Currently-hovered button id (HIT_NONE if none). Consumed by the host's overlay pass to derive the visible-RGB tint delta to apply at matching `hit_test_map` pixels in persistent_screen.
     pub hover_state: u8,
-    /// Last hover state that was baked into the chrome buffer. Used by the differential-hover path in `rasterize_chrome`: when only the hover changed (chrome layer NOT dirty, only `hover_dirty` set), we wrap-subtract `last_baked_hover` from the chrome buffer and wrap-add the current `hover_state`, avoiding a full chrome re-rasterize. Updated to `hover_state` after every rasterize cycle so the next differential pass undoes the right colour.
-    last_baked_hover: u8,
-    /// Set by [`set_hover`] when only the hover changed. Distinct from the chrome layer's dirty flag — `rasterize_chrome` checks this independently and takes the differential path (un-bake old hover, bake new hover) instead of running the full perimeter/orb/title/glyphs rasterization. Cleared after each rasterize.
-    hover_dirty: bool,
-    /// Cached pixel index list for the currently hovered button — recomputed on hover-state change.
-    pub hover_pixel_list: Vec<usize>,
     /// Last viewport passed to `new` or `resize`. Stored so chrome rasterization can read `effective_span` (= `span * ru`) and pick up the user's zoom multiplier automatically — chrome control sizing scales with the same `ceil(effective_span/32)` formula, so Ctrl+/ Ctrl-/ Ctrl+scroll zoom the chrome together with content.
     viewport: Viewport,
     layer_bg: usize,
@@ -96,9 +90,6 @@ impl DefaultChrome {
             focused: true,
             orb_tint: chrome::OrbTint::FollowFocus,
             hover_state: HIT_NONE,
-            last_baked_hover: HIT_NONE,
-            hover_dirty: false,
-            hover_pixel_list: Vec::new(),
             viewport,
             layer_bg,
             layer_chrome,
@@ -158,18 +149,7 @@ impl DefaultChrome {
 
         let chrome_dirty = self.group.rpn.layers[self.layer_chrome].dirty;
 
-        // Differential hover path: chrome layer is clean (perimeter, orb, title, glyphs all unchanged) but the hover state shifted. Wrap-subtract the last-baked hover colour from its hit-mask region, wrap-add the new one. ~`hit_test_map.len()` byte reads + a few muls and pixel writes; no squircle math, no glyph rasterization. Only mark the chrome layer dirty when the bake actually changed pixels (at least one of the hover states has a non-`None` `hover_color_for`); transitions where both sides are colorless (HIT_TEXTBOX, HIT_APP_ICON, HIT_NONE) leave chrome_buf untouched and shouldn't propagate a fake damage signal.
-        if !chrome_dirty && self.hover_dirty {
-            let bake_has_effect = hover_color_for(self.hover_state).is_some()
-                || hover_color_for(self.last_baked_hover).is_some();
-            self.differential_hover_rebake();
-            if bake_has_effect {
-                self.group.rpn.layers[self.layer_chrome].dirty = true;
-            }
-            self.hover_dirty = false;
-            return;
-        }
-
+        // Hover is no longer baked into chrome_buf — it lives entirely in the host's post-finalize overlay pass via `current_overlay_deltas` + `apply_overlay_diff`. chrome_buf stays tint-free; hit_test_map is the only thing chrome owes the overlay.
         if !chrome_dirty {
             return;
         }
@@ -400,67 +380,10 @@ impl DefaultChrome {
             );
         }
 
-        // Hover overlay: raw wrap-add of the hover colour's darkness into every chrome pixel whose hit_test_map matches the current hover_state. Done LAST so `hit_test_map` is fully populated. This is photon's intentional-wrap hover effect — `chrome_dark.wrapping_add(hover_dark)` per channel, α stays opaque. The wrap is the point: a cyan/magenta/yellow hover colour added to chrome's existing darkness shifts the visible RGB by exactly the hover colour (no overflow = identity), giving a distinct hover state without obscuring the glyph. `.under()` won't work here because chrome's button pixels are opaque after `draw_strip_bg`, so the opaque-top early-out fires and any blend gets silently dropped.
-        Self::bake_hover(chrome_buf, &self.hit_test_map, self.hover_state);
-        self.last_baked_hover = self.hover_state;
-        self.hover_dirty = false;
+        // Hover paint moved to the host overlay path; chrome_buf is intentionally tint-free here.
     }
 
-    /// Differential hover update: undo the previously-baked hover (wrap-subtract its colour from `last_baked_hover`'s hit-region) and bake the new one. Runs without re-rasterizing perimeter/orb/title/glyphs — those pixels in `chrome_buf` are already correct from the prior frame. ~`hit_test_map.len()` byte iterations plus a few per-pixel pack/unpack ops for the affected button(s); 10-100× cheaper than a full `rasterize_chrome` pass on real chrome.
-    fn differential_hover_rebake(&mut self) {
-        let chrome_buf = &mut self.group.rpn.layers[self.layer_chrome].pixels;
-        Self::unbake_hover(chrome_buf, &self.hit_test_map, self.last_baked_hover);
-        Self::bake_hover(chrome_buf, &self.hit_test_map, self.hover_state);
-        self.last_baked_hover = self.hover_state;
-    }
-
-    /// Wrap-add the hover colour into every chrome pixel whose `hit_test_map` byte equals `hover_state`. No-op for `HIT_NONE` or hit IDs that don't map to a button hover colour.
-    fn bake_hover(chrome_buf: &mut [u32], hit_test_map: &[u8], hover_state: u8) {
-        if hover_state == HIT_NONE {
-            return;
-        }
-        let Some(color) = hover_color_for(hover_state) else {
-            return;
-        };
-        let h_r = ((color >> 16) & 0xFF) as u8;
-        let h_g = ((color >> 8) & 0xFF) as u8;
-        let h_b = (color & 0xFF) as u8;
-        for (i, &hit) in hit_test_map.iter().enumerate() {
-            if hit == hover_state {
-                let p = chrome_buf[i];
-                let a = p & 0xFF000000;
-                let r = (((p >> 16) & 0xFF) as u8).wrapping_add(h_r) as u32;
-                let g = (((p >> 8) & 0xFF) as u8).wrapping_add(h_g) as u32;
-                let b = ((p & 0xFF) as u8).wrapping_add(h_b) as u32;
-                chrome_buf[i] = a | (r << 16) | (g << 8) | b;
-            }
-        }
-    }
-
-    /// Inverse of [`bake_hover`]: wrap-subtract the hover colour from every chrome pixel whose `hit_test_map` byte equals `hover_state`. The wrap arithmetic is exact-reversible — `wrapping_sub(x)` of a `wrapping_add(x)` returns the original byte for any input. Used by the differential-hover path to remove the previously-baked colour before applying the new one.
-    fn unbake_hover(chrome_buf: &mut [u32], hit_test_map: &[u8], hover_state: u8) {
-        if hover_state == HIT_NONE {
-            return;
-        }
-        let Some(color) = hover_color_for(hover_state) else {
-            return;
-        };
-        let h_r = ((color >> 16) & 0xFF) as u8;
-        let h_g = ((color >> 8) & 0xFF) as u8;
-        let h_b = (color & 0xFF) as u8;
-        for (i, &hit) in hit_test_map.iter().enumerate() {
-            if hit == hover_state {
-                let p = chrome_buf[i];
-                let a = p & 0xFF000000;
-                let r = (((p >> 16) & 0xFF) as u8).wrapping_sub(h_r) as u32;
-                let g = (((p >> 8) & 0xFF) as u8).wrapping_sub(h_g) as u32;
-                let b = ((p & 0xFF) as u8).wrapping_sub(h_b) as u32;
-                chrome_buf[i] = a | (r << 16) | (g << 8) | b;
-            }
-        }
-    }
-
-    /// **No-op stub.** Hover tint is baked into the chrome layer in `rasterize_chrome` directly (last pass), not maintained as a separate Stack layer — see the explanation in `new()` for why. Kept as a public method for forward-compat with future designs that may promote hover to a separate Stack operand once an `under_premult` for premultiplied-layer stacking exists.
+    /// **No-op stub.** Kept for source-compat with callers; hover tint lives in the host's post-finalize overlay pass now.
     pub fn rasterize_hover(&mut self) {}
 
     /// Composite the chrome group (bg + chrome layers via internal Stack `Push chrome, Push bg, Under(Normal)`) and flatten under the present buffer. Front-to-back: chrome's composited result is blended `under` whatever's already in target, so chrome wins where opaque and bg shows through where chrome is transparent.
@@ -490,81 +413,29 @@ impl DefaultChrome {
         }
     }
 
-    /// Damage region this chrome contributes to the host's per-frame clip rect.
-    ///
-    /// Returns `None` if no chrome state has changed since the last rasterize.
-    ///
-    /// Returns `Some(viewport)` when the chrome layers genuinely need a full rasterize (bg scroll, perimeter/orb/title/glyph re-rasterize triggered by focus / chord / resize).
-    ///
-    /// Returns `Some(button_bbox)` when only the hover changed — the union of bboxes for `hover_state` and `last_baked_hover` pixels in `hit_test_map`. Walks the map row-by-row to compute it. This keeps hover-only frames bbox-clipped (small finalize, no shadow) instead of dragging the whole viewport.
+    /// Damage region this chrome contributes to the host's per-frame clip rect. Returns `Some(viewport)` when bg or chrome layer needs a fresh rasterize (resize, focus change, debug toggle, scroll-driven bg); `None` otherwise. Hover is NOT damage anymore — it's an overlay operation against persistent_screen via `hit_test_map`, not a scratch repaint.
     pub fn damage_rect(&self) -> Option<crate::canvas::PixelRect> {
         let (w, h) = self.dims();
         let bg_dirty = self.group.rpn.layers[self.layer_bg].dirty;
         let chrome_dirty = self.group.rpn.layers[self.layer_chrome].dirty;
-        let hover_has_color = self.hover_dirty
-            && (hover_color_for(self.hover_state).is_some()
-                || hover_color_for(self.last_baked_hover).is_some());
-        if bg_dirty {
-            return Some(crate::canvas::PixelRect::new(0, 0, w, h));
-        }
-        if chrome_dirty || hover_has_color {
-            // Walk hit_test_map once for the union of hover_state and last_baked_hover bboxes — the only pixels the bake or unbake touches.
-            let combined = self
-                .hit_bbox(self.hover_state)
-                .map_or(self.hit_bbox(self.last_baked_hover), |a| {
-                    Some(match self.hit_bbox(self.last_baked_hover) {
-                        Some(b) => a.union(b),
-                        None => a,
-                    })
-                });
-            return combined.or_else(|| {
-                if chrome_dirty {
-                    Some(crate::canvas::PixelRect::new(0, 0, w, h))
-                } else {
-                    None
-                }
-            });
-        }
-        None
-    }
-
-    /// Compute the bounding rectangle of all `hit_test_map` cells equal to `id`. `None` if `id == HIT_NONE` or no cells match. Single pass over the map; called from `damage_rect` on hover transitions so we damage just the affected button area instead of the whole viewport.
-    fn hit_bbox(&self, id: u8) -> Option<crate::canvas::PixelRect> {
-        if id == HIT_NONE {
-            return None;
-        }
-        let (w, h) = self.dims();
-        let mut x_min = w;
-        let mut y_min = h;
-        let mut x_max = 0usize;
-        let mut y_max = 0usize;
-        let mut found = false;
-        for y in 0..h {
-            let row = y * w;
-            for x in 0..w {
-                if self.hit_test_map[row + x] == id {
-                    if x < x_min { x_min = x; }
-                    if y < y_min { y_min = y; }
-                    if x + 1 > x_max { x_max = x + 1; }
-                    if y + 1 > y_max { y_max = y + 1; }
-                    found = true;
-                }
-            }
-        }
-        if found {
-            Some(crate::canvas::PixelRect::new(x_min, y_min, x_max, y_max))
+        if bg_dirty || chrome_dirty {
+            Some(crate::canvas::PixelRect::new(0, 0, w, h))
         } else {
             None
         }
     }
 
-    /// Update the hover state if `new_hit` differs from the current. Returns `true` iff the state changed (so the consumer knows to request a redraw). Sets `hover_dirty` instead of the full chrome-layer dirty flag — `rasterize_chrome` checks `hover_dirty` and takes a differential path that wrap-subtracts the previously-baked hover and wrap-adds the new one, skipping the expensive perimeter/orb/title/glyph rasterization entirely.
+    /// Read-only accessor so the host overlay pass can walk the hit-test map without taking ownership.
+    pub fn hit_test_map(&self) -> &[u8] {
+        &self.hit_test_map
+    }
+
+    /// Update the hover state if `new_hit` differs from the current. Returns `true` iff the state changed (so the consumer knows to request a redraw — the host's overlay pass picks up the new state and applies the visible-RGB delta to persistent_screen, no scratch repaint needed).
     pub fn set_hover(&mut self, new_hit: u8) -> bool {
         if new_hit == self.hover_state {
             return false;
         }
         self.hover_state = new_hit;
-        self.hover_dirty = true;
         true
     }
 
@@ -679,16 +550,14 @@ mod tests {
     }
 
     #[test]
-    fn set_hover_marks_hover_dirty_not_chrome_layer() {
+    fn set_hover_does_not_dirty_chrome_layer() {
         let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "", None, None);
         // Run a flatten cycle so StackCompositor::evaluate clears all initial-dirty flags.
         let mut target = alloc::vec![0u32; 100 * 100];
         chrome.flatten_into(&mut target, 100, 100, None);
         assert!(!chrome.group.rpn.layers[chrome.layer_chrome].dirty);
-        assert!(!chrome.hover_dirty);
         chrome.set_hover(chrome::HIT_CLOSE_BUTTON);
-        // Differential-hover: set_hover sets `hover_dirty` only; the chrome layer stays clean so `rasterize_chrome` takes the cheap wrap-add path instead of re-rasterizing perimeter/orb/title/glyphs.
-        assert!(chrome.hover_dirty);
+        // Hover tint lives entirely in the host overlay pass against persistent_screen; no scratch repaint is needed, so the chrome layer must stay clean.
         assert!(!chrome.group.rpn.layers[chrome.layer_chrome].dirty);
     }
 

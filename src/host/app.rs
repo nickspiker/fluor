@@ -166,20 +166,14 @@ pub trait FluorApp {
     /// Per-frame paint into the host's CPU present buffer. Flatten owned Groups onto `target`. The damage clip computed pre-render is in `ctx.damage_clip`; thread it through every flatten / blit / glow call to skip pixels outside the dirty region.
     fn render(&mut self, target: &mut [u32], ctx: &mut Context);
 
-    /// Post-finalize, post-shadow screen overlay pass. Runs AFTER the host has composited `scratch` into the persistent screen buffer and painted the drop shadow. Use for non-destructive overlays that should mutate just a few pixels each frame WITHOUT going through scratch / finalize / shadow re-rasterization — the textbox blinkey is the canonical case (wrap-add the wave on, wrap-subtract off).
-    ///
-    /// `screen` is the host's persistent screen-sized buffer in **OS visible-RGB** format (already past the α + darkness → visible XOR boundary). `(window_origin_x, window_origin_y)` is where the window content starts inside `screen`, so a consumer translates viewport-space widget coords by adding these to land in the right pixels.
-    ///
-    /// Default impl: no-op.
-    fn paint_screen_overlay(
-        &mut self,
-        screen: &mut [u32],
-        scr_w: usize,
-        scr_h: usize,
-        window_origin_x: i32,
-        window_origin_y: i32,
-    ) {
-        let _ = (screen, scr_w, scr_h, window_origin_x, window_origin_y);
+    /// Per-hit-id overlay delta table for THIS frame. The host runs one walk over `hit_test_map()` after finalize+shadow; for each pixel `i`, if `current[id] != last_applied[id]`, it wrap-adds the prior delta back and wrap-subs the current delta in `persistent_screen` (visible-RGB space). Apps return a `[u32; 256]` where entry `[id]` is the visible-RGB delta to apply to pixels marked with that hit id this frame (e.g. the hover tint when a button is hovered, zero otherwise). Default impl: all zeros (no overlay tints).
+    fn overlay_deltas(&self) -> [u32; 256] {
+        [0u32; 256]
+    }
+
+    /// Read-only handle to the consumer's hit-test map so the host's overlay diff pass can walk it. Returns `Some((&map, win_w, win_h))` where `map.len() >= win_w * win_h` (one byte per pixel, the hit id). Default `None` = no overlay walk, no hover support.
+    fn hit_test_map(&self) -> Option<(&[u8], usize, usize)> {
+        None
     }
 
     /// Cursor icon at `(x, y)` in viewport pixel coords. Called whenever the cursor moves.
@@ -294,10 +288,18 @@ struct DesktopShell<A: FluorApp> {
     last_outline_active: bool,
     /// The bbox the damage outline was drawn around last frame (pending_damage.bbox at the time it painted). Used by the toggle-off case so we know which pixels to clear.
     last_outline_bbox: crate::canvas::PixelRect,
-    /// Persistent screen-sized pixel buffer, owned by us. Survives across frames so post-finalize overlays (the textbox blinkey via [`FluorApp::paint_screen_overlay`]) can mutate just a few pixels with wrap-add / wrap-sub semantics instead of re-running finalize for the whole window. The platform's softbuffer / wgpu back buffer may rotate or arrive stale; we always memcpy `persistent_screen` over it just before `present()` so the platform buffer's prior state doesn't matter. Resized when `screen_size` changes.
+    /// Persistent screen-sized pixel buffer, owned by us. Survives across frames so post-finalize overlays (hover/focus tint diffs, blinkey) can mutate just a few pixels each frame without re-running finalize for the whole window. The platform's softbuffer / wgpu back buffer may rotate or arrive stale; we always memcpy `persistent_screen` over it just before `present()` so the platform buffer's prior state doesn't matter. Resized when `screen_size` changes.
     persistent_screen: Vec<u32>,
-    /// Set on drag release: tells the next [`render_frame`] to wipe `persistent_screen` and force `damage_clip = viewport` for one frame. `apply_move_drag_shift` intentionally shifts the rotating platform back buffer (NOT persistent_screen) during drag so wrap artefacts don't accumulate frame-to-frame — but that means persistent_screen is stale post-drag and needs one full rebuild to match the new window position.
-    pending_full_invalidate: bool,
+    /// Set by any event that destroys the chrome perimeter + shadow band content in [`Self::persistent_screen`]: drag release, resize, zoom, focus change. Consumed once per `render_frame` to switch from incremental mode to full-repaint mode (wipe `persistent_screen`, finalize copies every pixel, paint_shadow runs once into the fresh band). Replaces every prior geometric-equality check on `damage_clip`.
+    pending_full_repaint: bool,
+    /// Last per-hit-id overlay delta applied to [`Self::persistent_screen`] (visible-RGB wrap-arithmetic). The host runs one generic walk over the consumer's `hit_test_map` each frame: for each pixel, if `current[id] != last_applied_delta[id]`, wrap-add the prior delta back and wrap-sub the current one. Reset to `[0; 256]` whenever `persistent_screen` is wiped (full repaint path) so the overlay starts from a known-clean state.
+    last_applied_delta: [u32; 256],
+    /// Last-seen value of `paint::DEBUG_SHOW_HITMASK`. When this differs from the current atomic value at the top of `render_frame`, we promote to a full repaint so the new finalize behavior (FORCE_OPAQUE-style scalar debug path / no shadow) lands across the whole window in one frame.
+    last_hitmask: bool,
+    /// Last-seen value of `paint::DEBUG_SHOW_ALPHA`. Same transition logic as `last_hitmask` — toggling alpha-viz changes finalize's debug branch, which requires a full repaint to refresh persistent_screen.
+    last_alpha_mode: u8,
+    /// Dedicated staging buffer for the FPS strip (debug). Sized to `win_w × DEBUG_STRIP_H` lazily on first use; the strip rasterizes here in α + darkness and then gets converted + clobbered into persistent_screen. Kept entirely separate from the app's scratch so the strip never contaminates the consumer's render path.
+    strip_buf: Vec<u32>,
 }
 
 impl<A: FluorApp> DesktopShell<A> {
@@ -335,7 +337,11 @@ impl<A: FluorApp> DesktopShell<A> {
             last_outline_active: false,
             last_outline_bbox: crate::canvas::PixelRect::empty(),
             persistent_screen: Vec::new(),
-            pending_full_invalidate: false,
+            pending_full_repaint: true,
+            last_applied_delta: [0u32; 256],
+            last_hitmask: false,
+            last_alpha_mode: 0,
+            strip_buf: Vec::new(),
         }
     }
 
@@ -360,49 +366,43 @@ impl<A: FluorApp> DesktopShell<A> {
         // Reset the frame's damage accumulator before the consumer paints. Every Canvas the consumer constructs against `ctx.damage` will union into this; after `app.render` returns we have the bounding rect of everything touched this frame.
         self.pending_damage.clear();
 
-        // Pre-render damage query. `None` from app.damage_rect = no widget needs scratch work — the screen overlay path (hover tint, blinkey) handles the visible change entirely. Empty `damage_clip` then skips the entire scratch / finalize / shadow chain below; only overlay + memcpy + present run. FPS strip bbox is unioned in when active so the strip's stats refresh each frame. Drag-release forces a full invalidate: persistent_screen is wiped and damage_clip is bumped to the whole viewport so finalize fully repaints at the new position.
-        let viewport_rect = crate::canvas::PixelRect::new(0, 0, win_w, win_h);
-        let mut damage_clip = if self.pending_full_invalidate {
-            self.pending_full_invalidate = false;
-            self.persistent_screen.fill(0);
-            viewport_rect
-        } else {
-            self.app.damage_rect(self.viewport).unwrap_or(crate::canvas::PixelRect::empty())
-        };
+        // Two render modes, chosen by an explicit host flag (NOT by comparing damage_clip's geometry to viewport_rect). `pending_full_repaint` is set by events that destroy the chrome perimeter + shadow band in persistent_screen — drag release, resize, zoom, focus change. Debug-toggle transitions (hitmask / alpha mode / FPS strip) also promote to a full repaint here because those flags change either finalize's branch or what's overlaid post-finalize, and need a clean window to flow through. On those frames we wipe persistent_screen, reset overlay state, set damage_clip = viewport, and finalize copies every pixel (including AA edges); paint_shadow then casts ONCE into the freshly-zero band (and only when hitmask is off). On every other frame, damage_clip is whatever app.damage_rect returns (typically a small interior region or empty); finalize is narrowed AND skips non-opaque source pixels so the AA hairline pixels at the window perimeter stay untouched, and paint_shadow is NOT called so it never compounds.
+        let hitmask_now = crate::paint::DEBUG_SHOW_HITMASK.load(std::sync::atomic::Ordering::Relaxed);
+        let alpha_mode_now = crate::paint::DEBUG_SHOW_ALPHA.load(std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "text")]
         let strip_active = crate::paint::DEBUG_SHOW_FPS.load(std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(feature = "text"))]
         let strip_active = false;
-        let strip_y_start = (win_h * 11) / 12;
-        let strip_rect = crate::canvas::PixelRect::new(0, strip_y_start, win_w, win_h);
-        // Strip needs the bbox union when it's currently active OR was active last frame (so toggle-off pixels get cleared from scratch + finalized away). Avoids saving a sticky viewport-prev that would force every subsequent hover frame into a full repaint.
-        if strip_active || self.last_strip_active {
-            damage_clip = damage_clip.union(strip_rect);
+        if hitmask_now != self.last_hitmask
+            || alpha_mode_now != self.last_alpha_mode
+            || strip_active != self.last_strip_active
+        {
+            self.pending_full_repaint = true;
+            self.last_hitmask = hitmask_now;
+            self.last_alpha_mode = alpha_mode_now;
+            self.last_strip_active = strip_active;
         }
-        self.last_strip_active = strip_active;
+        let viewport_rect = crate::canvas::PixelRect::new(0, 0, win_w, win_h);
+        let full_repaint = self.pending_full_repaint;
+        if full_repaint {
+            self.pending_full_repaint = false;
+            self.persistent_screen.fill(0);
+            self.last_applied_delta = [0u32; 256];
+        }
+        let mut damage_clip = if full_repaint {
+            viewport_rect
+        } else {
+            self.app.damage_rect(self.viewport).unwrap_or(crate::canvas::PixelRect::empty())
+        };
+        // Strip is painted in a clobber pass AFTER finalize + overlay — it does NOT contribute to damage_clip and does NOT bump damage_pct.
 
-        // Damage outline overlay: same toggle-off-cleanup pattern. The outline is drawn around the actual pending_damage post-render — but for clearing on toggle-off we use the bbox we recorded last frame.
+        // Damage outline overlay: any time an outline was drawn last frame, this frame's damage_clip must subsume that bbox so the stale magenta hairline gets cleared and re-finalized away. Covers both toggle-off (no new outline) and continuing-active-but-bbox-moved (outline jumps to a new region of the viewport on the next hover change). Without this, the previous frame's outline strands on persistent_screen since finalize is now damage-clip-narrowed and doesn't repaint outside the new clip.
         let outline_active = crate::paint::DEBUG_SHOW_DAMAGE.load(std::sync::atomic::Ordering::Relaxed);
-        if !outline_active && self.last_outline_active {
+        if self.last_outline_active {
             damage_clip = damage_clip.union(self.last_outline_bbox);
         }
 
         clear_scratch_rect(&mut self.scratch, win_w, damage_clip);
-
-        // Paint the FPS strip first (topmost-first inside `damage_clip`). Uses the previous frame's stats — this frame's time isn't known until after render+finalize+shadow below.
-        #[cfg(feature = "text")]
-        if strip_active {
-            if let Some(text) = self.text.as_mut() {
-                let mut strip_damage = crate::canvas::Damage::new();
-                let mut canvas = crate::canvas::Canvas::new(
-                    &mut self.scratch,
-                    win_w,
-                    win_h,
-                    &mut strip_damage,
-                );
-                crate::paint::draw_debug_strip(&mut canvas, text, &self.debug_stats);
-            }
-        }
 
         let Some(text) = self.text.as_mut() else {
             return;
@@ -434,22 +434,19 @@ impl<A: FluorApp> DesktopShell<A> {
         // Outline state for next frame's toggle-off check. Record only when active so a toggle-off can union the rect.
         self.last_outline_active = outline_active;
         if outline_active {
-            self.last_outline_bbox = self.pending_damage.bbox();
+            self.last_outline_bbox = damage_clip;
         }
 
-        // Optional damage outline overlay (Ctrl+Shift+D+W). Paints a 2-px magenta hairline around the bounding rect of everything that reported damage this frame. Painted into scratch BEFORE finalize so it flows through the boundary like any other content. Outline drawing reports its own damage back into `pending_damage`, which is harmless because we've already snapshot the bbox.
-        if crate::paint::DEBUG_SHOW_DAMAGE.load(std::sync::atomic::Ordering::Relaxed) {
-            let bbox = self.pending_damage.bbox();
-            if !bbox.is_empty() {
-                let mut overlay_damage = crate::canvas::Damage::new();
-                let mut canvas = crate::canvas::Canvas::new(
-                    &mut self.scratch,
-                    win_w,
-                    win_h,
-                    &mut overlay_damage,
-                );
-                crate::paint::draw_damage_outline(&mut canvas, bbox);
-            }
+        // Optional damage outline overlay (Ctrl+Shift+D+W). Paints a 2-px magenta hairline around `damage_clip` — the actual sub-rect the host decided to repaint this frame. We use damage_clip rather than `pending_damage.bbox()` because not every primitive reports through a Canvas: chrome's bake_hover and the flatten path mutate buffers directly, so `pending_damage` under-reports on hover-only frames. damage_clip is the ground truth for "what got repainted." Painted into scratch BEFORE finalize so it flows through the boundary like any other content.
+        if outline_active && !damage_clip.is_empty() {
+            let mut overlay_damage = crate::canvas::Damage::new();
+            let mut canvas = crate::canvas::Canvas::new(
+                &mut self.scratch,
+                win_w,
+                win_h,
+                &mut overlay_damage,
+            );
+            crate::paint::draw_damage_outline(&mut canvas, damage_clip);
         }
 
         let scr_w = self.screen_size.0 as usize;
@@ -465,7 +462,20 @@ impl<A: FluorApp> DesktopShell<A> {
         }
         fill_dt = t.elapsed().as_secs_f32();
 
-        // Finalize + shadow ONLY when there's real scratch damage to push through. On overlay-only frames (hover, focus tint change, blinkey tick) `damage_clip` is empty and the persistent_screen + shadow band from prior frames already hold the correct content — the overlay does the entire visible change. The shadow specifically only re-paints on a full-viewport repaint (chrome / focus / drag-release / resize), since damage that's interior to the window never affects edge-band shadow pixels.
+        // Debug fade: saturating-subtract `FADE_STEP` from every persistent_screen RGB byte. Runs BEFORE finalize so pixels that finalize / overlay / strip overwrite this frame land at full brightness while pixels that nobody touches visibly decay toward black — diagnoses whether the incremental opaque-scan finalize is actually copying the regions it should. Skipped on full_repaint since persistent_screen is being wiped anyway.
+        let fade_active = crate::paint::DEBUG_SHOW_FADE.load(std::sync::atomic::Ordering::Relaxed);
+        if fade_active && !full_repaint {
+            const FADE_STEP: u8 = 4;
+            for px in self.persistent_screen.iter_mut() {
+                let a = *px & 0xFF00_0000;
+                let r = (((*px >> 16) & 0xFF) as u8).saturating_sub(FADE_STEP) as u32;
+                let g = (((*px >> 8) & 0xFF) as u8).saturating_sub(FADE_STEP) as u32;
+                let b = ((*px & 0xFF) as u8).saturating_sub(FADE_STEP) as u32;
+                *px = a | (r << 16) | (g << 8) | b;
+            }
+        }
+
+        // Finalize: on a full repaint we copy every pixel from scratch (AA + opaque alike). On an incremental frame we narrow to damage_clip AND skip non-opaque source pixels — the chrome perimeter AA pixels in persistent_screen already carry their finalized RGB and the shadow boost from the last full repaint, and overwriting them would (a) drop the shadow integration and (b) require re-running paint_shadow. The opaque-only path uses left/right scans per row to find the bounded copy range, then does a contiguous finalize on that range (no per-pixel if-gating).
         let t = Instant::now();
         if !damage_clip.is_empty() {
             crate::paint::finalize_into_screen(
@@ -477,13 +487,15 @@ impl<A: FluorApp> DesktopShell<A> {
                 scr_w,
                 rect_x,
                 rect_y,
+                damage_clip,
+                full_repaint,
             );
         }
         finalize_dt = t.elapsed().as_secs_f32();
 
+        // Drop shadow runs ONCE per full repaint, into a known-cleared band (persistent_screen.fill(0) above). Never runs on incremental frames — the perimeter AA pixels with their shadow contribution were preserved by the opaque-only finalize, and the shadow band cells outside the window were not touched either, so the shadow visible from the last full repaint is still correct. Also skipped when hitmask debug is on so the band doesn't disturb the raw hit-id view at the chrome edge.
         let t = Instant::now();
-        if damage_clip == viewport_rect {
-            // Drop shadow: 45-degree diagonal rays cast from each chrome right/bottom edge pixel. factor_256 derived from `effective_span` so ray length is RU-invariant: target ≈ effective_span / 16; `factor_256 ≈ 256 − 1240/r`. Seed is the starting shadow α: 0x80 when focused, 0x40 (quarter strength) when unfocused.
+        if full_repaint && !hitmask_now {
             let span = self.viewport.effective_span();
             let target_radius = (span / 16.0).max(8.0);
             let drop = (1240.0 / target_radius) as u32;
@@ -505,14 +517,71 @@ impl<A: FluorApp> DesktopShell<A> {
         }
         shadow_dt = t.elapsed().as_secs_f32();
 
-        // Post-finalize, post-shadow overlay pass — runs against persistent_screen so it can wrap-add/wrap-sub a few pixels (textbox blinkey) without going through the whole scratch / finalize / shadow chain.
-        self.app.paint_screen_overlay(
-            &mut self.persistent_screen,
-            scr_w,
-            scr_h,
-            self.window_rect.x,
-            self.window_rect.y,
-        );
+        // Post-finalize, post-shadow overlay diff pass. Walks the consumer's hit_test_map once and applies per-id tint deltas to persistent_screen via wrap-arithmetic. Skipped if the consumer doesn't provide a hit_test_map. Runs every frame regardless of damage_clip so hover tints follow the cursor even on frames where finalize/shadow didn't run.
+        if let Some((map, hw, hh)) = self.app.hit_test_map() {
+            let current = self.app.overlay_deltas();
+            crate::paint::apply_overlay_diff(
+                &mut self.persistent_screen,
+                scr_w,
+                self.window_rect.x,
+                self.window_rect.y,
+                map,
+                hw,
+                hh,
+                &mut self.last_applied_delta,
+                &current,
+            );
+        }
+
+        // FPS strip: drawn LAST, clobber-style, into a DEDICATED staging buffer (`self.strip_buf`) — never touches the app's scratch or clip_mask. After rasterizing α + darkness into the staging buffer we XOR → visible RGB, force α=0xFF, and clobber-write into persistent_screen at the strip rect. The whole pass is bracketed by a snapshot+restore of `RASTERIZE_OPS` so the strip's text/rect rasterizers don't bump the R counter or pollute `damage_pct`. Does NOT contribute to `damage_clip`, does NOT trigger paint_shadow. Toggle on/off promotes to full repaint via the transition detector above so the strip-rect underlying pixels get correctly restored when it disappears.
+        #[cfg(feature = "text")]
+        if strip_active {
+            let strip_h = crate::paint::DEBUG_STRIP_H;
+            // Centre the strip in the bottom 1/12th of the window (mirrors the old computation; flush-bottom would collide with the squircle corner cutouts).
+            let band_top = (win_h * 11) / 12;
+            let strip_y_in_window = band_top + ((win_h - band_top).saturating_sub(strip_h)) / 2;
+
+            let strip_px = win_w.saturating_mul(strip_h);
+            if self.strip_buf.len() != strip_px {
+                self.strip_buf = vec![0u32; strip_px];
+            } else {
+                self.strip_buf.fill(0);
+            }
+            let saved_ops = crate::paint::RASTERIZE_OPS.load(std::sync::atomic::Ordering::Relaxed);
+            if let Some(text) = self.text.as_mut() {
+                let mut strip_damage = crate::canvas::Damage::new();
+                let mut canvas = crate::canvas::Canvas::new(
+                    &mut self.strip_buf,
+                    win_w,
+                    strip_h,
+                    &mut strip_damage,
+                );
+                crate::paint::draw_debug_strip(&mut canvas, text, &self.debug_stats, 0);
+            }
+            crate::paint::RASTERIZE_OPS.store(saved_ops, std::sync::atomic::Ordering::Relaxed);
+
+            // Clobber `strip_buf` rows into persistent_screen at `(window.x, window.y + strip_y_in_window)`. Per-pixel: XOR α + darkness → visible RGB, force α=0xFF.
+            let rect_x = self.window_rect.x;
+            let rect_y_top = self.window_rect.y + strip_y_in_window as i32;
+            for y in 0..strip_h {
+                let scr_y = rect_y_top + y as i32;
+                if scr_y < 0 || (scr_y as usize) >= scr_h {
+                    continue;
+                }
+                let scr_y = scr_y as usize;
+                let sb_row = y * win_w;
+                let ps_row = scr_y * scr_w;
+                for x in 0..win_w {
+                    let scr_x = rect_x + x as i32;
+                    if scr_x < 0 || (scr_x as usize) >= scr_w {
+                        continue;
+                    }
+                    let scr_x = scr_x as usize;
+                    let v = self.strip_buf[sb_row + x] ^ 0x00FF_FFFF;
+                    self.persistent_screen[ps_row + scr_x] = 0xFF00_0000 | (v & 0x00FF_FFFF);
+                }
+            }
+        }
 
         // Copy persistent_screen → platform back buffer (whichever softbuffer/wgpu hands us this frame; it may be stale or rotated, but we always overwrite the whole thing from our owned persistent_screen).
         #[cfg(target_os = "macos")]
@@ -700,6 +769,8 @@ impl<A: FluorApp> DesktopShell<A> {
             let win_px = (new_w as usize) * (new_h as usize);
             self.scratch = vec![0u32; win_px];
             self.clip_mask = vec![255u8; win_px];
+            // Window dims changed → perimeter, AA edges, shadow rays all need a fresh single-pass repaint.
+            self.pending_full_repaint = true;
 
             // Let the consumer reflow — they may relayout panes, recompute glyph metrics, etc.
             if let Some(text) = self.text.as_mut() {
@@ -917,6 +988,8 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                         let win_px = (new_w as usize) * (new_h as usize);
                         self.scratch = vec![0u32; win_px];
                         self.clip_mask = vec![255u8; win_px];
+                        // Surface-driven resize → window geometry changed → full repaint required.
+                        self.pending_full_repaint = true;
                         if let (Some(window), Some(text)) =
                             (self.window.as_ref().cloned(), self.text.as_mut())
                         {
@@ -1045,6 +1118,8 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                     self.is_dragging_resize = false;
                     self.resize_edge = ResizeEdge::None;
                 }
+                // Shadow seed depends on focus (full strength vs quarter strength) → re-cast shadow over a fresh band, which only happens on the full-repaint path.
+                self.pending_full_repaint = true;
                 self.dispatch_event(event);
                 // Repaint so the drop shadow dims/brightens immediately.
                 if let Some(window) = self.window.as_ref() {
@@ -1061,10 +1136,10 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                     self.is_dragging_resize = false;
                     self.resize_edge = ResizeEdge::None;
                 }
-                // End of in-buffer drag-to-move. Drop the flag and request one full redraw — the wrap-shift fast-path leaves wrap artefacts at whichever edges the window slid across AND persistent_screen has stale content from before the drag. Set `pending_full_invalidate` so the next render_frame wipes persistent_screen and forces a full repaint at the new window position.
+                // End of in-buffer drag-to-move. Drop the flag and request one full redraw — the wrap-shift fast-path leaves wrap artefacts at whichever edges the window slid across AND persistent_screen has stale content from before the drag. Set `pending_full_repaint` so the next render_frame wipes persistent_screen and forces a full repaint at the new window position.
                 if self.is_dragging_move {
                     self.is_dragging_move = false;
-                    self.pending_full_invalidate = true;
+                    self.pending_full_repaint = true;
                     if let Some(window) = self.window.as_ref() {
                         window.request_redraw();
                     }
@@ -1097,6 +1172,8 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
             Some(s) => self.viewport.adjust_zoom(s),
             None => self.viewport.reset_zoom(),
         }
+        // Zoom changes effective_span → chrome perimeter, AA edges, glyphs, shadow ray length all scale. Full repaint required.
+        self.pending_full_repaint = true;
         if let (Some(window), Some(text)) = (self.window.as_ref().cloned(), self.text.as_mut()) {
             let mut ctx = Context {
                 viewport: self.viewport,
