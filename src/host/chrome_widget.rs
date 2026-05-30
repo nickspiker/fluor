@@ -209,7 +209,7 @@ impl DefaultChrome {
         //   5. Strip BL squircle curves.
         //   6. Strip background fill (lowest — fills remaining empty pixels in the strip).
         //   7. Hover-state tint baked into chrome (wrap-add on hit_test_map matches).
-        // Ctrl+Shift+D+C: skip the window edge/perimeter AND title text (both are "decoration"). Controls still render. clip_mask stays at host default (255 everywhere), so the window appears as a rectangle (no rounded corners).
+        // `[]c`: skip the window edge/perimeter AND title text (both are "decoration"). Controls still render. clip_mask stays at host default (255 everywhere), so the window appears as a rectangle (no rounded corners).
         // Focus-driven palette. Each element pulls from a named theme constant so a downstream consumer can override (e.g. an app that wants a totally different unfocused look) by swapping the theme module rather than re-implementing the rasterizer wiring.
         let (edge_light, edge_shadow, title_color) = if self.focused {
             (
@@ -282,7 +282,7 @@ impl DefaultChrome {
             }
         }
 
-        // Ctrl+Shift+D+X: skip ONLY the controls strip (perimeter + title stay).
+        // `[]l`: skip ONLY the controls strip (perimeter + title stay).
         if crate::paint::DEBUG_SKIP_CONTROLS.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }

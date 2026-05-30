@@ -773,38 +773,37 @@ fn background_row(
     }
 }
 
-/// Debug toggle that lets the chord `Ctrl/Cmd+Shift+D+P` skip the boundary premultiply at runtime — A/B the Linux premult fix without recompiling. Stays `false` by default.
+/// Debug toggle that lets the `[]p` chord skip the boundary premultiply at runtime — A/B the Linux premult fix without recompiling. Stays `false` by default.
 pub static DEBUG_SKIP_PREMULT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Debug cycle bound to the `Ctrl/Cmd + Shift + D + A` chord. Three states (rotate each press): `0` = off (normal boundary conversion), `1` = α-as-grayscale (replace each pixel with `(final_α, final_α, final_α, 0xFF)` — inspect alpha distribution), `2` = force-opaque (force every pixel's α to 255 and pass the visible RGB through unmodified — inspect what the kernel produced BEFORE the clip mask + premultiply trimmed it).
+/// Debug cycle bound to the `[]a` chord. Three states (rotate each press): `0` = off (normal boundary conversion), `1` = α-as-grayscale (replace each pixel with `(final_α, final_α, final_α, 0xFF)` — inspect alpha distribution), `2` = force-opaque (force every pixel's α to 255 and pass the visible RGB through unmodified — inspect what the kernel produced BEFORE the clip mask + premultiply trimmed it).
 pub static DEBUG_SHOW_ALPHA: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 pub const DEBUG_SHOW_ALPHA_OFF: u8 = 0;
 pub const DEBUG_SHOW_ALPHA_GRAYSCALE: u8 = 1;
 pub const DEBUG_SHOW_ALPHA_FORCE_OPAQUE: u8 = 2;
 
-/// Debug toggle bound to the `Ctrl/Cmd + Shift + D + H` chord. When set, `finalize_into_screen` routes through the FORCE_OPAQUE debug branch (XOR darkness → visible RGB, ignore clip_mask trim, force α=0xFF, skip premult) so the per-id colours the consumer paints into scratch land in `persistent_screen` exactly as written — no AA edges, no corner cutouts, no shadow boost on the perimeter. The host additionally skips `paint_shadow` while this is on so the band outside the window doesn't disturb the hit-id view at the chrome edge.
+/// Debug toggle bound to the `[]h` chord. When set, `finalize_into_screen` routes through the FORCE_OPAQUE debug branch (XOR darkness → visible RGB, ignore clip_mask trim, force α=0xFF, skip premult) so the per-id colours the consumer paints into scratch land in `persistent_screen` exactly as written — no AA edges, no corner cutouts, no shadow boost on the perimeter. The host additionally skips `paint_shadow` while this is on so the band outside the window doesn't disturb the hit-id view at the chrome edge.
 pub static DEBUG_SHOW_HITMASK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Debug toggle bound to the `Ctrl/Cmd + Shift + D + S` chord. When set, the host saturating-subtracts 1 from every persistent_screen pixel's RGB at the top of each frame (before finalize) and self-requests a continuous redraw chain. Fresh pixels written by finalize / overlay land at full brightness; pixels that aren't repainted fade visibly toward black. Used to verify the incremental left/right opaque-scan finalize is actually copying the regions it should — anything that doesn't get touched on a given frame visibly decays.
+/// Debug toggle bound to the `[]d` chord (Decay). When set, the host saturating-subtracts 1 from every persistent_screen pixel's RGB at the top of each frame (before finalize) and self-requests a continuous redraw chain. Fresh pixels written by finalize / overlay land at full brightness; pixels that aren't repainted fade visibly toward black. Used to verify the incremental left/right opaque-scan finalize is actually copying the regions it should — anything that doesn't get touched on a given frame visibly decays.
 pub static DEBUG_SHOW_FADE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Debug toggle that suppresses chrome layer rasterization (perimeter hairline + future controls + title) so consumers can see the background / panes / textbox underneath without chrome on top. Bound to the `Ctrl/Cmd + Shift + D + C` chord. The clip_mask is still carved at the boundary, so the window-shape trim remains visible. Stays `false` by default.
+/// Debug toggle bound to the `[]b` chord. When set, the finalize path saturating-adds 16 to the blue byte of every pixel where `clip_mask == 255` (the silhouette interior), AFTER the chunk dispatch writes the post-XOR visible-RGB pixel. Makes the exact region finalize touches this frame glow blue — incremental frames trace the consumer's damage rect inside the silhouette; full_repaint frames glow the entire interior. Pairs naturally with `DEBUG_SHOW_FADE` (the blue stack reaches equilibrium where finalize hits often, decays elsewhere). On the incremental path the scan invariant already restricts writes to `clip_mask == 255` so the tint is unconditional inside `[l, r)`; on the full_repaint path the chunk runs over the whole damage_clip including cutout corners (clip_mask == 0), so the tint filters per-pixel to avoid glowing cutouts.
+pub static DEBUG_SHOW_OPAQUE_SCAN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Debug toggle that suppresses chrome layer rasterization (perimeter hairline + future controls + title) so consumers can see the background / panes / textbox underneath without chrome on top. Bound to the `[]c` chord. The clip_mask is still carved at the boundary, so the window-shape trim remains visible. Stays `false` by default.
 pub static DEBUG_SKIP_CHROME: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Debug toggle that suppresses ONLY the controls strip (curves + hairlines + glyphs + dividers + strip-bg fill) while keeping the window perimeter intact. Bound to the `Ctrl/Cmd + Shift + D + X` chord. Useful for isolating perimeter rendering from controls rendering. Stays `false` by default.
+/// Debug toggle that suppresses ONLY the controls strip (curves + hairlines + glyphs + dividers + strip-bg fill) while keeping the window perimeter intact. Bound to the `[]l` chord (controLs). Useful for isolating perimeter rendering from controls rendering. Stays `false` by default.
 pub static DEBUG_SKIP_CONTROLS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Debug toggle that overlays a one-line diagnostic strip across the bottom of the window
-/// showing live render-pipeline stats: composite-FPS (= `1.0 / composite_time`, NOT the vsync-
-/// capped frame rate) and the cumulative frame counter. Bound to the `Ctrl/Cmd + Shift + D + Q`
-/// chord (F was the original choice but Linux window managers eat Ctrl+Shift+F as a system
-/// shortcut). The composite-FPS is the actual headroom — a 144 Hz display showing "1240 FPS"
-/// means each composite took ~0.8 ms, leaving 6.1 ms of slack against vsync. `false` by default.
+/// Debug toggle that overlays a one-line diagnostic strip across the bottom of the window showing live render-pipeline stats: composite-FPS (= `1.0 / composite_time`, NOT the vsync-capped frame rate) and the cumulative frame counter. Bound to the `[]f` chord. The composite-FPS is the actual headroom — a 144 Hz display showing "1240 FPS" means each composite took ~0.8 ms, leaving 6.1 ms of slack against vsync. `false` by default.
 /// Counter bumped by primitives that perform genuine *rasterize* work (geometric paint, glyph shaping, etc.) — NOT by blits/copies/tint applications. The host reads-and-resets this with `.swap(0, ...)` after `app.render` to decide whether to call `DebugStats::record_rasterize` or only `record_present`. Lets the F (frame) counter climb on hover-only frames while R (rasterize) stays put.
 pub static RASTERIZE_OPS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -812,7 +811,7 @@ pub static RASTERIZE_OPS: std::sync::atomic::AtomicU64 =
 pub static DEBUG_SHOW_FPS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Debug toggle that overlays a 2-px magenta hairline around the damage rect the host repaints this frame. Bound to the `Ctrl/Cmd + Shift + D + W` chord ("Where"). Drawn directly into the platform back buffer AFTER `persistent_screen` has been copied in, BEFORE `present()`. The outline never enters `persistent_screen`, never flows through finalize, and never survives more than one frame — so toggling it on/off needs no full-repaint promotion and there is no stale-bbox state to carry between frames. `false` by default.
+/// Debug toggle that overlays a 2-px magenta hairline around the damage rect the host repaints this frame. Bound to the `[]w` chord ("Where"). Drawn directly into the platform back buffer AFTER `persistent_screen` has been copied in, BEFORE `present()`. The outline never enters `persistent_screen`, never flows through finalize, and never survives more than one frame — so toggling it on/off needs no full-repaint promotion and there is no stale-bbox state to carry between frames. `false` by default.
 pub static DEBUG_SHOW_DAMAGE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -1078,8 +1077,8 @@ pub const DEBUG_STRIP_H: usize = 24;
 /// 4. Pack back into `0xααRRGGBB`.
 ///
 /// Debug toggles:
-/// * `DEBUG_SHOW_ALPHA` (Ctrl+Shift+D+A): replace each pixel with `(final_α, final_α, final_α, 0xFF)` — grayscale α visualization, opaque so the OS shows it.
-/// * `DEBUG_SKIP_PREMULT` (Ctrl+Shift+D+P): skip the Linux RGB×α step.
+/// * `DEBUG_SHOW_ALPHA` (`[]a`): replace each pixel with `(final_α, final_α, final_α, 0xFF)` — grayscale α visualization, opaque so the OS shows it.
+/// * `DEBUG_SKIP_PREMULT` (`[]p`): skip the Linux RGB×α step.
 pub fn finalize_for_os(pixels: &mut [u32], clip_mask: &[u8]) {
     let alpha_mode = DEBUG_SHOW_ALPHA.load(std::sync::atomic::Ordering::Relaxed);
     let n = pixels.len().min(clip_mask.len());
@@ -1326,6 +1325,7 @@ pub fn finalize_into_screen(
     #[cfg(not(target_os = "linux"))]
     let skip_premult = true;
 
+    let tint_scan = DEBUG_SHOW_OPAQUE_SCAN.load(std::sync::atomic::Ordering::Relaxed);
     if full_repaint {
         // Full-repaint path: copy every pixel in the damage_clip rect, AA and opaque alike. Same SIMD inner kernel as before.
         crate::par::par_rows(screen, scr_w, dst_y_min, dst_y_max, |dst_y, screen_row| {
@@ -1335,31 +1335,47 @@ pub fn finalize_into_screen(
             let clip_chunk = &clip_mask[scratch_off..scratch_off + row_len];
             let dst_chunk = &mut screen_row[dst_x_min..dst_x_min + row_len];
             finalize_into_chunk_dispatch(src_chunk, clip_chunk, dst_chunk, skip_premult);
+            if tint_scan {
+                // Per-pixel mask filter: the full-repaint chunk runs over the whole damage_clip rect including cutout corners (clip_mask == 0), so an unconditional tint would glow the cutouts. Restricting to `clip_mask == 255` matches the incremental path's scan invariant — both paths now visualize "fully-interior pixels finalize wrote this frame."
+                for (i, px) in dst_chunk.iter_mut().enumerate() {
+                    if clip_chunk[i] == 255 {
+                        let b = ((*px & 0xFF) as u8).saturating_add(16) as u32;
+                        *px = (*px & 0xFFFF_FF00) | b;
+                    }
+                }
+            }
         });
     } else {
-        // Incremental path: per row, scan inward from the left until we hit an opaque pixel (α byte == 0xFF in scratch's α + darkness storage), then inward from the right. The window has no holes, so everything between is also opaque. Skip pixels outside [l, r) — those are the AA hairline at the window perimeter and were correctly finalized + shadow-integrated during the last full repaint; preserving them lets us skip paint_shadow entirely on incremental frames. SIMD still applies to the bounded range since interior rows are wholly opaque.
+        // Incremental path: per row, scan `clip_mask` (the silhouette alpha map, already baked into the window by chrome) inward from both ends, walking past anything < 255 — fully-transparent cutout cells (rows above/below the curve), and the squircle's outer-AA cells where the mask carries `h_cov < 255`. Stop at the first cell where `clip_mask == 255`: that's the fully-inside-silhouette interior, the only region the incremental finalize is allowed to touch. Pixels outside [l, r) are the AA hairline at the perimeter; they were correctly finalized + shadow-integrated during the last full repaint, and skipping them preserves the shadow boost frame-over-frame. The window tapers per row (the squircle curve insets the interior at the four corner row bands), so the scan runs every row rather than once. Inside [l, r) the chunk dispatch copies whatever the consumer painted into scratch — solid or translucent — through XOR + clip_mask × scratch α (here clip_mask == 255 by construction) + optional premult. SIMD applies to the bounded range.
         crate::par::par_rows(screen, scr_w, dst_y_min, dst_y_max, |dst_y, screen_row| {
             let sy = (dst_y as i32 - rect_y) as usize;
             let scratch_off = sy * win_w + sx_min;
-            let src_row = &scratch[scratch_off..scratch_off + row_len];
-            // Left scan: first index where α byte == 0xFF.
+            let clip_row = &clip_mask[scratch_off..scratch_off + row_len];
+            // Left scan: walk past every cell where the silhouette isn't fully covered. Stops at the first `clip_mask == 255` (the interior).
             let mut l = 0;
-            while l < row_len && (src_row[l] >> 24) != 0xFF {
+            while l < row_len && clip_row[l] != 255 {
                 l += 1;
             }
             if l == row_len {
-                return; // Whole row is non-opaque (e.g. above the chrome perimeter) → nothing to copy.
+                return; // Row is entirely cutout or hairline (e.g. the top-of-curve rows above the squircle's interior) — nothing to copy.
             }
-            // Right scan: last index where α byte == 0xFF, +1 for half-open.
+            // Right scan: same condition, half-open from the right.
             let mut r = row_len;
-            while r > l && (src_row[r - 1] >> 24) != 0xFF {
+            while r > l && clip_row[r - 1] != 255 {
                 r -= 1;
             }
             let len = r - l;
-            let clip_chunk = &clip_mask[scratch_off + l..scratch_off + l + len];
+            let src_row = &scratch[scratch_off..scratch_off + row_len];
+            let clip_chunk = &clip_row[l..l + len];
             let src_chunk = &src_row[l..l + len];
             let dst_chunk = &mut screen_row[dst_x_min + l..dst_x_min + l + len];
             finalize_into_chunk_dispatch(src_chunk, clip_chunk, dst_chunk, skip_premult);
+            if tint_scan {
+                for px in dst_chunk.iter_mut() {
+                    let b = ((*px & 0xFF) as u8).saturating_add(16) as u32;
+                    *px = (*px & 0xFFFF_FF00) | b;
+                }
+            }
         });
     }
 }
