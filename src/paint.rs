@@ -286,63 +286,82 @@ pub fn wrap_add_rgb_where(pixels: &mut [u32], hit_map: &[u8], target_id: u8, del
     }
 }
 
-/// Generic per-hit-id overlay diff pass against a screen-space buffer. One walk over `hit_test_map` (window-sized, one byte per pixel). For each pixel `i`: compares the per-id deltas `current[id]` vs `last_applied[id]`. If they differ, wrap-ADDS the prior delta back to the persistent screen pixel (reverts the prior frame's tint) and wrap-SUBs the current delta (applies this frame's tint). Wrap arithmetic is exact-reversible — a wrap-sub of N exactly undoes a wrap-add of N — so chains of unbake/bake never accumulate drift. After the walk, `last_applied` is updated to `current` so the next frame can diff against it.
+/// Generic per-hit-id overlay pass: walk `hit_test_map`, for each pixel whose hit id is currently tinted OR was tinted last frame, COPY the corresponding scratch pixel into persistent_screen — XOR'd to visible RGB, forced opaque, with an optional per-channel wrap-sub of `deltas[id]` if the id is currently tinted. The hit_test_map IS the silhouette trace of each interactive element (same flood-fill identification Photon uses), and we use it strictly to bound which pixels we touch — there's no diff math, no `last_applied_delta` accumulation, just "read scratch, maybe-adjust, write screen." Every frame's overlay is independently correct against scratch's content, so nothing the persistent_screen does between frames (fade, debug toggles, anything) can corrupt the tint.
 ///
-/// Why wrap-sub when applying: chrome's hover colour constants and `wrap_sub_rgb(THEME_HOVER, THEME_FILL)` are stored in α + darkness space. The persistent screen is visible-RGB (post-finalize XOR). Since `visible = 255 - darkness` per channel, adding `delta` in darkness storage = subtracting `delta` in visible storage. So the same delta constants from the widget-internal bake path apply here with a flipped operator. The α byte is preserved (overlay only tints visible RGB).
+/// `deltas[id] == 0` means "this id is not currently tinted." `last_active[id] == true` means "we wrote this id last frame, so this frame we still need to restore its pixels to clean scratch baseline even if the tint is now zero." After the walk, `last_active` is updated to reflect which ids had non-zero delta this frame.
 ///
-/// `win_ox / win_oy` are the screen-space offset of the window's top-left. `hit_test_map` is in window-space; for each pixel `(x, y)` in the map, the screen index is `(y + win_oy) * scr_w + (x + win_ox)`. Pixels whose translated screen coord falls outside the screen are skipped (bounds-clamped).
-pub fn apply_overlay_diff(
-    screen: &mut [u32],
+/// Why wrap-sub when applying: chrome's hover-colour constants and `wrap_sub_rgb(THEME_HOVER, THEME_FILL)` are darkness-space deltas. The persistent screen is post-finalize visible-RGB. Since `visible = 255 − darkness` per channel, adding `delta` in darkness = subtracting `delta` in visible. So the same delta constants the bake path used apply here with a flipped operator.
+///
+/// `win_ox / win_oy` are the screen-space offset of the window's top-left. `hit_test_map` and `scratch` are window-space (both length `win_w × win_h`). Pixels translating outside the screen are skipped.
+///
+/// Force-α=0xFF on every write is safe because pixels with non-`HIT_NONE` id are always interior to the window shape (corners and the squircle AA rim are stamped `HIT_NONE`), so no clip_mask carve gets stomped.
+pub fn apply_overlay(
+    scratch: &[u32],
+    persistent_screen: &mut [u32],
     scr_w: usize,
     win_ox: i32,
     win_oy: i32,
     hit_test_map: &[u8],
     win_w: usize,
     win_h: usize,
-    last_applied: &mut [u32; 256],
-    current: &[u32; 256],
+    deltas: &[u32; 256],
+    last_active: &mut [bool; 256],
 ) {
-    if scr_w == 0 || win_w == 0 || win_h == 0 || hit_test_map.len() < win_w * win_h {
+    // Quick reject: if no id is currently tinted AND none were tinted last frame, the overlay has zero work.
+    let any_current = deltas.iter().any(|&d| d != 0);
+    let any_last = last_active.iter().any(|&a| a);
+    if !any_current && !any_last {
         return;
     }
-    let scr_h = screen.len() / scr_w;
+    if scr_w == 0
+        || win_w == 0
+        || win_h == 0
+        || hit_test_map.len() < win_w * win_h
+        || scratch.len() < win_w * win_h
+    {
+        return;
+    }
+    let scr_h = persistent_screen.len() / scr_w;
     // Compute the window-space y/x range whose screen coords land inside [0, scr_h) / [0, scr_w).
     let y_lo = ((-win_oy).max(0) as usize).min(win_h);
     let y_hi = win_h.min(((scr_h as i32) - win_oy).max(0) as usize);
     let x_lo = ((-win_ox).max(0) as usize).min(win_w);
     let x_hi = win_w.min(((scr_w as i32) - win_ox).max(0) as usize);
     if y_lo >= y_hi || x_lo >= x_hi {
-        // After updating last_applied, still no work to do — but the diff state is owed.
-        *last_applied = *current;
+        *last_active = [false; 256];
         return;
     }
+
+    let mut new_active = [false; 256];
     for y in y_lo..y_hi {
         let scr_y = (y as i32 + win_oy) as usize;
         let map_row = y * win_w;
         let scr_row = scr_y * scr_w;
         for x in x_lo..x_hi {
-            let id = hit_test_map[map_row + x] as usize;
-            let cur = current[id];
-            let last = last_applied[id];
-            if cur == last {
+            let map_idx = map_row + x;
+            let id = hit_test_map[map_idx] as usize;
+            let delta = deltas[id];
+            let was_active = last_active[id];
+            // Skip pixels for ids that aren't tinted now AND weren't tinted last frame — nothing to do.
+            if delta == 0 && !was_active {
                 continue;
             }
-            // Revert prior tint: wrap-ADD last (visible-space inverse of wrap-sub).
-            // Apply new tint: wrap-SUB cur.
-            // Combined per-channel: pixel += last - cur (mod 256).
-            let dr = (((last >> 16) & 0xFF) as u8).wrapping_sub(((cur >> 16) & 0xFF) as u8);
-            let dg = (((last >> 8) & 0xFF) as u8).wrapping_sub(((cur >> 8) & 0xFF) as u8);
-            let db = ((last & 0xFF) as u8).wrapping_sub((cur & 0xFF) as u8);
-            let idx = scr_row + (x as i32 + win_ox) as usize;
-            let p = screen[idx];
-            let a = p & 0xFF00_0000;
-            let r = (((p >> 16) & 0xFF) as u8).wrapping_add(dr) as u32;
-            let g = (((p >> 8) & 0xFF) as u8).wrapping_add(dg) as u32;
-            let b = ((p & 0xFF) as u8).wrapping_add(db) as u32;
-            screen[idx] = a | (r << 16) | (g << 8) | b;
+            if delta != 0 {
+                new_active[id] = true;
+            }
+            let raw = scratch[map_idx];
+            let visible = raw ^ 0x00FF_FFFF;
+            let dr = ((delta >> 16) & 0xFF) as u8;
+            let dg = ((delta >> 8) & 0xFF) as u8;
+            let db = (delta & 0xFF) as u8;
+            let r = (((visible >> 16) & 0xFF) as u8).wrapping_sub(dr) as u32;
+            let g = (((visible >> 8) & 0xFF) as u8).wrapping_sub(dg) as u32;
+            let b = ((visible & 0xFF) as u8).wrapping_sub(db) as u32;
+            let scr_x = (x as i32 + win_ox) as usize;
+            persistent_screen[scr_row + scr_x] = 0xFF00_0000 | (r << 16) | (g << 8) | b;
         }
     }
-    *last_applied = *current;
+    *last_active = new_active;
 }
 
 /// Compose `src` underneath `dst` where `src` is in *pre-composed* α + darkness form (the result of a chain of `under()` writes starting from empty — so `src.dark` is already attenuated by `src.α`). Unlike [`flatten`] with `BlendMode::Normal`, this kernel scales src's contribution by `(256 − dst.α)` only, NOT by `(256 − dst.α) × src.α`, avoiding the second premult that would dim every AA pixel.
