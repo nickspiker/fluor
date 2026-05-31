@@ -69,6 +69,8 @@ pub const TEXTBOX_HOVER: u32 = dark(fmt(0x00_12_16_18));
 pub const TEXTBOX_ACTIVE: u32 = dark(fmt(0x00_00_00_00));
 pub const TEXTBOX_LIGHT_EDGE: u32 = dark(fmt(0x00_44_41_37));
 pub const TEXTBOX_SHADOW_EDGE: u32 = dark(fmt(0x00_2B_34_37));
+pub const TEXTBOX_TEXT: u32 = dark(fmt(0x00_E0_E0_DC));
+pub const TEXTBOX_SELECTION_BG: u32 = dark(fmt(0x00_3A_5A_8C));
 
 // Cursor (blinkey).
 pub const CURSOR_BRIGHTNESS: f32 = 100.0;
