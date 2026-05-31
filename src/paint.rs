@@ -1597,6 +1597,23 @@ fn compute_alphas(seed: u32, factor_256: u32) -> ([u32; 1024], usize) {
     (alphas, len)
 }
 
+/// Same decay iteration as [`compute_alphas`] but returns only the length (`alpha_len`). Callers that need the per-ray pixel reach to pre-size damage rects (textbox focus glow padding, chrome shadow extent) use this so the geometry the host clears + finalizes matches *exactly* what the rasterizer will paint — no early cutoff at the bbox edge, no over-clearing past where rays actually decay to zero.
+pub fn ray_reach_px(seed: u32, factor_256: u32) -> usize {
+    if seed == 0 || factor_256 == 0 || factor_256 >= 256 {
+        return 0;
+    }
+    let mut a = seed;
+    let mut len = 1usize;
+    while len < 1024 {
+        a = (a * factor_256) >> 8;
+        if a == 0 {
+            break;
+        }
+        len += 1;
+    }
+    len
+}
+
 /// Band fill for a straight right edge: source col = `source_col`, source rows `[y_start..y_end)`, rays going (+1,+1). Each output row r > y_start gets a horizontal run starting at column `source_col + k_min` going right. k = column offset from source_col; alpha = `alphas[k]`. Iterates output-row-major for cache locality.
 fn band_fill_right_dr(
     screen: &mut [u32],
