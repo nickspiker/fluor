@@ -168,16 +168,7 @@ impl Compositor {
             // Transitional Canvas wrapper for the migrated rasterizer; the consumer call sites are the next slice. Damage discarded — the pane is invalidated wholesale by upstream layout changes today.
             let mut pane_damage = crate::canvas::Damage::new();
             let mut canvas = crate::canvas::Canvas::new(target, buf_w, buf_h, &mut pane_damage);
-            paint::fill_rect(
-                &mut canvas,
-                x,
-                y,
-                w,
-                h,
-                pane.background,
-                None,
-                None,
-            );
+            paint::fill_rect(&mut canvas, x, y, w, h, pane.background, None, None);
         }
     }
 

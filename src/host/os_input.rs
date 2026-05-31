@@ -139,7 +139,7 @@ mod linux {
                     None
                 }
                 2 => {
-                    // Color: 4 × u16 = 8 bytes
+                    // Colour: 4 × u16 = 8 bytes
                     off += 8;
                     None
                 }
@@ -155,11 +155,7 @@ mod linux {
     /// `gsettings get org.gnome.desktop.peripherals.mouse double-click` returns an integer (ms) as plain text. Works on GNOME, Cinnamon, MATE, Pantheon, Budgie. Returns `None` on KDE/sway/etc. without GSettings, or if the binary is missing. Subprocess runs once per process via the OnceLock cache in the caller.
     pub fn gsettings_double_click_ms() -> Option<u32> {
         let out = Command::new("gsettings")
-            .args([
-                "get",
-                "org.gnome.desktop.peripherals.mouse",
-                "double-click",
-            ])
+            .args(["get", "org.gnome.desktop.peripherals.mouse", "double-click"])
             .output()
             .ok()?;
         if !out.status.success() {

@@ -83,7 +83,7 @@ impl Renderer {
 
         let caps = surface.get_capabilities(&adapter);
 
-        // Lock the format. fluor's pixel convention is `0xAARRGGBB` u32 → LE bytes [B,G,R,A] = Bgra8Unorm. If the surface doesn't offer it, fail loud — we'd otherwise silently swap R↔B and produce wrong colors. The host upload boundary is the only legal place to convert; this surface does direct memcpy so it must match.
+        // Lock the format. fluor's pixel convention is `0xAARRGGBB` u32 → LE bytes [B,G,R,A] = Bgra8Unorm. If the surface doesn't offer it, fail loud — we'd otherwise silently swap R↔B and produce wrong colours. The host upload boundary is the only legal place to convert; this surface does direct memcpy so it must match.
         let surface_format = caps.formats.iter().copied()
             .find(|f| *f == wgpu::TextureFormat::Bgra8Unorm)
             .expect("wgpu: surface does not support Bgra8Unorm — fluor's pixel convention requires it for zero-conversion upload");

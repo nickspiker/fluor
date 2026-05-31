@@ -53,7 +53,7 @@ pub struct Textbox {
     // --- Three-layer cache (front-to-back composition via under()) ---
     // Pill bg (bottom): squircle fill + AA edges. Rarely changes (geometry / zoom only).
     // Text glyphs (top, painted first to claim opaque pixels): per-char rasterized via TextRenderer. Changes on text edits.
-    // Selection bg (middle): painted fresh each frame from the cursor / selection_anchor range — no cache needed, it's just a colored rect.
+    // Selection bg (middle): painted fresh each frame from the cursor / selection_anchor range — no cache needed, it's just a coloured rect.
     //
     // Composition each frame: text_cache → target via under() (topmost wins on its opaque glyph pixels), selection rect → target via under() (claims empty selection-range cells beneath the glyphs), pill_cache → target via under() (fills remaining empty pill-interior cells beneath both). Result reads as the textbook text-field selection look: glyph colour unchanged over both selection and non-selection backgrounds.
     pill_cache: Vec<u32>,
@@ -99,8 +99,12 @@ fn char_class(c: char) -> u8 {
     }
 }
 
-/// Convert a viewport-coord `Region` (Coord f32 rectangle, possibly negative or off-buffer) into a `PixelRect` (usize half-open rect) clamped to the viewport bounds. Used by [`Textbox::damage_rect`] / [`Textbox::record_painted`] to express widget bboxes in the host's pixel-rect language for damage union.
-fn region_to_pixelrect(region: Region, viewport_w: usize, viewport_h: usize) -> PixelRect {
+/// Convert a viewport-coord `Region` (Coord f32 rectangle, possibly negative or off-buffer) into a `PixelRect` (usize half-open rect) clamped to the viewport bounds. Used by [`Textbox::damage_rect`] / [`Textbox::record_painted`] to express widget bboxes in the host's pixel-rect language for damage union. `pub(crate)` so sibling widgets ([`crate::widgets::button::Button`], future scroll views) share one canonical Region→PixelRect cast rather than duplicating the clamp math.
+pub(crate) fn region_to_pixelrect(
+    region: Region,
+    viewport_w: usize,
+    viewport_h: usize,
+) -> PixelRect {
     let vw = viewport_w as f32;
     let vh = viewport_h as f32;
     let x0 = region.x.max(0.0).min(vw) as usize;
@@ -110,12 +114,12 @@ fn region_to_pixelrect(region: Region, viewport_w: usize, viewport_h: usize) -> 
     PixelRect::new(x0, y0, x1, y1)
 }
 
-/// Blit the cache (pre-composed α + darkness, holding the BASE-color squircle — no tint baked in) onto `canvas` at `(origin_x, origin_y)`. The cache stays tint-free; hover/focus tints are applied entirely by the host's post-finalize overlay pass against persistent_screen using `hit_test_map` and the per-hit-id delta table.
+/// Blit the cache (pre-composed α + darkness, holding the BASE-colour squircle — no tint baked in) onto `canvas` at `(origin_x, origin_y)`. The cache stays tint-free; hover/focus tints are applied entirely by the host's post-finalize overlay pass against persistent_screen using `hit_test_map` and the per-hit-id delta table.
 ///
 /// Composition uses the `flatten_premult` formula (src is pre-attenuated, so we scale by `(256 − dst.α)` only — not by `(256 − dst.α) × src.α`).
 ///
 /// Hit stamp: writes `hit_id` to `hit_map` at every opaque cache pixel during the same walk.
-fn blit_cache_to_target(
+pub(crate) fn blit_cache_to_target(
     cache: &[u32],
     cache_w: usize,
     cache_h: usize,
@@ -258,7 +262,8 @@ impl Textbox {
         let focus_changed = self.focused != self.last_painted_focused;
         // Selection range change (extend / contract / new / clear) doesn't dirty either cache — pill unchanged, glyphs unchanged — but DOES require the bbox to repaint so the selection rect reflects the new range. Treat as pill-dirty for damage purposes.
         let selection_changed = self.selection_range() != self.last_painted_selection;
-        let pill_dirty = self.pill_cache_dirty || self.text_cache_dirty || focus_changed || selection_changed;
+        let pill_dirty =
+            self.pill_cache_dirty || self.text_cache_dirty || focus_changed || selection_changed;
 
         // Blinkey contribution: if it'll be on this frame OR was on last frame, the cursor_bbox needs to be in damage so it can be redrawn (or cleared). Tiny rect — typically ~16 × font_size.
         let blinkey_want = self.focused && !self.has_selection() && self.blinkey_visible;
@@ -271,7 +276,9 @@ impl Textbox {
 
         let mut combined: Option<PixelRect> = None;
         let union_in = |slot: &mut Option<PixelRect>, r: PixelRect| {
-            if r.is_empty() { return; }
+            if r.is_empty() {
+                return;
+            }
             *slot = Some(match *slot {
                 Some(c) => c.union(r),
                 None => r,
@@ -281,7 +288,11 @@ impl Textbox {
         // Pill bbox (current + prev) — contributes only when pill is dirty. Glow padding is included ONLY when the glow itself is changing this frame: focus transition (paint or clear glow), or pill geometry change (glow moves with the pill). Steady-state text editing while focused keeps the glow exactly where it was last frame — glow rays source from the pill silhouette which doesn't move with text edits — so damage stays inside the bare pill `bbox` and the glow region in `persistent_screen` is untouched. Cuts damage area ~3× on every keystroke compared to including the glow envelope.
         if pill_dirty {
             let need_glow_damage = focus_changed || self.pill_cache_dirty;
-            let current_region = if need_glow_damage { self.glow_bbox() } else { self.bbox() };
+            let current_region = if need_glow_damage {
+                self.glow_bbox()
+            } else {
+                self.bbox()
+            };
             let current_rect = region_to_pixelrect(current_region, viewport_w, viewport_h);
             union_in(&mut combined, current_rect);
             if let Some(prev) = self.last_painted_bbox {
@@ -339,7 +350,11 @@ impl Textbox {
 
     /// Reposition the pill. Width / height changes don't touch the text's pixel positions (a wider pill just exposes more of the existing text-layout pixel grid), so `scroll_offset` is preserved verbatim — the character that was at the pill centre before still sits there after. The post-geometry clamp prevents an aspect-ratio shift from leaving the text stranded with empty space on one side and overflow on the other.
     pub fn set_rect(&mut self, center_x: Coord, center_y: Coord, width: Coord, height: Coord) {
-        if self.center_x != center_x || self.center_y != center_y || self.width != width || self.height != height {
+        if self.center_x != center_x
+            || self.center_y != center_y
+            || self.width != width
+            || self.height != height
+        {
             self.pill_cache_dirty = true;
             self.text_cache_dirty = true;
         }
@@ -353,7 +368,11 @@ impl Textbox {
     /// Change the font size. Glyph widths rescale by `font_size_new / font_size_old`, so `scroll_offset` (a pixel value) is scaled by the same factor to keep the character that was at the pill centre still at the pill centre — the visual anchor under the user's eye stays put while the text grows or shrinks around it. Post-clamp keeps the rescaled offset within the new fit / overflow bounds so an aggressive zoom-in can't fling the text past the pill edges.
     pub fn set_font_size(&mut self, font_size: Coord, text: &mut TextRenderer) {
         if self.font_size != font_size {
-            let scale = if self.font_size > 0.0 { font_size / self.font_size } else { 1.0 };
+            let scale = if self.font_size > 0.0 {
+                font_size / self.font_size
+            } else {
+                1.0
+            };
             if scale != 1.0 && self.scroll_offset != 0.0 {
                 self.scroll_offset *= scale;
             }
@@ -606,7 +625,6 @@ impl Textbox {
         self.clamp_scroll_to_bounds();
     }
 
-
     // --- Click ---
 
     pub fn cursor_index_from_x(&self, click_x: Coord) -> usize {
@@ -755,7 +773,7 @@ impl Textbox {
         }
         let cw = pill_w as usize;
         let ch = pill_h as usize;
-        let squirdleyness = 3i32;
+        let squirdleyness = 3;
         let stroke_px = (self.stroke_ru * self.font_size) as isize + 1;
 
         // --- Pill cache rasterize (squircle fill + AA edges), only when geometry / zoom changed ---
@@ -774,9 +792,8 @@ impl Textbox {
             let mut cache_damage = crate::canvas::Damage::new();
             // Inner squircle (the fill INSIDE the stroke). Scope so cache_canvas drops before the mask read.
             {
-                let mut cache_canvas = crate::canvas::Canvas::new(
-                    &mut self.pill_cache, cw, ch, &mut cache_damage,
-                );
+                let mut cache_canvas =
+                    crate::canvas::Canvas::new(&mut self.pill_cache, cw, ch, &mut cache_damage);
                 if inner_w > 0 && inner_h > 0 {
                     paint::draw_squircle_pill(
                         &mut cache_canvas,
@@ -797,9 +814,8 @@ impl Textbox {
             }
             // Outer two-tone stroke painted after the snapshot so it doesn't influence the mask.
             {
-                let mut cache_canvas = crate::canvas::Canvas::new(
-                    &mut self.pill_cache, cw, ch, &mut cache_damage,
-                );
+                let mut cache_canvas =
+                    crate::canvas::Canvas::new(&mut self.pill_cache, cw, ch, &mut cache_damage);
                 paint::draw_squircle_pill_two_tone(
                     &mut cache_canvas,
                     0,
@@ -834,18 +850,24 @@ impl Textbox {
             let local_text_left = pill_w as Coord * 0.5 - tw * 0.5 + self.scroll_offset;
             let local_y_center = pill_h as Coord * 0.5;
             // Pre-compute the selection rect in local coords BEFORE the mutable borrow of self.text_cache starts (selection_range / widths read self).
-            let sel_rect: Option<(isize, isize, isize, isize)> = self.selection_range().and_then(|(sel_start, sel_end)| {
-                let sel_x0 = local_text_left + self.widths[..sel_start].iter().sum::<Coord>();
-                let sel_x1 = local_text_left + self.widths[..sel_end].iter().sum::<Coord>();
-                let sel_y0 = local_y_center - self.font_size * 0.5;
-                let sel_w = sel_x1 - sel_x0;
-                let sel_h_actual = self.font_size;
-                if sel_w > 0.0 && sel_h_actual > 0.0 {
-                    Some((sel_x0 as isize, sel_y0 as isize, sel_w as isize, sel_h_actual as isize))
-                } else {
-                    None
-                }
-            });
+            let sel_rect: Option<(isize, isize, isize, isize)> =
+                self.selection_range().and_then(|(sel_start, sel_end)| {
+                    let sel_x0 = local_text_left + self.widths[..sel_start].iter().sum::<Coord>();
+                    let sel_x1 = local_text_left + self.widths[..sel_end].iter().sum::<Coord>();
+                    let sel_y0 = local_y_center - self.font_size * 0.5;
+                    let sel_w = sel_x1 - sel_x0;
+                    let sel_h_actual = self.font_size;
+                    if sel_w > 0.0 && sel_h_actual > 0.0 {
+                        Some((
+                            sel_x0 as isize,
+                            sel_y0 as isize,
+                            sel_w as isize,
+                            sel_h_actual as isize,
+                        ))
+                    } else {
+                        None
+                    }
+                });
             // Pre-trim: only shape the substring that's actually visible in this frame's cache buffer (plus 3 chars of padding on each side for kerning context with the nearest off-screen char). For a 100K-char string scrolled to show 50 chars, this drops shaping cost from "shape all 100K" to "shape ~56" — orders of magnitude faster, makes drag-scrolling through long content interactive. Forward scan accumulating widths to find first/last visible char indices; for typical UI text (~200 chars) this is trivial, and for long content the early-out on `char_left >= cw` keeps it bounded.
             const PAD_CHARS: usize = 3;
             let s: Option<(String, Coord)> = if !self.chars.is_empty() && self.font_size > 0.0 {
@@ -875,7 +897,8 @@ impl Textbox {
                         // Left-anchor at the substring's first char position. Centre-anchoring with our cached `sub_width` was jerking when `first_padded`/`last_padded` shifted across char boundaries during scroll, because cosmic-text measures the substring's actual width (max_x − min_x of its glyphs) — which differs from our sum-of-widths by the substring's leading/trailing sidebearings, and those sidebearings change with the boundary chars. Left-anchoring uses only the LEFT position derived from our widths array, so each char lands where the corresponding char in the full string would land regardless of substring boundary.
                         let cum_to_first: Coord = self.widths[..first_padded].iter().sum();
                         let sub_left = local_text_left + cum_to_first;
-                        let substring: String = self.chars[first_padded..=last_padded].iter().collect();
+                        let substring: String =
+                            self.chars[first_padded..=last_padded].iter().collect();
                         Some((substring, sub_left))
                     }
                     _ => None,
@@ -885,9 +908,8 @@ impl Textbox {
             };
 
             let mut text_damage = crate::canvas::Damage::new();
-            let mut text_canvas = crate::canvas::Canvas::new(
-                &mut self.text_cache, cw, ch, &mut text_damage,
-            );
+            let mut text_canvas =
+                crate::canvas::Canvas::new(&mut self.text_cache, cw, ch, &mut text_damage);
             let mask_buffer = paint::AlphaMask::new(&self.inner_pill_mask, cw, ch);
 
             // Front-to-back: TOPMOST paints FIRST in fluor's model. Glyphs are visually topmost (the things you read), so they claim their cells before the selection bg paints into the surrounding empties. Anchor x is the LEFT edge of the visible substring (derived from cumulative widths up to first_padded), not the substring's centre — keeps the substring's first char locked to the same local x regardless of where the substring boundary falls during scroll.
@@ -1030,7 +1052,9 @@ impl Textbox {
                     let w_base = wave as u32;
                     for dx in -7i32..=7 {
                         let w = w_base >> (dx.unsigned_abs() as u32);
-                        if w == 0 { continue; }
+                        if w == 0 {
+                            continue;
+                        }
                         let w = w.min(255) as u8;
                         let idx = (row_base as isize + blinkey_x as isize + dx as isize) as usize;
                         let p = pixels[idx];

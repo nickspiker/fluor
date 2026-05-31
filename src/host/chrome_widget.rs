@@ -6,10 +6,10 @@
 //!
 //! Pattern: `chrome.rasterize_bg(|bg, w, h| { /* paint into bg */ });` → `chrome.rasterize_chrome(text);` → `chrome.rasterize_hover();` → `chrome.flatten_into(target, w, h);`. Each rasterize_* checks the layer's dirty bit internally and is a no-op on clean.
 
+use super::app::EventResponse;
 use super::chrome::{
     self, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE, HitId,
 };
-use super::app::EventResponse;
 use super::widget::{self, Click, Container, Hover, PaintCtx, Widget};
 use crate::canvas::PixelRect;
 use crate::coord::Coord;
@@ -26,7 +26,7 @@ use winit::event::KeyEvent;
 use winit::keyboard::ModifiersState;
 
 /// Map a hit-test ID to the wrap-add hover colour the chrome paints when that button is hovered. Returns `None` for IDs that don't have a hover colour (e.g. `HIT_APP_ICON`, `HIT_NONE`) so the bake/unbake paths can no-op cleanly. Public so consumers can build per-hit overlay delta tables from the same single source of truth.
-pub fn hover_color_for(hit: HitId) -> Option<u32> {
+pub fn hover_colour_for(hit: HitId) -> Option<u32> {
     let c = match hit {
         chrome::HIT_CLOSE_BUTTON => theme::CLOSE_HOVER,
         chrome::HIT_MAXIMIZE_BUTTON => theme::MAXIMIZE_HOVER,
@@ -340,7 +340,7 @@ impl DefaultChrome {
         //   7. Hover-state tint baked into chrome (wrap-add on hit_test_map matches).
         // `[]c`: skip the window edge/perimeter AND title text (both are "decoration"). Controls still render. clip_mask stays at host default (255 everywhere), so the window appears as a rectangle (no rounded corners).
         // Focus-driven palette. Each element pulls from a named theme constant so a downstream consumer can override (e.g. an app that wants a totally different unfocused look) by swapping the theme module rather than re-implementing the rasterizer wiring.
-        let (edge_light, edge_shadow, title_color) = if self.focused {
+        let (edge_light, edge_shadow, title_colour) = if self.focused {
             (
                 theme::WINDOW_LIGHT_EDGE,
                 theme::WINDOW_SHADOW_EDGE,
@@ -399,8 +399,7 @@ impl DefaultChrome {
             }
             {
                 // Title-text rasterization through the frame-level damage accumulator. Other chrome rasterizers (perimeter, app icon, button glyphs) still write into `chrome_buf` directly without damage tracking — they'll migrate when the rest of the chrome surface gets the Canvas treatment.
-                let mut canvas =
-                    crate::canvas::Canvas::new(chrome_buf, buf_w, buf_h, damage);
+                let mut canvas = crate::canvas::Canvas::new(chrome_buf, buf_w, buf_h, damage);
                 chrome::draw_title_text(
                     &mut canvas,
                     &self.title,
@@ -408,7 +407,7 @@ impl DefaultChrome {
                     button_size,
                     strip_x,
                     title_left_extra,
-                    title_color,
+                    title_colour,
                 );
             }
         }
@@ -517,7 +516,6 @@ impl DefaultChrome {
             bound_x_max,
         );
 
-
         // Symbols painted AFTER flood-fill: now that hit_test_map is populated, glyph opacity in chrome_buf no longer affects the hit map (and the hit fill won't see them as walls since it already ran).
         chrome::draw_maximize_symbol(
             chrome_buf,
@@ -561,14 +559,13 @@ impl DefaultChrome {
             &crossings,
         );
 
-        // Status bar — bottom band, half the height of the top strip. Painted last (after every top-side chrome element) but the regions never overlap, so order is just for readability. `band_h = 0` ⇒ no-op rasterizer when `status_text` is `None` or empty. Hairline uses `edge_light` (same colour as the top strip's dividers); bg matches the top strip's `WINDOW_CONTROLS_BG` so both bands read as the same material. Title-text colour reuses the same focus-driven `title_color` so the status text dims when the window is unfocused.
+        // Status bar — bottom band, half the height of the top strip. Painted last (after every top-side chrome element) but the regions never overlap, so order is just for readability. `band_h = 0` ⇒ no-op rasterizer when `status_text` is `None` or empty. Hairline uses `edge_light` (same colour as the top strip's dividers); bg matches the top strip's `WINDOW_CONTROLS_BG` so both bands read as the same material. Title-text colour reuses the same focus-driven `title_colour` so the status text dims when the window is unfocused.
         let status_band_h = match self.status_text.as_deref() {
             Some(t) if !t.is_empty() => button_size / 2,
             _ => 0,
         };
         if status_band_h > 0 {
-            let mut canvas =
-                crate::canvas::Canvas::new(chrome_buf, buf_w, buf_h, damage);
+            let mut canvas = crate::canvas::Canvas::new(chrome_buf, buf_w, buf_h, damage);
             chrome::draw_status_bar(
                 &mut canvas,
                 status_band_h,
@@ -576,7 +573,7 @@ impl DefaultChrome {
                 edge_light,
                 self.status_text.as_deref().unwrap_or(""),
                 text,
-                title_color,
+                title_colour,
             );
         }
 

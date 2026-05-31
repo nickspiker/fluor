@@ -79,3 +79,5 @@ pub const CURSOR_BRIGHTNESS: f32 = 100.0;
 pub const GLOW_DEFAULT: u32 = dark_rgb_only(fmt(0x00_FF_FF_FF));
 pub const GLOW_SUCCESS: u32 = dark_rgb_only(fmt(0x00_40_FF_40));
 pub const GLOW_ERROR: u32 = dark_rgb_only(fmt(0x00_FF_60_60));
+/// Black halo — the rays add darkness instead of brightness, drawing the surrounding pixels toward 0. Used by [`crate::widgets::Button`] so its focus motif reads as a "deepening shadow / pressing into the surface" rather than the textbox glow's "lit-from-within" feel. Distinct visual vocabulary at the same pixel cost.
+pub const GLOW_DARK: u32 = dark_rgb_only(fmt(0x00_00_00_00));

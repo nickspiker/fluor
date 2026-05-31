@@ -73,7 +73,10 @@ impl core::fmt::Display for IconError {
             IconError::MissingImageSection => write!(f, "no 'image' section in file"),
             IconError::MissingDataField => write!(f, "'image' section has no 'data' field"),
             IconError::UnsupportedDataType => {
-                write!(f, "'data' field has unsupported VSF type (expected t_u3 or v(b'a', ...))")
+                write!(
+                    f,
+                    "'data' field has unsupported VSF type (expected t_u3 or v(b'a', ...))"
+                )
             }
             IconError::BadTensorShape(s) => write!(f, "tensor shape {:?} not [h, w, 3]", s),
             IconError::Av1Decode(s) => write!(f, "AV1 decode: {}", s),
@@ -114,9 +117,12 @@ impl Icon {
         p += 1;
 
         if p < data.len() && data[p] != b'(' {
-            let _name = parse(data, &mut p).map_err(|e| IconError::Parse(format!("section name: {:?}", e)))?;
-            let _count = parse(data, &mut p).map_err(|e| IconError::Parse(format!("section n: {:?}", e)))?;
-            let _length = parse(data, &mut p).map_err(|e| IconError::Parse(format!("section b: {:?}", e)))?;
+            let _name = parse(data, &mut p)
+                .map_err(|e| IconError::Parse(format!("section name: {:?}", e)))?;
+            let _count =
+                parse(data, &mut p).map_err(|e| IconError::Parse(format!("section n: {:?}", e)))?;
+            let _length =
+                parse(data, &mut p).map_err(|e| IconError::Parse(format!("section b: {:?}", e)))?;
         }
 
         let mut data_value: Option<VsfType> = None;
@@ -145,7 +151,11 @@ impl Icon {
         let h = shape[0] as u32;
         let w = shape[1] as u32;
         let pixels = pack_alpha_darkness(&bytes, w, h);
-        Ok(Self { width: w, height: h, pixels })
+        Ok(Self {
+            width: w,
+            height: h,
+            pixels,
+        })
     }
 
     /// Decode an AV1 OBU bitstream → YCbCr → VSF RGB gamma2 → α + darkness. YCbCr inverse mirrors `vsfimg`'s encoder math byte-for-byte.
@@ -164,13 +174,16 @@ impl Icon {
         if open.0 < 0 {
             return Err(IconError::Av1Decode(format!("dav1d_open: {}", open.0)));
         }
-        let ctx = ctx.ok_or_else(|| IconError::Av1Decode("dav1d_open returned null context".into()))?;
+        let ctx =
+            ctx.ok_or_else(|| IconError::Av1Decode("dav1d_open returned null context".into()))?;
 
         let mut data = Dav1dData::default();
         let data_ptr = unsafe { dav1d_data_create(NonNull::new(&mut data), av1.len()) };
         if data_ptr.is_null() {
             unsafe { dav1d_close(NonNull::new(&mut Some(ctx) as *mut _)) };
-            return Err(IconError::Av1Decode("dav1d_data_create returned null".into()));
+            return Err(IconError::Av1Decode(
+                "dav1d_data_create returned null".into(),
+            ));
         }
         unsafe { std::ptr::copy_nonoverlapping(av1.as_ptr(), data_ptr, av1.len()) };
 

@@ -315,7 +315,11 @@ pub fn apply_overlay(
     deltas: &[u32],
     last_active: &mut [bool],
 ) {
-    debug_assert_eq!(deltas.len(), last_active.len(), "deltas / last_active must be sized identically to registry.next_id");
+    debug_assert_eq!(
+        deltas.len(),
+        last_active.len(),
+        "deltas / last_active must be sized identically to registry.next_id"
+    );
     // Quick reject: if no id is currently tinted AND none were tinted last frame, the overlay has zero work.
     let any_current = deltas.iter().any(|&d| d != 0);
     let any_last = last_active.iter().any(|&a| a);
@@ -388,7 +392,9 @@ pub fn flatten_premult(dst: &mut [u32], src: &[u32]) {
     let n = dst.len().min(src.len());
     for i in 0..n {
         let d = dst[i];
-        if d >= 0xFF000000 { continue; }
+        if d >= 0xFF000000 {
+            continue;
+        }
         let s = src[i];
         let d_a = d >> 24;
         let factor = 256 - d_a;
@@ -407,7 +413,7 @@ pub fn flatten_premult(dst: &mut [u32], src: &[u32]) {
     }
 }
 
-/// Per-byte wrap-subtract of `b` from `a`'s RGB bytes, returning a packed RGB delta suitable for [`wrap_add_rgb_where`]. The α byte is zeroed in the result. Used to derive a tint delta from two theme colors at runtime (e.g. `wrap_sub_rgb(TEXTBOX_HOVER, TEXTBOX_FILL)` → the per-channel offset that, wrap-added to a `TEXTBOX_FILL` pixel, lands at `TEXTBOX_HOVER`).
+/// Per-byte wrap-subtract of `b` from `a`'s RGB bytes, returning a packed RGB delta suitable for [`wrap_add_rgb_where`]. The α byte is zeroed in the result. Used to derive a tint delta from two theme colours at runtime (e.g. `wrap_sub_rgb(TEXTBOX_HOVER, TEXTBOX_FILL)` → the per-channel offset that, wrap-added to a `TEXTBOX_FILL` pixel, lands at `TEXTBOX_HOVER`).
 #[inline]
 pub fn wrap_sub_rgb(a: u32, b: u32) -> u32 {
     let ar = (a >> 16) & 0xFF;
@@ -759,10 +765,7 @@ fn background_row(
             noise_buf[i] =
                 ((colour.wrapping_add(BG_BASE) & RGB_MASK) ^ VISIBLE_TO_DARK_FLIP) | OPAQUE_ALPHA;
         }
-        under_chunk_normal_dispatch(
-            &mut row_pixels[x..x + chunk_len],
-            &noise_buf[..chunk_len],
-        );
+        under_chunk_normal_dispatch(&mut row_pixels[x..x + chunk_len], &noise_buf[..chunk_len]);
         x += chunk_len;
     }
 
@@ -786,10 +789,7 @@ fn background_row(
             noise_buf[i] =
                 ((colour.wrapping_add(BG_BASE) & RGB_MASK) ^ VISIBLE_TO_DARK_FLIP) | OPAQUE_ALPHA;
         }
-        under_chunk_normal_dispatch(
-            &mut row_pixels[chunk_lo..x_hi],
-            &noise_buf[..chunk_len],
-        );
+        under_chunk_normal_dispatch(&mut row_pixels[chunk_lo..x_hi], &noise_buf[..chunk_len]);
         x_hi = chunk_lo;
     }
 }
@@ -826,8 +826,7 @@ pub static DEBUG_SKIP_CONTROLS: std::sync::atomic::AtomicBool =
 
 /// Debug toggle that overlays a one-line diagnostic strip across the bottom of the window showing live render-pipeline stats: composite-FPS (= `1.0 / composite_time`, NOT the vsync-capped frame rate) and the cumulative frame counter. Bound to the `[]f` chord. The composite-FPS is the actual headroom — a 144 Hz display showing "1240 FPS" means each composite took ~0.8 ms, leaving 6.1 ms of slack against vsync. `false` by default.
 /// Counter bumped by primitives that perform genuine *rasterize* work (geometric paint, glyph shaping, etc.) — NOT by blits/copies/tint applications. The host reads-and-resets this with `.swap(0, ...)` after `app.render` to decide whether to call `DebugStats::record_rasterize` or only `record_present`. Lets the F (frame) counter climb on hover-only frames while R (rasterize) stays put.
-pub static RASTERIZE_OPS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static RASTERIZE_OPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub static DEBUG_SHOW_FPS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -916,8 +915,8 @@ pub fn draw_chord_hint(
     let cy = canvas.height as f32 * 0.4;
     let panel_y = cy - panel_h * 0.5;
 
-    let title_color = pack_argb(255, 255, 255, 0xFF);
-    let body_color = pack_argb(220, 220, 220, 0xFF);
+    let title_colour = pack_argb(255, 255, 255, 0xFF);
+    let body_colour = pack_argb(220, 220, 220, 0xFF);
 
     text.draw_text_center_u32(
         canvas,
@@ -926,7 +925,7 @@ pub fn draw_chord_hint(
         panel_y + pad + header_size * 0.5,
         header_size,
         500,
-        title_color,
+        title_colour,
         "Open Sans",
         None,
         None,
@@ -943,7 +942,7 @@ pub fn draw_chord_hint(
             line_y,
             font_size,
             400,
-            body_color,
+            body_colour,
             "Open Sans",
             None,
             None,
@@ -1101,8 +1100,14 @@ pub fn finalize_for_os(pixels: &mut [u32], clip_mask: &[u8]) {
 
     // Debug-visualization paths stay scalar — they're rare (toggle-only) and not worth SIMD-izing. Hitmask piggybacks on FORCE_OPAQUE here too.
     let hitmask = DEBUG_SHOW_HITMASK.load(std::sync::atomic::Ordering::Relaxed);
-    let effective_alpha_mode = if hitmask { DEBUG_SHOW_ALPHA_FORCE_OPAQUE } else { alpha_mode };
-    if effective_alpha_mode == DEBUG_SHOW_ALPHA_GRAYSCALE || effective_alpha_mode == DEBUG_SHOW_ALPHA_FORCE_OPAQUE {
+    let effective_alpha_mode = if hitmask {
+        DEBUG_SHOW_ALPHA_FORCE_OPAQUE
+    } else {
+        alpha_mode
+    };
+    if effective_alpha_mode == DEBUG_SHOW_ALPHA_GRAYSCALE
+        || effective_alpha_mode == DEBUG_SHOW_ALPHA_FORCE_OPAQUE
+    {
         finalize_scalar_debug_inplace(&mut pixels[..n], &clip_mask[..n], effective_alpha_mode);
         return;
     }
@@ -1324,11 +1329,27 @@ pub fn finalize_into_screen(
 
     // Debug-visualization paths stay scalar. Hitmask piggybacks on the FORCE_OPAQUE branch — same semantics (XOR to visible, ignore clip_mask, force α=0xFF, skip premult) so the consumer's per-id colours land in `persistent_screen` unmodified.
     let hitmask = DEBUG_SHOW_HITMASK.load(std::sync::atomic::Ordering::Relaxed);
-    let effective_alpha_mode = if hitmask { DEBUG_SHOW_ALPHA_FORCE_OPAQUE } else { alpha_mode };
-    if effective_alpha_mode == DEBUG_SHOW_ALPHA_GRAYSCALE || effective_alpha_mode == DEBUG_SHOW_ALPHA_FORCE_OPAQUE {
+    let effective_alpha_mode = if hitmask {
+        DEBUG_SHOW_ALPHA_FORCE_OPAQUE
+    } else {
+        alpha_mode
+    };
+    if effective_alpha_mode == DEBUG_SHOW_ALPHA_GRAYSCALE
+        || effective_alpha_mode == DEBUG_SHOW_ALPHA_FORCE_OPAQUE
+    {
         finalize_into_scalar_debug(
-            scratch, clip_mask, screen, scr_w, win_w, effective_alpha_mode, sy_min, sy_max, sx_min, sx_max,
-            rect_x, rect_y,
+            scratch,
+            clip_mask,
+            screen,
+            scr_w,
+            win_w,
+            effective_alpha_mode,
+            sy_min,
+            sy_max,
+            sx_min,
+            sx_max,
+            rect_x,
+            rect_y,
         );
         return;
     }
@@ -2003,7 +2024,7 @@ pub fn paint_shadow(
     let _ = scr_h;
 }
 
-/// Debug-color ray cast. Same shape as [`cast_shadow_ray`] but per cell:
+/// Debug-colour ray cast. Same shape as [`cast_shadow_ray`] but per cell:
 ///   * α > 0 → under-blend BLUE (ray 0) or GREEN (rays 1+) — α boost + corresponding channel boost.
 ///   * α == 0 → direct-assign RED (ray 0) or MAGENTA (rays 1+) premult.
 /// Used in development phases to validate trace geometry; swap for `cast_shadow_ray` once the phase is correct.
@@ -2182,9 +2203,9 @@ pub fn blend_rgb_only(bg_colour: u32, fg_colour: u32, weight_bg: u8, weight_fg: 
     (blended as u32) | 0xFF000000
 }
 
-/// Filled rectangle, anti-aliased, axis-aligned. Centered at `(cx, cy)` with fractional dimensions `(rect_w, rect_h)` — sub-pixel position + size both honoured. Color is α + darkness packed (build with [`pack_argb`]); the rect blends UNDER any existing pixel content in the buffer via [`Blend::under`].
+/// Filled rectangle, anti-aliased, axis-aligned. Centered at `(cx, cy)` with fractional dimensions `(rect_w, rect_h)` — sub-pixel position + size both honoured. Colour is α + darkness packed (build with [`pack_argb`]); the rect blends UNDER any existing pixel content in the buffer via [`Blend::under`].
 ///
-/// AA: each pixel's coverage = `clamp(0.5 + distance_inside, 0, 1)` against the nearest rect edge. Interior pixels saturate to coverage = 1.0 (full color). Edge pixels get a fraction of the source α. Off-buffer pixels are clipped by the iteration bounds.
+/// AA: each pixel's coverage = `clamp(0.5 + distance_inside, 0, 1)` against the nearest rect edge. Interior pixels saturate to coverage = 1.0 (full colour). Edge pixels get a fraction of the source α. Off-buffer pixels are clipped by the iteration bounds.
 ///
 /// Rule 0: iteration bounds clamp `x_min/y_min ≥ 0` and `x_max/y_max ≤ buffer dim` because the rect can be partially or fully off-screen (caller passes arbitrary cx/cy); without the clamps an i32→usize cast on negative values wraps to a huge number → OOB panic. Coverage clamps to `[0, 1]` because pixels inside the rect have unbounded `d_inside`; without the cap, the `α × coverage` multiply would exceed the 0..255 byte range.
 pub fn draw_rect(
@@ -2193,7 +2214,7 @@ pub fn draw_rect(
     cy: Coord,
     rect_w: Coord,
     rect_h: Coord,
-    color: u32,
+    colour: u32,
     clip: Option<Clip>,
 ) {
     let width = canvas.width;
@@ -2216,8 +2237,8 @@ pub fn draw_rect(
     canvas.damage.add_bounds(x_start, y_start, x_end, y_end);
     let pixels: &mut [u32] = canvas.pixels;
 
-    let color_alpha = ((color >> 24) & 0xFF) as Coord;
-    let color_dark = color & 0x00FFFFFF;
+    let colour_alpha = ((colour >> 24) & 0xFF) as Coord;
+    let colour_dark = colour & 0x00FFFFFF;
 
     // Row-parallel via Rayon when enabled; sequential walk otherwise. Each row is fully
     // independent (no row-to-row data hazards), so this scales linearly with cores up to the
@@ -2234,11 +2255,11 @@ pub fn draw_rect(
             if coverage <= 0.0 {
                 continue;
             }
-            let new_alpha = (color_alpha * coverage) as u32;
+            let new_alpha = (colour_alpha * coverage) as u32;
             if new_alpha == 0 {
                 continue;
             }
-            let rect_pixel = (new_alpha << 24) | color_dark;
+            let rect_pixel = (new_alpha << 24) | colour_dark;
             row[px] = row[px].under(rect_pixel, BlendMode::Normal);
         }
     });
@@ -2256,7 +2277,7 @@ pub fn draw_rect_rotated(
     rect_w: Coord,
     rect_h: Coord,
     angle: Coord,
-    color: u32,
+    colour: u32,
     clip: Option<Clip>,
 ) {
     let width = canvas.width;
@@ -2286,10 +2307,10 @@ pub fn draw_rect_rotated(
     canvas.damage.add_bounds(x_start, y_start, x_end, y_end);
     let pixels: &mut [u32] = canvas.pixels;
 
-    let color_alpha = ((color >> 24) & 0xFF) as Coord;
-    let color_dark = color & 0x00FFFFFF;
-    let full_alpha = (color >> 24) & 0xFF;
-    let full_top = (full_alpha << 24) | color_dark;
+    let colour_alpha = ((colour >> 24) & 0xFF) as Coord;
+    let colour_dark = colour & 0x00FFFFFF;
+    let full_alpha = (colour >> 24) & 0xFF;
+    let full_top = (full_alpha << 24) | colour_dark;
 
     // Per-pixel local-coord deltas (px += 1 → screen dx += 1).
     let dlx = cos_a;
@@ -2347,9 +2368,9 @@ pub fn draw_rect_rotated(
             let cov_t = (0.5 + (hh - ly)).clamp(0.0, 1.0);
             let cov_b = (0.5 + (ly + hh)).clamp(0.0, 1.0);
             let coverage = cov_r * cov_l * cov_t * cov_b;
-            let na = (color_alpha * coverage) as u32;
+            let na = (colour_alpha * coverage) as u32;
             if na > 0 {
-                let rect_pixel = (na << 24) | color_dark;
+                let rect_pixel = (na << 24) | colour_dark;
                 row[px] = row[px].under(rect_pixel, BlendMode::Normal);
             }
             lx += dlx;
@@ -2370,9 +2391,9 @@ pub fn draw_rect_rotated(
             let cov_t = (0.5 + (hh - ly)).clamp(0.0, 1.0);
             let cov_b = (0.5 + (ly + hh)).clamp(0.0, 1.0);
             let coverage = cov_r * cov_l * cov_t * cov_b;
-            let na = (color_alpha * coverage) as u32;
+            let na = (colour_alpha * coverage) as u32;
             if na > 0 {
-                let rect_pixel = (na << 24) | color_dark;
+                let rect_pixel = (na << 24) | colour_dark;
                 row[px] = row[px].under(rect_pixel, BlendMode::Normal);
             }
             lx += dlx;
@@ -2446,7 +2467,7 @@ pub fn draw_circle(
     cx: Coord,
     cy: Coord,
     r: Coord,
-    color: u32,
+    colour: u32,
     clip: Option<Clip>,
 ) {
     let width = canvas.width;
@@ -2473,10 +2494,10 @@ pub fn draw_circle(
     canvas.damage.add_bounds(x_start, y_start, x_end, y_end);
     let pixels: &mut [u32] = canvas.pixels;
 
-    let color_alpha = ((color >> 24) & 0xFF) as Coord;
-    let color_dark = color & 0x00FFFFFF;
-    let full_alpha = (color >> 24) & 0xFF;
-    let full_pixel = (full_alpha << 24) | color_dark;
+    let colour_alpha = ((colour >> 24) & 0xFF) as Coord;
+    let colour_dark = colour & 0x00FFFFFF;
+    let full_alpha = (colour >> 24) & 0xFF;
+    let full_pixel = (full_alpha << 24) | colour_dark;
 
     crate::par::par_rows(pixels, width, y_start, y_end, |py, row| {
         let dy = (py as Coord + 0.5) - cy;
@@ -2488,9 +2509,9 @@ pub fn draw_circle(
                 row[px] = row[px].under(full_pixel, BlendMode::Normal);
             } else if dist2 < r_out2 {
                 let t = (r_out2 - dist2) * inv_diff;
-                let na = (color_alpha * t) as u32;
+                let na = (colour_alpha * t) as u32;
                 if na > 0 {
-                    let circle_pixel = (na << 24) | color_dark;
+                    let circle_pixel = (na << 24) | colour_dark;
                     row[px] = row[px].under(circle_pixel, BlendMode::Normal);
                 }
             }
@@ -2511,7 +2532,7 @@ pub fn draw_ellipse(
     cy: Coord,
     rx: Coord,
     ry: Coord,
-    color: u32,
+    colour: u32,
     clip: Option<Clip>,
 ) {
     let width = canvas.width;
@@ -2534,10 +2555,10 @@ pub fn draw_ellipse(
     canvas.damage.add_bounds(x_start, y_start, x_end, y_end);
     let pixels: &mut [u32] = canvas.pixels;
 
-    let color_alpha = ((color >> 24) & 0xFF) as Coord;
-    let color_dark = color & 0x00FFFFFF;
-    let full_alpha = (color >> 24) & 0xFF;
-    let full_pixel = (full_alpha << 24) | color_dark;
+    let colour_alpha = ((colour >> 24) & 0xFF) as Coord;
+    let colour_dark = colour & 0x00FFFFFF;
+    let full_alpha = (colour >> 24) & 0xFF;
+    let full_pixel = (full_alpha << 24) | colour_dark;
 
     crate::par::par_rows(pixels, width, y_start, y_end, |py, row| {
         let dy = (py as Coord + 0.5) - cy;
@@ -2559,9 +2580,9 @@ pub fn draw_ellipse(
                 // the 8-bit coverage tolerance.
                 let inv_g = fast_inv_sqrt(grad2);
                 let coverage = (0.5 - f * inv_g).clamp(0.0, 1.0);
-                let na = (color_alpha * coverage) as u32;
+                let na = (colour_alpha * coverage) as u32;
                 if na > 0 {
-                    let ellipse_pixel = (na << 24) | color_dark;
+                    let ellipse_pixel = (na << 24) | colour_dark;
                     row[px] = row[px].under(ellipse_pixel, BlendMode::Normal);
                 }
             }
@@ -2581,7 +2602,7 @@ pub fn draw_ellipse_rotated(
     rx: Coord,
     ry: Coord,
     angle: Coord,
-    color: u32,
+    colour: u32,
     clip: Option<Clip>,
 ) {
     let width = canvas.width;
@@ -2609,10 +2630,10 @@ pub fn draw_ellipse_rotated(
     canvas.damage.add_bounds(x_start, y_start, x_end, y_end);
     let pixels: &mut [u32] = canvas.pixels;
 
-    let color_alpha = ((color >> 24) & 0xFF) as Coord;
-    let color_dark = color & 0x00FFFFFF;
-    let full_alpha = (color >> 24) & 0xFF;
-    let full_pixel = (full_alpha << 24) | color_dark;
+    let colour_alpha = ((colour >> 24) & 0xFF) as Coord;
+    let colour_dark = colour & 0x00FFFFFF;
+    let full_alpha = (colour >> 24) & 0xFF;
+    let full_pixel = (full_alpha << 24) | colour_dark;
 
     let x_start_f = x_start as Coord + 0.5;
     crate::par::par_rows(pixels, width, y_start, y_end, |py, row| {
@@ -2632,9 +2653,9 @@ pub fn draw_ellipse_rotated(
                 // AA via fused reciprocal-sqrt — see [`draw_ellipse`] for the rationale.
                 let inv_g = fast_inv_sqrt(grad2);
                 let coverage = (0.5 - f * inv_g).clamp(0., 1.);
-                let na = (color_alpha * coverage) as u32;
+                let na = (colour_alpha * coverage) as u32;
                 if na > 0 {
-                    let ellipse_pixel = (na << 24) | color_dark;
+                    let ellipse_pixel = (na << 24) | colour_dark;
                     row[px] = row[px].under(ellipse_pixel, BlendMode::Normal);
                 }
             }
@@ -2644,9 +2665,9 @@ pub fn draw_ellipse_rotated(
     });
 }
 
-/// Hard-pixel squircle pill with AA on both the X-axis curve (sides) and Y-axis curve (cap tops/bottoms). Photon's avatar-ring strategy in one call — render twice with different sizes/colors to get a stroke ring.
+/// Hard-pixel squircle pill with AA on both the X-axis curve (sides) and Y-axis curve (cap tops/bottoms). Photon's avatar-ring strategy in one call — render twice with different sizes/colours to get a stroke ring.
 ///
-/// Photon-faithful: precompute squircle crossings once (`(inset_px, l_aa, h_aa)` per pixel-row offset into the cap), then walk pure integer indices per corner. Each crossing produces BOTH a vertical-edge AA pixel and a horizontal-edge AA pixel via the squircle's diagonal symmetry — no separate per-col walk needed. Photon's `compositing.rs` `draw_textbox` is the reference; this is the single-color silhouette adaptation (`draw_textbox_pill` keeps the two-tone hairline version photon uses for textboxes).
+/// Photon-faithful: precompute squircle crossings once (`(inset_px, l_aa, h_aa)` per pixel-row offset into the cap), then walk pure integer indices per corner. Each crossing produces BOTH a vertical-edge AA pixel and a horizontal-edge AA pixel via the squircle's diagonal symmetry — no separate per-col walk needed. Photon's `compositing.rs` `draw_textbox` is the reference; this is the single-colour silhouette adaptation (`draw_textbox_pill` keeps the two-tone hairline version photon uses for textboxes).
 ///
 /// Every interior + AA-edge write composes the new pixel UNDERNEATH whatever's already in the buffer via [`Blend::under`] (`BlendMode::Normal`). Two stacked pills in the same buffer therefore behave like any other front-to-back composite: draw the topmost first (it lands cleanly into the empty buffer), then the underneath one (it fills only the remaining α budget the topmost left behind). No max-α tiebreaker, no inner/outer dual mode — one consistent kernel.
 pub fn draw_squircle_pill(
@@ -2655,8 +2676,38 @@ pub fn draw_squircle_pill(
     pill_y: isize,
     pill_w: isize,
     pill_h: isize,
-    color: u32,
+    colour: u32,
     squirdleyness: i32,
+) {
+    let radius_f = pill_h as f32 * 0.5;
+    let crossings = squircle_crossings(radius_f, squirdleyness);
+    draw_squircle_pill_with_crossings(canvas, pill_x, pill_y, pill_w, pill_h, colour, &crossings);
+}
+
+/// Fractional-exponent variant of [`draw_squircle_pill`]. Identical rasterization (shares the inner `_with_crossings` worker) — only the crossings-table computation differs, using [`squircle_crossings_f`]'s `powf` path so non-integer `squirdleyness` traces smooth in-between shapes (e.g. `1.5` between ellipse and diamond). Slower per-call; use only when the desired shape can't be expressed with an integer exponent.
+pub fn draw_squircle_pill_f(
+    canvas: &mut Canvas,
+    pill_x: isize,
+    pill_y: isize,
+    pill_w: isize,
+    pill_h: isize,
+    colour: u32,
+    squirdleyness: f32,
+) {
+    let radius_f = pill_h as f32 * 0.5;
+    let crossings = squircle_crossings_f(radius_f, squirdleyness);
+    draw_squircle_pill_with_crossings(canvas, pill_x, pill_y, pill_w, pill_h, colour, &crossings);
+}
+
+/// Shared rasterizer body for [`draw_squircle_pill`] and [`draw_squircle_pill_f`]. Takes pre-computed `crossings` so the two entry points can dispatch through one painting kernel — the integer / fractional choice lives entirely in which crossings generator the caller used.
+fn draw_squircle_pill_with_crossings(
+    canvas: &mut Canvas,
+    pill_x: isize,
+    pill_y: isize,
+    pill_w: isize,
+    pill_h: isize,
+    colour: u32,
+    crossings: &[(u16, u8, u8)],
 ) {
     let buf_w = canvas.width;
     let buf_h = canvas.height;
@@ -2678,12 +2729,10 @@ pub fn draw_squircle_pill(
         canvas.damage.add_bounds(dx0, dy0, dx1, dy1);
     }
 
-    let radius_f = pill_h as f32 * 0.5;
     let radius = (pill_h / 2) as isize;
     // α + darkness: force opaque (α=0xFF) by setting the top byte. RGB darkness intact.
-    let solid = (color & 0x00FF_FFFF) | 0xFF000000;
-    let color_rgb = color & 0x00FF_FFFF;
-    let crossings = squircle_crossings(radius_f, squirdleyness);
+    let solid = (colour & 0x00FF_FFFF) | 0xFF000000;
+    let colour_rgb = colour & 0x00FF_FFFF;
     let pixels: &mut [u32] = canvas.pixels;
 
     // Fast/slow split. Fast path: pill bbox fully inside the buffer → no per-pixel checks. Slow path: partial overhang (scroll/resize transitions) → range clips at the corner-block boundary so each AA write has its row already proven in-buffer.
@@ -2699,22 +2748,13 @@ pub fn draw_squircle_pill(
             pill_w as usize,
             pill_h as usize,
             radius as usize,
-            &crossings,
-            color_rgb,
+            crossings,
+            colour_rgb,
             solid,
         );
     } else {
         draw_squircle_pill_clipped(
-            pixels,
-            buf_w,
-            buf_h,
-            pill_x,
-            pill_y,
-            pill_w,
-            pill_h,
-            radius,
-            &crossings,
-            color_rgb,
+            pixels, buf_w, buf_h, pill_x, pill_y, pill_w, pill_h, radius, crossings, colour_rgb,
             solid,
         );
     }
@@ -2742,9 +2782,9 @@ pub fn draw_squircle_pill(
 ///
 /// For square pills (`pill_w == pill_h`) the flat middle collapses and the seam becomes the bbox anti-diagonal (TR→BL) — natural degenerate case.
 ///
-/// No `fill` parameter — the pill is exactly two colors.
+/// No `fill` parameter — the pill is exactly two colours.
 ///
-/// Every pixel write composes UNDER the buffer via [`Blend::under`] (Normal) — same kernel as the single-color path.
+/// Every pixel write composes UNDER the buffer via [`Blend::under`] (Normal) — same kernel as the single-colour path.
 pub fn draw_squircle_pill_two_tone(
     canvas: &mut Canvas,
     pill_x: isize,
@@ -2754,6 +2794,45 @@ pub fn draw_squircle_pill_two_tone(
     light: u32,
     shadow: u32,
     squirdleyness: i32,
+    hit_map: Option<&mut [HitId]>,
+    hit_id: HitId,
+) {
+    let radius_f = pill_h as f32 * 0.5;
+    let crossings = squircle_crossings(radius_f, squirdleyness);
+    draw_squircle_pill_two_tone_with_crossings(
+        canvas, pill_x, pill_y, pill_w, pill_h, light, shadow, &crossings, hit_map, hit_id,
+    );
+}
+
+/// Fractional-exponent variant of [`draw_squircle_pill_two_tone`]. Identical seam logic and rasterizer — only the crossings-table computation swaps to [`squircle_crossings_f`] for non-integer `squirdleyness`. Used by [`crate::widgets::Button`] for its in-between-ellipse-and-diamond silhouette.
+pub fn draw_squircle_pill_two_tone_f(
+    canvas: &mut Canvas,
+    pill_x: isize,
+    pill_y: isize,
+    pill_w: isize,
+    pill_h: isize,
+    light: u32,
+    shadow: u32,
+    squirdleyness: f32,
+    hit_map: Option<&mut [HitId]>,
+    hit_id: HitId,
+) {
+    let radius_f = pill_h as f32 * 0.5;
+    let crossings = squircle_crossings_f(radius_f, squirdleyness);
+    draw_squircle_pill_two_tone_with_crossings(
+        canvas, pill_x, pill_y, pill_w, pill_h, light, shadow, &crossings, hit_map, hit_id,
+    );
+}
+
+fn draw_squircle_pill_two_tone_with_crossings(
+    canvas: &mut Canvas,
+    pill_x: isize,
+    pill_y: isize,
+    pill_w: isize,
+    pill_h: isize,
+    light: u32,
+    shadow: u32,
+    crossings: &[(u16, u8, u8)],
     hit_map: Option<&mut [HitId]>,
     hit_id: HitId,
 ) {
@@ -2775,30 +2854,40 @@ pub fn draw_squircle_pill_two_tone(
         canvas.damage.add_bounds(dx0, dy0, dx1, dy1);
     }
 
-    let radius_f = pill_h as f32 * 0.5;
     let radius = (pill_h / 2) as isize;
     let light_solid = (light & 0x00FF_FFFF) | 0xFF000000;
     let shadow_solid = (shadow & 0x00FF_FFFF) | 0xFF000000;
     let light_rgb = light & 0x00FF_FFFF;
     let shadow_rgb = shadow & 0x00FF_FFFF;
-    let crossings = squircle_crossings(radius_f, squirdleyness);
     let pixels: &mut [u32] = canvas.pixels;
     let mut hit_map = hit_map;
 
     // Football-seam pick: 45° from TR down-left into the right cap → flat across the centerline → 45° down-left to BL. dy ≤ seam_y(dx) → light, which puts TL inside the light region and BR inside the shadow region.
     let half_h = pill_h / 2;
-    let a_left = pill_h - 1 - half_h;  // left-cap segment exits onto the flat at this dx (seam_y = half_h)
+    let a_left = pill_h - 1 - half_h; // left-cap segment exits onto the flat at this dx (seam_y = half_h)
     let a_right = pill_w - 1 - half_h; // right-cap segment enters from the flat at this dx
     let seam_y = |dx: isize| -> isize {
-        if dx <= a_left { pill_h - 1 - dx }
-        else if dx >= a_right { pill_w - 1 - dx }
-        else { half_h }
+        if dx <= a_left {
+            pill_h - 1 - dx
+        } else if dx >= a_right {
+            pill_w - 1 - dx
+        } else {
+            half_h
+        }
     };
     let pick_rgb = |dx: isize, dy: isize| -> u32 {
-        if dy <= seam_y(dx) { light_rgb } else { shadow_rgb }
+        if dy <= seam_y(dx) {
+            light_rgb
+        } else {
+            shadow_rgb
+        }
     };
     let pick_solid = |dx: isize, dy: isize| -> u32 {
-        if dy <= seam_y(dx) { light_solid } else { shadow_solid }
+        if dy <= seam_y(dx) {
+            light_solid
+        } else {
+            shadow_solid
+        }
     };
 
     for (i, &(inset, _l, h)) in crossings.iter().enumerate() {
@@ -2831,7 +2920,12 @@ pub fn draw_squircle_pill_two_tone(
                 if v_aa_col >= 0 && v_aa_col < buf_w_i {
                     let dx = v_aa_col - pill_x;
                     let dy = v_row - pill_y;
-                    write_aa(pixels, row_base + v_aa_col as usize, pick_rgb(dx, dy), h_u32);
+                    write_aa(
+                        pixels,
+                        row_base + v_aa_col as usize,
+                        pick_rgb(dx, dy),
+                        h_u32,
+                    );
                 }
                 let (fx_start, fx_end) = if flip_x {
                     (diag_col, v_aa_col)
@@ -2934,7 +3028,7 @@ fn draw_squircle_pill_unclipped(
     pill_h: usize,
     radius: usize,
     crossings: &[(u16, u8, u8)],
-    color_rgb: u32,
+    colour_rgb: u32,
     solid: u32,
 ) {
     for (i, &(inset, _l, h)) in crossings.iter().enumerate() {
@@ -2961,7 +3055,7 @@ fn draw_squircle_pill_unclipped(
                 pill_x + radius - i
             };
             let row_base = v_row * buf_w;
-            write_aa(pixels, row_base + v_aa_col, color_rgb, h_u32);
+            write_aa(pixels, row_base + v_aa_col, colour_rgb, h_u32);
             let (fx_start, fx_end) = if flip_x {
                 (diag_col, v_aa_col)
             } else {
@@ -2988,7 +3082,7 @@ fn draw_squircle_pill_unclipped(
             } else {
                 pill_y + radius - i
             };
-            write_aa(pixels, h_aa_row * buf_w + h_col, color_rgb, h_u32);
+            write_aa(pixels, h_aa_row * buf_w + h_col, colour_rgb, h_u32);
             let (fy_start, fy_end) = if flip_y {
                 (diag_row, h_aa_row)
             } else {
@@ -3020,7 +3114,7 @@ fn draw_squircle_pill_clipped(
     pill_h: isize,
     radius: isize,
     crossings: &[(u16, u8, u8)],
-    color_rgb: u32,
+    colour_rgb: u32,
     solid: u32,
 ) {
     let buf_w_i = buf_w as isize;
@@ -3054,7 +3148,7 @@ fn draw_squircle_pill_clipped(
                 };
                 let diag_col = h_col;
                 if v_aa_col >= 0 && v_aa_col < buf_w_i {
-                    write_aa(pixels, row_base + v_aa_col as usize, color_rgb, h_u32);
+                    write_aa(pixels, row_base + v_aa_col as usize, colour_rgb, h_u32);
                 }
                 let (fx_start, fx_end) = if flip_x {
                     (diag_col, v_aa_col)
@@ -3079,7 +3173,12 @@ fn draw_squircle_pill_clipped(
                 };
                 let diag_row = v_row;
                 if h_aa_row >= 0 && h_aa_row < buf_h_i {
-                    write_aa(pixels, h_aa_row as usize * buf_w + col_us, color_rgb, h_u32);
+                    write_aa(
+                        pixels,
+                        h_aa_row as usize * buf_w + col_us,
+                        colour_rgb,
+                        h_u32,
+                    );
                 }
                 let (fy_start, fy_end) = if flip_y {
                     (diag_row, h_aa_row)
@@ -3098,6 +3197,8 @@ fn draw_squircle_pill_clipped(
 }
 
 /// Generate photon's squircle crossings: one entry per pixel-row offset from the cap edge into the diagonal. Each entry is `(inset_int, l_aa, h_aa)` where `inset_int` is the integer column offset where the curve crosses that row, and `l/h_aa = sqrt(frac(inset))*256` / `sqrt(1-frac(inset))*256` are the perceptual AA weights (low = outside fraction, high = inside fraction). Verbatim port of photon's loop in `compositing.rs::draw_textbox`.
+///
+/// **Integer-exponent fast path.** `powi(x, n)` for small `n` is `n−1` multiplies (`x*x*x` for `n=3`), while `powf` is `exp(y * ln(x))` — orders of magnitude slower. Chrome's perimeter at `n=24`, textbox's `n=3`, and most "pill or rounded-rect" shapes use integer values; they get the fast path here. For fractional shapes (e.g. button's `n=1.5` for an in-between ellipse / diamond), see [`squircle_crossings_f`].
 pub fn squircle_crossings(radius: f32, squirdleyness: i32) -> alloc::vec::Vec<(u16, u8, u8)> {
     let mut crossings: alloc::vec::Vec<(u16, u8, u8)> = alloc::vec::Vec::new();
     let mut offset = 0f32;
@@ -3122,14 +3223,39 @@ pub fn squircle_crossings(radius: f32, squirdleyness: i32) -> alloc::vec::Vec<(u
     crossings
 }
 
-/// AA write at a proven-in-buffer index. Composes a partial-α pixel (`α=h_aa`, straight darkness=`color_rgb`) UNDERNEATH whatever's already in the buffer via [`Blend::under`] — same kernel as every other compositing op in fluor. The buffer is treated as the topmost-first composite (anything already painted there sits "above" this write). With `Normal` mode, an empty pixel (`0x00000000`) absorbs the new contribution fully; an already-opaque pixel takes the early-out and the new write is invisible.
+/// Fractional-exponent variant of [`squircle_crossings`]. Same math, swaps the inner `powi` for `powf` so non-integer `squirdleyness` (e.g. `1.5`, `1.41`, `2.5`) traces the in-between curves between ellipse / diamond / squared-pill. Slower per iteration; only worth using when the desired shape can't be expressed with an integer exponent. Outer root in the integer version is already `powf(x, 1/n)` so the speed gap is roughly the inner `powi` vs `powf` — ~2× total for small `n`.
+pub fn squircle_crossings_f(radius: f32, squirdleyness: f32) -> alloc::vec::Vec<(u16, u8, u8)> {
+    let mut crossings: alloc::vec::Vec<(u16, u8, u8)> = alloc::vec::Vec::new();
+    let mut offset = 0f32;
+    loop {
+        let y_norm = offset / radius;
+        let x_norm = crate::math::powf(
+            1. - crate::math::powf(y_norm, squirdleyness),
+            1. / squirdleyness,
+        );
+        let cx = x_norm * radius;
+        let inset = radius - cx;
+        if inset >= 0. {
+            let l = (crate::math::sqrt(crate::math::fract(inset)) * 256.) as u8;
+            let h = (crate::math::sqrt(1. - crate::math::fract(inset)) * 256.) as u8;
+            crossings.push((inset as u16, l, h));
+        }
+        if cx < offset {
+            break;
+        }
+        offset += 1.0;
+    }
+    crossings
+}
+
+/// AA write at a proven-in-buffer index. Composes a partial-α pixel (`α=h_aa`, straight darkness=`colour_rgb`) UNDERNEATH whatever's already in the buffer via [`Blend::under`] — same kernel as every other compositing op in fluor. The buffer is treated as the topmost-first composite (anything already painted there sits "above" this write). With `Normal` mode, an empty pixel (`0x00000000`) absorbs the new contribution fully; an already-opaque pixel takes the early-out and the new write is invisible.
 #[inline]
-fn write_aa(pixels: &mut [u32], idx: usize, color_rgb: u32, h_aa: u32) {
-    let new_pixel = (h_aa << 24) | color_rgb;
+fn write_aa(pixels: &mut [u32], idx: usize, colour_rgb: u32, h_aa: u32) {
+    let new_pixel = (h_aa << 24) | colour_rgb;
     pixels[idx] = pixels[idx].under(new_pixel, BlendMode::Normal);
 }
 
-/// Photon's squircle inset formula — single row, parameterized by `squirdleyness`. Returns the curve's inset (distance from the bbox edge to the leftmost / rightmost inside pixel) for a row at `y_from_center` rows above or below the squircle's vertical center.
+/// Photon's squircle inset formula — single row, parameterized by `squirdleyness`. Returns the curve's inset (distance from the bbox edge to the leftmost / rightmost inside pixel) for a row at `y_from_center` rows above or below the squircle's vertical center. Integer-exponent fast path; see [`squircle_inset_f`] for fractional shapes.
 ///
 /// `squirdleyness = 2` → circle. `squirdleyness = 3` → photon's textbox pill default (slightly flatter than a circle). Higher = more rectangular. Both `draw_textbox_pill` (AA path) and the textbox widget's hard-pixel renderer route thru this so any tweak to the curve math flows thru both code paths.
 ///
@@ -3535,18 +3661,10 @@ pub fn draw_textbox_pill(
 /// **Rule 0 — WHY/PROOF/PREVENTS:** `bx` must be ≥ 7 and < `buf_w - 7` for the ±7 spread.
 /// Caller must ensure the blinkey is within textbox bounds (which are inset from window edges).
 /// PREVENTS: out-of-bounds writes on the horizontal spread.
-pub fn draw_blinkey(
-    canvas: &mut Canvas,
-    bx: usize,
-    by: usize,
-    height: usize,
-    top_bright: bool,
-) {
+pub fn draw_blinkey(canvas: &mut Canvas, bx: usize, by: usize, height: usize, top_bright: bool) {
     let buf_w = canvas.width;
     // Damage: ±7 horizontal spread × `height` vertical band. Caller's bounds invariant (bx ≥ 7, bx < buf_w-7) guarantees this stays in-buffer.
-    canvas
-        .damage
-        .add_bounds(bx - 7, by, bx + 8, by + height);
+    canvas.damage.add_bounds(bx - 7, by, bx + 8, by + height);
     let pixels: &mut [u32] = canvas.pixels;
     let half = height / 2;
     for y in by..by + height {
@@ -3589,10 +3707,14 @@ pub fn apply_textbox_glow_right(
     let clip_rect = Clip::resolve(clip, buf_w, buf_h);
     let y0 = (pill_y.max(0) as usize).max(clip_rect.y_start);
     let y1 = ((pill_y + pill_h).min(buf_h_i).max(0) as usize).min(clip_rect.y_end);
-    if y0 >= y1 { return; }
+    if y0 >= y1 {
+        return;
+    }
     let scan_left = (pill_x.max(0) as usize).max(clip_rect.x_start);
     let scan_right = ((pill_x + pill_w).min(buf_w_i).max(0) as usize).min(clip_rect.x_end);
-    if scan_left >= scan_right { return; }
+    if scan_left >= scan_right {
+        return;
+    }
 
     let (alphas, alpha_len) = compute_alphas(seed, factor_256);
     {
@@ -3614,11 +3736,15 @@ pub fn apply_textbox_glow_right(
                 break;
             }
         }
-        let Some(ox) = opaque_x else { continue; };
+        let Some(ox) = opaque_x else {
+            continue;
+        };
         let ray_start = ox + 1;
         for k in 0..alpha_len {
             let bx = ray_start + k;
-            if bx >= ray_x_end { break; }
+            if bx >= ray_x_end {
+                break;
+            }
             let new_pixel = (alphas[k] << 24) | glow_rgb;
             let idx = row_base + bx;
             pixels[idx] = pixels[idx].under(new_pixel, BlendMode::Normal);
@@ -3648,10 +3774,14 @@ pub fn apply_textbox_glow_left(
     let clip_rect = Clip::resolve(clip, buf_w, buf_h);
     let y0 = (pill_y.max(0) as usize).max(clip_rect.y_start);
     let y1 = ((pill_y + pill_h).min(buf_h_i).max(0) as usize).min(clip_rect.y_end);
-    if y0 >= y1 { return; }
+    if y0 >= y1 {
+        return;
+    }
     let scan_left = (pill_x.max(0) as usize).max(clip_rect.x_start);
     let scan_right = ((pill_x + pill_w).min(buf_w_i).max(0) as usize).min(clip_rect.x_end);
-    if scan_left >= scan_right { return; }
+    if scan_left >= scan_right {
+        return;
+    }
 
     let (alphas, alpha_len) = compute_alphas(seed, factor_256);
     {
@@ -3673,13 +3803,21 @@ pub fn apply_textbox_glow_left(
                 break;
             }
         }
-        let Some(ox) = opaque_x else { continue; };
-        if ox == 0 { continue; }
+        let Some(ox) = opaque_x else {
+            continue;
+        };
+        if ox == 0 {
+            continue;
+        }
         let ray_start = ox - 1;
         for k in 0..alpha_len {
-            if ray_start < k { break; }
+            if ray_start < k {
+                break;
+            }
             let bx = ray_start - k;
-            if bx < ray_x_start { break; }
+            if bx < ray_x_start {
+                break;
+            }
             let new_pixel = (alphas[k] << 24) | glow_rgb;
             let idx = row_base + bx;
             pixels[idx] = pixels[idx].under(new_pixel, BlendMode::Normal);
@@ -3711,10 +3849,14 @@ pub fn apply_textbox_glow_top(
     let clip_rect = Clip::resolve(clip, buf_w, buf_h);
     let x0 = (pill_x.max(0) as usize).max(clip_rect.x_start);
     let x1 = ((pill_x + pill_w).min(buf_w_i).max(0) as usize).min(clip_rect.x_end);
-    if x0 >= x1 { return; }
+    if x0 >= x1 {
+        return;
+    }
     let scan_top = (pill_y.max(0) as usize).max(clip_rect.y_start);
     let scan_bot = ((pill_y + pill_h).min(buf_h_i).max(0) as usize).min(clip_rect.y_end);
-    if scan_top >= scan_bot { return; }
+    if scan_top >= scan_bot {
+        return;
+    }
 
     let (alphas, alpha_len) = compute_alphas(seed, factor_256);
     {
@@ -3735,13 +3877,21 @@ pub fn apply_textbox_glow_top(
                 break;
             }
         }
-        let Some(oy) = opaque_y else { continue; };
-        if oy == 0 { continue; }
+        let Some(oy) = opaque_y else {
+            continue;
+        };
+        if oy == 0 {
+            continue;
+        }
         let ray_start = oy - 1;
         for k in 0..alpha_len {
-            if ray_start < k { break; }
+            if ray_start < k {
+                break;
+            }
             let by = ray_start - k;
-            if by < ray_y_start { break; }
+            if by < ray_y_start {
+                break;
+            }
             let new_pixel = (alphas[k] << 24) | glow_rgb;
             let idx = by * buf_w + x;
             pixels[idx] = pixels[idx].under(new_pixel, BlendMode::Normal);
@@ -3771,10 +3921,14 @@ pub fn apply_textbox_glow_bottom(
     let clip_rect = Clip::resolve(clip, buf_w, buf_h);
     let x0 = (pill_x.max(0) as usize).max(clip_rect.x_start);
     let x1 = ((pill_x + pill_w).min(buf_w_i).max(0) as usize).min(clip_rect.x_end);
-    if x0 >= x1 { return; }
+    if x0 >= x1 {
+        return;
+    }
     let scan_top = (pill_y.max(0) as usize).max(clip_rect.y_start);
     let scan_bot = ((pill_y + pill_h).min(buf_h_i).max(0) as usize).min(clip_rect.y_end);
-    if scan_top >= scan_bot { return; }
+    if scan_top >= scan_bot {
+        return;
+    }
 
     let (alphas, alpha_len) = compute_alphas(seed, factor_256);
     {
@@ -3795,11 +3949,15 @@ pub fn apply_textbox_glow_bottom(
                 break;
             }
         }
-        let Some(oy) = opaque_y else { continue; };
+        let Some(oy) = opaque_y else {
+            continue;
+        };
         let ray_start = oy + 1;
         for k in 0..alpha_len {
             let by = ray_start + k;
-            if by >= ray_y_end { break; }
+            if by >= ray_y_end {
+                break;
+            }
             let new_pixel = (alphas[k] << 24) | glow_rgb;
             let idx = by * buf_w + x;
             pixels[idx] = pixels[idx].under(new_pixel, BlendMode::Normal);
@@ -4343,15 +4501,7 @@ mod tests {
         let mut buf = vec![0u32; 16 * 16];
         let mut damage = crate::canvas::Damage::new();
         let mut canvas = crate::canvas::Canvas::new(&mut buf, 16, 16, &mut damage);
-        circle_filled(
-            &mut canvas,
-            8,
-            8,
-            5,
-            pack_argb(255, 0, 0, 255),
-            None,
-            None,
-        );
+        circle_filled(&mut canvas, 8, 8, 5, pack_argb(255, 0, 0, 255), None, None);
         let (r, g, b, _) = unpack_argb(buf[8 * 16 + 8]);
         assert!(
             r > 240 && g < 16 && b < 16,
@@ -4520,16 +4670,7 @@ mod tests {
         let mut buf = vec![pack_argb(50, 60, 70, 255); 4 * 4];
         let mut damage = crate::canvas::Damage::new();
         let mut canvas = crate::canvas::Canvas::new(&mut buf, 4, 4, &mut damage);
-        fill_rect(
-            &mut canvas,
-            0,
-            0,
-            4,
-            4,
-            pack_argb(255, 0, 0, 0),
-            None,
-            None,
-        );
+        fill_rect(&mut canvas, 0, 0, 4, 4, pack_argb(255, 0, 0, 0), None, None);
         // Buffer unchanged — every pixel was opaque dst, every under call early-out'd.
         assert!(buf.iter().all(|&p| p == pack_argb(50, 60, 70, 255)));
     }
