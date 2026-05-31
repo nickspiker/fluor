@@ -341,13 +341,12 @@ impl Textbox {
     }
 
     fn recalc_widths(&mut self, text: &mut TextRenderer) {
-        self.widths.clear();
-        self.widths.reserve(self.chars.len());
-        let mut buf = [0u8; 4];
-        for ch in &self.chars {
-            let s = ch.encode_utf8(&mut buf);
-            let w = text.measure_text_width(s, self.font_size, 400, self.font);
-            self.widths.push(w);
+        // Shape the FULL string once and attribute glyph advances to source chars, rather than calling `measure_text_width` N times (one cosmic-text shape per char). For a 100K-char paste, this is the difference between ~100K shape calls (laggy) and a single shape (immediate).
+        if self.chars.is_empty() {
+            self.widths.clear();
+        } else {
+            let s: String = self.chars.iter().collect();
+            self.widths = text.measure_text_widths_per_char(&s, self.font_size, 400, self.font);
         }
         // Any width recompute → text content or font changed → glyph layer must re-rasterize.
         self.text_cache_dirty = true;
@@ -766,7 +765,6 @@ impl Textbox {
             // Anchor at the LOCAL pill centre (in cache coords), shifted by scroll_offset. `draw_text_center_u32` keeps text and cursor on the SAME anchor point — the textbox centre — instead of going through a derived text_start_x that depends on the running sum of glyph widths. When the window scales, all the per-glyph widths change and a left-anchored layout would have positions drifting because text_start_x = center_x − tw/2 sees both terms shift. Centre-anchored stays stable. Selection x range uses the same local_text_left math so selection bg lines up with glyph positions exactly.
             let tw = self.text_width();
             let local_text_left = pill_w as Coord * 0.5 - tw * 0.5 + self.scroll_offset;
-            let local_center_x = pill_w as Coord * 0.5 + self.scroll_offset;
             let local_y_center = pill_h as Coord * 0.5;
             // Pre-compute the selection rect in local coords BEFORE the mutable borrow of self.text_cache starts (selection_range / widths read self).
             let sel_rect: Option<(isize, isize, isize, isize)> = self.selection_range().and_then(|(sel_start, sel_end)| {
@@ -781,8 +779,40 @@ impl Textbox {
                     None
                 }
             });
-            let s: Option<String> = if !self.chars.is_empty() && self.font_size > 0.0 {
-                Some(self.chars.iter().collect())
+            // Pre-trim: only shape the substring that's actually visible in this frame's cache buffer (plus 3 chars of padding on each side for kerning context with the nearest off-screen char). For a 100K-char string scrolled to show 50 chars, this drops shaping cost from "shape all 100K" to "shape ~56" — orders of magnitude faster, makes drag-scrolling through long content interactive. Forward scan accumulating widths to find first/last visible char indices; for typical UI text (~200 chars) this is trivial, and for long content the early-out on `char_left >= cw` keeps it bounded.
+            const PAD_CHARS: usize = 3;
+            let s: Option<(String, Coord)> = if !self.chars.is_empty() && self.font_size > 0.0 {
+                let cw_f = cw as Coord;
+                let mut cum: Coord = 0.0;
+                let mut first_visible: Option<usize> = None;
+                let mut last_visible: Option<usize> = None;
+                for (i, &w) in self.widths.iter().enumerate() {
+                    let char_left = local_text_left + cum;
+                    let char_right = char_left + w;
+                    if first_visible.is_none() && char_right > 0.0 {
+                        first_visible = Some(i);
+                    }
+                    if char_left < cw_f {
+                        last_visible = Some(i);
+                    } else if first_visible.is_some() {
+                        // Past right edge AND we've already seen a visible char — no later chars will be visible.
+                        break;
+                    }
+                    cum += w;
+                }
+                match (first_visible, last_visible) {
+                    (Some(fv), Some(lv)) if fv <= lv => {
+                        let n = self.chars.len();
+                        let first_padded = fv.saturating_sub(PAD_CHARS);
+                        let last_padded = (lv + PAD_CHARS).min(n.saturating_sub(1));
+                        // Left-anchor at the substring's first char position. Centre-anchoring with our cached `sub_width` was jerking when `first_padded`/`last_padded` shifted across char boundaries during scroll, because cosmic-text measures the substring's actual width (max_x − min_x of its glyphs) — which differs from our sum-of-widths by the substring's leading/trailing sidebearings, and those sidebearings change with the boundary chars. Left-anchoring uses only the LEFT position derived from our widths array, so each char lands where the corresponding char in the full string would land regardless of substring boundary.
+                        let cum_to_first: Coord = self.widths[..first_padded].iter().sum();
+                        let sub_left = local_text_left + cum_to_first;
+                        let substring: String = self.chars[first_padded..=last_padded].iter().collect();
+                        Some((substring, sub_left))
+                    }
+                    _ => None,
+                }
             } else {
                 None
             };
@@ -793,12 +823,12 @@ impl Textbox {
             );
             let mask_buffer = paint::AlphaMask::new(&self.inner_pill_mask, cw, ch);
 
-            // Front-to-back: TOPMOST paints FIRST in fluor's model. Glyphs are visually topmost (the things you read), so they claim their cells before the selection bg paints into the surrounding empties.
-            if let Some(ref text_str) = s {
-                text.draw_text_center_u32(
+            // Front-to-back: TOPMOST paints FIRST in fluor's model. Glyphs are visually topmost (the things you read), so they claim their cells before the selection bg paints into the surrounding empties. Anchor x is the LEFT edge of the visible substring (derived from cumulative widths up to first_padded), not the substring's centre — keeps the substring's first char locked to the same local x regardless of where the substring boundary falls during scroll.
+            if let Some((ref text_str, anchor_x)) = s {
+                text.draw_text_left_u32(
                     &mut text_canvas,
                     text_str,
-                    local_center_x,
+                    anchor_x,
                     local_y_center,
                     self.font_size,
                     400,

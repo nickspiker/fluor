@@ -1096,6 +1096,43 @@ impl TextRenderer {
         })
     }
 
+    /// Per-char widths for the entire string, computed by shaping ONCE and attributing each glyph's advance back to its source char via `glyph.start` (byte offset). For 1-glyph-per-char scripts (typical Latin), the result is exact. For ligatures (e.g. "fi" → 1 glyph), the ligature width gets attributed to the FIRST source char and subsequent chars in the ligature get 0 — approximate but stable for cursor positioning. Massively faster than per-char `measure_text_width` calls when the input is long: one cosmic-text shape pass instead of N.
+    ///
+    /// Returns a Vec sized `text.chars().count()`. Each entry is the advance contribution of all glyphs originating from that char.
+    pub fn measure_text_widths_per_char(&mut self, text: &str, size: f32, weight: u16, font: &str) -> alloc::vec::Vec<f32> {
+        let char_count = text.chars().count();
+        let mut widths = alloc::vec![0.0f32; char_count];
+        if text.is_empty() {
+            return widths;
+        }
+        // Build (byte_offset, char_idx) pairs in increasing byte order — for pure ASCII this is the identity; for multi-byte UTF-8 it remaps each glyph.start (byte offset) back to its char_idx.
+        let mut byte_to_char: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::with_capacity(char_count);
+        for (char_idx, (byte_idx, _ch)) in text.char_indices().enumerate() {
+            byte_to_char.push((byte_idx, char_idx));
+        }
+        let attrs = Attrs::new()
+            .family(Family::Name(font))
+            .weight(Weight(weight));
+        let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(size, size));
+        buffer.set_size(&mut self.font_system, Some(10000.0), Some(size * 2.0));
+        buffer.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced);
+        for run in buffer.layout_runs() {
+            for glyph in run.glyphs {
+                // Binary search for the largest byte_idx <= glyph.start: that's the char whose UTF-8 encoding starts at or before this glyph's source byte.
+                let byte_start = glyph.start;
+                let char_idx = match byte_to_char.binary_search_by(|&(b, _)| b.cmp(&byte_start)) {
+                    Ok(i) => byte_to_char[i].1,
+                    Err(i) if i > 0 => byte_to_char[i - 1].1,
+                    Err(_) => continue,
+                };
+                if char_idx < widths.len() {
+                    widths[char_idx] += glyph.w;
+                }
+            }
+        }
+        widths
+    }
+
     /// Render a single character with additive blending (reversible with wrapping_add/sub)
     /// Returns the width of the rendered character in pixels
     pub fn render_char_additive(
