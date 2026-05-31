@@ -253,6 +253,12 @@ impl FluorApp for PanesDemo {
         self.compositor
             .resize(ctx.viewport.width_px, ctx.viewport.height_px);
         self.chrome.resize(ctx.viewport);
+        // Push the orb into the OS taskbar / window-list / alt-tab so the in-window chrome icon and the OS-level app icon are the same artifact. One-shot at startup — winit holds the icon for the surface's lifetime.
+        if let Some(orb) = self.chrome.app_icon.as_ref() {
+            if let Some(winit_icon) = orb.to_winit_icon() {
+                ctx.window.set_window_icon(Some(winit_icon));
+            }
+        }
         self.update_layout(ctx);
     }
 
