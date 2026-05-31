@@ -1089,13 +1089,15 @@ impl Textbox {
 mod widget_impls {
     //! [`crate::host::widget`] capability-trait implementations for [`Textbox`]. Gated on `host-winit` because the trait signatures reference winit's [`winit::event::KeyEvent`] and [`winit::keyboard::ModifiersState`]; the rest of [`Textbox`] is feature-flag-agnostic and compiles in any build with the `text` feature.
     //!
-    //! [`crate::host::widget::Key`] is **not** implemented here yet — Phase 3b absorbs the keyboard match arm from `examples/panes.rs`. For now panes still owns keystroke routing and calls Textbox's public mutation methods (`insert_char`, `backspace`, etc.) directly. The Click + Focus + Hover impls below are what makes Textbox a first-class participant in the widget tree (Container::visit, click / focus / hover dispatch).
+    //! Click + Focus + Hover + Key make Textbox a first-class participant in the widget tree. Clipboard ops (Ctrl+C / Ctrl+X / Ctrl+V) deliberately stay with the app rather than living on Textbox — the OS clipboard adapter (arboard today) is a single global resource and threading it through every widget that might want it would be premature abstraction. Apps intercept those chords before delivering the key to the focused widget; the widget never sees them.
 
     use super::Textbox;
     use crate::coord::Coord;
-    use crate::host::widget::{Click, Focus, Hover, PaintCtx, Widget};
+    use crate::host::widget::{Click, Focus, Hover, Key, PaintCtx, Widget};
     use crate::paint::HitId;
-    use winit::keyboard::ModifiersState;
+    use crate::text::TextRenderer;
+    use winit::event::KeyEvent;
+    use winit::keyboard::{Key as WKey, ModifiersState, NamedKey};
 
     impl Widget for Textbox {
         fn id(&self) -> HitId {
@@ -1105,6 +1107,9 @@ mod widget_impls {
             // Intentional no-op — panes still drives Textbox rendering via [`Textbox::render_content_into`] with its existing ad-hoc parameter list (sub-canvas offset, optional AlphaMask, etc. that don't fit PaintCtx today). Phase 5 will reshape the paint contract once the host's overall paint orchestration grows around the widget tree. The Widget trait impl here makes Textbox a participant in click / focus / hover dispatch in the meantime.
         }
         fn click(&mut self) -> Option<&mut dyn Click> {
+            Some(self)
+        }
+        fn key(&mut self) -> Option<&mut dyn Key> {
             Some(self)
         }
         fn focus(&mut self) -> Option<&mut dyn Focus> {
@@ -1146,6 +1151,87 @@ mod widget_impls {
     impl Hover for Textbox {
         fn set_hovered(&mut self, hovered: bool) {
             Textbox::set_hovered(self, hovered);
+        }
+    }
+
+    impl Key for Textbox {
+        fn on_key(
+            &mut self,
+            kev: &KeyEvent,
+            mods: ModifiersState,
+            text: &mut TextRenderer,
+        ) -> crate::host::app::EventResponse {
+            // Only handle key-down; let the dispatch layer treat key-up as Pass.
+            if kev.state != winit::event::ElementState::Pressed {
+                return crate::host::app::EventResponse::Pass;
+            }
+            let shift = mods.shift_key();
+            // `ctrl` covers both Control and Super (Cmd on macOS, Windows key on Windows / Linux) — fluor treats them as equivalent for editing shortcuts because the codebase already does so in the chord-key logic and the panes match arm we're replacing.
+            let ctrl = mods.super_key() || mods.control_key();
+            let mut changed = false;
+
+            // Shift+arrow / shift+Home / shift+End: extend existing selection or start one from the current cursor. Non-shift movement collapses any selection. Refactor of the per-arrow boilerplate from the old panes match — `start_selection_if_needed` ensures the anchor is set before the cursor moves so a fresh selection actually contains anything.
+            let mut start_selection_if_needed = |slf: &mut Textbox| {
+                if shift && slf.selection_anchor.is_none() {
+                    slf.selection_anchor = Some(slf.cursor);
+                } else if !shift {
+                    slf.selection_anchor = None;
+                }
+            };
+
+            match &kev.logical_key {
+                WKey::Named(NamedKey::Backspace) => {
+                    self.backspace(text);
+                    changed = true;
+                }
+                WKey::Named(NamedKey::Delete) => {
+                    self.delete_forward(text);
+                    changed = true;
+                }
+                WKey::Named(NamedKey::ArrowLeft) => {
+                    start_selection_if_needed(self);
+                    self.cursor_left();
+                    changed = true;
+                }
+                WKey::Named(NamedKey::ArrowRight) => {
+                    start_selection_if_needed(self);
+                    self.cursor_right();
+                    changed = true;
+                }
+                WKey::Named(NamedKey::Home) => {
+                    start_selection_if_needed(self);
+                    self.cursor_home();
+                    changed = true;
+                }
+                WKey::Named(NamedKey::End) => {
+                    start_selection_if_needed(self);
+                    self.cursor_end();
+                    changed = true;
+                }
+                WKey::Character(c) if ctrl && (c == "a" || c == "A") => {
+                    self.select_all();
+                    changed = true;
+                }
+                _ => {
+                    // Character insertion via the OS's text payload (so dead-keys / IME composition produce the right glyph rather than us reconstructing it from logical_key). Skip while Ctrl is held — Ctrl+letter combos that aren't handled above (Ctrl+S, Ctrl+Z, etc.) shouldn't type their letter. Skip control codepoints so Backspace / Enter / Tab fallthroughs don't get inserted as glyphs.
+                    if !ctrl {
+                        if let Some(s) = &kev.text {
+                            for c in s.chars() {
+                                if !c.is_control() {
+                                    self.insert_char(c, text);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if changed {
+                crate::host::app::EventResponse::Handled
+            } else {
+                crate::host::app::EventResponse::Pass
+            }
         }
     }
 }

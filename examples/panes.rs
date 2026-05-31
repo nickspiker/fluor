@@ -15,6 +15,7 @@ use fluor::host::chrome::{
 use fluor::host::chrome_widget::DefaultChrome;
 use fluor::host::icon::Icon;
 use fluor::host::os_input;
+use fluor::host::widget::{self as widget, Container, TabDir};
 use fluor::paint::pack_argb;
 use fluor::paint::{self, BlendMode, Transform};
 use fluor::region::Region;
@@ -78,8 +79,14 @@ struct PanesDemo {
     compositor: Compositor,
     chrome: DefaultChrome,
     textbox: Textbox,
+    textbox_b: Textbox,
     textbox_group: Group,
+    textbox_b_group: Group,
     cursor_group: Group,
+    /// Currently focused widget id, or `None` for "nothing focused" (background click, Esc, no prior focus). Source of truth for keyboard delivery and Tab cycling — widgets' internal `focused` flags are derived state set by `apply_focus_change` after this field updates.
+    current_focus: Option<HitId>,
+    /// Monotonic dense-ID counter shared across chrome + textboxes. Chrome claims 1..=4 at construction; textbox_a gets 5, textbox_b gets 6. Stored on the demo so future runtime widget creation (e.g. a popup) can keep allocating without re-threading the counter through constructors.
+    hit_counter: HitId,
     /// Rotation demo text — full-viewport AlphaOver group, re-rasterized only when aspect changes.
     rotation_group: Group,
     blink: BlinkTimer,
@@ -144,15 +151,21 @@ impl PanesDemo {
             &mut hit_counter,
         );
 
-        // Placeholder textbox + groups — actual geometry computed in `init`/`on_resize`.
+        // Placeholder textboxes + groups — actual geometry computed in `init`/`on_resize`.
         // Solid-fill-only iteration: textbox_group has just the content layer in its program. We still allocate a glow layer slot so the existing rasterize loop can clear it without panicking, but we don't fold it into the composite — that avoids double premultiplication (an empty glow on top of content via under() premultiplies content once, then `flatten_into` to target premultiplies it again, brightening every AA edge). When we wire glow back in we'll choose a compose that does the math correctly.
         let mut textbox = Textbox::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 12.0);
-        textbox.stroke_ru = 1. / 12.; // thin-but-non-zero so the diagonal two-tone reads as a visible band, not just a hairline
+        textbox.stroke_ru = 1. / 12.;
+        let mut textbox_b = Textbox::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 12.0);
+        textbox_b.stroke_ru = 1. / 12.;
         let placeholder_region = Region::new(0.0, 0.0, 1.0, 1.0);
         let mut textbox_group = Group::new(placeholder_region, BlendMode::Normal);
         let content_layer = textbox_group.new_layer();
         let _glow_layer = textbox_group.new_layer();
         textbox_group.set_program(vec![Op::Push(content_layer)]);
+        let mut textbox_b_group = Group::new(placeholder_region, BlendMode::Normal);
+        let content_layer_b = textbox_b_group.new_layer();
+        let _glow_layer_b = textbox_b_group.new_layer();
+        textbox_b_group.set_program(vec![Op::Push(content_layer_b)]);
         let mut cursor_group = Group::new(placeholder_region, BlendMode::Add);
         let l = cursor_group.new_layer();
         cursor_group.set_program(vec![Op::Push(l)]);
@@ -172,8 +185,12 @@ impl PanesDemo {
             compositor,
             chrome,
             textbox,
+            textbox_b,
             textbox_group,
+            textbox_b_group,
             cursor_group,
+            current_focus: None,
+            hit_counter,
             rotation_group,
             blink: BlinkTimer::new(),
             is_dragging_select: false,
@@ -208,8 +225,13 @@ impl PanesDemo {
         let font_size = bw;
         self.textbox.set_rect(center_x, center_y, width, height);
         self.textbox.set_font_size(font_size, ctx.text);
+        // Second textbox stacks below the first with 1 button-width vertical gap. Same width / height / font as A so the pair reads as a coherent form.
+        let center_y_b = center_y + height + bw;
+        self.textbox_b.set_rect(center_x, center_y_b, width, height);
+        self.textbox_b.set_font_size(font_size, ctx.text);
 
         self.textbox_group.resize(self.textbox.bbox());
+        self.textbox_b_group.resize(self.textbox_b.bbox());
         self.cursor_group.resize(self.textbox.cursor_bbox());
 
         let viewport_region = Region::new(0.0, 0.0, vp.width_px as Coord, vp.height_px as Coord);
@@ -241,6 +263,62 @@ impl PanesDemo {
             now,
             CHORD_RELEASE_GRACE,
         )
+    }
+
+    /// Convenience: borrow whichever textbox currently has focus (or `None` if focus is on a non-textbox widget or nothing). Used by the Ctrl+C / X / V clipboard interception path which needs to ask the focused textbox for its selected text without doing a full Container::visit. Returns `None` for chrome-button focus because chrome buttons don't carry text to copy.
+    fn focused_textbox_mut(&mut self) -> Option<&mut Textbox> {
+        let focus = self.current_focus?;
+        if focus == self.textbox.hit_id() {
+            Some(&mut self.textbox)
+        } else if focus == self.textbox_b.hit_id() {
+            Some(&mut self.textbox_b)
+        } else {
+            None
+        }
+    }
+
+    /// Invalidate the [`Group`] cache associated with `id`. Used by `change_focus` to mark the prior + new focused widget's group dirty so the next paint reflects the focus-glow on/off transition. No-op for ids that don't have a group (chrome buttons paint into chrome's monolithic layer; chrome handles its own dirty marking via `set_focused`).
+    fn invalidate_group_by_id(&mut self, id: HitId) {
+        if id == self.textbox.hit_id() {
+            self.textbox_group.invalidate();
+        } else if id == self.textbox_b.hit_id() {
+            self.textbox_b_group.invalidate();
+        }
+    }
+
+    /// Apply a focus change: drive `apply_focus_change` over the widget tree (which calls `set_focused` on the old + new targets), invalidate the involved groups so the focus-glow transition lands on the next paint, and start / stop the blink timer. Returns `true` if anything changed (no-op when `new == self.current_focus`).
+    fn change_focus(&mut self, new_focus: Option<HitId>, ctx: &mut Context) -> bool {
+        if new_focus == self.current_focus {
+            return false;
+        }
+        let prior = self.current_focus;
+        widget::apply_focus_change(self as &mut dyn Container, prior, new_focus);
+        self.current_focus = new_focus;
+        if let Some(id) = prior {
+            self.invalidate_group_by_id(id);
+        }
+        if let Some(id) = new_focus {
+            self.invalidate_group_by_id(id);
+            self.blink.start(Instant::now());
+        } else {
+            self.blink.stop();
+        }
+        ctx.window.request_redraw();
+        true
+    }
+
+    /// `click_count` capped at 3. Multi-click escalation only goes up to triple-click (select-all); past that the user is just clicking, treat as "still triple."
+    fn click_count_capped(&self) -> u32 {
+        self.click_count.min(3)
+    }
+}
+
+/// Walk our two textboxes + the chrome's four buttons in tab order. Textboxes first (content), then chrome buttons (window controls) — matches macOS / GNOME convention where Tab traverses form fields before window-frame controls. `linear_tab_next` reads this order off the visit walk to compute the next focusable id.
+impl Container for PanesDemo {
+    fn visit(&mut self, f: &mut dyn FnMut(&mut dyn fluor::host::widget::Widget)) {
+        f(&mut self.textbox);
+        f(&mut self.textbox_b);
+        self.chrome.visit(f);
     }
 }
 
@@ -274,40 +352,55 @@ impl FluorApp for PanesDemo {
         match event {
             WindowEvent::CursorMoved { .. } => {
                 if self.is_dragging_select {
-                    let tl = self.textbox.center_x - self.textbox.width * 0.5
-                        + self.textbox.font_size * 0.4;
-                    let tr = self.textbox.center_x + self.textbox.width * 0.5
-                        - self.textbox.font_size * 0.4;
-                    let clamped_x = ctx.cursor_x.clamp(tl, tr);
-                    if self.textbox.selection_anchor.is_none() {
-                        self.textbox.selection_anchor = Some(self.textbox.cursor);
+                    let focus_id = self.current_focus;
+                    if let Some(tb) = self.focused_textbox_mut() {
+                        let tl = tb.center_x - tb.width * 0.5 + tb.font_size * 0.4;
+                        let tr = tb.center_x + tb.width * 0.5 - tb.font_size * 0.4;
+                        let clamped_x = ctx.cursor_x.clamp(tl, tr);
+                        if tb.selection_anchor.is_none() {
+                            tb.selection_anchor = Some(tb.cursor);
+                        }
+                        tb.cursor = tb.cursor_index_from_x(clamped_x);
                     }
-                    self.textbox.cursor = self.textbox.cursor_index_from_x(clamped_x);
-                    self.textbox_group.invalidate();
+                    if let Some(id) = focus_id {
+                        self.invalidate_group_by_id(id);
+                    }
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
                 }
                 let new_hit = self.chrome.hit_at(ctx.cursor_x, ctx.cursor_y);
                 let chrome_changed = self.chrome.set_hover(new_hit);
-                let new_textbox_hover = new_hit == HIT_TEXTBOX;
-                let textbox_changed = self.textbox.is_hovered() != new_textbox_hover;
-                if textbox_changed {
-                    self.textbox.set_hovered(new_textbox_hover);
+                // Manual hover dispatch for textboxes — at N=2 the if/else pair is clearer than a Container::visit walk that has to compare against a snapshot to detect change. Generalises to a helper at higher N.
+                let tb_a_want = new_hit == self.textbox.hit_id();
+                let tb_a_changed = self.textbox.is_hovered() != tb_a_want;
+                if tb_a_changed {
+                    self.textbox.set_hovered(tb_a_want);
                     self.textbox_group.invalidate();
                 }
-                if chrome_changed || textbox_changed {
+                let tb_b_want = new_hit == self.textbox_b.hit_id();
+                let tb_b_changed = self.textbox_b.is_hovered() != tb_b_want;
+                if tb_b_changed {
+                    self.textbox_b.set_hovered(tb_b_want);
+                    self.textbox_b_group.invalidate();
+                }
+                if chrome_changed || tb_a_changed || tb_b_changed {
                     ctx.window.request_redraw();
                 }
                 EventResponse::Pass
             }
             WindowEvent::CursorLeft { .. } => {
                 let chrome_changed = self.chrome.set_hover(HIT_NONE);
-                let textbox_changed = self.textbox.is_hovered();
-                if textbox_changed {
+                let tb_a_changed = self.textbox.is_hovered();
+                if tb_a_changed {
                     self.textbox.set_hovered(false);
                     self.textbox_group.invalidate();
                 }
-                if chrome_changed || textbox_changed {
+                let tb_b_changed = self.textbox_b.is_hovered();
+                if tb_b_changed {
+                    self.textbox_b.set_hovered(false);
+                    self.textbox_b_group.invalidate();
+                }
+                if chrome_changed || tb_a_changed || tb_b_changed {
                     ctx.window.request_redraw();
                 }
                 EventResponse::Pass
@@ -317,15 +410,7 @@ impl FluorApp for PanesDemo {
                 button: MouseButton::Left,
                 ..
             } => {
-                match self.chrome.hit_at(ctx.cursor_x, ctx.cursor_y) {
-                    HIT_CLOSE_BUTTON => return EventResponse::Close,
-                    HIT_MINIMIZE_BUTTON => {
-                        ctx.window.set_minimized(true);
-                        return EventResponse::Handled;
-                    }
-                    HIT_MAXIMIZE_BUTTON => return EventResponse::ToggleMaximized,
-                    _ => {}
-                }
+                // 1. Resize-edge wins over widget dispatch — the perimeter is host-owned territory, not part of any widget's hit zone.
                 let edge = chrome::get_resize_edge(
                     ctx.viewport.width_px,
                     ctx.viewport.height_px,
@@ -333,15 +418,46 @@ impl FluorApp for PanesDemo {
                     ctx.cursor_y,
                 );
                 if edge != ResizeEdge::None {
-                    // Starting a resize-drag — defensively clear any in-progress selection-drag state so cursor moves during the resize can't bleed into the textbox's "extend selection" path. Host suppresses CursorMoved dispatch during resize, but if `is_dragging_select` was set from a prior interaction that didn't release cleanly, the post-resize state would still have stale drag flags.
+                    // Defensively clear any in-progress selection-drag so cursor moves during resize can't bleed into textbox selection extension. Host suppresses CursorMoved dispatch during resize, but a prior interaction that didn't release cleanly could leave stale state.
                     self.is_dragging_select = false;
                     self.selection_scroll_time = None;
                     return EventResponse::StartResize(edge);
                 }
-                let was_focused = self.textbox.is_focused();
-                self.textbox.handle_click(ctx.cursor_x, ctx.cursor_y);
-                if self.textbox.is_focused() {
-                    // Multi-click sequence: continuation iff the gap to the previous press is within the OS double-click interval AND the cursor hasn't moved more than `MULTI_CLICK_TOL_PX`. count==2 → word-select around current cursor; count==3 → select-all. Reset to 1 on a non-continuation. We let `handle_click` set the cursor first so the word-select probe targets the actual clicked char.
+                // 2. Read the hit id at the cursor. HIT_NONE → background click → clear focus + start window drag.
+                let hit_id = self.chrome.hit_at(ctx.cursor_x, ctx.cursor_y);
+                if hit_id == HIT_NONE {
+                    let had_focus = self.current_focus.is_some();
+                    if had_focus {
+                        self.change_focus(None, ctx);
+                        self.is_dragging_select = false;
+                    }
+                    return EventResponse::StartWindowDrag;
+                }
+                // 3. Dispatch click + capture focus target via Container walk. The closure stays small — captures the event-response and focus-target slots; the actual focus side-effect is applied below where we can re-borrow self mutably.
+                let x = ctx.cursor_x;
+                let y = ctx.cursor_y;
+                let mods = ctx.modifiers;
+                let mut response = EventResponse::Pass;
+                let mut focus_target: Option<HitId> = None;
+                self.visit(&mut |w| {
+                    if w.id() == hit_id {
+                        if let Some(c) = w.click() {
+                            response = c.on_click(x, y, mods);
+                        }
+                        if w.focus().is_some() {
+                            focus_target = Some(hit_id);
+                        }
+                    }
+                });
+                // 4. Apply focus change (drives set_focused on old/new widgets + group invalidations + blink timer).
+                if self.current_focus != focus_target {
+                    self.change_focus(focus_target, ctx);
+                }
+                // 5. Textbox-specific post-click: multi-click escalation + selection-drag setup. Chrome buttons return their action response above and we propagate it unchanged.
+                let is_textbox_focus = focus_target
+                    .map(|id| id == self.textbox.hit_id() || id == self.textbox_b.hit_id())
+                    .unwrap_or(false);
+                if is_textbox_focus {
                     let now = Instant::now();
                     let is_continuation = match self.last_click_time {
                         Some(prev) => {
@@ -356,28 +472,28 @@ impl FluorApp for PanesDemo {
                     self.click_count = if is_continuation { self.click_count + 1 } else { 1 };
                     self.last_click_time = Some(now);
                     self.last_click_pos = (ctx.cursor_x, ctx.cursor_y);
-                    match self.click_count {
-                        2 => self.textbox.select_word_at(self.textbox.cursor),
-                        n if n >= 3 => {
-                            self.textbox.select_all();
-                            // Cap the counter so a 4th-click doesn't try to "escalate" past select-all — at that point the user is just clicking, treat the 4th click as another triple-cycle anchor.
-                            self.click_count = 3;
+                    let capped = self.click_count_capped();
+                    if let Some(tb) = self.focused_textbox_mut() {
+                        match capped {
+                            2 => tb.select_word_at(tb.cursor),
+                            3 => tb.select_all(),
+                            _ => {}
                         }
-                        _ => {}
+                    }
+                    // Cap the counter so a 4th-click doesn't try to "escalate" past select-all — treat the 4th click as another triple-cycle anchor.
+                    if self.click_count >= 3 {
+                        self.click_count = 3;
                     }
                     self.is_dragging_select = true;
                     self.selection_scroll_time = None;
-                    self.textbox_group.invalidate();
-                    self.blink.start(Instant::now());
+                    if let Some(id) = focus_target {
+                        self.invalidate_group_by_id(id);
+                    }
+                    self.blink.start(now);
                     ctx.window.request_redraw();
                     return EventResponse::Handled;
-                } else if was_focused {
-                    self.blink.stop();
-                    self.is_dragging_select = false;
-                    self.textbox_group.invalidate();
-                    ctx.window.request_redraw();
                 }
-                EventResponse::StartWindowDrag
+                response
             }
             WindowEvent::MouseInput {
                 state: ElementState::Released,
@@ -387,8 +503,10 @@ impl FluorApp for PanesDemo {
                 if self.is_dragging_select {
                     self.is_dragging_select = false;
                     self.selection_scroll_time = None;
-                    if self.textbox.selection_anchor == Some(self.textbox.cursor) {
-                        self.textbox.selection_anchor = None;
+                    if let Some(tb) = self.focused_textbox_mut() {
+                        if tb.selection_anchor == Some(tb.cursor) {
+                            tb.selection_anchor = None;
+                        }
                     }
                     self.blink.start(Instant::now());
                     ctx.window.request_redraw();
@@ -551,104 +669,104 @@ impl FluorApp for PanesDemo {
                 if kev.state != ElementState::Pressed {
                     return EventResponse::Pass;
                 }
-                if !self.textbox.is_focused() {
+                // Tab / Shift+Tab → focus cycle. Runs BEFORE clipboard interception and BEFORE delivery to the focused widget so a textbox can't swallow Tab as a "\t" insertion. `linear_tab_next` walks the Container in registration order; with our visit order (textbox_a → textbox_b → chrome buttons) Tab advances textbox_a → textbox_b → app_icon → min → max → close → wrap.
+                if matches!(kev.logical_key, Key::Named(NamedKey::Tab)) {
+                    let dir = if shift { TabDir::Backward } else { TabDir::Forward };
+                    let current = self.current_focus;
+                    let next =
+                        widget::linear_tab_next(self as &mut dyn Container, current, dir);
+                    self.change_focus(next, ctx);
+                    return EventResponse::Handled;
+                }
+                // Escape → clear focus.
+                if matches!(kev.logical_key, Key::Named(NamedKey::Escape)) {
+                    if self.current_focus.is_some() {
+                        self.change_focus(None, ctx);
+                    }
+                    return EventResponse::Handled;
+                }
+                let Some(focus_id) = self.current_focus else {
                     return EventResponse::Pass;
-                }
-                let mut changed = false;
-                match &kev.logical_key {
-                    Key::Named(NamedKey::Backspace) => {
-                        self.textbox.backspace(ctx.text);
-                        changed = true;
-                    }
-                    Key::Named(NamedKey::Delete) => {
-                        self.textbox.delete_forward(ctx.text);
-                        changed = true;
-                    }
-                    Key::Named(NamedKey::ArrowLeft) => {
-                        if shift && self.textbox.selection_anchor.is_none() {
-                            self.textbox.selection_anchor = Some(self.textbox.cursor);
-                        } else if !shift {
-                            self.textbox.selection_anchor = None;
-                        }
-                        self.textbox.cursor_left();
-                        changed = true;
-                    }
-                    Key::Named(NamedKey::ArrowRight) => {
-                        if shift && self.textbox.selection_anchor.is_none() {
-                            self.textbox.selection_anchor = Some(self.textbox.cursor);
-                        } else if !shift {
-                            self.textbox.selection_anchor = None;
-                        }
-                        self.textbox.cursor_right();
-                        changed = true;
-                    }
-                    Key::Named(NamedKey::Home) => {
-                        if shift && self.textbox.selection_anchor.is_none() {
-                            self.textbox.selection_anchor = Some(self.textbox.cursor);
-                        } else if !shift {
-                            self.textbox.selection_anchor = None;
-                        }
-                        self.textbox.cursor_home();
-                        changed = true;
-                    }
-                    Key::Named(NamedKey::End) => {
-                        if shift && self.textbox.selection_anchor.is_none() {
-                            self.textbox.selection_anchor = Some(self.textbox.cursor);
-                        } else if !shift {
-                            self.textbox.selection_anchor = None;
-                        }
-                        self.textbox.cursor_end();
-                        changed = true;
-                    }
-                    Key::Character(c) if ctrl && (c == "a" || c == "A") => {
-                        self.textbox.select_all();
-                        changed = true;
-                    }
-                    Key::Character(c) if ctrl && (c == "c" || c == "C") => {
-                        if let Some(selected) = self.textbox.selected_text() {
-                            if let Ok(mut clip) = arboard::Clipboard::new() {
-                                let _ = clip.set_text(selected);
-                            }
-                        }
-                    }
-                    Key::Character(c) if ctrl && (c == "x" || c == "X") => {
-                        if let Some(selected) = self.textbox.selected_text() {
-                            let ok = arboard::Clipboard::new()
-                                .and_then(|mut clip| clip.set_text(selected))
-                                .is_ok();
-                            if ok {
-                                self.textbox.delete_selection(ctx.text);
-                                changed = true;
-                            }
-                        }
-                    }
-                    Key::Character(c) if ctrl && (c == "v" || c == "V") => {
-                        if let Ok(mut clip) = arboard::Clipboard::new() {
-                            if let Ok(paste) = clip.get_text() {
-                                self.textbox.insert_str(&paste, ctx.text);
-                                changed = true;
-                            }
-                        }
-                    }
-                    _ => {
-                        if let Some(s) = &kev.text {
-                            if !ctrl {
-                                for c in s.chars() {
-                                    if !c.is_control() {
-                                        self.textbox.insert_char(c, ctx.text);
-                                        changed = true;
+                };
+                // Enter / Space on a chrome button activates it. The widget's Key::on_key returns the action's EventResponse; we propagate it so the host fires Close / Minimize / ToggleMaximized as if the button were clicked.
+                // Clipboard interception (textbox-focused only). Ctrl+C / Ctrl+X / Ctrl+V need the OS clipboard adapter (arboard) which is a single global resource — threading it through every widget that might want clipboard access would be premature abstraction at one consumer. Apps handle the chord before delivering to the focused widget; the widget never sees Ctrl+C/X/V. Ctrl+A is widget-internal (select-all) and Textbox::on_key handles it.
+                let focused_is_textbox = focus_id == self.textbox.hit_id()
+                    || focus_id == self.textbox_b.hit_id();
+                if focused_is_textbox {
+                    if let Key::Character(c) = &kev.logical_key {
+                        if ctrl {
+                            let lower = c.to_ascii_lowercase();
+                            // Hoist `ctx.text` reborrow out of the match arms so the focused-textbox borrow (which extends until end-of-arm via `tb`) doesn't conflict with the renderer borrow. `text` here is a fresh `&mut TextRenderer` per match arm; rust's NLL closes it cleanly when each arm returns.
+                            match lower.as_str() {
+                                "c" => {
+                                    if let Some(tb) = self.focused_textbox_mut() {
+                                        if let Some(selected) = tb.selected_text() {
+                                            if let Ok(mut clip) = arboard::Clipboard::new() {
+                                                let _ = clip.set_text(selected);
+                                            }
+                                        }
                                     }
+                                    return EventResponse::Handled;
                                 }
+                                "x" => {
+                                    let mut did_change = false;
+                                    if let Some(tb) = self.focused_textbox_mut() {
+                                        if let Some(selected) = tb.selected_text() {
+                                            if arboard::Clipboard::new()
+                                                .and_then(|mut clip| clip.set_text(selected))
+                                                .is_ok()
+                                            {
+                                                tb.delete_selection(&mut *ctx.text);
+                                                did_change = true;
+                                            }
+                                        }
+                                    }
+                                    if did_change {
+                                        self.invalidate_group_by_id(focus_id);
+                                        self.blink.start(Instant::now());
+                                        ctx.window.request_redraw();
+                                    }
+                                    return EventResponse::Handled;
+                                }
+                                "v" => {
+                                    let mut did_change = false;
+                                    if let Some(tb) = self.focused_textbox_mut() {
+                                        if let Ok(mut clip) = arboard::Clipboard::new() {
+                                            if let Ok(paste) = clip.get_text() {
+                                                tb.insert_str(&paste, &mut *ctx.text);
+                                                did_change = true;
+                                            }
+                                        }
+                                    }
+                                    if did_change {
+                                        self.invalidate_group_by_id(focus_id);
+                                        self.blink.start(Instant::now());
+                                        ctx.window.request_redraw();
+                                    }
+                                    return EventResponse::Handled;
+                                }
+                                _ => {}
                             }
                         }
                     }
                 }
-                if changed {
-                    self.textbox_group.invalidate();
+                // Deliver remaining keys to the focused widget via the Key trait. Walk the tree, match on id, call on_key. The closure body holds the only `&mut TextRenderer` it needs (via the explicit reborrow); `response` is captured as `&mut EventResponse` and mutated on the match.
+                let modifiers = ctx.modifiers;
+                let text = &mut *ctx.text;
+                let mut response = EventResponse::Pass;
+                self.visit(&mut |w| {
+                    if w.id() == focus_id {
+                        if let Some(k) = w.key() {
+                            response = k.on_key(kev, modifiers, text);
+                        }
+                    }
+                });
+                if matches!(response, EventResponse::Handled) && focused_is_textbox {
+                    self.invalidate_group_by_id(focus_id);
                     self.blink.start(Instant::now());
                     ctx.window.request_redraw();
                 }
-                EventResponse::Handled
+                response
             }
             WindowEvent::Focused(focused) => {
                 if self.chrome.set_focused(*focused) {
@@ -700,18 +818,23 @@ impl FluorApp for PanesDemo {
     }
 
     fn overlay_deltas(&self) -> Vec<u32> {
-        // Per-hit-id tint deltas applied to persistent_screen by the host's overlay pass. Slice sized to the highest live hit id + 1 (HIT_TEXTBOX is the max here). Most apps will allocate this from `registry.next_id` once it exists; for now the demo uses the compat constants.
-        let mut t = vec![0u32; HIT_TEXTBOX as usize + 1];
+        // Per-hit-id tint deltas applied to persistent_screen by the host's overlay pass. Slice sized to the live hit-id count (hit_counter + 1 since IDs are 1-indexed and HIT_NONE = 0 takes slot 0).
+        let mut t = vec![0u32; self.hit_counter as usize + 1];
         if let Some(c) = fluor::host::chrome_widget::hover_color_for(self.chrome.hover_state) {
             t[self.chrome.hover_state as usize] = c;
         }
-        t[HIT_TEXTBOX as usize] = if self.textbox.is_focused() {
-            paint::wrap_sub_rgb(fluor::theme::TEXTBOX_ACTIVE, fluor::theme::TEXTBOX_FILL)
-        } else if self.textbox.is_hovered() {
-            paint::wrap_sub_rgb(fluor::theme::TEXTBOX_HOVER, fluor::theme::TEXTBOX_FILL)
-        } else {
-            0
+        // Same focus / hover → tint formula applied to each textbox at its own dense hit id. Generalises to a Container walk in Phase 5 once we have a way for widgets to surface their tint contribution through the trait.
+        let tb_tint = |tb: &Textbox| -> u32 {
+            if tb.is_focused() {
+                paint::wrap_sub_rgb(fluor::theme::TEXTBOX_ACTIVE, fluor::theme::TEXTBOX_FILL)
+            } else if tb.is_hovered() {
+                paint::wrap_sub_rgb(fluor::theme::TEXTBOX_HOVER, fluor::theme::TEXTBOX_FILL)
+            } else {
+                0
+            }
         };
+        t[self.textbox.hit_id() as usize] = tb_tint(&self.textbox);
+        t[self.textbox_b.hit_id() as usize] = tb_tint(&self.textbox_b);
         t
     }
 
@@ -818,6 +941,7 @@ impl FluorApp for PanesDemo {
         let clip = pixelrect_to_clip(ctx.damage_clip);
         {
             let mut canvas = fluor::canvas::Canvas::new(target, buf_w, buf_h, ctx.damage);
+            // Stamp each textbox's pill silhouette into the shared hit_test_map at its own dense hit id — click + hover dispatch routes by `hit_map[idx]` and finds the matching widget via Container::visit.
             self.textbox.render_content_into(
                 &mut canvas,
                 0.0,
@@ -826,7 +950,17 @@ impl FluorApp for PanesDemo {
                 clip,
                 None,
                 Some(&mut self.chrome.hit_test_map),
-                HIT_TEXTBOX,
+                self.textbox.hit_id(),
+            );
+            self.textbox_b.render_content_into(
+                &mut canvas,
+                0.0,
+                0.0,
+                ctx.text,
+                clip,
+                None,
+                Some(&mut self.chrome.hit_test_map),
+                self.textbox_b.hit_id(),
             );
         }
         // Textbox tint is now baked into its own cache by `render_content_into` (Photon-style differential) — no per-frame walk over `hit_test_map` needed here.
@@ -876,37 +1010,45 @@ impl FluorApp for PanesDemo {
     fn tick(&mut self, ctx: &mut Context) -> bool {
         let mut needs_redraw = false;
 
-        // Selection drag: auto-scroll the textbox content while the cursor is held outside its bounds.
+        // Selection drag: auto-scroll the focused textbox's content while the cursor is held outside its bounds.
         if self.is_dragging_select {
-            let tl =
-                self.textbox.center_x - self.textbox.width * 0.5 + self.textbox.font_size * 0.4;
-            let tr =
-                self.textbox.center_x + self.textbox.width * 0.5 - self.textbox.font_size * 0.4;
-            let distance_outside = if ctx.cursor_x < tl {
-                tl - ctx.cursor_x
-            } else if ctx.cursor_x > tr {
-                ctx.cursor_x - tr
-            } else {
-                0.0
-            };
-            if distance_outside > 0.0 {
-                let now = Instant::now();
-                let dt = self
-                    .selection_scroll_time
-                    .map(|t| now.duration_since(t).as_secs_f32())
-                    .unwrap_or(0.0);
-                self.selection_scroll_time = Some(now);
-                let uw = self.textbox.width - self.textbox.font_size * 0.8;
-                let speed = 1000.0 * distance_outside / uw;
-                let delta = speed * dt;
-                if ctx.cursor_x < tl {
-                    self.textbox.nudge_scroll_offset(delta);
+            let cursor_x = ctx.cursor_x;
+            let focus_id = self.current_focus;
+            let mut did_scroll = false;
+            let last_scroll = self.selection_scroll_time;
+            let now = Instant::now();
+            if let Some(tb) = self.focused_textbox_mut() {
+                let tl = tb.center_x - tb.width * 0.5 + tb.font_size * 0.4;
+                let tr = tb.center_x + tb.width * 0.5 - tb.font_size * 0.4;
+                let distance_outside = if cursor_x < tl {
+                    tl - cursor_x
+                } else if cursor_x > tr {
+                    cursor_x - tr
                 } else {
-                    self.textbox.nudge_scroll_offset(-delta);
+                    0.0
+                };
+                if distance_outside > 0.0 {
+                    let dt = last_scroll
+                        .map(|t| now.duration_since(t).as_secs_f32())
+                        .unwrap_or(0.0);
+                    let uw = tb.width - tb.font_size * 0.8;
+                    let speed = 1000.0 * distance_outside / uw;
+                    let delta = speed * dt;
+                    if cursor_x < tl {
+                        tb.nudge_scroll_offset(delta);
+                    } else {
+                        tb.nudge_scroll_offset(-delta);
+                    }
+                    let clamped_x = cursor_x.clamp(tl, tr);
+                    tb.cursor = tb.cursor_index_from_x(clamped_x);
+                    did_scroll = true;
                 }
-                let clamped_x = ctx.cursor_x.clamp(tl, tr);
-                self.textbox.cursor = self.textbox.cursor_index_from_x(clamped_x);
-                self.textbox_group.invalidate();
+            }
+            if did_scroll {
+                self.selection_scroll_time = Some(now);
+                if let Some(id) = focus_id {
+                    self.invalidate_group_by_id(id);
+                }
                 needs_redraw = true;
             } else {
                 self.selection_scroll_time = None;
