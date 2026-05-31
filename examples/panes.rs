@@ -14,6 +14,7 @@ use fluor::host::chrome::{
 };
 use fluor::host::chrome_widget::DefaultChrome;
 use fluor::host::icon::Icon;
+use fluor::host::os_input;
 use fluor::paint::pack_argb;
 use fluor::paint::{self, BlendMode, Transform};
 use fluor::region::Region;
@@ -27,6 +28,9 @@ use winit::window::CursorIcon;
 
 /// Grace period after a `[` or `]` Release event before we consider the key actually released. X11 fires synthetic Release events for held keys when another key is pressed — without this grace, the chord disarms a millisecond before an action key fires and you'd never see one work. Long enough to absorb the synthetic release, short enough that real releases feel instant.
 const CHORD_RELEASE_GRACE: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// Pixel proximity tolerance for multi-click sequences. A press farther than this from the previous resets the count. The temporal half of the test uses [`host::os_input::double_click_interval`] — OS-polled, not a hardcoded constant — so users who've cranked the system double-click speed up or down get the behavior they expect.
+const MULTI_CLICK_TOL_PX: Coord = 4.0;
 
 /// Debug chord bindings shown in the hint overlay while the chord is armed. Keep in sync with the action dispatch in the keyboard handler.
 const CHORD_HINTS: &[(&str, &str)] = &[
@@ -81,6 +85,12 @@ struct PanesDemo {
     blink: BlinkTimer,
     is_dragging_select: bool,
     selection_scroll_time: Option<Instant>,
+    /// Most-recent mouse-press timestamp. Used to detect double/triple-click sequences for word- / line-select. Reset when the gap exceeds `MULTI_CLICK_WINDOW` OR the cursor moves more than `MULTI_CLICK_TOL_PX` between presses.
+    last_click_time: Option<Instant>,
+    /// Cursor position at the last mouse press, for the proximity test on multi-clicks.
+    last_click_pos: (Coord, Coord),
+    /// Consecutive-click count: 1 = single, 2 = double (word-select), 3 = triple (line/whole-text select). Increments on a continuation; resets to 1 otherwise.
+    click_count: u32,
     /// Last `[` Press timestamp; refreshed by auto-repeat events too. `None` until first press.
     chord_lb_press: Option<Instant>,
     /// Last `[` Release timestamp. Combined with [`Self::chord_lb_press`] this determines whether `[` is currently held: held iff `press > release` OR the release was within [`CHORD_RELEASE_GRACE`].
@@ -161,6 +171,9 @@ impl PanesDemo {
             blink: BlinkTimer::new(),
             is_dragging_select: false,
             selection_scroll_time: None,
+            last_click_time: None,
+            last_click_pos: (0.0, 0.0),
+            click_count: 0,
             chord_lb_press: None,
             chord_lb_release: None,
             chord_rb_press: None,
@@ -316,6 +329,30 @@ impl FluorApp for PanesDemo {
                 let was_focused = self.textbox.focused;
                 self.textbox.handle_click(ctx.cursor_x, ctx.cursor_y);
                 if self.textbox.focused {
+                    // Multi-click sequence: continuation iff the gap to the previous press is within the OS double-click interval AND the cursor hasn't moved more than `MULTI_CLICK_TOL_PX`. count==2 → word-select around current cursor; count==3 → select-all. Reset to 1 on a non-continuation. We let `handle_click` set the cursor first so the word-select probe targets the actual clicked char.
+                    let now = Instant::now();
+                    let is_continuation = match self.last_click_time {
+                        Some(prev) => {
+                            let dx = ctx.cursor_x - self.last_click_pos.0;
+                            let dy = ctx.cursor_y - self.last_click_pos.1;
+                            let dist_sq = dx * dx + dy * dy;
+                            now.duration_since(prev) <= os_input::double_click_interval()
+                                && dist_sq <= MULTI_CLICK_TOL_PX * MULTI_CLICK_TOL_PX
+                        }
+                        None => false,
+                    };
+                    self.click_count = if is_continuation { self.click_count + 1 } else { 1 };
+                    self.last_click_time = Some(now);
+                    self.last_click_pos = (ctx.cursor_x, ctx.cursor_y);
+                    match self.click_count {
+                        2 => self.textbox.select_word_at(self.textbox.cursor),
+                        n if n >= 3 => {
+                            self.textbox.select_all();
+                            // Cap the counter so a 4th-click doesn't try to "escalate" past select-all — at that point the user is just clicking, treat the 4th click as another triple-cycle anchor.
+                            self.click_count = 3;
+                        }
+                        _ => {}
+                    }
                     self.is_dragging_select = true;
                     self.selection_scroll_time = None;
                     self.textbox_group.invalidate();
