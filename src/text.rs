@@ -151,7 +151,16 @@ impl TextRenderer {
             }
             let text_width = max_x - min_x;
             let text_height = run.line_height;
-            damage_text_bbox(canvas.damage, buf_w, buf_h, x, y, text_width, text_height, 0);
+            damage_text_bbox(
+                canvas.damage,
+                buf_w,
+                buf_h,
+                x,
+                y,
+                text_width,
+                text_height,
+                0,
+            );
             self.render_buffer_u32(
                 &mut buffer,
                 canvas.pixels,
@@ -204,7 +213,16 @@ impl TextRenderer {
                 text_width = text_width.max(glyph.x + glyph.w);
             }
             let text_height = run.line_height;
-            damage_text_bbox(canvas.damage, buf_w, buf_h, x, y, text_width, text_height, 1);
+            damage_text_bbox(
+                canvas.damage,
+                buf_w,
+                buf_h,
+                x,
+                y,
+                text_width,
+                text_height,
+                1,
+            );
             self.render_buffer_u32(
                 &mut buffer,
                 canvas.pixels,
@@ -257,7 +275,16 @@ impl TextRenderer {
                 text_width = text_width.max(glyph.x + glyph.w);
             }
             let text_height = run.line_height;
-            damage_text_bbox(canvas.damage, buf_w, buf_h, x, y, text_width, text_height, 2);
+            damage_text_bbox(
+                canvas.damage,
+                buf_w,
+                buf_h,
+                x,
+                y,
+                text_width,
+                text_height,
+                2,
+            );
             self.render_buffer_u32(
                 &mut buffer,
                 canvas.pixels,
@@ -1099,14 +1126,21 @@ impl TextRenderer {
     /// Per-char widths for the entire string, computed by shaping ONCE and attributing each glyph's advance back to its source char via `glyph.start` (byte offset). For 1-glyph-per-char scripts (typical Latin), the result is exact. For ligatures (e.g. "fi" → 1 glyph), the ligature width gets attributed to the FIRST source char and subsequent chars in the ligature get 0 — approximate but stable for cursor positioning. Massively faster than per-char `measure_text_width` calls when the input is long: one cosmic-text shape pass instead of N.
     ///
     /// Returns a Vec sized `text.chars().count()`. Each entry is the advance contribution of all glyphs originating from that char.
-    pub fn measure_text_widths_per_char(&mut self, text: &str, size: f32, weight: u16, font: &str) -> alloc::vec::Vec<f32> {
+    pub fn measure_text_widths_per_char(
+        &mut self,
+        text: &str,
+        size: f32,
+        weight: u16,
+        font: &str,
+    ) -> alloc::vec::Vec<f32> {
         let char_count = text.chars().count();
         let mut widths = alloc::vec![0.0f32; char_count];
         if text.is_empty() {
             return widths;
         }
         // Build (byte_offset, char_idx) pairs in increasing byte order — for pure ASCII this is the identity; for multi-byte UTF-8 it remaps each glyph.start (byte offset) back to its char_idx.
-        let mut byte_to_char: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::with_capacity(char_count);
+        let mut byte_to_char: alloc::vec::Vec<(usize, usize)> =
+            alloc::vec::Vec::with_capacity(char_count);
         for (char_idx, (byte_idx, _ch)) in text.char_indices().enumerate() {
             byte_to_char.push((byte_idx, char_idx));
         }

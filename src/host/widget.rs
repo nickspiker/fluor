@@ -139,11 +139,7 @@ pub fn linear_tab_next(
 }
 
 /// Apply a focus change: call `set_focused(false)` on the old target (if any) and `set_focused(true)` on the new target (if any). Idempotent when `old == new`. Walks `root` once per non-null target so widgets that change visual state on focus transition can mark themselves dirty in the same frame.
-pub fn apply_focus_change(
-    root: &mut dyn Container,
-    old: Option<HitId>,
-    new: Option<HitId>,
-) {
+pub fn apply_focus_change(root: &mut dyn Container, old: Option<HitId>, new: Option<HitId>) {
     if old == new {
         return;
     }
@@ -218,9 +214,21 @@ mod tests {
     fn linear_tab_skips_non_focusable() {
         let mut root = TestRoot {
             widgets: alloc::vec![
-                TestWidget { id: 1, focusable: true, focused: false },
-                TestWidget { id: 2, focusable: false, focused: false },
-                TestWidget { id: 3, focusable: true, focused: false },
+                TestWidget {
+                    id: 1,
+                    focusable: true,
+                    focused: false
+                },
+                TestWidget {
+                    id: 2,
+                    focusable: false,
+                    focused: false
+                },
+                TestWidget {
+                    id: 3,
+                    focusable: true,
+                    focused: false
+                },
             ],
         };
         let next = linear_tab_next(&mut root, Some(1), TabDir::Forward);
@@ -231,8 +239,16 @@ mod tests {
     fn linear_tab_wraps_forward() {
         let mut root = TestRoot {
             widgets: alloc::vec![
-                TestWidget { id: 1, focusable: true, focused: false },
-                TestWidget { id: 2, focusable: true, focused: false },
+                TestWidget {
+                    id: 1,
+                    focusable: true,
+                    focused: false
+                },
+                TestWidget {
+                    id: 2,
+                    focusable: true,
+                    focused: false
+                },
             ],
         };
         let next = linear_tab_next(&mut root, Some(2), TabDir::Forward);
@@ -243,8 +259,16 @@ mod tests {
     fn linear_tab_wraps_backward() {
         let mut root = TestRoot {
             widgets: alloc::vec![
-                TestWidget { id: 1, focusable: true, focused: false },
-                TestWidget { id: 2, focusable: true, focused: false },
+                TestWidget {
+                    id: 1,
+                    focusable: true,
+                    focused: false
+                },
+                TestWidget {
+                    id: 2,
+                    focusable: true,
+                    focused: false
+                },
             ],
         };
         let next = linear_tab_next(&mut root, Some(1), TabDir::Backward);
@@ -255,8 +279,16 @@ mod tests {
     fn linear_tab_none_goes_to_first_forward() {
         let mut root = TestRoot {
             widgets: alloc::vec![
-                TestWidget { id: 5, focusable: true, focused: false },
-                TestWidget { id: 7, focusable: true, focused: false },
+                TestWidget {
+                    id: 5,
+                    focusable: true,
+                    focused: false
+                },
+                TestWidget {
+                    id: 7,
+                    focusable: true,
+                    focused: false
+                },
             ],
         };
         let next = linear_tab_next(&mut root, None, TabDir::Forward);
@@ -267,8 +299,16 @@ mod tests {
     fn linear_tab_none_goes_to_last_backward() {
         let mut root = TestRoot {
             widgets: alloc::vec![
-                TestWidget { id: 5, focusable: true, focused: false },
-                TestWidget { id: 7, focusable: true, focused: false },
+                TestWidget {
+                    id: 5,
+                    focusable: true,
+                    focused: false
+                },
+                TestWidget {
+                    id: 7,
+                    focusable: true,
+                    focused: false
+                },
             ],
         };
         let next = linear_tab_next(&mut root, None, TabDir::Backward);
@@ -277,7 +317,9 @@ mod tests {
 
     #[test]
     fn linear_tab_empty_returns_none() {
-        let mut root = TestRoot { widgets: alloc::vec![] };
+        let mut root = TestRoot {
+            widgets: alloc::vec![],
+        };
         assert_eq!(linear_tab_next(&mut root, None, TabDir::Forward), None);
     }
 
@@ -285,8 +327,16 @@ mod tests {
     fn apply_focus_change_toggles_old_and_new() {
         let mut root = TestRoot {
             widgets: alloc::vec![
-                TestWidget { id: 1, focusable: true, focused: true },
-                TestWidget { id: 2, focusable: true, focused: false },
+                TestWidget {
+                    id: 1,
+                    focusable: true,
+                    focused: true
+                },
+                TestWidget {
+                    id: 2,
+                    focusable: true,
+                    focused: false
+                },
             ],
         };
         apply_focus_change(&mut root, Some(1), Some(2));
@@ -297,7 +347,11 @@ mod tests {
     #[test]
     fn apply_focus_change_noop_when_same() {
         let mut root = TestRoot {
-            widgets: alloc::vec![TestWidget { id: 1, focusable: true, focused: true }],
+            widgets: alloc::vec![TestWidget {
+                id: 1,
+                focusable: true,
+                focused: true
+            }],
         };
         apply_focus_change(&mut root, Some(1), Some(1));
         assert!(root.widgets[0].focused);

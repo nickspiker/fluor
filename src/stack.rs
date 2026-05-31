@@ -268,7 +268,11 @@ mod tests {
         stk.layers[bot].dirty = true;
         let result = stk.evaluate()[0];
         // B-darkness ≈ 0 means visible blue ≈ 255.
-        assert!(result & 0xFF <= 0x01, "result B darkness = {:#x}", result & 0xFF);
+        assert!(
+            result & 0xFF <= 0x01,
+            "result B darkness = {:#x}",
+            result & 0xFF
+        );
     }
 
     #[test]

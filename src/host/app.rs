@@ -90,7 +90,15 @@ mod x11_atomic {
             height: h.min(u16::MAX as u32) as u16,
         };
         if conn
-            .shape_rectangles(SO::SET, SK::INPUT, ClipOrdering::UNSORTED, xid, 0, 0, &[rect])
+            .shape_rectangles(
+                SO::SET,
+                SK::INPUT,
+                ClipOrdering::UNSORTED,
+                xid,
+                0,
+                0,
+                &[rect],
+            )
             .is_err()
         {
             return false;
@@ -317,7 +325,12 @@ impl<A: FluorApp> DesktopShell<A> {
             window: None,
             viewport: Viewport::new(1, 1),
             screen_size: (1, 1),
-            window_rect: WindowRect { x: 0, y: 0, w: 1, h: 1 },
+            window_rect: WindowRect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            },
             scratch: Vec::new(),
             #[cfg(target_os = "macos")]
             renderer: None,
@@ -337,7 +350,12 @@ impl<A: FluorApp> DesktopShell<A> {
             move_drag_armed: false,
             drag_move_anchor_screen: (0, 0),
             drag_move_rect_start: (0, 0),
-            last_painted_rect: WindowRect { x: 0, y: 0, w: 1, h: 1 },
+            last_painted_rect: WindowRect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            },
             surface_ready: false,
             is_focused: true,
             debug_stats: crate::paint::DebugStats::default(),
@@ -376,9 +394,12 @@ impl<A: FluorApp> DesktopShell<A> {
         self.pending_damage.clear();
 
         // Two render modes, chosen by an explicit host flag (NOT by comparing damage_clip's geometry to viewport_rect). `pending_full_repaint` is set by events that destroy the chrome perimeter + shadow band in persistent_screen — drag release, resize, zoom, focus change. Debug-toggle transitions (hitmask / alpha mode / FPS strip) also promote to a full repaint here because those flags change either finalize's branch or what's overlaid post-finalize, and need a clean window to flow through. On those frames we wipe persistent_screen, reset overlay state, set damage_clip = viewport, and finalize copies every pixel (including AA edges); paint_shadow then casts ONCE into the freshly-zero band (and only when hitmask is off). On every other frame, damage_clip is whatever app.damage_rect returns (typically a small interior region or empty); finalize is narrowed AND skips non-opaque source pixels so the AA hairline pixels at the window perimeter stay untouched, and paint_shadow is NOT called so it never compounds.
-        let hitmask_now = crate::paint::DEBUG_SHOW_HITMASK.load(std::sync::atomic::Ordering::Relaxed);
-        let alpha_mode_now = crate::paint::DEBUG_SHOW_ALPHA.load(std::sync::atomic::Ordering::Relaxed);
-        let opaque_scan_now = crate::paint::DEBUG_SHOW_OPAQUE_SCAN.load(std::sync::atomic::Ordering::Relaxed);
+        let hitmask_now =
+            crate::paint::DEBUG_SHOW_HITMASK.load(std::sync::atomic::Ordering::Relaxed);
+        let alpha_mode_now =
+            crate::paint::DEBUG_SHOW_ALPHA.load(std::sync::atomic::Ordering::Relaxed);
+        let opaque_scan_now =
+            crate::paint::DEBUG_SHOW_OPAQUE_SCAN.load(std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "text")]
         let strip_active = crate::paint::DEBUG_SHOW_FPS.load(std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(feature = "text"))]
@@ -406,12 +427,15 @@ impl<A: FluorApp> DesktopShell<A> {
         let damage_clip = if full_repaint {
             viewport_rect
         } else {
-            self.app.damage_rect(self.viewport).unwrap_or(crate::canvas::PixelRect::empty())
+            self.app
+                .damage_rect(self.viewport)
+                .unwrap_or(crate::canvas::PixelRect::empty())
         };
         // Strip is painted in a clobber pass AFTER finalize + overlay — it does NOT contribute to damage_clip and does NOT bump damage_pct.
 
         // Damage outline overlay (`[]w`). Sampled once here so the post-finalize stamp uses a stable value for this frame. The outline is stamped DIRECTLY into the platform back buffer between the persistent_screen copy and `present()`, so it never enters persistent_screen, never flows through finalize, and never carries state between frames.
-        let outline_active = crate::paint::DEBUG_SHOW_DAMAGE.load(std::sync::atomic::Ordering::Relaxed);
+        let outline_active =
+            crate::paint::DEBUG_SHOW_DAMAGE.load(std::sync::atomic::Ordering::Relaxed);
 
         clear_scratch_rect(&mut self.scratch, win_w, damage_clip);
 
@@ -628,9 +652,14 @@ impl<A: FluorApp> DesktopShell<A> {
         let ras_ops = crate::paint::RASTERIZE_OPS.swap(0, std::sync::atomic::Ordering::Relaxed);
         let viewport_area = (win_w * win_h) as f32;
         let damage_area = (damage_clip.width() * damage_clip.height()) as f32;
-        let damage_pct = if viewport_area > 0.0 { damage_area / viewport_area } else { 0.0 };
+        let damage_pct = if viewport_area > 0.0 {
+            damage_area / viewport_area
+        } else {
+            0.0
+        };
         if ras_ops > 0 {
-            self.debug_stats.record_rasterize(app_dt, fill_dt, finalize_dt, shadow_dt, damage_pct);
+            self.debug_stats
+                .record_rasterize(app_dt, fill_dt, finalize_dt, shadow_dt, damage_pct);
         }
         self.debug_stats.record_present(damage_pct);
     }
@@ -689,8 +718,7 @@ impl<A: FluorApp> DesktopShell<A> {
                 // Maximized state suppresses drag entirely. Most WMs handle this with "drag a maximized window → unmaximize and resume drag at cursor"; that's the right ergonomic but more involved (need to compute the unmaximized origin relative to cursor, then begin the drag). For v0 the simpler rule is "ignore the drag request" — title-bar clicks while maximized do nothing instead of producing nonsense (the drag would translate the fullscreen-sized rect into negative offsets and clip_through the input region). Revisit when we add the unmaximize-then-drag flow.
                 if self.saved_rect_for_maximize.is_none() {
                     self.move_drag_armed = true;
-                    self.drag_move_anchor_screen =
-                        (self.cursor_x as i32, self.cursor_y as i32);
+                    self.drag_move_anchor_screen = (self.cursor_x as i32, self.cursor_y as i32);
                     self.drag_move_rect_start = (self.window_rect.x, self.window_rect.y);
                 }
                 false
@@ -807,45 +835,85 @@ impl<A: FluorApp> DesktopShell<A> {
         let (new_w, new_h, new_x, new_y) = match self.resize_edge {
             ResizeEdge::Right => {
                 let w = (self.drag_start_size.0 as Coord + dx).max(min_size) as u32;
-                (w, self.drag_start_size.1, self.drag_start_window_pos.0, self.drag_start_window_pos.1)
+                (
+                    w,
+                    self.drag_start_size.1,
+                    self.drag_start_window_pos.0,
+                    self.drag_start_window_pos.1,
+                )
             }
             ResizeEdge::Left => {
                 let w = (self.drag_start_size.0 as Coord - dx).max(min_size) as u32;
                 let dw = self.drag_start_size.0 as i32 - w as i32;
-                (w, self.drag_start_size.1, self.drag_start_window_pos.0 + dw, self.drag_start_window_pos.1)
+                (
+                    w,
+                    self.drag_start_size.1,
+                    self.drag_start_window_pos.0 + dw,
+                    self.drag_start_window_pos.1,
+                )
             }
             ResizeEdge::Bottom => {
                 let h = (self.drag_start_size.1 as Coord + dy).max(min_size) as u32;
-                (self.drag_start_size.0, h, self.drag_start_window_pos.0, self.drag_start_window_pos.1)
+                (
+                    self.drag_start_size.0,
+                    h,
+                    self.drag_start_window_pos.0,
+                    self.drag_start_window_pos.1,
+                )
             }
             ResizeEdge::Top => {
                 let h = (self.drag_start_size.1 as Coord - dy).max(min_size) as u32;
                 let dh = self.drag_start_size.1 as i32 - h as i32;
-                (self.drag_start_size.0, h, self.drag_start_window_pos.0, self.drag_start_window_pos.1 + dh)
+                (
+                    self.drag_start_size.0,
+                    h,
+                    self.drag_start_window_pos.0,
+                    self.drag_start_window_pos.1 + dh,
+                )
             }
             ResizeEdge::TopRight => {
                 let w = (self.drag_start_size.0 as Coord + dx).max(min_size) as u32;
                 let h = (self.drag_start_size.1 as Coord - dy).max(min_size) as u32;
                 let dh = self.drag_start_size.1 as i32 - h as i32;
-                (w, h, self.drag_start_window_pos.0, self.drag_start_window_pos.1 + dh)
+                (
+                    w,
+                    h,
+                    self.drag_start_window_pos.0,
+                    self.drag_start_window_pos.1 + dh,
+                )
             }
             ResizeEdge::TopLeft => {
                 let w = (self.drag_start_size.0 as Coord - dx).max(min_size) as u32;
                 let h = (self.drag_start_size.1 as Coord - dy).max(min_size) as u32;
                 let dw = self.drag_start_size.0 as i32 - w as i32;
                 let dh = self.drag_start_size.1 as i32 - h as i32;
-                (w, h, self.drag_start_window_pos.0 + dw, self.drag_start_window_pos.1 + dh)
+                (
+                    w,
+                    h,
+                    self.drag_start_window_pos.0 + dw,
+                    self.drag_start_window_pos.1 + dh,
+                )
             }
             ResizeEdge::BottomRight => {
                 let w = (self.drag_start_size.0 as Coord + dx).max(min_size) as u32;
                 let h = (self.drag_start_size.1 as Coord + dy).max(min_size) as u32;
-                (w, h, self.drag_start_window_pos.0, self.drag_start_window_pos.1)
+                (
+                    w,
+                    h,
+                    self.drag_start_window_pos.0,
+                    self.drag_start_window_pos.1,
+                )
             }
             ResizeEdge::BottomLeft => {
                 let w = (self.drag_start_size.0 as Coord - dx).max(min_size) as u32;
                 let h = (self.drag_start_size.1 as Coord + dy).max(min_size) as u32;
                 let dw = self.drag_start_size.0 as i32 - w as i32;
-                (w, h, self.drag_start_window_pos.0 + dw, self.drag_start_window_pos.1)
+                (
+                    w,
+                    h,
+                    self.drag_start_window_pos.0 + dw,
+                    self.drag_start_window_pos.1,
+                )
             }
             ResizeEdge::None => return,
         };
@@ -889,7 +957,12 @@ impl<A: FluorApp> DesktopShell<A> {
                     cursor_x: self.cursor_x - self.window_rect.x as Coord,
                     cursor_y: self.cursor_y - self.window_rect.y as Coord,
                     is_maximized: self.saved_rect_for_maximize.is_some(),
-                    damage_clip: crate::canvas::PixelRect::new(0, 0, self.viewport.width_px as usize, self.viewport.height_px as usize),
+                    damage_clip: crate::canvas::PixelRect::new(
+                        0,
+                        0,
+                        self.viewport.width_px as usize,
+                        self.viewport.height_px as usize,
+                    ),
                 };
                 self.app.on_resize(new_w, new_h, &mut ctx);
             }
@@ -989,7 +1062,12 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
                 cursor_y: self.cursor_y - self.window_rect.y as Coord,
                 is_maximized: self.saved_rect_for_maximize.is_some(),
-                damage_clip: crate::canvas::PixelRect::new(0, 0, self.viewport.width_px as usize, self.viewport.height_px as usize),
+                damage_clip: crate::canvas::PixelRect::new(
+                    0,
+                    0,
+                    self.viewport.width_px as usize,
+                    self.viewport.height_px as usize,
+                ),
             };
             self.app.init(&mut ctx);
         }
@@ -1025,7 +1103,12 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
                 cursor_y: self.cursor_y - self.window_rect.y as Coord,
                 is_maximized: self.saved_rect_for_maximize.is_some(),
-                damage_clip: crate::canvas::PixelRect::new(0, 0, self.viewport.width_px as usize, self.viewport.height_px as usize),
+                damage_clip: crate::canvas::PixelRect::new(
+                    0,
+                    0,
+                    self.viewport.width_px as usize,
+                    self.viewport.height_px as usize,
+                ),
             };
             self.app.tick(&mut ctx)
         } else {
@@ -1110,7 +1193,12 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                                 modifiers: self.modifiers,
                                 cursor_x: self.cursor_x - new_x as Coord,
                                 cursor_y: self.cursor_y - new_y as Coord,
-                                damage_clip: crate::canvas::PixelRect::new(0, 0, self.viewport.width_px as usize, self.viewport.height_px as usize),
+                                damage_clip: crate::canvas::PixelRect::new(
+                                    0,
+                                    0,
+                                    self.viewport.width_px as usize,
+                                    self.viewport.height_px as usize,
+                                ),
                                 is_maximized: self.saved_rect_for_maximize.is_some(),
                             };
                             self.app.on_resize(new_w, new_h, &mut ctx);
@@ -1170,7 +1258,12 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                         cursor_x: self.cursor_x - self.window_rect.x as Coord,
                         cursor_y: self.cursor_y - self.window_rect.y as Coord,
                         is_maximized: self.saved_rect_for_maximize.is_some(),
-                        damage_clip: crate::canvas::PixelRect::new(0, 0, self.viewport.width_px as usize, self.viewport.height_px as usize),
+                        damage_clip: crate::canvas::PixelRect::new(
+                            0,
+                            0,
+                            self.viewport.width_px as usize,
+                            self.viewport.height_px as usize,
+                        ),
                     };
                     let response = self.app.on_event(&event, &mut ctx);
                     // Cursor coords must be window-relative — same translation as Context's cursor_x/y — so the consumer's hit_at sees the chrome at origin (0,0). Raw screen-space coords would miss every button when the window_rect isn't at (0,0).
@@ -1305,7 +1398,12 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
                 cursor_y: self.cursor_y - self.window_rect.y as Coord,
                 is_maximized: self.saved_rect_for_maximize.is_some(),
-                damage_clip: crate::canvas::PixelRect::new(0, 0, self.viewport.width_px as usize, self.viewport.height_px as usize),
+                damage_clip: crate::canvas::PixelRect::new(
+                    0,
+                    0,
+                    self.viewport.width_px as usize,
+                    self.viewport.height_px as usize,
+                ),
             };
             self.app
                 .on_resize(self.viewport.width_px, self.viewport.height_px, &mut ctx);
@@ -1327,7 +1425,12 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
                 cursor_y: self.cursor_y - self.window_rect.y as Coord,
                 is_maximized: self.saved_rect_for_maximize.is_some(),
-                damage_clip: crate::canvas::PixelRect::new(0, 0, self.viewport.width_px as usize, self.viewport.height_px as usize),
+                damage_clip: crate::canvas::PixelRect::new(
+                    0,
+                    0,
+                    self.viewport.width_px as usize,
+                    self.viewport.height_px as usize,
+                ),
             };
             let response = self.app.on_event(&event, &mut ctx);
             drop(ctx);
@@ -1335,4 +1438,3 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
         }
     }
 }
-

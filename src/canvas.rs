@@ -115,12 +115,7 @@ pub struct Canvas<'a> {
 impl<'a> Canvas<'a> {
     /// Build a canvas from caller-owned pixel storage and damage accumulator.
     #[inline]
-    pub fn new(
-        pixels: &'a mut [u32],
-        width: usize,
-        height: usize,
-        damage: &'a mut Damage,
-    ) -> Self {
+    pub fn new(pixels: &'a mut [u32], width: usize, height: usize, damage: &'a mut Damage) -> Self {
         Self {
             pixels,
             width,

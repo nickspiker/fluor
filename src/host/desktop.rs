@@ -248,8 +248,7 @@ impl DesktopApp {
                 {
                     // Transitional damage sink — desktop.rs renders into the chrome's bg layer which has its own per-layer dirty flag; the host's frame-level damage accumulator hasn't been wired yet (Phase 2).
                     let mut bg_damage = crate::canvas::Damage::new();
-                    let mut canvas =
-                        crate::canvas::Canvas::new(bg, buf_w, buf_h, &mut bg_damage);
+                    let mut canvas = crate::canvas::Canvas::new(bg, buf_w, buf_h, &mut bg_damage);
                     paint::background_noise(&mut canvas, 0, false, 0, None); // fullscreen=false leaves a 1px transparent border so the chrome perimeter's partial-t outer edge passes through to the OS for soft AA against the desktop.
                 }
                 compositor.render(bg, buf_w, buf_h);

@@ -31,10 +31,7 @@ pub enum OrbTint {
     /// Default — ring colour equals the active perimeter colour and the orb image desaturates to 50 % grey when the window is unfocused. Window-state-as-orb-state, no app intervention.
     FollowFocus,
     /// App-driven override. `ring` paints the AA ring (already darkness-packed, e.g. a `theme::*` constant or `dark(fmt(0x00_FF_FF_FF))`). `brighten = true` applies photon's 3/2 lift to the icon image (online/active state), `false` leaves it as decoded.
-    Custom {
-        ring: u32,
-        brighten: bool,
-    },
+    Custom { ring: u32, brighten: bool },
 }
 
 impl Default for OrbTint {
@@ -95,7 +92,7 @@ pub fn get_resize_edge(window_width: u32, window_height: u32, x: Coord, y: Coord
 ///
 /// Topology: straight edges paint opaque RGB in non-corner ranges (`cap..(end-cap)`) and leave the clip mask alone (= 255, fully visible). Each crossing entry handles **one row** of the curve region for the four corners: zero out the cutout cols, write opaque hairline RGB at the curve's outer + inner pixel positions, and write `h_cov` / `l` into the clip mask at those same positions. Above-the-curve rows (`0..start`) and below-the-curve rows (`h-start..h`) are *entirely* cutout — the curve never enters them — so the full cap-width at those rows is zeroed in the clip mask.
 ///
-/// Two-tone bevel (light from upper-left): top + left straight edges are light, bottom + right are shadow. TL and BR corners are uniform (both adjacent edges agree); TR and BL transition along the curve. The per-pixel colour test (`tr_color`, `bl_color`) is the same one we settled on previously — closer-to-light-edge wins.
+/// Two-tone bevel (light from upper-left): top + left straight edges are light, bottom + right are shadow. TL and BR corners are uniform (both adjacent edges agree); TR and BL transition along the curve. The per-pixel colour test (`tr_colour`, `bl_colour`) is the same one we settled on previously — closer-to-light-edge wins.
 ///
 /// `hit_test_map` is preserved as a parameter for forward compatibility with the controls scaffold step but is not modified here.
 pub fn draw_window_edges_and_mask(
@@ -155,9 +152,9 @@ pub fn draw_window_edges_and_mask(
         }
     }
 
-    let tr_color =
+    let tr_colour =
         |row: usize, col: usize| -> u32 { if row < (w - 1 - col) { light } else { shadow } };
-    let bl_color =
+    let bl_colour =
         |row: usize, col: usize| -> u32 { if col < (h - 1 - row) { light } else { shadow } };
 
     // Curve rows AND curve cols: the squircle is symmetric under x↔y swap, so the same crossings table walks both axes. The row-walk handles the corner's near-vertical segment (one row, two-pixel hairline at the curve crossing); the col-walk handles the near-horizontal segment (one col, two-pixel hairline). Both walks together fully cover the corner — without the col-walk, the near-horizontal portion of the corner (where the curve travels many cols per row) shows visible gaps.
@@ -173,7 +170,7 @@ pub fn draw_window_edges_and_mask(
         let col_left = start + i;
         let col_right = w - 1 - start - i;
 
-        // Two-sided AA convention. OUTER pixel = on the curve, partially outside the window: clip_mask = h_cov trims against the OS bg; chrome stays opaque (α=0xFF) because the entire inside-window portion IS hairline. INNER pixel = one step inside the curve: clip_mask = 255 (fully inside the window shape); chrome's α-byte carries the hairline-vs-bg AA, set to `inner_α = 255 − h_cov` so the Under blend mixes (255−h_cov)/256 of hairline color over h_cov/256 of window bg. The `l` slot in each crossing entry is the linear-coverage counterpart of h_cov, retained for the outer-pixel chrome-α AA when we move from a 2-pixel hairline to a 1-pixel-with-halo hairline.
+        // Two-sided AA convention. OUTER pixel = on the curve, partially outside the window: clip_mask = h_cov trims against the OS bg; chrome stays opaque (α=0xFF) because the entire inside-window portion IS hairline. INNER pixel = one step inside the curve: clip_mask = 255 (fully inside the window shape); chrome's α-byte carries the hairline-vs-bg AA, set to `inner_α = 255 − h_cov` so the Under blend mixes (255−h_cov)/256 of hairline colour over h_cov/256 of window bg. The `l` slot in each crossing entry is the linear-coverage counterpart of h_cov, retained for the outer-pixel chrome-α AA when we move from a 2-pixel hairline to a 1-pixel-with-halo hairline.
         let _ = l;
         let inner_alpha = ((255 - h_cov) as u32) << 24;
         let light_inner = (light & 0x00FFFFFF) | inner_alpha;
@@ -197,10 +194,10 @@ pub fn draw_window_edges_and_mask(
         let tr_out_col = w - 1 - inset;
         let tr_in_col = w - 2 - inset;
         let idx = row_top * w + tr_out_col;
-        pixels[idx] = pixels[idx].under(tr_color(row_top, tr_out_col), BlendMode::Normal);
+        pixels[idx] = pixels[idx].under(tr_colour(row_top, tr_out_col), BlendMode::Normal);
         clip_mask[idx] = h_cov;
         let idx = row_top * w + tr_in_col;
-        let layer = (tr_color(row_top, tr_in_col) & 0x00FFFFFF) | inner_alpha;
+        let layer = (tr_colour(row_top, tr_in_col) & 0x00FFFFFF) | inner_alpha;
         pixels[idx] = pixels[idx].under(layer, BlendMode::Normal);
         clip_mask[idx] = 255;
 
@@ -209,10 +206,10 @@ pub fn draw_window_edges_and_mask(
             clip_mask[row_bot * w + c] = 0;
         }
         let idx = row_bot * w + inset;
-        pixels[idx] = pixels[idx].under(bl_color(row_bot, inset), BlendMode::Normal);
+        pixels[idx] = pixels[idx].under(bl_colour(row_bot, inset), BlendMode::Normal);
         clip_mask[idx] = h_cov;
         let idx = row_bot * w + inset + 1;
-        let layer = (bl_color(row_bot, inset + 1) & 0x00FFFFFF) | inner_alpha;
+        let layer = (bl_colour(row_bot, inset + 1) & 0x00FFFFFF) | inner_alpha;
         pixels[idx] = pixels[idx].under(layer, BlendMode::Normal);
         clip_mask[idx] = 255;
 
@@ -243,10 +240,10 @@ pub fn draw_window_edges_and_mask(
             clip_mask[r * w + col_right] = 0;
         }
         let idx = inset * w + col_right;
-        pixels[idx] = pixels[idx].under(tr_color(inset, col_right), BlendMode::Normal);
+        pixels[idx] = pixels[idx].under(tr_colour(inset, col_right), BlendMode::Normal);
         clip_mask[idx] = h_cov;
         let idx = (inset + 1) * w + col_right;
-        let layer = (tr_color(inset + 1, col_right) & 0x00FFFFFF) | inner_alpha;
+        let layer = (tr_colour(inset + 1, col_right) & 0x00FFFFFF) | inner_alpha;
         pixels[idx] = pixels[idx].under(layer, BlendMode::Normal);
         clip_mask[idx] = 255;
 
@@ -257,10 +254,10 @@ pub fn draw_window_edges_and_mask(
         let bl_out_row = h - 1 - inset;
         let bl_in_row = h - 2 - inset;
         let idx = bl_out_row * w + col_left;
-        pixels[idx] = pixels[idx].under(bl_color(bl_out_row, col_left), BlendMode::Normal);
+        pixels[idx] = pixels[idx].under(bl_colour(bl_out_row, col_left), BlendMode::Normal);
         clip_mask[idx] = h_cov;
         let idx = bl_in_row * w + col_left;
-        let layer = (bl_color(bl_in_row, col_left) & 0x00FFFFFF) | inner_alpha;
+        let layer = (bl_colour(bl_in_row, col_left) & 0x00FFFFFF) | inner_alpha;
         pixels[idx] = pixels[idx].under(layer, BlendMode::Normal);
         clip_mask[idx] = 255;
 
@@ -277,7 +274,7 @@ pub fn draw_window_edges_and_mask(
     }
 }
 
-/// Rasterize the window title text into the chrome layer, left-aligned in the area between the perimeter hairline (left edge) and the controls strip (right edge). Vertically centered in the strip-tall band. `left_extra` shifts the start position right to make room for the app-icon orb (pass `0` when no orb). `color` is darkness-packed (typically `theme::TEXT_COLOUR` when focused, `theme::LABEL_COLOUR` when unfocused). Bails on empty title or impractically small `button_size` (below readability — the text wouldn't be legible anyway). Clip rect prevents the title from painting over the controls strip even at long titles or narrow windows. Font is "Open Sans" regular at `button_size * 0.55` — proportional to the rest of the chrome under the current zoom (since button_size is derived from `effective_span`).
+/// Rasterize the window title text into the chrome layer, left-aligned in the area between the perimeter hairline (left edge) and the controls strip (right edge). Vertically centered in the strip-tall band. `left_extra` shifts the start position right to make room for the app-icon orb (pass `0` when no orb). `colour` is darkness-packed (typically `theme::TEXT_COLOUR` when focused, `theme::LABEL_COLOUR` when unfocused). Bails on empty title or impractically small `button_size` (below readability — the text wouldn't be legible anyway). Clip rect prevents the title from painting over the controls strip even at long titles or narrow windows. Font is "Open Sans" regular at `button_size * 0.55` — proportional to the rest of the chrome under the current zoom (since button_size is derived from `effective_span`).
 pub fn draw_title_text(
     canvas: &mut crate::canvas::Canvas,
     title: &str,
@@ -285,7 +282,7 @@ pub fn draw_title_text(
     button_size: usize,
     strip_x: usize,
     left_extra: usize,
-    color: u32,
+    colour: u32,
 ) {
     if title.is_empty() || button_size < 8 {
         return;
@@ -307,7 +304,7 @@ pub fn draw_title_text(
         y_center,
         font_size,
         400,
-        color,
+        colour,
         "Open Sans",
         Some(clip),
         None,
@@ -315,17 +312,17 @@ pub fn draw_title_text(
     );
 }
 
-/// Rasterize the bottom status band: a thin strip at `height − band_h .. height` filled with `bg`, topped by a 1-px `hairline_color` divider where the band meets the pane content. Optional left-aligned `text` paints in `text_color` (Open Sans, font size = `band_h × 0.55`). The band is short — `band_h` is typically `button_size / 2` — so it reads as a secondary surface, distinct from the top controls strip.
+/// Rasterize the bottom status band: a thin strip at `height − band_h .. height` filled with `bg`, topped by a 1-px `hairline_colour` divider where the band meets the pane content. Optional left-aligned `text` paints in `text_colour` (Open Sans, font size = `band_h × 0.55`). The band is short — `band_h` is typically `button_size / 2` — so it reads as a secondary surface, distinct from the top controls strip.
 ///
 /// The window perimeter's clip_mask carving handles the BL/BR squircle corners for free: chrome pixels in the corner cutout are written but masked off at the OS boundary, so the band's rectangular fill becomes a rounded bottom edge without per-pixel geometry here. Bails on `band_h == 0` or impractical `band_h` (>= height) so the rasterizer can be called unconditionally from a `chrome_widget` that always has a status field, with `band_h = 0` meaning "no status bar".
 pub fn draw_status_bar(
     canvas: &mut crate::canvas::Canvas,
     band_h: usize,
     bg: u32,
-    hairline_color: u32,
+    hairline_colour: u32,
     text: &str,
     text_renderer: &mut TextRenderer,
-    text_color: u32,
+    text_colour: u32,
 ) {
     let width = canvas.width;
     let height = canvas.height;
@@ -338,7 +335,7 @@ pub fn draw_status_bar(
     let pixels: &mut [u32] = canvas.pixels;
 
     // Top hairline (1 px) — claims y_top across the full width. The squircle perimeter's clip_mask handles rounding at BL/BR.
-    let hairline = 0xFF000000 | (hairline_color & 0x00FFFFFF);
+    let hairline = 0xFF000000 | (hairline_colour & 0x00FFFFFF);
     let row_top = y_top * width;
     for x in 0..width {
         let idx = row_top + x;
@@ -375,7 +372,7 @@ pub fn draw_status_bar(
         y_center,
         font_size,
         400,
-        text_color,
+        text_colour,
         "Open Sans",
         Some(clip),
         None,
@@ -383,7 +380,7 @@ pub fn draw_status_bar(
     );
 }
 
-/// Rasterize the top-left app-icon orb: a circular sample of `icon` clipped to `radius`, wrapped in an optional 1-px AA ring stroked in `ring_color`. Topology mirrors [`draw_window_edges_and_mask`]'s two-sided AA: ring is 1px solid + 1px inner-AA + 1px outer-AA. `cx`/`cy` give the orb centre in pixel coords; `radius` is the icon sampling radius (ring extends outward from it). Without an `icon`, the interior fills with `ring_color` (treated as a solid dark disk). Without a `ring_color`, the orb is just the icon clipped to a circle (1-pixel outer-AA against the chrome).
+/// Rasterize the top-left app-icon orb: a circular sample of `icon` clipped to `radius`, wrapped in an optional 1-px AA ring stroked in `ring_colour`. Topology mirrors [`draw_window_edges_and_mask`]'s two-sided AA: ring is 1px solid + 1px inner-AA + 1px outer-AA. `cx`/`cy` give the orb centre in pixel coords; `radius` is the icon sampling radius (ring extends outward from it). Without an `icon`, the interior fills with `ring_colour` (treated as a solid dark disk). Without a `ring_colour`, the orb is just the icon clipped to a circle (1-pixel outer-AA against the chrome).
 ///
 /// Pixel sampling is nearest-neighbour from `icon`'s `width × height` source — the source is square in practice (`vsfimg` doesn't reshape) but the math doesn't assume that. Per-pixel cost is one map index + one `under` composite; total work is `O(diameter²)`, well under a millisecond at typical chrome sizes (~30–100 px orbs).
 ///
@@ -397,7 +394,7 @@ pub fn draw_app_icon(
     cy: isize,
     radius: isize,
     icon: Option<&Icon>,
-    ring_color: Option<u32>,
+    ring_colour: Option<u32>,
     darken: u8,
     brighten: bool,
 ) {
@@ -421,7 +418,7 @@ pub fn draw_app_icon(
     let diff_outer = r_outer_outer2 - r_outer2;
 
     // BBox intersection with screen. WHY: caller can pass any (cx, cy) — orb may be partially or fully off-screen (e.g. scroll offsets in a future viewport). PROOF: clip the circle bounding box to `[0, width) × [0, height)`, returning early if the intersection is empty. PREVENTS: a negative isize converting to usize would wrap to a huge value and the iteration would index well past the buffer end (out-of-bounds → panic, or in release with overflow-checks=false → undefined behaviour).
-    let max_r = if ring_color.is_some() {
+    let max_r = if ring_colour.is_some() {
         r_outer_outer
     } else {
         r_inner
@@ -456,7 +453,7 @@ pub fn draw_app_icon(
                 }
             }
 
-            if let Some(ring) = ring_color {
+            if let Some(ring) = ring_colour {
                 let ring_rgb = ring & 0x00FFFFFF;
                 if dist2 <= r_inner_inner2 {
                     let top = sample_icon(icon, dx, dy, r, ring, darken, brighten);
@@ -608,9 +605,8 @@ pub fn paint_button_hit_row_scan(
     if row_start >= row_end || width == 0 || start_col < bound_x_min || start_col >= bound_x_max {
         return;
     }
-    let static_wall = |idx: usize| -> bool {
-        (chrome_buf[idx] >> 24) == 0xFF || clip_mask[idx] < 128
-    };
+    let static_wall =
+        |idx: usize| -> bool { (chrome_buf[idx] >> 24) == 0xFF || clip_mask[idx] < 128 };
     for row in row_start..row_end {
         let row_base = row * width;
         let start_idx = row_base + start_col;
@@ -652,7 +648,6 @@ pub fn paint_button_hit_row_scan(
         }
     }
 }
-
 
 /// **Step 2** in the chrome rasterizer (after window perimeter). Paint the BL squircle hairline of the controls strip — row-walk (the curve's near-vertical leg) and col-walk (the near-horizontal leg). Uses [`paint_if_empty`] so writes from the window perimeter are not overwritten. Each curve pixel gets at most ONE writer (this function or the perimeter, whichever ran first).
 pub fn draw_strip_curves(
@@ -824,7 +819,7 @@ pub fn draw_strip_bg(
     }
 }
 
-/// Rasterize the minimize glyph (a small horizontal squircle dash) centered at `(cx, cy)` with radius `r`. Top-down per-pixel: each pixel inside the squircle footprint computes its coverage and writes either the solid `stroke` color or a `stroke`-blended-with-`bg` color. The chrome layer is opaque at the button bg before this call; this function only overwrites pixels INSIDE the glyph footprint.
+/// Rasterize the minimize glyph (a small horizontal squircle dash) centered at `(cx, cy)` with radius `r`. Top-down per-pixel: each pixel inside the squircle footprint computes its coverage and writes either the solid `stroke` colour or a `stroke`-blended-with-`bg` colour. The chrome layer is opaque at the button bg before this call; this function only overwrites pixels INSIDE the glyph footprint.
 pub fn draw_minimize_symbol(
     pixels: &mut [u32],
     width: usize,
@@ -925,7 +920,7 @@ pub fn draw_maximize_symbol(
             let idx = (py as usize) * width + (px as usize);
 
             let value = if dist4 <= r_inner4 {
-                // INSIDE inner squircle = fill region. Inner edge (stroke ↔ fill) is between two known glyph colors, so pre-blending is correct here (both colors are deterministic, no bg layer involvement). Both `stroke` and `fill` are stored in darkness (theme constants); linear interpolation in darkness space = linear interpolation in visible space, so the formula is identical to the visible-space version. Theme constants are α=0xFF (opaque) by default.
+                // INSIDE inner squircle = fill region. Inner edge (stroke ↔ fill) is between two known glyph colours, so pre-blending is correct here (both colours are deterministic, no bg layer involvement). Both `stroke` and `fill` are stored in darkness (theme constants); linear interpolation in darkness space = linear interpolation in visible space, so the formula is identical to the visible-space version. Theme constants are α=0xFF (opaque) by default.
                 let dist_from_inner = r_inner4 - dist4;
                 if dist_from_inner <= inner_thresh {
                     let gradient = (dist_from_inner << 8) / inner_thresh;

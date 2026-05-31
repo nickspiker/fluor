@@ -240,7 +240,10 @@ mod tests {
             let r_dark = (p >> 16) & 0xFF;
             let a = p >> 24;
             assert_eq!(a, 0xFF, "pixel ({x},{y}) α expected 0xFF, got {a:#x}");
-            assert!(r_dark <= 0x01, "pixel ({x},{y}) R-darkness expected ~0, got {r_dark:#x}");
+            assert!(
+                r_dark <= 0x01,
+                "pixel ({x},{y}) R-darkness expected ~0, got {r_dark:#x}"
+            );
         }
         // Pixels outside the group's bbox stay at TRANSPARENT.
         assert_eq!(target[0 * 4 + 0], TRANSPARENT);
@@ -266,7 +269,10 @@ mod tests {
             0xFF,
             "blitted pixel should be opaque (α=0xFF) after under-blend"
         );
-        assert!(((g_pixel >> 8) & 0xFF) <= 0x01, "G-darkness ~0 (visible green)");
+        assert!(
+            ((g_pixel >> 8) & 0xFF) <= 0x01,
+            "G-darkness ~0 (visible green)"
+        );
         assert_eq!(target[3 * 4 + 3], TRANSPARENT);
     }
 
@@ -282,7 +288,11 @@ mod tests {
         let mut target = alloc::vec![TRANSPARENT; 4];
         g.flatten_into(&mut target, 2, 2, None);
         let first = target[0];
-        assert_eq!(first >> 24, 0xFF, "first blit should make pixel opaque (α=0xFF)");
+        assert_eq!(
+            first >> 24,
+            0xFF,
+            "first blit should make pixel opaque (α=0xFF)"
+        );
 
         // Simulate a back-buffer swap: target is now TRANSPARENT again (the OTHER frame buffer).
         target.fill(TRANSPARENT);

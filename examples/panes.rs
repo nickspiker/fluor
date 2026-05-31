@@ -21,7 +21,7 @@ use fluor::paint::{self, BlendMode, Transform};
 use fluor::region::Region;
 use fluor::stack::Op;
 use fluor::theme;
-use fluor::widgets::{BlinkTimer, Textbox};
+use fluor::widgets::{BlinkTimer, Button, Textbox};
 use fluor::{Compositor, RuVec2};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{Key, NamedKey};
@@ -82,6 +82,9 @@ struct PanesDemo {
     textboxes: Vec<Textbox>,
     /// Per-textbox group caches, indexed lockstep with [`Self::textboxes`]. Invariant: `textbox_groups.len() == textboxes.len()`. Helper methods rely on this so id-to-group lookup is `textboxes.iter().position(|tb| tb.hit_id() == id).map(|i| &mut textbox_groups[i])`.
     textbox_groups: Vec<Group>,
+    /// All buttons the demo owns. Same Vec pattern as [`Self::textboxes`] — adding a button is `self.buttons.push(Button::new(&mut self.hit_counter, ..., "label"))`.
+    buttons: Vec<Button>,
+    button_groups: Vec<Group>,
     cursor_group: Group,
     /// Currently focused widget id, or `None` for "nothing focused" (background click, Esc, no prior focus). Source of truth for keyboard delivery and Tab cycling — widgets' internal `focused` flags are derived state set by `apply_focus_change` after this field updates.
     current_focus: Option<HitId>,
@@ -168,6 +171,16 @@ impl PanesDemo {
             textboxes.push(tb);
             textbox_groups.push(make_textbox_group());
         }
+        // Demo button — proves the Button widget participates in the same dispatch (click / focus / hover / keyboard activate) and tab cycle as Textbox. Same group pattern (content + placeholder glow layer); rasterize-into-target via `render_content_into`. Tick polls `take_click` and prints when fired.
+        let mut buttons: Vec<Button> = Vec::new();
+        let mut button_groups: Vec<Group> = Vec::new();
+        for (i, label) in [("Submit"), ("Clear")].iter().enumerate() {
+            let mut b = Button::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 12.0, *label);
+            b.stroke_ru = 1. / 12.;
+            let _ = i;
+            buttons.push(b);
+            button_groups.push(make_textbox_group());
+        }
         let mut cursor_group = Group::new(placeholder_region, BlendMode::Add);
         let l = cursor_group.new_layer();
         cursor_group.set_program(vec![Op::Push(l)]);
@@ -188,6 +201,8 @@ impl PanesDemo {
             chrome,
             textboxes,
             textbox_groups,
+            buttons,
+            button_groups,
             cursor_group,
             current_focus: None,
             hit_counter,
@@ -235,6 +250,18 @@ impl PanesDemo {
         if let Some(first) = self.textboxes.first() {
             self.cursor_group.resize(first.cursor_bbox());
         }
+        // Buttons row below the textbox stack: half-width each, sitting side-by-side with a button-width gap, centred on the same column. Same RU-driven sizing — they grow / shrink with the window like the textboxes.
+        let buttons_row_y = center_y + (self.textboxes.len() as Coord) * (height + bw);
+        let button_w = (width * 0.5 - bw * 0.5).max(bw * 4.0);
+        let button_count = self.buttons.len() as Coord;
+        for (i, btn) in self.buttons.iter_mut().enumerate() {
+            let offset = (i as Coord - (button_count - 1.0) * 0.5) * (button_w + bw);
+            btn.set_rect(center_x + offset, buttons_row_y, button_w, height);
+            btn.set_font_size(font_size);
+        }
+        for (btn, g) in self.buttons.iter().zip(self.button_groups.iter_mut()) {
+            g.resize(btn.bbox());
+        }
 
         let viewport_region = Region::new(0.0, 0.0, vp.width_px as Coord, vp.height_px as Coord);
         self.rotation_group.resize(viewport_region);
@@ -278,10 +305,17 @@ impl PanesDemo {
         self.textboxes.iter().position(|tb| tb.hit_id() == id)
     }
 
+    /// Index of the button with `id`, or `None`. Same shape as `textbox_index_by_id`.
+    fn button_index_by_id(&self, id: HitId) -> Option<usize> {
+        self.buttons.iter().position(|b| b.hit_id() == id)
+    }
+
     /// Invalidate the [`Group`] cache associated with `id`. Used by `change_focus` to mark the prior + new focused widget's group dirty so the next paint reflects the focus-glow on/off transition. No-op for ids that don't have a group (chrome buttons paint into chrome's monolithic layer; chrome handles its own dirty marking via `set_focused`).
     fn invalidate_group_by_id(&mut self, id: HitId) {
         if let Some(i) = self.textbox_index_by_id(id) {
             self.textbox_groups[i].invalidate();
+        } else if let Some(i) = self.button_index_by_id(id) {
+            self.button_groups[i].invalidate();
         }
     }
 
@@ -317,6 +351,9 @@ impl Container for PanesDemo {
     fn visit(&mut self, f: &mut dyn FnMut(&mut dyn fluor::host::widget::Widget)) {
         for tb in self.textboxes.iter_mut() {
             f(tb);
+        }
+        for btn in self.buttons.iter_mut() {
+            f(btn);
         }
         self.chrome.visit(f);
     }
@@ -371,7 +408,7 @@ impl FluorApp for PanesDemo {
                 let new_hit = self.chrome.hit_at(ctx.cursor_x, ctx.cursor_y);
                 let chrome_changed = self.chrome.set_hover(new_hit);
                 // Iterate textboxes so adding more doesn't touch this. `any_textbox_changed` is the union-redraw signal.
-                let mut any_textbox_changed = false;
+                let mut any_widget_changed = false;
                 for (tb, g) in self
                     .textboxes
                     .iter_mut()
@@ -381,17 +418,25 @@ impl FluorApp for PanesDemo {
                     if tb.is_hovered() != want {
                         tb.set_hovered(want);
                         g.invalidate();
-                        any_textbox_changed = true;
+                        any_widget_changed = true;
                     }
                 }
-                if chrome_changed || any_textbox_changed {
+                for (btn, g) in self.buttons.iter_mut().zip(self.button_groups.iter_mut()) {
+                    let want = new_hit == btn.hit_id();
+                    if btn.is_hovered() != want {
+                        btn.set_hovered(want);
+                        g.invalidate();
+                        any_widget_changed = true;
+                    }
+                }
+                if chrome_changed || any_widget_changed {
                     ctx.window.request_redraw();
                 }
                 EventResponse::Pass
             }
             WindowEvent::CursorLeft { .. } => {
                 let chrome_changed = self.chrome.set_hover(HIT_NONE);
-                let mut any_textbox_changed = false;
+                let mut any_widget_changed = false;
                 for (tb, g) in self
                     .textboxes
                     .iter_mut()
@@ -400,10 +445,17 @@ impl FluorApp for PanesDemo {
                     if tb.is_hovered() {
                         tb.set_hovered(false);
                         g.invalidate();
-                        any_textbox_changed = true;
+                        any_widget_changed = true;
                     }
                 }
-                if chrome_changed || any_textbox_changed {
+                for (btn, g) in self.buttons.iter_mut().zip(self.button_groups.iter_mut()) {
+                    if btn.is_hovered() {
+                        btn.set_hovered(false);
+                        g.invalidate();
+                        any_widget_changed = true;
+                    }
+                }
+                if chrome_changed || any_widget_changed {
                     ctx.window.request_redraw();
                 }
                 EventResponse::Pass
@@ -819,6 +871,9 @@ impl FluorApp for PanesDemo {
         for tb in self.textboxes.iter() {
             union_in(tb.damage_rect(vw, vh));
         }
+        for btn in self.buttons.iter() {
+            union_in(btn.damage_rect(vw, vh));
+        }
         // Chord hint overlay — when both `[` and `]` are held the hint panel paints into the viewport center. Union its bbox so the host's damage_clip + finalize cover it. Also covers the "was held last frame" case (toggle off) by checking last_chord_held — clears stale hint pixels in one frame.
         let held_now = self.brackets_held(Instant::now());
         if held_now || self.last_chord_held {
@@ -835,7 +890,7 @@ impl FluorApp for PanesDemo {
     fn overlay_deltas(&self) -> Vec<u32> {
         // Per-hit-id tint deltas applied to persistent_screen by the host's overlay pass. Slice sized to the live hit-id count (hit_counter + 1 since IDs are 1-indexed and HIT_NONE = 0 takes slot 0).
         let mut t = vec![0u32; self.hit_counter as usize + 1];
-        if let Some(c) = fluor::host::chrome_widget::hover_color_for(self.chrome.hover_state) {
+        if let Some(c) = fluor::host::chrome_widget::hover_colour_for(self.chrome.hover_state) {
             t[self.chrome.hover_state as usize] = c;
         }
         // Same focus / hover → tint formula applied to each textbox at its own dense hit id. Generalises to a Container walk in Phase 5 once we have a way for widgets to surface their tint contribution through the trait.
@@ -850,6 +905,19 @@ impl FluorApp for PanesDemo {
         };
         for tb in self.textboxes.iter() {
             t[tb.hit_id() as usize] = tb_tint(tb);
+        }
+        // Buttons share the same fill / hover / active palette in the demo. Both widgets read from the same theme constants so a Button next to a Textbox reads as the same family.
+        let btn_tint = |b: &Button| -> u32 {
+            if b.is_focused() {
+                paint::wrap_sub_rgb(fluor::theme::TEXTBOX_ACTIVE, fluor::theme::TEXTBOX_FILL)
+            } else if b.is_hovered() {
+                paint::wrap_sub_rgb(fluor::theme::TEXTBOX_HOVER, fluor::theme::TEXTBOX_FILL)
+            } else {
+                0
+            }
+        };
+        for btn in self.buttons.iter() {
+            t[btn.hit_id() as usize] = btn_tint(btn);
         }
         t
     }
@@ -877,51 +945,51 @@ impl FluorApp for PanesDemo {
         let cy = view_h * 0.7;
         let rect_w = span / 8.0;
         let rect_h = span / 24.0;
-        let rect_color = pack_argb(80, 220, 220, 0x80);
+        let rect_colour = pack_argb(80, 220, 220, 0x80);
         let static_w = span / 10.0;
         let static_h = span / 16.0;
         let static_cx = cx + rect_w * 0.35;
         let static_cy = cy - rect_h * 0.6;
-        let static_color = pack_argb(255, 180, 80, 0x40);
+        let static_colour = pack_argb(255, 180, 80, 0x40);
         // Circle.
         let circle_cx = view_w * 0.25;
         let circle_cy = view_h * 0.3;
         let circle_r = span / 20.0;
-        let circle_color = pack_argb(255, 120, 200, 0x80);
+        let circle_colour = pack_argb(255, 120, 200, 0x80);
         // Aligned ellipse — aspect matches the window.
         let ellipse_cx = view_w * 0.5;
         let ellipse_cy = view_h * 0.3;
         let ellipse_ry = span / 24.0;
         let ellipse_rx = ellipse_ry * aspect;
-        let ellipse_color = pack_argb(200, 120, 255, 0x80);
+        let ellipse_colour = pack_argb(200, 120, 255, 0x80);
         // Rotated ellipse — 2:1, opposite direction at 1/3 speed.
         let rot_ellipse_cx = view_w * 0.75;
         let rot_ellipse_cy = view_h * 0.3;
         let rot_ellipse_rx = span / 14.0;
         let rot_ellipse_ry = rot_ellipse_rx * 0.5;
-        let rot_ellipse_color = pack_argb(255, 230, 100, 0x80);
+        let rot_ellipse_colour = pack_argb(255, 230, 100, 0x80);
         let angle = self.rect_angle;
         let ellipse_angle = -self.rect_angle / 3.0;
         let bg_scroll = self.bg_scroll;
         self.chrome.rasterize_bg(ctx.damage, move |canvas| {
-            paint::draw_rect_rotated(canvas, cx, cy, rect_w, rect_h, angle, rect_color, None);
+            paint::draw_rect_rotated(canvas, cx, cy, rect_w, rect_h, angle, rect_colour, None);
             paint::draw_rect(
                 canvas,
                 static_cx,
                 static_cy,
                 static_w,
                 static_h,
-                static_color,
+                static_colour,
                 None,
             );
-            paint::draw_circle(canvas, circle_cx, circle_cy, circle_r, circle_color, None);
+            paint::draw_circle(canvas, circle_cx, circle_cy, circle_r, circle_colour, None);
             paint::draw_ellipse(
                 canvas,
                 ellipse_cx,
                 ellipse_cy,
                 ellipse_rx,
                 ellipse_ry,
-                ellipse_color,
+                ellipse_colour,
                 None,
             );
             paint::draw_ellipse_rotated(
@@ -931,7 +999,7 @@ impl FluorApp for PanesDemo {
                 rot_ellipse_rx,
                 rot_ellipse_ry,
                 ellipse_angle,
-                rot_ellipse_color,
+                rot_ellipse_colour,
                 None,
             );
             paint::background_noise(canvas, 0, true, bg_scroll, None);
@@ -967,6 +1035,18 @@ impl FluorApp for PanesDemo {
                     ctx.text,
                     clip,
                     None,
+                    Some(&mut self.chrome.hit_test_map),
+                    id,
+                );
+            }
+            for btn in self.buttons.iter_mut() {
+                let id = btn.hit_id();
+                btn.render_content_into(
+                    &mut canvas,
+                    0.0,
+                    0.0,
+                    ctx.text,
+                    clip,
                     Some(&mut self.chrome.hit_test_map),
                     id,
                 );
@@ -1071,6 +1151,13 @@ impl FluorApp for PanesDemo {
                 if tb.flip_blinkey() {
                     needs_redraw = true;
                 }
+            }
+        }
+
+        // Button poll — each button's internal click counter is consumed by `take_click`; we react with a stderr print so it's obvious the dispatch path is alive. App-defined behaviour (clearing a textbox, submitting a form, etc.) hangs off the same boolean per button.
+        for btn in self.buttons.iter_mut() {
+            if btn.take_click() {
+                eprintln!("[button] '{}' clicked", btn.label());
             }
         }
 
