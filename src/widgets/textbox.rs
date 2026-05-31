@@ -14,11 +14,14 @@ use alloc::vec::Vec;
 pub struct Textbox {
     /// Text content as a `Vec<char>` — character-indexed cursor + width arrays.
     pub chars: Vec<char>,
-    /// Insertion point in `[0, chars.len()]`.
+    /// Insertion point in `[0, chars.len()]`. Intentionally public — selection-drag in the app's `CursorMoved` handler mutates it directly each frame as the cursor moves; a setter would require either an opaque "extend-selection-to-pixel-x" API on Textbox (which would force the textbox to know about the drag state machine) or per-event call overhead. Treat as widget-internal otherwise.
     pub cursor: usize,
-    pub focused: bool,
-    /// Cursor is hovering over the textbox bbox. Drives the hover fill colour.
-    pub hovered: bool,
+    /// Dense hit ID allocated at construction via [`crate::host::widget::next_id`]. Stamped into the host hit map at every opaque pill pixel during `render_content_into` so a click at `(x, y)` resolves to this textbox iff `hit_map[y * w + x] == self.hit_id`.
+    hit_id: HitId,
+    /// `true` while this textbox is the focused-input target — blinkey runs, glow paints, key events route here. Mutate via [`Self::set_focused`] (or the [`crate::host::widget::Focus`] trait method) so the host's full-repaint promotion can fire on focus on/off transitions.
+    focused: bool,
+    /// `true` while the cursor is hovering over the textbox bbox. Drives the hover fill colour. Mutate via [`Self::set_hovered`] / the [`crate::host::widget::Hover`] trait method.
+    hovered: bool,
     /// Stroke thickness in RU (multiplied by `font_size`). `0.0` → 1px minimum via the photon `+ 1`
     /// idiom in `render_content_into`. Stroke eats inward from the outer pill silhouette.
     pub stroke_ru: f32,
@@ -196,7 +199,9 @@ fn blit_cache_to_target(
 }
 
 impl Textbox {
+    /// `hit_counter` is the app's monotonic [`HitId`] allocator. Each Textbox claims one ID at construction via [`crate::host::widget::next_id`]; that ID is stamped into the host hit map at every opaque pill pixel, making click + hover dispatch a single map read.
     pub fn new(
+        hit_counter: &mut HitId,
         center_x: Coord,
         center_y: Coord,
         width: Coord,
@@ -206,6 +211,7 @@ impl Textbox {
         Self {
             chars: Vec::new(),
             cursor: 0,
+            hit_id: crate::host::widget::next_id(hit_counter),
             focused: false,
             hovered: false,
             stroke_ru: 0.0, // → 1 px minimum stroke via the +1 idiom in render_content_into
@@ -1040,6 +1046,106 @@ impl Textbox {
                 blinkey_h,
                 self.blinkey_wave_top,
             );
+        }
+    }
+
+    /// The dense hit-id allocated at construction. Stamped into the host hit map; consulted by click / hover dispatch to route to this textbox.
+    pub fn hit_id(&self) -> HitId {
+        self.hit_id
+    }
+
+    /// `true` while this textbox is the focused-input target.
+    pub fn is_focused(&self) -> bool {
+        self.focused
+    }
+
+    /// Set the focused state and side-effects: an unfocused textbox stops the blinkey and drops any pending selection anchor (clicking off should not preserve a half-formed selection). The focus indicator (glow) lights up on `set_focused(true)` because the painter consults `focused` directly on the next render. Caller is responsible for the host-side wake (request_redraw, blink-timer start) — Textbox doesn't reach across into the event loop.
+    pub fn set_focused(&mut self, focused: bool) {
+        if focused == self.focused {
+            return;
+        }
+        self.focused = focused;
+        if focused {
+            self.blinkey_visible = true;
+            self.blinkey_wave_top = true;
+        } else {
+            self.blinkey_visible = false;
+            self.selection_anchor = None;
+        }
+    }
+
+    /// `true` while the cursor is hovering over this textbox.
+    pub fn is_hovered(&self) -> bool {
+        self.hovered
+    }
+
+    /// Set the hovered state. Idempotent — caller drives the host-side dirty / redraw decision off whether the value actually changed (compare `is_hovered()` before + after if it matters).
+    pub fn set_hovered(&mut self, hovered: bool) {
+        self.hovered = hovered;
+    }
+}
+
+#[cfg(feature = "host-winit")]
+mod widget_impls {
+    //! [`crate::host::widget`] capability-trait implementations for [`Textbox`]. Gated on `host-winit` because the trait signatures reference winit's [`winit::event::KeyEvent`] and [`winit::keyboard::ModifiersState`]; the rest of [`Textbox`] is feature-flag-agnostic and compiles in any build with the `text` feature.
+    //!
+    //! [`crate::host::widget::Key`] is **not** implemented here yet — Phase 3b absorbs the keyboard match arm from `examples/panes.rs`. For now panes still owns keystroke routing and calls Textbox's public mutation methods (`insert_char`, `backspace`, etc.) directly. The Click + Focus + Hover impls below are what makes Textbox a first-class participant in the widget tree (Container::visit, click / focus / hover dispatch).
+
+    use super::Textbox;
+    use crate::coord::Coord;
+    use crate::host::widget::{Click, Focus, Hover, PaintCtx, Widget};
+    use crate::paint::HitId;
+    use winit::keyboard::ModifiersState;
+
+    impl Widget for Textbox {
+        fn id(&self) -> HitId {
+            self.hit_id()
+        }
+        fn paint(&mut self, _ctx: &mut PaintCtx<'_, '_>) {
+            // Intentional no-op — panes still drives Textbox rendering via [`Textbox::render_content_into`] with its existing ad-hoc parameter list (sub-canvas offset, optional AlphaMask, etc. that don't fit PaintCtx today). Phase 5 will reshape the paint contract once the host's overall paint orchestration grows around the widget tree. The Widget trait impl here makes Textbox a participant in click / focus / hover dispatch in the meantime.
+        }
+        fn click(&mut self) -> Option<&mut dyn Click> {
+            Some(self)
+        }
+        fn focus(&mut self) -> Option<&mut dyn Focus> {
+            Some(self)
+        }
+        fn hover(&mut self) -> Option<&mut dyn Hover> {
+            Some(self)
+        }
+    }
+
+    impl Click for Textbox {
+        fn on_click(
+            &mut self,
+            x: Coord,
+            _y: Coord,
+            _mods: ModifiersState,
+        ) -> crate::host::app::EventResponse {
+            // Click on a textbox sets the cursor at the clicked column and clears any prior selection anchor. Focus is set by the dispatch layer AFTER the walk (via [`Focus::set_focused`]) — this method is reached only because the click landed on this widget's stamped hit id, so the focus decision belongs upstream where multiple widgets are arbitrated.
+            self.cursor = self.cursor_index_from_x(x);
+            self.selection_anchor = None;
+            crate::host::app::EventResponse::Handled
+        }
+    }
+
+    impl Focus for Textbox {
+        fn set_focused(&mut self, focused: bool) {
+            Textbox::set_focused(self, focused);
+        }
+        fn focus_bbox(&self) -> Option<crate::canvas::PixelRect> {
+            // Textbox's geometry is stored as floating-point center + size; converting to PixelRect (usize-bounded integer rect) is a Region-to-PixelRect cast, not the same as `bbox()` (which returns a Region for the focus-glow region API). Truncate toward zero to integer pixels and clamp negative sides to 0 — the focus-bbox is purely for spatial tab-order math, not damage rects, so single-pixel imprecision is fine.
+            let x0 = (self.center_x - self.width * 0.5).max(0.0) as usize;
+            let y0 = (self.center_y - self.height * 0.5).max(0.0) as usize;
+            let x1 = (self.center_x + self.width * 0.5).max(0.0) as usize;
+            let y1 = (self.center_y + self.height * 0.5).max(0.0) as usize;
+            Some(crate::canvas::PixelRect::new(x0, y0, x1, y1))
+        }
+    }
+
+    impl Hover for Textbox {
+        fn set_hovered(&mut self, hovered: bool) {
+            Textbox::set_hovered(self, hovered);
         }
     }
 }
