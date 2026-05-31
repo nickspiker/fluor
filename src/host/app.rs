@@ -264,6 +264,8 @@ struct DesktopShell<A: FluorApp> {
 
     // --- Drag-to-move tracking. In the fullscreen-compositor architecture the OS window is fullscreen and `window.drag_window()` doesn't move anything — we move our internal `window_rect` inside the screen buffer instead. On press we capture the cursor's screen position + window_rect origin; on cursor-move we update window_rect.x/y by the delta. The actual screen-buffer shift happens at vsync (RedrawRequested) via paint::shift_screen_wrap — skipping consumer render + finalize + shadow entirely during the drag. On drag release, a request_redraw kicks off a clean full re-render that overwrites the wrap artefacts.
     is_dragging_move: bool,
+    /// Click hit a drag-eligible area and we're waiting to see if the cursor crosses the drag threshold (`DRAG_DEADZONE_PX`) before committing to an actual move-drag. Set on `EventResponse::StartWindowDrag`; cleared on mouse release. While armed but not yet committed, the cursor handler treats movements below the threshold as a no-op (so a click that defocuses a widget but doesn't drag doesn't promote to full_repaint via the wrap-shift fast path). On crossing the threshold, `is_dragging_move` flips true and the shift logic engages.
+    move_drag_armed: bool,
     drag_move_anchor_screen: (i32, i32),
     drag_move_rect_start: (i32, i32),
     /// Last window_rect (x, y, w, h) that was actually painted into the screen buffer. Set after every render_frame; consulted at drag-move vsync ticks to compute the (dx, dy) delta to feed into `shift_screen_wrap`. Without this we'd have no way to know "how much did the window move since the last frame" because the cursor anchor describes total drag distance, not per-frame increment.
@@ -324,6 +326,7 @@ impl<A: FluorApp> DesktopShell<A> {
             drag_start_window_pos: (0, 0),
             drag_start_cursor_screen_pos: (0, 0),
             is_dragging_move: false,
+            move_drag_armed: false,
             drag_move_anchor_screen: (0, 0),
             drag_move_rect_start: (0, 0),
             last_painted_rect: WindowRect { x: 0, y: 0, w: 1, h: 1 },
@@ -665,8 +668,8 @@ impl<A: FluorApp> DesktopShell<A> {
         match response {
             EventResponse::Handled | EventResponse::Pass => false,
             EventResponse::StartWindowDrag => {
-                // Fullscreen-compositor model: OS window.drag_window() would do nothing (OS window is fullscreen). Drag is internal — capture the anchor here and move window_rect on CursorMoved.
-                self.is_dragging_move = true;
+                // Fullscreen-compositor model: OS window.drag_window() would do nothing (OS window is fullscreen). Drag is internal — capture the anchor here and move window_rect on CursorMoved. We ARM the drag without committing; `is_dragging_move` doesn't flip true until the cursor crosses `DRAG_DEADZONE_PX` in `CursorMoved`. Click-without-drag (e.g. defocus click on the panel area) never commits, so no wrap-shift fast path runs, no persistent_screen wrap artefacts, and the textbox's small `glow_bbox` damage_rect drives the only repaint.
+                self.move_drag_armed = true;
                 self.drag_move_anchor_screen = (self.cursor_x as i32, self.cursor_y as i32);
                 self.drag_move_rect_start = (self.window_rect.x, self.window_rect.y);
                 false
@@ -1029,10 +1032,17 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                     return;
                 }
 
-                // In-buffer drag-to-move: update window_rect.x/y by the cursor delta from the drag anchor. The actual screen-buffer shift + input-region update + present happens at vsync in `apply_move_drag_shift` (called from RedrawRequested), naturally coalescing the 200+ Hz raw input rate down to the display refresh rate. Skip consumer dispatch — they don't need cursor moves during the drag.
-                if self.is_dragging_move {
+                // In-buffer drag-to-move: update window_rect.x/y by the cursor delta from the drag anchor. The actual screen-buffer shift + input-region update + present happens at vsync in `apply_move_drag_shift` (called from RedrawRequested), naturally coalescing the 200+ Hz raw input rate down to the display refresh rate. Skip consumer dispatch — they don't need cursor moves during the drag. Drag commits only after the cursor crosses `DRAG_DEADZONE_PX` from the press anchor — sub-threshold jitter on click-without-drag stays a no-op so no wrap-shift fast path runs and no persistent_screen artefact accumulates.
+                if self.move_drag_armed {
+                    const DRAG_DEADZONE_PX: i32 = 4;
                     let dx = (self.cursor_x as i32) - self.drag_move_anchor_screen.0;
                     let dy = (self.cursor_y as i32) - self.drag_move_anchor_screen.1;
+                    if !self.is_dragging_move {
+                        if dx.abs() < DRAG_DEADZONE_PX && dy.abs() < DRAG_DEADZONE_PX {
+                            return;
+                        }
+                        self.is_dragging_move = true;
+                    }
                     self.window_rect.x = self.drag_move_rect_start.0 + dx;
                     self.window_rect.y = self.drag_move_rect_start.1 + dy;
                     if let Some(window) = self.window.as_ref() {
@@ -1136,10 +1146,13 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                     self.is_dragging_resize = false;
                     self.resize_edge = ResizeEdge::None;
                 }
-                // End of in-buffer drag-to-move. Drop the flag and request one full redraw — the wrap-shift fast-path leaves wrap artefacts at whichever edges the window slid across AND persistent_screen has stale content from before the drag. Set `pending_full_repaint` so the next render_frame wipes persistent_screen and forces a full repaint at the new window position.
-                if self.is_dragging_move {
-                    self.is_dragging_move = false;
-                    self.pending_full_repaint = true;
+                // End of in-buffer drag-to-move. Two release paths from the deadzone state machine: (a) armed but never committed (cursor never crossed `DRAG_DEADZONE_PX`) — no shifts happened, persistent_screen is intact, consumer's damage_rect drives the next paint. (b) Committed (`is_dragging_move = true`) — the wrap-shift fast path moved persistent_screen contents, leaving wrap artefacts at whichever edges the window slid across, so a full repaint is required to clean them up. Always request_redraw on either path so consumer-side invalidations queued during the press window (e.g. textbox defocus → glow_bbox damage) get a fresh render_frame to flush.
+                if self.move_drag_armed {
+                    self.move_drag_armed = false;
+                    if self.is_dragging_move {
+                        self.is_dragging_move = false;
+                        self.pending_full_repaint = true;
+                    }
                     if let Some(window) = self.window.as_ref() {
                         window.request_redraw();
                     }

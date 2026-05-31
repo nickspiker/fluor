@@ -586,21 +586,72 @@ fn strip_layout(
     Some((w, strip_w, strip_x, button_area_offset, last_row, h))
 }
 
-#[inline]
-fn hit_for_dx(dx: usize, button_size: usize, button_area_offset: usize) -> u8 {
-    if dx < button_area_offset {
-        HIT_MINIMIZE_BUTTON
-    } else {
-        let x_in = dx - button_area_offset;
-        if x_in < button_size {
-            HIT_MINIMIZE_BUTTON
-        } else if x_in < button_size * 2 {
-            HIT_MAXIMIZE_BUTTON
+/// Per-row directional fill. For each row in `[row_start, row_end)`, anchor at `start_col` (typically one pixel past the inner divider — i.e. just inside the slot) and walk in the direction given by `scan_right` until hitting a wall or peaking past one. Stamps `hit_id` at each accepted pixel.
+///
+/// Stop conditions per step: static wall (`chrome α == 0xFF` OR `clip_mask < 128`), or peak-descent (`current α < prev α`, single check). Since `start_col` is positioned one pixel inside the divider on the inner side, the scan goes **outward** across the slot toward the curve / silhouette / strip edge on the far side — no inward scan is needed because the divider itself is the inner boundary and we start past it.
+///
+/// CRITICAL ordering: called AFTER hairlines + curves are painted, BEFORE symbols + bg fill paint — symbol and bg pixels are opaque and would be misread as walls, collapsing the scan immediately.
+pub fn paint_button_hit_row_scan(
+    chrome_buf: &[u32],
+    clip_mask: &[u8],
+    hit_test_map: &mut [u8],
+    width: usize,
+    start_col: usize,
+    scan_right: bool,
+    hit_id: u8,
+    row_start: usize,
+    row_end: usize,
+    bound_x_min: usize,
+    bound_x_max: usize,
+) {
+    if row_start >= row_end || width == 0 || start_col < bound_x_min || start_col >= bound_x_max {
+        return;
+    }
+    let static_wall = |idx: usize| -> bool {
+        (chrome_buf[idx] >> 24) == 0xFF || clip_mask[idx] < 128
+    };
+    for row in row_start..row_end {
+        let row_base = row * width;
+        let start_idx = row_base + start_col;
+        if static_wall(start_idx) {
+            continue;
+        }
+        hit_test_map[start_idx] = hit_id;
+        let mut prev_a = (chrome_buf[start_idx] >> 24) & 0xFF;
+        if scan_right {
+            let mut col = start_col + 1;
+            while col < bound_x_max {
+                let idx = row_base + col;
+                if static_wall(idx) {
+                    break;
+                }
+                let a = (chrome_buf[idx] >> 24) & 0xFF;
+                if a < prev_a {
+                    break;
+                }
+                hit_test_map[idx] = hit_id;
+                prev_a = a;
+                col += 1;
+            }
         } else {
-            HIT_CLOSE_BUTTON
+            let mut col = start_col;
+            while col > bound_x_min {
+                col -= 1;
+                let idx = row_base + col;
+                if static_wall(idx) {
+                    break;
+                }
+                let a = (chrome_buf[idx] >> 24) & 0xFF;
+                if a < prev_a {
+                    break;
+                }
+                hit_test_map[idx] = hit_id;
+                prev_a = a;
+            }
         }
     }
 }
+
 
 /// **Step 2** in the chrome rasterizer (after window perimeter). Paint the BL squircle hairline of the controls strip — row-walk (the curve's near-vertical leg) and col-walk (the near-horizontal leg). Uses [`paint_if_empty`] so writes from the window perimeter are not overwritten. Each curve pixel gets at most ONE writer (this function or the perimeter, whichever ran first).
 pub fn draw_strip_curves(
@@ -726,7 +777,9 @@ pub fn draw_strip_bg(
     start: usize,
     crossings: &[(u16, u8, u8)],
 ) {
-    let Some((w, _strip_w, strip_x, button_area_offset, last_row, _h)) =
+    // hit_test_map is no longer written here — population happens via per-button directional row scans (`paint_button_hit_row_scan`) BEFORE this bg pass runs, using the chrome buffer's post-hairlines/post-curves state as the wall geometry. Param retained for caller-signature stability.
+    let _ = hit_test_map;
+    let Some((w, _strip_w, strip_x, _button_area_offset, last_row, _h)) =
         strip_layout(width, height, button_size)
     else {
         return;
@@ -766,8 +819,6 @@ pub fn draw_strip_bg(
             }
             let idx = row_base + px;
             pixels[idx] = pixels[idx].under(bg, BlendMode::Normal);
-            // Hit map is independent of chrome layering — every in-strip-interior pixel registers as the button at this dx, regardless of whether a higher-priority paint (divider/curve/glyph) already claimed the chrome pixel.
-            hit_test_map[idx] = hit_for_dx(dx, button_size, button_area_offset);
         }
     }
 }

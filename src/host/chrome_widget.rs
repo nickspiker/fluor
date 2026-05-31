@@ -6,7 +6,7 @@
 //!
 //! Pattern: `chrome.rasterize_bg(|bg, w, h| { /* paint into bg */ });` → `chrome.rasterize_chrome(text);` → `chrome.rasterize_hover();` → `chrome.flatten_into(target, w, h);`. Each rasterize_* checks the layer's dirty bit internally and is a no-op on clean.
 
-use super::chrome::{self, HIT_NONE};
+use super::chrome::{self, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE};
 use crate::coord::Coord;
 use crate::geom::Viewport;
 use crate::group::Group;
@@ -293,7 +293,101 @@ impl DefaultChrome {
         let min_cx = button_area_x + button_size / 2;
         let max_cx = button_area_x + button_size + button_size / 2;
         let close_cx = button_area_x + button_size * 2 + button_size / 2;
+        let strip_w = button_size * 7 / 2;
 
+        // Hairlines (dividers + bottom) BEFORE curves: solid lines have to win at intersection pixels, otherwise the curve's inner-AA hairline (which is mostly transparent in the linear region) fragments them. With this order, dividers and bottom hairline claim their pixels first; the BL curve's hairlines fill in only the gaps the straight lines didn't reach.
+        //
+        // Strip-frame colours follow the focus palette: vertical dividers + bottom hairline take `edge_light` (same as the top/left window perimeter), the BL squircle curve's vertical face takes `edge_light` (continues the left-of-strip vertical hairline) and its horizontal face takes `edge_shadow` (continues the bottom-of-strip hairline if no curve is present, and matches the bottom-of-window shadow) — so the strip reads as a continuation of the window edge, not a separate piece.
+        chrome::draw_strip_hairlines(
+            chrome_buf,
+            vp_w,
+            vp_h,
+            button_size,
+            start,
+            &crossings,
+            edge_light,
+        );
+
+        chrome::draw_strip_curves(
+            chrome_buf,
+            &mut self.hit_test_map,
+            vp_w,
+            vp_h,
+            button_size,
+            start,
+            &crossings,
+            edge_light,
+            edge_shadow,
+        );
+
+        // Per-row directional fills — runs AFTER hairlines + curves but BEFORE symbols + bg fill. Each button anchors at the slot's inner edge (one pixel past its adjacent divider on the side opposite the slot's content boundary) and scans outward across the row toward the curve / silhouette / strip edge. No inward scan needed: the divider itself is the inner boundary, and we start past it. MAX is the only button with dividers on BOTH sides — handled by splitting top half / bottom half between the two directions, so each half-row scan still only crosses one direction.
+        let div1_col = button_area_x + button_size;
+        let div2_col = button_area_x + 2 * button_size;
+        let bound_x_min = strip_x;
+        let bound_x_max = strip_x + strip_w;
+
+        // MIN: anchor just left of div1, scan LEFT toward strip edge / BL curve.
+        chrome::paint_button_hit_row_scan(
+            chrome_buf,
+            clip_mask,
+            &mut self.hit_test_map,
+            buf_w,
+            div1_col - 1,
+            false,
+            HIT_MINIMIZE_BUTTON,
+            0,
+            button_size,
+            bound_x_min,
+            bound_x_max,
+        );
+
+        // CLOSE: anchor just right of div2, scan RIGHT toward perimeter / silhouette.
+        chrome::paint_button_hit_row_scan(
+            chrome_buf,
+            clip_mask,
+            &mut self.hit_test_map,
+            buf_w,
+            div2_col + 1,
+            true,
+            HIT_CLOSE_BUTTON,
+            0,
+            button_size,
+            bound_x_min,
+            bound_x_max,
+        );
+
+        // MAX top half: anchor just right of div1, scan RIGHT. Stops at div2 (static wall).
+        chrome::paint_button_hit_row_scan(
+            chrome_buf,
+            clip_mask,
+            &mut self.hit_test_map,
+            buf_w,
+            div1_col + 1,
+            true,
+            HIT_MAXIMIZE_BUTTON,
+            0,
+            button_size / 2,
+            bound_x_min,
+            bound_x_max,
+        );
+
+        // MAX bottom half: anchor just left of div2, scan LEFT. Stops at div1.
+        chrome::paint_button_hit_row_scan(
+            chrome_buf,
+            clip_mask,
+            &mut self.hit_test_map,
+            buf_w,
+            div2_col - 1,
+            false,
+            HIT_MAXIMIZE_BUTTON,
+            button_size / 2,
+            button_size,
+            bound_x_min,
+            bound_x_max,
+        );
+
+
+        // Symbols painted AFTER flood-fill: now that hit_test_map is populated, glyph opacity in chrome_buf no longer affects the hit map (and the hit fill won't see them as walls since it already ran).
         chrome::draw_maximize_symbol(
             chrome_buf,
             buf_w,
@@ -326,31 +420,6 @@ impl DefaultChrome {
             theme::WINDOW_CONTROLS_BG,
         );
 
-        // Hairlines (dividers + bottom) BEFORE curves: solid lines have to win at intersection pixels, otherwise the curve's inner-AA hairline (which is mostly transparent in the linear region) fragments them. With this order, dividers and bottom hairline claim their pixels first; the BL curve's hairlines fill in only the gaps the straight lines didn't reach.
-        //
-        // Strip-frame colours follow the focus palette: vertical dividers + bottom hairline take `edge_light` (same as the top/left window perimeter), the BL squircle curve's vertical face takes `edge_light` (continues the left-of-strip vertical hairline) and its horizontal face takes `edge_shadow` (continues the bottom-of-strip hairline if no curve is present, and matches the bottom-of-window shadow) — so the strip reads as a continuation of the window edge, not a separate piece.
-        chrome::draw_strip_hairlines(
-            chrome_buf,
-            vp_w,
-            vp_h,
-            button_size,
-            start,
-            &crossings,
-            edge_light,
-        );
-
-        chrome::draw_strip_curves(
-            chrome_buf,
-            &mut self.hit_test_map,
-            vp_w,
-            vp_h,
-            button_size,
-            start,
-            &crossings,
-            edge_light,
-            edge_shadow,
-        );
-
         chrome::draw_strip_bg(
             chrome_buf,
             &mut self.hit_test_map,
@@ -381,6 +450,13 @@ impl DefaultChrome {
         }
 
         // Hover paint moved to the host overlay path; chrome_buf is intentionally tint-free here.
+
+        // Silhouette restriction post-pass — photon-style. Any pixel the perimeter dropped below full coverage (clip_mask < 255 = corner cutouts, AA fringes) gets HIT_NONE so a non-strip rasterizer (currently the app icon at the top-left) can't leave a stale hit_id at a pixel that's geometrically outside the silhouette.
+        for i in 0..clip_mask.len() {
+            if clip_mask[i] < 255 {
+                self.hit_test_map[i] = HIT_NONE;
+            }
+        }
     }
 
     /// **No-op stub.** Kept for source-compat with callers; hover tint lives in the host's post-finalize overlay pass now.

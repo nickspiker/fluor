@@ -572,14 +572,23 @@ impl Textbox {
         )
     }
 
-    /// Larger bbox with `font_size` glow padding on every side. Use this for the focus-on / focus-off transition (glow appearing / disappearing) — the only time we need to repaint the wider halo region. Roughly 3× the area of [`bbox`] at default geometry, so keep it off the per-keystroke hot path.
+    /// Compute the `factor_256` decay multiplier for this textbox's current `font_size`. Single source of truth used by both [`Self::glow_bbox`] (to size the bbox padding to the actual ray reach) and the focus-glow render pass (to drive the per-pixel α taper). Matches the chrome shadow's `target_radius`/`drop` formula — RU-invariant since `target_radius` scales with `font_size`.
+    fn glow_factor_256(font_size: f32) -> u32 {
+        let target_radius = (font_size * 3.0).max(8.0);
+        let drop = (1240.0 / target_radius) as u32;
+        (256u32.saturating_sub(drop)).clamp(96, 254)
+    }
+
+    /// Larger bbox with the actual focus-glow ray reach added on every side. Horizontal sides use the 0x80 seed reach (the left/right rays' actual decay length); vertical sides use the 0x40 seed reach (the top/bottom rays' shorter decay since they start at half intensity). Both derived from the same `factor_256` the render pass uses so the bbox exactly contains what `apply_textbox_glow_{right,left,top,bottom}` will paint — no early cutoff, no over-clearing. Use this for the focus-on / focus-off transition (glow appearing / disappearing) — the only time we need to repaint the wider halo region. Keep off the per-keystroke hot path.
     pub fn glow_bbox(&self) -> Region {
-        let glow_pad = self.font_size;
+        let factor_256 = Self::glow_factor_256(self.font_size);
+        let horiz_pad = crate::paint::ray_reach_px(0x80, factor_256) as f32;
+        let vert_pad = crate::paint::ray_reach_px(0x40, factor_256) as f32;
         Region::new(
-            self.center_x - self.width * 0.5 - glow_pad,
-            self.center_y - self.height * 0.5 - glow_pad,
-            self.width + 2.0 * glow_pad,
-            self.height + 2.0 * glow_pad,
+            self.center_x - self.width * 0.5 - horiz_pad,
+            self.center_y - self.height * 0.5 - vert_pad,
+            self.width + 2.0 * horiz_pad,
+            self.height + 2.0 * vert_pad,
         )
     }
 
@@ -694,9 +703,7 @@ impl Textbox {
         //
         // RU-invariant exponential falloff matching the chrome shadow: target_radius derived from font_size (3× font_size as the half-life-ish reach), factor_256 = 256 − 1240/target_radius clamped to [96, 254]. Same curve as paint_shadow; just emitted at 0°/180° (left/right) and 90°/270° (top/bottom) instead of 45° diagonals, and white instead of black. Vertical passes use half-density seed (0x40 vs horizontal 0x80) so the top/bottom halo reads softer.
         if self.focused {
-            let target_radius = (self.font_size * 3.0).max(8.0);
-            let drop = (1240.0 / target_radius) as u32;
-            let factor_256 = (256u32.saturating_sub(drop)).clamp(96, 254);
+            let factor_256 = Self::glow_factor_256(self.font_size);
             paint::apply_textbox_glow_right(
                 canvas,
                 pill_x_target,
