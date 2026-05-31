@@ -16,13 +16,14 @@ use crate::pixel::{Blend, BlendMode};
 use crate::text::TextRenderer;
 use crate::theme;
 
-/// Hit-test IDs that the per-pixel hit_test_map can carry. `HIT_NONE` = clicks pass through. Button IDs are placeholders for the future controls scaffold step.
-pub const HIT_NONE: u8 = 0;
-pub const HIT_MINIMIZE_BUTTON: u8 = 1;
-pub const HIT_MAXIMIZE_BUTTON: u8 = 2;
-pub const HIT_CLOSE_BUTTON: u8 = 3;
-pub const HIT_APP_ICON: u8 = 4;
-pub const HIT_TEXTBOX: u8 = 5;
+pub use crate::paint::{HIT_NONE, HitId};
+
+/// Compatibility constants for the four pre-registry chrome zones. [`super::chrome_widget::DefaultChrome`] now reserves IDs 1–4 in registration order (min, max, close, app icon) so the numeric values match what the [`super::app::HitRegistry`] would have assigned. New code should query the chrome for its registered handlers instead of referencing these constants; they stay only so [`super::desktop`]'s legacy shim and a couple of debug paths in `examples/panes.rs` keep compiling during the photon transition.
+pub const HIT_MINIMIZE_BUTTON: HitId = 1;
+pub const HIT_MAXIMIZE_BUTTON: HitId = 2;
+pub const HIT_CLOSE_BUTTON: HitId = 3;
+pub const HIT_APP_ICON: HitId = 4;
+pub const HIT_TEXTBOX: HitId = 5;
 
 /// Orb visual state. The app sets this to give the orb a meaning beyond window-focus (network indicator, recording badge, presence light). Layered defaults: `FollowFocus` means "ring matches the perimeter, image dims when the window is unfocused" with zero app code; `Custom` lets the app dictate ring colour + brightness regardless of window state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,7 +100,7 @@ pub fn get_resize_edge(window_width: u32, window_height: u32, x: Coord, y: Coord
 /// `hit_test_map` is preserved as a parameter for forward compatibility with the controls scaffold step but is not modified here.
 pub fn draw_window_edges_and_mask(
     pixels: &mut [u32],
-    hit_test_map: &mut [u8],
+    hit_test_map: &mut [HitId],
     clip_mask: &mut [u8],
     width: u32,
     height: u32,
@@ -389,7 +390,7 @@ pub fn draw_status_bar(
 /// Hit-test: every pixel inside `r_outer²` (excluding the AA fringe) is tagged `HIT_APP_ICON` so the host can route clicks. Decorative-only consumers can pass `None` for `hit_test_map` to skip the tag.
 pub fn draw_app_icon(
     pixels: &mut [u32],
-    hit_test_map: Option<&mut [u8]>,
+    hit_test_map: Option<&mut [HitId]>,
     width: usize,
     height: usize,
     cx: isize,
@@ -594,11 +595,11 @@ fn strip_layout(
 pub fn paint_button_hit_row_scan(
     chrome_buf: &[u32],
     clip_mask: &[u8],
-    hit_test_map: &mut [u8],
+    hit_test_map: &mut [HitId],
     width: usize,
     start_col: usize,
     scan_right: bool,
-    hit_id: u8,
+    hit_id: HitId,
     row_start: usize,
     row_end: usize,
     bound_x_min: usize,
@@ -656,7 +657,7 @@ pub fn paint_button_hit_row_scan(
 /// **Step 2** in the chrome rasterizer (after window perimeter). Paint the BL squircle hairline of the controls strip — row-walk (the curve's near-vertical leg) and col-walk (the near-horizontal leg). Uses [`paint_if_empty`] so writes from the window perimeter are not overwritten. Each curve pixel gets at most ONE writer (this function or the perimeter, whichever ran first).
 pub fn draw_strip_curves(
     pixels: &mut [u32],
-    hit_test_map: &mut [u8],
+    hit_test_map: &mut [HitId],
     width: u32,
     height: u32,
     button_size: usize,
@@ -770,7 +771,7 @@ pub fn draw_strip_hairlines(
 /// The curve's OUTER pixel is explicitly skipped because geometrically it sits on the strip's boundary; its "behind" is the bg-layer (panes), not strip bg. Leaving it partial preserves the correct visible-over-panes composite at the Stack step.
 pub fn draw_strip_bg(
     pixels: &mut [u32],
-    hit_test_map: &mut [u8],
+    hit_test_map: &mut [HitId],
     width: u32,
     height: u32,
     button_size: usize,

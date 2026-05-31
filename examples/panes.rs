@@ -9,7 +9,7 @@ use fluor::geom::Viewport;
 use fluor::group::Group;
 use fluor::host::app::{Context, EventResponse, FluorApp};
 use fluor::host::chrome::{
-    self, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE, HIT_TEXTBOX,
+    self, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE, HIT_TEXTBOX, HitId,
     ResizeEdge,
 };
 use fluor::host::chrome_widget::DefaultChrome;
@@ -252,6 +252,8 @@ impl FluorApp for PanesDemo {
     fn on_resize(&mut self, w: u32, h: u32, ctx: &mut Context) {
         self.compositor.resize(w, h);
         self.chrome.resize(ctx.viewport);
+        // Sync chrome's full-edge mode with the host's maximized state — they only diverge across a ToggleMaximized, which always triggers an on_resize (size always changes between user-sized and screen-sized).
+        self.chrome.set_full_edge(ctx.is_maximized);
         self.update_layout(ctx);
     }
 
@@ -308,10 +310,7 @@ impl FluorApp for PanesDemo {
                         ctx.window.set_minimized(true);
                         return EventResponse::Handled;
                     }
-                    HIT_MAXIMIZE_BUTTON => {
-                        ctx.window.set_maximized(!ctx.window.is_maximized());
-                        return EventResponse::Handled;
-                    }
+                    HIT_MAXIMIZE_BUTTON => return EventResponse::ToggleMaximized,
                     _ => {}
                 }
                 let edge = chrome::get_resize_edge(
@@ -682,14 +681,14 @@ impl FluorApp for PanesDemo {
         combined
     }
 
-    fn hit_test_map(&self) -> Option<(&[u8], usize, usize)> {
+    fn hit_test_map(&self) -> Option<(&[HitId], usize, usize)> {
         let (w, h) = self.chrome.dims();
         Some((self.chrome.hit_test_map(), w, h))
     }
 
-    fn overlay_deltas(&self) -> [u32; 256] {
-        // Per-hit-id tint deltas applied to persistent_screen by the host's overlay pass. Empty by default; only the currently-hovered button (chrome side) and the textbox's hovered/focused state contribute non-zero entries. Wrap-arithmetic semantics in visible RGB (host wraps these into wrap-sub at apply time).
-        let mut t = [0u32; 256];
+    fn overlay_deltas(&self) -> Vec<u32> {
+        // Per-hit-id tint deltas applied to persistent_screen by the host's overlay pass. Slice sized to the highest live hit id + 1 (HIT_TEXTBOX is the max here). Most apps will allocate this from `registry.next_id` once it exists; for now the demo uses the compat constants.
+        let mut t = vec![0u32; HIT_TEXTBOX as usize + 1];
         if let Some(c) = fluor::host::chrome_widget::hover_color_for(self.chrome.hover_state) {
             t[self.chrome.hover_state as usize] = c;
         }
@@ -820,12 +819,16 @@ impl FluorApp for PanesDemo {
         // Textbox tint is now baked into its own cache by `render_content_into` (Photon-style differential) — no per-frame walk over `hit_test_map` needed here.
         self.chrome.flatten_into(target, buf_w, buf_h, clip);
 
-        // Debug overlay (photon-style): for every pixel, look up the hit_test_map's ID and paint its opaque random colour from `debug_hit_colours`. Fully replaces the underlying image — distinct hit zones are visually unmistakable. Drawn last over everything (including textbox + cursor) since hit testing is per-final-pixel anyway.
+        // Debug overlay (photon-style): for every pixel, look up the hit_test_map's ID and paint its opaque random colour from `debug_hit_colours`. Fully replaces the underlying image — distinct hit zones are visually unmistakable. Drawn last over everything (including textbox + cursor) since hit testing is per-final-pixel anyway. Bounds check on the colour-table index keeps the post-u16 widening safe: real widget IDs in this demo stay well under 256, but a future stale stamp at an unregistered high id would panic without the `.get`.
         if self.show_hitmask && !self.debug_hit_colours.is_empty() {
             let map = &self.chrome.hit_test_map;
             let n = map.len().min(target.len());
             for i in 0..n {
-                target[i] = self.debug_hit_colours[map[i] as usize];
+                target[i] = self
+                    .debug_hit_colours
+                    .get(map[i] as usize)
+                    .copied()
+                    .unwrap_or(0);
             }
         }
     }

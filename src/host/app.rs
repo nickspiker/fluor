@@ -119,6 +119,8 @@ pub struct Context<'a> {
     /// Last known cursor position in viewport pixels (host-tracked across all events).
     pub cursor_x: Coord,
     pub cursor_y: Coord,
+    /// `true` if the host's `window_rect` is currently in the screen-sized "maximized" state set by [`EventResponse::ToggleMaximized`]. Consumers consult this so chrome can switch to full-edge mode (no corner cutouts, no perimeter hairline, no drop shadow) — the shadow/hairline are screen edges anyway, the WM can't show them, and AA on a corner that's flush with the screen is wasted work.
+    pub is_maximized: bool,
 }
 
 /// What the consumer wants the host to do after [`FluorApp::on_event`]. Pass-through behaviour lets the consumer ignore events they don't care about; the explicit variants override the host's default for that event.
@@ -134,6 +136,8 @@ pub enum EventResponse {
     StartResize(ResizeEdge),
     /// Consumer requests window close. Host calls `std::process::exit(0)` (Killswitch-compliant).
     Close,
+    /// Toggle the internal `window_rect` between user-sized and screen-sized. The fullscreen-compositor architecture means the OS surface is always at monitor size; `winit::Window::set_maximized` is a no-op on a borderless fullscreen window. The host owns the actual toggle state — on first invocation it saves the current `window_rect` and resizes to the full screen; on the next, it restores the saved rect. Triggers `on_resize`, full-repaint, and an X11 input-region update under the hood.
+    ToggleMaximized,
 }
 
 /// What a consumer implements to drive the desktop host.
@@ -166,13 +170,13 @@ pub trait FluorApp {
     /// Per-frame paint into the host's CPU present buffer. Flatten owned Groups onto `target`. The damage clip computed pre-render is in `ctx.damage_clip`; thread it through every flatten / blit / glow call to skip pixels outside the dirty region.
     fn render(&mut self, target: &mut [u32], ctx: &mut Context);
 
-    /// Per-hit-id overlay delta table for THIS frame. The host runs one walk over `hit_test_map()` after finalize+shadow; for each pixel `i`, if `current[id] != last_applied[id]`, it wrap-adds the prior delta back and wrap-subs the current delta in `persistent_screen` (visible-RGB space). Apps return a `[u32; 256]` where entry `[id]` is the visible-RGB delta to apply to pixels marked with that hit id this frame (e.g. the hover tint when a button is hovered, zero otherwise). Default impl: all zeros (no overlay tints).
-    fn overlay_deltas(&self) -> [u32; 256] {
-        [0u32; 256]
+    /// Per-hit-id overlay delta table for THIS frame. The host runs one walk over `hit_test_map()` after finalize+shadow; for each pixel `i`, if `current[id] != last_applied[id]`, it wrap-adds the prior delta back and wrap-subs the current delta in `persistent_screen` (visible-RGB space). Apps return a slice where entry `[id]` is the visible-RGB delta to apply to pixels marked with that hit id this frame (e.g. the hover tint when a button is hovered, zero otherwise). Length must equal `registry.next_id` (= 1 + number of registered hit zones); IDs past the slice are treated as zero-delta. Default impl: empty slice (no overlay tints, no allocations).
+    fn overlay_deltas(&self) -> Vec<u32> {
+        Vec::new()
     }
 
-    /// Read-only handle to the consumer's hit-test map so the host's overlay diff pass can walk it. Returns `Some((&map, win_w, win_h))` where `map.len() >= win_w * win_h` (one byte per pixel, the hit id). Default `None` = no overlay walk, no hover support.
-    fn hit_test_map(&self) -> Option<(&[u8], usize, usize)> {
+    /// Read-only handle to the consumer's hit-test map so the host's overlay diff pass can walk it. Returns `Some((&map, win_w, win_h))` where `map.len() >= win_w * win_h` (one [`crate::paint::HitId`] per pixel — `u16` since the v0.0 widening). Default `None` = no overlay walk, no hover support.
+    fn hit_test_map(&self) -> Option<(&[crate::paint::HitId], usize, usize)> {
         None
     }
 
@@ -270,6 +274,8 @@ struct DesktopShell<A: FluorApp> {
     drag_move_rect_start: (i32, i32),
     /// Last window_rect (x, y, w, h) that was actually painted into the screen buffer. Set after every render_frame; consulted at drag-move vsync ticks to compute the (dx, dy) delta to feed into `shift_screen_wrap`. Without this we'd have no way to know "how much did the window move since the last frame" because the cursor anchor describes total drag distance, not per-frame increment.
     last_painted_rect: WindowRect,
+    /// Saved `window_rect` from BEFORE the last `EventResponse::ToggleMaximized` set us screen-sized. `Some` ⇒ we're currently in the maximized state and the next toggle restores from here; `None` ⇒ we're at user-sized and the next toggle saves+grows. Drag-to-move while maximized currently drags the screen-sized rect (weird but harmless); a future iteration could auto-unmaximize on drag like most WMs.
+    saved_rect_for_maximize: Option<WindowRect>,
 
     /// `false` until the first `WindowEvent::Resized` arrives confirming the OS surface size. Most WMs open a default-sized window (800×600 or similar) and then animate / configure it to fullscreen — Resized fires when the actual surface is ready. Until then, painting positions chrome against a stale `window_rect` (sized for the monitor we expected) inside a buffer that's smaller than expected, producing a brief "chrome in the top-left of a tiny window" flash as the WM grows the surface. Defer all rendering until this flips true.
     surface_ready: bool,
@@ -290,8 +296,8 @@ struct DesktopShell<A: FluorApp> {
     persistent_screen: Vec<u32>,
     /// Set by any event that destroys the chrome perimeter + shadow band content in [`Self::persistent_screen`]: drag release, resize, zoom, focus change. Consumed once per `render_frame` to switch from incremental mode to full-repaint mode (wipe `persistent_screen`, finalize copies every pixel, paint_shadow runs once into the fresh band). Replaces every prior geometric-equality check on `damage_clip`.
     pending_full_repaint: bool,
-    /// Which hit-ids the overlay wrote to persistent_screen LAST frame. Used so a transition (an id that was tinted, no longer is) still gets its pixels rewritten from scratch this frame to clear the prior tint. No tint magnitude is kept — the overlay just reads scratch and conditionally subtracts the current frame's delta. Reset to all-false whenever persistent_screen is wiped (full repaint path).
-    last_overlay_active: [bool; 256],
+    /// Which hit-ids the overlay wrote to persistent_screen LAST frame. Used so a transition (an id that was tinted, no longer is) still gets its pixels rewritten from scratch this frame to clear the prior tint. No tint magnitude is kept — the overlay just reads scratch and conditionally subtracts the current frame's delta. Re-sized to match the consumer's `overlay_deltas().len()` each frame (extended with `false` if the app registered new IDs since last frame; shrunk only on a full repaint). Cleared whenever `persistent_screen` is wiped.
+    last_overlay_active: Vec<bool>,
     /// Last-seen value of `paint::DEBUG_SHOW_HITMASK`. When this differs from the current atomic value at the top of `render_frame`, we promote to a full repaint so the new finalize behavior (FORCE_OPAQUE-style scalar debug path / no shadow) lands across the whole window in one frame.
     last_hitmask: bool,
     /// Last-seen value of `paint::DEBUG_SHOW_ALPHA`. Same transition logic as `last_hitmask` — toggling alpha-viz changes finalize's debug branch, which requires a full repaint to refresh persistent_screen.
@@ -341,7 +347,8 @@ impl<A: FluorApp> DesktopShell<A> {
             last_alpha_mode: 0,
             last_opaque_scan: false,
             strip_buf: Vec::new(),
-            last_overlay_active: [false; 256],
+            last_overlay_active: Vec::new(),
+            saved_rect_for_maximize: None,
         }
     }
 
@@ -390,7 +397,9 @@ impl<A: FluorApp> DesktopShell<A> {
         if full_repaint {
             self.pending_full_repaint = false;
             self.persistent_screen.fill(0);
-            self.last_overlay_active = [false; 256];
+            for a in self.last_overlay_active.iter_mut() {
+                *a = false;
+            }
         }
         let damage_clip = if full_repaint {
             viewport_rect
@@ -417,6 +426,7 @@ impl<A: FluorApp> DesktopShell<A> {
             modifiers: self.modifiers,
             cursor_x: self.cursor_x - self.window_rect.x as Coord,
             cursor_y: self.cursor_y - self.window_rect.y as Coord,
+            is_maximized: self.saved_rect_for_maximize.is_some(),
             damage_clip,
         };
 
@@ -475,9 +485,9 @@ impl<A: FluorApp> DesktopShell<A> {
         }
         finalize_dt = t.elapsed().as_secs_f32();
 
-        // Drop shadow runs ONCE per full repaint, into a known-cleared band (persistent_screen.fill(0) above). Never runs on incremental frames — the perimeter AA pixels with their shadow contribution were preserved by the opaque-only finalize, and the shadow band cells outside the window were not touched either, so the shadow visible from the last full repaint is still correct. Also skipped when hitmask debug is on so the band doesn't disturb the raw hit-id view at the chrome edge.
+        // Drop shadow runs ONCE per full repaint, into a known-cleared band (persistent_screen.fill(0) above). Never runs on incremental frames — the perimeter AA pixels with their shadow contribution were preserved by the opaque-only finalize, and the shadow band cells outside the window were not touched either, so the shadow visible from the last full repaint is still correct. Skipped when hitmask debug is on so the band doesn't disturb the raw hit-id view at the chrome edge, and skipped when maximized because there's nothing outside the window to cast onto — the OS surface already covers the screen.
         let t = Instant::now();
-        if full_repaint && !hitmask_now {
+        if full_repaint && !hitmask_now && self.saved_rect_for_maximize.is_none() {
             let span = self.viewport.effective_span();
             let target_radius = (span / 16.0).max(8.0);
             let drop = (1240.0 / target_radius) as u32;
@@ -502,6 +512,10 @@ impl<A: FluorApp> DesktopShell<A> {
         // Post-finalize, post-shadow overlay pass. For each pixel whose hit id is currently tinted OR was tinted last frame, copy the scratch pixel → XOR to visible → optionally wrap-sub the per-id delta → write to persistent_screen. Restores the scratch baseline on unhover and applies the tint on hover — no diff math, no accumulation, just "copy and conditionally adjust." Runs every frame regardless of damage_clip so hover tints follow the cursor even when nothing else dirtied scratch.
         if let Some((map, hw, hh)) = self.app.hit_test_map() {
             let current = self.app.overlay_deltas();
+            // Match last_overlay_active length to deltas length. Grow with `false` if the app registered new IDs since last frame; shrink if it (rare) collapsed. apply_overlay debug-asserts equal lengths.
+            if self.last_overlay_active.len() != current.len() {
+                self.last_overlay_active.resize(current.len(), false);
+            }
             crate::paint::apply_overlay(
                 &self.scratch,
                 &mut self.persistent_screen,
@@ -669,9 +683,14 @@ impl<A: FluorApp> DesktopShell<A> {
             EventResponse::Handled | EventResponse::Pass => false,
             EventResponse::StartWindowDrag => {
                 // Fullscreen-compositor model: OS window.drag_window() would do nothing (OS window is fullscreen). Drag is internal — capture the anchor here and move window_rect on CursorMoved. We ARM the drag without committing; `is_dragging_move` doesn't flip true until the cursor crosses `DRAG_DEADZONE_PX` in `CursorMoved`. Click-without-drag (e.g. defocus click on the panel area) never commits, so no wrap-shift fast path runs, no persistent_screen wrap artefacts, and the textbox's small `glow_bbox` damage_rect drives the only repaint.
-                self.move_drag_armed = true;
-                self.drag_move_anchor_screen = (self.cursor_x as i32, self.cursor_y as i32);
-                self.drag_move_rect_start = (self.window_rect.x, self.window_rect.y);
+                //
+                // Maximized state suppresses drag entirely. Most WMs handle this with "drag a maximized window → unmaximize and resume drag at cursor"; that's the right ergonomic but more involved (need to compute the unmaximized origin relative to cursor, then begin the drag). For v0 the simpler rule is "ignore the drag request" — title-bar clicks while maximized do nothing instead of producing nonsense (the drag would translate the fullscreen-sized rect into negative offsets and clip_through the input region). Revisit when we add the unmaximize-then-drag flow.
+                if self.saved_rect_for_maximize.is_none() {
+                    self.move_drag_armed = true;
+                    self.drag_move_anchor_screen =
+                        (self.cursor_x as i32, self.cursor_y as i32);
+                    self.drag_move_rect_start = (self.window_rect.x, self.window_rect.y);
+                }
                 false
             }
             EventResponse::StartResize(edge) => {
@@ -681,7 +700,79 @@ impl<A: FluorApp> DesktopShell<A> {
             EventResponse::Close => {
                 std::process::exit(0);
             }
+            EventResponse::ToggleMaximized => {
+                self.toggle_maximized(&window);
+                false
+            }
         }
+    }
+
+    /// Flip `window_rect` between the user-sized rect (saved in `saved_rect_for_maximize`) and the full screen. Mirrors the geometry-change tail of `resize_drag_update`: resize scratch + clip_mask, reflow viewport, notify the consumer via `on_resize`, mark full-repaint, and update the X11 input region. No-op if `screen_size` is still the (1,1) placeholder — first `Resized` event hasn't landed yet, no real geometry to swap to.
+    fn toggle_maximized(&mut self, window: &Window) {
+        let (scr_w, scr_h) = self.screen_size;
+        if scr_w <= 1 || scr_h <= 1 {
+            return;
+        }
+        let new_rect = match self.saved_rect_for_maximize.take() {
+            Some(prev) => prev,
+            None => {
+                self.saved_rect_for_maximize = Some(self.window_rect);
+                WindowRect {
+                    x: 0,
+                    y: 0,
+                    w: scr_w,
+                    h: scr_h,
+                }
+            }
+        };
+
+        if new_rect.w == self.window_rect.w
+            && new_rect.h == self.window_rect.h
+            && new_rect.x == self.window_rect.x
+            && new_rect.y == self.window_rect.y
+        {
+            return;
+        }
+
+        let size_changed = new_rect.w != self.window_rect.w || new_rect.h != self.window_rect.h;
+        self.window_rect = new_rect;
+
+        if size_changed {
+            self.viewport = Viewport::new(new_rect.w, new_rect.h).with_ru(self.viewport.ru);
+            let win_px = (new_rect.w as usize) * (new_rect.h as usize);
+            self.scratch = vec![0u32; win_px];
+            self.clip_mask = vec![255u8; win_px];
+            self.pending_full_repaint = true;
+
+            if let Some(text) = self.text.as_mut() {
+                let mut ctx = Context {
+                    viewport: self.viewport,
+                    text,
+                    clip_mask: &mut self.clip_mask,
+                    damage: &mut self.pending_damage,
+                    window,
+                    modifiers: self.modifiers,
+                    cursor_x: self.cursor_x - self.window_rect.x as Coord,
+                    cursor_y: self.cursor_y - self.window_rect.y as Coord,
+                    is_maximized: self.saved_rect_for_maximize.is_some(),
+                    damage_clip: crate::canvas::PixelRect::new(
+                        0,
+                        0,
+                        self.viewport.width_px as usize,
+                        self.viewport.height_px as usize,
+                    ),
+                };
+                self.app.on_resize(new_rect.w, new_rect.h, &mut ctx);
+            }
+        } else {
+            // Position-only change still needs a full repaint — the old window_rect's pixels in persistent_screen are stale.
+            self.pending_full_repaint = true;
+        }
+
+        #[cfg(target_os = "linux")]
+        x11_atomic::set_input_region(window, new_rect.x, new_rect.y, new_rect.w, new_rect.h);
+
+        window.request_redraw();
     }
 
     /// Begin a self-driven resize drag. In the fullscreen-compositor model we resize `window_rect` inside our own screen buffer instead of asking the OS to resize the OS window (which is fullscreen). Captures the start geometry (window_rect size + position) and the screen-space cursor anchor; subsequent cursor moves compute the new (w, h, x, y) by delta from these starting values.
@@ -759,6 +850,11 @@ impl<A: FluorApp> DesktopShell<A> {
             return;
         }
 
+        // Manual resize invalidates any saved-for-maximize rect: the user has picked a new "natural" size and that's what the next un-maximize should restore to. Clearing here means the next ToggleMaximized will save the post-resize rect, not the pre-toggle one.
+        if size_changed {
+            self.saved_rect_for_maximize = None;
+        }
+
         self.window_rect = WindowRect {
             x: new_x,
             y: new_y,
@@ -786,6 +882,7 @@ impl<A: FluorApp> DesktopShell<A> {
                     modifiers: self.modifiers,
                     cursor_x: self.cursor_x - self.window_rect.x as Coord,
                     cursor_y: self.cursor_y - self.window_rect.y as Coord,
+                    is_maximized: self.saved_rect_for_maximize.is_some(),
                     damage_clip: crate::canvas::PixelRect::new(0, 0, self.viewport.width_px as usize, self.viewport.height_px as usize),
                 };
                 self.app.on_resize(new_w, new_h, &mut ctx);
@@ -885,6 +982,7 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 modifiers: self.modifiers,
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
                 cursor_y: self.cursor_y - self.window_rect.y as Coord,
+                is_maximized: self.saved_rect_for_maximize.is_some(),
                 damage_clip: crate::canvas::PixelRect::new(0, 0, self.viewport.width_px as usize, self.viewport.height_px as usize),
             };
             self.app.init(&mut ctx);
@@ -920,6 +1018,7 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 modifiers: self.modifiers,
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
                 cursor_y: self.cursor_y - self.window_rect.y as Coord,
+                is_maximized: self.saved_rect_for_maximize.is_some(),
                 damage_clip: crate::canvas::PixelRect::new(0, 0, self.viewport.width_px as usize, self.viewport.height_px as usize),
             };
             self.app.tick(&mut ctx)
@@ -1006,6 +1105,7 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                                 cursor_x: self.cursor_x - new_x as Coord,
                                 cursor_y: self.cursor_y - new_y as Coord,
                                 damage_clip: crate::canvas::PixelRect::new(0, 0, self.viewport.width_px as usize, self.viewport.height_px as usize),
+                                is_maximized: self.saved_rect_for_maximize.is_some(),
                             };
                             self.app.on_resize(new_w, new_h, &mut ctx);
                         }
@@ -1063,6 +1163,7 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                         modifiers: self.modifiers,
                         cursor_x: self.cursor_x - self.window_rect.x as Coord,
                         cursor_y: self.cursor_y - self.window_rect.y as Coord,
+                        is_maximized: self.saved_rect_for_maximize.is_some(),
                         damage_clip: crate::canvas::PixelRect::new(0, 0, self.viewport.width_px as usize, self.viewport.height_px as usize),
                     };
                     let response = self.app.on_event(&event, &mut ctx);
@@ -1197,6 +1298,7 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
                 modifiers: self.modifiers,
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
                 cursor_y: self.cursor_y - self.window_rect.y as Coord,
+                is_maximized: self.saved_rect_for_maximize.is_some(),
                 damage_clip: crate::canvas::PixelRect::new(0, 0, self.viewport.width_px as usize, self.viewport.height_px as usize),
             };
             self.app
@@ -1218,6 +1320,7 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
                 modifiers: self.modifiers,
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
                 cursor_y: self.cursor_y - self.window_rect.y as Coord,
+                is_maximized: self.saved_rect_for_maximize.is_some(),
                 damage_clip: crate::canvas::PixelRect::new(0, 0, self.viewport.width_px as usize, self.viewport.height_px as usize),
             };
             let response = self.app.on_event(&event, &mut ctx);
