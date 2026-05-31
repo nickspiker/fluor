@@ -26,6 +26,30 @@ pub struct Icon {
     pub pixels: Vec<u32>,
 }
 
+#[cfg(feature = "host-winit")]
+impl Icon {
+    /// Convert to a [`winit::window::Icon`] for the OS taskbar / window-list / alt-tab. Flips fluor's darkness-packed RGB back to visible RGB and reshapes into the row-major `[R, G, B, A, ...]` byte layout winit expects. Returns `None` if winit rejects the byte buffer (size mismatch — shouldn't happen with our own decoder but the conversion API is fallible).
+    ///
+    /// **Why this lives on Icon**: the orb file IS the canonical app-identity asset; baking the OS-icon path into the same struct keeps the chrome's `app_icon` and the OS taskbar icon perfectly synced — set one, set the other.
+    pub fn to_winit_icon(&self) -> Option<winit::window::Icon> {
+        let n = self.pixels.len();
+        let mut rgba: Vec<u8> = Vec::with_capacity(n * 4);
+        for &p in &self.pixels {
+            // fluor pixel is 0xααDDDDDD where DDDDDD is darkness; flip via XOR with 0x00FF_FFFF to get visible RGB.
+            let visible = p ^ 0x00FF_FFFF;
+            let a = ((visible >> 24) & 0xFF) as u8;
+            let r = ((visible >> 16) & 0xFF) as u8;
+            let g = ((visible >> 8) & 0xFF) as u8;
+            let b = (visible & 0xFF) as u8;
+            rgba.push(r);
+            rgba.push(g);
+            rgba.push(b);
+            rgba.push(a);
+        }
+        winit::window::Icon::from_rgba(rgba, self.width, self.height).ok()
+    }
+}
+
 #[derive(Debug)]
 pub enum IconError {
     /// VSF parse or structural problem (header, section, field).
