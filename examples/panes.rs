@@ -146,7 +146,7 @@ impl PanesDemo {
 
         // Placeholder textbox + groups — actual geometry computed in `init`/`on_resize`.
         // Solid-fill-only iteration: textbox_group has just the content layer in its program. We still allocate a glow layer slot so the existing rasterize loop can clear it without panicking, but we don't fold it into the composite — that avoids double premultiplication (an empty glow on top of content via under() premultiplies content once, then `flatten_into` to target premultiplies it again, brightening every AA edge). When we wire glow back in we'll choose a compose that does the math correctly.
-        let mut textbox = Textbox::new(0.0, 0.0, 1.0, 1.0, 12.0);
+        let mut textbox = Textbox::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 12.0);
         textbox.stroke_ru = 1. / 12.; // thin-but-non-zero so the diagonal two-tone reads as a visible band, not just a hairline
         let placeholder_region = Region::new(0.0, 0.0, 1.0, 1.0);
         let mut textbox_group = Group::new(placeholder_region, BlendMode::Normal);
@@ -284,9 +284,9 @@ impl FluorApp for PanesDemo {
                 let new_hit = self.chrome.hit_at(ctx.cursor_x, ctx.cursor_y);
                 let chrome_changed = self.chrome.set_hover(new_hit);
                 let new_textbox_hover = new_hit == HIT_TEXTBOX;
-                let textbox_changed = self.textbox.hovered != new_textbox_hover;
+                let textbox_changed = self.textbox.is_hovered() != new_textbox_hover;
                 if textbox_changed {
-                    self.textbox.hovered = new_textbox_hover;
+                    self.textbox.set_hovered(new_textbox_hover);
                     self.textbox_group.invalidate();
                 }
                 if chrome_changed || textbox_changed {
@@ -296,9 +296,9 @@ impl FluorApp for PanesDemo {
             }
             WindowEvent::CursorLeft { .. } => {
                 let chrome_changed = self.chrome.set_hover(HIT_NONE);
-                let textbox_changed = self.textbox.hovered;
+                let textbox_changed = self.textbox.is_hovered();
                 if textbox_changed {
-                    self.textbox.hovered = false;
+                    self.textbox.set_hovered(false);
                     self.textbox_group.invalidate();
                 }
                 if chrome_changed || textbox_changed {
@@ -332,9 +332,9 @@ impl FluorApp for PanesDemo {
                     self.selection_scroll_time = None;
                     return EventResponse::StartResize(edge);
                 }
-                let was_focused = self.textbox.focused;
+                let was_focused = self.textbox.is_focused();
                 self.textbox.handle_click(ctx.cursor_x, ctx.cursor_y);
-                if self.textbox.focused {
+                if self.textbox.is_focused() {
                     // Multi-click sequence: continuation iff the gap to the previous press is within the OS double-click interval AND the cursor hasn't moved more than `MULTI_CLICK_TOL_PX`. count==2 → word-select around current cursor; count==3 → select-all. Reset to 1 on a non-continuation. We let `handle_click` set the cursor first so the word-select probe targets the actual clicked char.
                     let now = Instant::now();
                     let is_continuation = match self.last_click_time {
@@ -545,7 +545,7 @@ impl FluorApp for PanesDemo {
                 if kev.state != ElementState::Pressed {
                     return EventResponse::Pass;
                 }
-                if !self.textbox.focused {
+                if !self.textbox.is_focused() {
                     return EventResponse::Pass;
                 }
                 let mut changed = false;
@@ -699,9 +699,9 @@ impl FluorApp for PanesDemo {
         if let Some(c) = fluor::host::chrome_widget::hover_color_for(self.chrome.hover_state) {
             t[self.chrome.hover_state as usize] = c;
         }
-        t[HIT_TEXTBOX as usize] = if self.textbox.focused {
+        t[HIT_TEXTBOX as usize] = if self.textbox.is_focused() {
             paint::wrap_sub_rgb(fluor::theme::TEXTBOX_ACTIVE, fluor::theme::TEXTBOX_FILL)
-        } else if self.textbox.hovered {
+        } else if self.textbox.is_hovered() {
             paint::wrap_sub_rgb(fluor::theme::TEXTBOX_HOVER, fluor::theme::TEXTBOX_FILL)
         } else {
             0

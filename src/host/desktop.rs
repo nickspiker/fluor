@@ -178,7 +178,9 @@ impl DesktopApp {
             tb.set_rect(center_x, center_y, width, height);
             tb.set_font_size(font_size, text);
         } else {
-            let mut tb = Textbox::new(center_x, center_y, width, height, font_size);
+            // Legacy desktop shim — allocates its own hit-id counter starting from a fixed offset past the chrome IDs (1..=4). Standalone path; chrome IDs in `desktop` happen to be hardcoded constants and don't go through the new allocator, so we pick `5` as the first textbox ID.
+            let mut counter: HitId = 4;
+            let mut tb = Textbox::new(&mut counter, center_x, center_y, width, height, font_size);
             tb.set_font_size(font_size, text);
             self.demo_textbox = Some(tb);
         }
@@ -949,9 +951,9 @@ impl ApplicationHandler for DesktopApp {
                 }
                 // Textbox click — focus + cursor positioning if inside, defocus otherwise.
                 if let Some(tb) = self.demo_textbox.as_mut() {
-                    let was_focused = tb.focused;
+                    let was_focused = tb.is_focused();
                     tb.handle_click(self.cursor_x, self.cursor_y);
-                    if tb.focused {
+                    if tb.is_focused() {
                         self.is_dragging_select = true;
                         self.selection_scroll_time = None;
                         if let Some(g) = self.textbox_group.as_mut() {
@@ -1015,7 +1017,7 @@ impl ApplicationHandler for DesktopApp {
                 let Some(tb) = self.demo_textbox.as_mut() else {
                     return;
                 };
-                if !tb.focused {
+                if !tb.is_focused() {
                     return;
                 }
                 let Some(text) = self.text.as_mut() else {
