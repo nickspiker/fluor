@@ -43,7 +43,11 @@ const CHORD_HINTS: &[(&str, &str)] = &[
 ];
 
 /// Compute the bbox the chord hint panel covers — matches `paint::draw_chord_hint`'s positioning math so `panes.damage_rect` can include it when both brackets are held.
-fn chord_hint_bbox(viewport: fluor::geom::Viewport, vw: usize, vh: usize) -> fluor::canvas::PixelRect {
+fn chord_hint_bbox(
+    viewport: fluor::geom::Viewport,
+    vw: usize,
+    vh: usize,
+) -> fluor::canvas::PixelRect {
     let span = viewport.effective_span();
     let font_size = (span * 0.014).max(11.0);
     let line_h = font_size * 1.55;
@@ -180,8 +184,8 @@ impl PanesDemo {
         let center_x = vp.width_px as Coord * 0.5 + (aspect - 1.0) * span * 0.25;
         let center_y = bw * 7.0;
         let width = (vp.width_px as Coord * 0.5).max(bw * 8.0);
-        let height = bw * 1.6;
-        let font_size = bw * 0.55;
+        let height = bw * 2.;
+        let font_size = bw;
         self.textbox.set_rect(center_x, center_y, width, height);
         self.textbox.set_font_size(font_size, ctx.text);
 
@@ -430,7 +434,11 @@ impl FluorApp for PanesDemo {
                             let next = (cur + 1) % 3;
                             paint::DEBUG_SHOW_ALPHA
                                 .store(next, std::sync::atomic::Ordering::Relaxed);
-                            let label = match next { 0 => "off", 1 => "grayscale", _ => "force-opaque" };
+                            let label = match next {
+                                0 => "off",
+                                1 => "grayscale",
+                                _ => "force-opaque",
+                            };
                             eprintln!("[]a show-alpha = {} ({})", next, label);
                         } else if ac == 'c' {
                             let cur =
@@ -476,8 +484,8 @@ impl FluorApp for PanesDemo {
                             eprintln!("[]d screen-decay = {}", !cur);
                         } else if ac == 'b' {
                             // Toggle the finalize's opaque-scan blue-tint visualization. Each finalize-written pixel (clip_mask == 255) gets +16 to its blue byte (saturating). On []b transition the host promotes the next frame to a full_repaint, so toggling visibly washes the entire silhouette interior in one shot.
-                            let cur =
-                                paint::DEBUG_SHOW_OPAQUE_SCAN.load(std::sync::atomic::Ordering::Relaxed);
+                            let cur = paint::DEBUG_SHOW_OPAQUE_SCAN
+                                .load(std::sync::atomic::Ordering::Relaxed);
                             paint::DEBUG_SHOW_OPAQUE_SCAN
                                 .store(!cur, std::sync::atomic::Ordering::Relaxed);
                             eprintln!("[]b opaque-scan tint = {}", !cur);
@@ -657,7 +665,6 @@ impl FluorApp for PanesDemo {
         };
         t
     }
-
 
     fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
         let buf_w = ctx.viewport.width_px as usize;
