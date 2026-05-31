@@ -811,11 +811,11 @@ pub static RASTERIZE_OPS: std::sync::atomic::AtomicU64 =
 pub static DEBUG_SHOW_FPS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Debug toggle that overlays a 2-px magenta hairline around the damage rect the host repaints this frame. Bound to the `[]w` chord ("Where"). Drawn directly into the platform back buffer AFTER `persistent_screen` has been copied in, BEFORE `present()`. The outline never enters `persistent_screen`, never flows through finalize, and never survives more than one frame — so toggling it on/off needs no full-repaint promotion and there is no stale-bbox state to carry between frames. `false` by default.
+/// Debug toggle that overlays a 1-px magenta hairline around the damage rect the host repaints this frame. Bound to the `[]w` chord ("Where"). Drawn directly into the platform back buffer AFTER `persistent_screen` has been copied in, BEFORE `present()`. The outline never enters `persistent_screen`, never flows through finalize, and never survives more than one frame — so toggling it on/off needs no full-repaint promotion and there is no stale-bbox state to carry between frames. `false` by default.
 pub static DEBUG_SHOW_DAMAGE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Stamp a 2-pixel magenta hairline around `bbox` directly into the screen-sized, visible-RGB back buffer. `bbox` is window-local; `offset_x` / `offset_y` are the window's top-left in screen space. Pure overwrite — no blending, no `under` path, no damage tracking. Caller invokes between `copy_from_slice(&persistent_screen)` and `buffer.present()` so the magenta lives for exactly one frame.
+/// Stamp a 1-pixel magenta hairline around `bbox` directly into the screen-sized, visible-RGB back buffer. `bbox` is window-local; `offset_x` / `offset_y` are the window's top-left in screen space. Pure overwrite — no blending, no `under` path, no damage tracking. Caller invokes between `copy_from_slice(&persistent_screen)` and `buffer.present()` so the magenta lives for exactly one frame.
 pub fn stamp_damage_outline_visible(
     buf: &mut [u32],
     scr_w: usize,
@@ -824,7 +824,6 @@ pub fn stamp_damage_outline_visible(
     offset_x: i32,
     offset_y: i32,
 ) {
-    const STROKE: usize = 2;
     const MAGENTA: u32 = 0xFFFF_00FF;
     if bbox.is_empty() || scr_w == 0 || scr_h == 0 {
         return;
@@ -841,36 +840,29 @@ pub fn stamp_damage_outline_visible(
         return;
     }
 
-    // Top band.
-    let top_end = (y0 + STROKE).min(y1);
-    for py in y0..top_end {
-        let row = py * scr_w;
+    // Top row.
+    let top_row = y0 * scr_w;
+    for px in x0..x1 {
+        buf[top_row + px] = MAGENTA;
+    }
+    // Bottom row — only paint if distinct from the top (i.e., rect is ≥ 2 tall); otherwise the top row already covered it.
+    if y1 - 1 > y0 {
+        let bot_row = (y1 - 1) * scr_w;
         for px in x0..x1 {
-            buf[row + px] = MAGENTA;
+            buf[bot_row + px] = MAGENTA;
         }
     }
-    // Bottom band — clamped so it never overlaps the top on a < 2·STROKE tall rect.
-    let bot_start = y1.saturating_sub(STROKE).max(top_end);
-    for py in bot_start..y1 {
-        let row = py * scr_w;
-        for px in x0..x1 {
-            buf[row + px] = MAGENTA;
-        }
-    }
-    // Left column (interior rows only).
-    let left_end = (x0 + STROKE).min(x1);
-    for py in top_end..bot_start {
-        let row = py * scr_w;
-        for px in x0..left_end {
-            buf[row + px] = MAGENTA;
-        }
-    }
-    // Right column.
-    let right_start = x1.saturating_sub(STROKE).max(left_end);
-    for py in top_end..bot_start {
-        let row = py * scr_w;
-        for px in right_start..x1 {
-            buf[row + px] = MAGENTA;
+    // Left and right columns (interior rows only — corners are claimed by the top/bottom rows).
+    let interior_y0 = y0 + 1;
+    let interior_y1 = y1.saturating_sub(1);
+    if interior_y0 < interior_y1 {
+        let right_col = x1 - 1;
+        for py in interior_y0..interior_y1 {
+            let row = py * scr_w;
+            buf[row + x0] = MAGENTA;
+            if right_col > x0 {
+                buf[row + right_col] = MAGENTA;
+            }
         }
     }
 }

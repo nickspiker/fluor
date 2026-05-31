@@ -47,16 +47,26 @@ pub struct Textbox {
     /// If Some, the anchor index where the selection started (shift+click or shift+arrow).
     pub selection_anchor: Option<usize>,
 
-    // --- Photon-style differential cache ---
-    /// Persistent painted pill (α + darkness, post-composed from-empty). Bbox-sized. Squircle re-rasterizes only when [`cache_dirty`] is set (geometry / zoom change); hover / focus state shifts mutate this buffer in place via wrap-add/sub of a tint delta.
-    cache: Vec<u32>,
-    cache_w: usize,
-    cache_h: usize,
-    /// Viewport-space top-left where the cache should blit. Recomputed in `render_content_into` from `(center_x − width/2, center_y − height/2)` after offset.
-    cache_origin_x: isize,
-    cache_origin_y: isize,
-    /// `true` → squircle needs full re-rasterize on the next render. Set by `set_rect` / `set_font_size`. Cleared at end of cache rasterize. The cache stores the BASE-color (TEXTBOX_FILL) squircle; hover / focus tints are applied in-flight during blit, never baked into the cache.
-    cache_dirty: bool,
+    // --- Three-layer cache (front-to-back composition via under()) ---
+    // Pill bg (bottom): squircle fill + AA edges. Rarely changes (geometry / zoom only).
+    // Text glyphs (top, painted first to claim opaque pixels): per-char rasterized via TextRenderer. Changes on text edits.
+    // Selection bg (middle): painted fresh each frame from the cursor / selection_anchor range — no cache needed, it's just a colored rect.
+    //
+    // Composition each frame: text_cache → target via under() (topmost wins on its opaque glyph pixels), selection rect → target via under() (claims empty selection-range cells beneath the glyphs), pill_cache → target via under() (fills remaining empty pill-interior cells beneath both). Result reads as the textbook text-field selection look: glyph colour unchanged over both selection and non-selection backgrounds.
+    pill_cache: Vec<u32>,
+    pill_cache_w: usize,
+    pill_cache_h: usize,
+    /// Viewport-space top-left where the pill cache should blit. Recomputed in `render_content_into`.
+    pill_cache_origin_x: isize,
+    pill_cache_origin_y: isize,
+    /// `true` → pill squircle needs re-rasterize on the next render. Set by `set_rect` / `set_font_size`.
+    pill_cache_dirty: bool,
+    /// Pre-rasterized text glyphs in α + darkness. Bbox-sized (same dims as pill_cache). Glyph pixels are opaque; surrounding cells are α = 0 so under()-blits expose whatever's below (selection bg or pill bg).
+    text_cache: Vec<u32>,
+    text_cache_w: usize,
+    text_cache_h: usize,
+    /// `true` → text glyphs need re-rasterize on the next render. Set by every text-mutating method (insert_char, backspace, etc.) and by geometry / font-size changes.
+    text_cache_dirty: bool,
 
     // --- Blinkey state (paints into scratch each frame as part of render_content_into) ---
     /// Was the blinkey rendered last frame? Used by [`damage_rect`] to union the prior cursor_bbox into this frame's damage so a blink-off transition (or a cursor move while blinking) clears the old position cleanly.
@@ -195,12 +205,16 @@ impl Textbox {
             blinkey_visible: false,
             blinkey_wave_top: true,
             selection_anchor: None,
-            cache: Vec::new(),
-            cache_w: 0,
-            cache_h: 0,
-            cache_origin_x: 0,
-            cache_origin_y: 0,
-            cache_dirty: true,
+            pill_cache: Vec::new(),
+            pill_cache_w: 0,
+            pill_cache_h: 0,
+            pill_cache_origin_x: 0,
+            pill_cache_origin_y: 0,
+            pill_cache_dirty: true,
+            text_cache: Vec::new(),
+            text_cache_w: 0,
+            text_cache_h: 0,
+            text_cache_dirty: true,
             last_painted_bbox: None,
             last_painted_focused: false,
             last_painted_blinkey_on: false,
@@ -219,7 +233,7 @@ impl Textbox {
     /// Picks the right bbox flavor: `glow_bbox` if glow is currently OR was previously painted; `bbox` for the bare-pill steady state. Hover transitions never report damage here — the tint lives in the host overlay pass.
     pub fn damage_rect(&self, viewport_w: usize, viewport_h: usize) -> Option<PixelRect> {
         let focus_changed = self.focused != self.last_painted_focused;
-        let pill_dirty = self.cache_dirty || focus_changed;
+        let pill_dirty = self.pill_cache_dirty || self.text_cache_dirty || focus_changed;
 
         // Blinkey contribution: if it'll be on this frame OR was on last frame, the cursor_bbox needs to be in damage so it can be redrawn (or cleared). Tiny rect — typically ~16 × font_size.
         let blinkey_want = self.focused && !self.has_selection() && self.blinkey_visible;
@@ -239,10 +253,10 @@ impl Textbox {
             });
         };
 
-        // Pill bbox (current + prev) — same logic as before, contributes only when pill is dirty.
+        // Pill bbox (current + prev) — contributes only when pill is dirty. Glow padding is included ONLY when the glow itself is changing this frame: focus transition (paint or clear glow), or pill geometry change (glow moves with the pill). Steady-state text editing while focused keeps the glow exactly where it was last frame — glow rays source from the pill silhouette which doesn't move with text edits — so damage stays inside the bare pill `bbox` and the glow region in `persistent_screen` is untouched. Cuts damage area ~3× on every keystroke compared to including the glow envelope.
         if pill_dirty {
-            let need_glow = self.focused || self.last_painted_focused;
-            let current_region = if need_glow { self.glow_bbox() } else { self.bbox() };
+            let need_glow_damage = focus_changed || self.pill_cache_dirty;
+            let current_region = if need_glow_damage { self.glow_bbox() } else { self.bbox() };
             let current_rect = region_to_pixelrect(current_region, viewport_w, viewport_h);
             union_in(&mut combined, current_rect);
             if let Some(prev) = self.last_painted_bbox {
@@ -264,10 +278,9 @@ impl Textbox {
         combined.filter(|r| !r.is_empty())
     }
 
-    /// Record the bbox we just painted into and the focus/hover/blinkey state that drove it — called at the tail of [`render_content_into`] so the next frame's [`damage_rect`] knows what to union with.
+    /// Record the bbox we just painted into and the focus/hover/blinkey state that drove it — called at the tail of [`render_content_into`] so the next frame's [`damage_rect`] knows what to union with. Always records the bare `bbox` (no glow padding) so the next frame's prev-union doesn't inflate steady-state damage back to `glow_bbox`. The glow envelope only enters damage on focus transitions or pill geometry changes, both of which `damage_rect` handles via `need_glow_damage` independently of `last_painted_bbox`.
     fn record_painted(&mut self, viewport_w: usize, viewport_h: usize) {
-        let need_glow = self.focused;
-        let region = if need_glow { self.glow_bbox() } else { self.bbox() };
+        let region = self.bbox();
         let rect = region_to_pixelrect(region, viewport_w, viewport_h);
         self.last_painted_bbox = if rect.is_empty() { None } else { Some(rect) };
         self.last_painted_focused = self.focused;
@@ -282,9 +295,10 @@ impl Textbox {
         };
     }
 
-    /// Force a full cache rasterize on the next `render_content_into`. Call after any geometry/zoom change that affects the squircle shape.
+    /// Force a full cache rasterize on the next `render_content_into`. Call after any geometry/zoom change that affects the squircle shape OR text layout (both caches are invalidated so they re-rasterize together — geometry change forces glyph positions to be reflowed too).
     pub fn invalidate_cache(&mut self) {
-        self.cache_dirty = true;
+        self.pill_cache_dirty = true;
+        self.text_cache_dirty = true;
     }
 
     /// True if pixel `(x, y)` is inside the textbox's bare bbox rect (`width × height`, NO glow padding). This is a rectangular check, NOT shape-aware — square bbox corners outside the squircle return `true`. For pill-silhouette-accurate hit testing in a chrome-integrated app, prefer `chrome.hit_at(x, y) == HIT_TEXTBOX` (chrome's hit_test_map is stamped with the actual pill shape by the textbox stroke pass). This method is the fallback for chrome-less consumers and for internal click routing where coarse bbox accuracy is acceptable.
@@ -299,7 +313,8 @@ impl Textbox {
 
     pub fn set_rect(&mut self, center_x: Coord, center_y: Coord, width: Coord, height: Coord) {
         if self.center_x != center_x || self.center_y != center_y || self.width != width || self.height != height {
-            self.cache_dirty = true;
+            self.pill_cache_dirty = true;
+            self.text_cache_dirty = true;
         }
         self.center_x = center_x;
         self.center_y = center_y;
@@ -309,7 +324,8 @@ impl Textbox {
 
     pub fn set_font_size(&mut self, font_size: Coord, text: &mut TextRenderer) {
         if self.font_size != font_size {
-            self.cache_dirty = true;
+            self.pill_cache_dirty = true;
+            self.text_cache_dirty = true;
         }
         self.font_size = font_size;
         self.recalc_widths(text);
@@ -324,6 +340,8 @@ impl Textbox {
             let w = text.measure_text_width(s, self.font_size, 400, self.font);
             self.widths.push(w);
         }
+        // Any width recompute → text content or font changed → glyph layer must re-rasterize.
+        self.text_cache_dirty = true;
     }
 
     /// Total text width in pixels.
@@ -572,18 +590,19 @@ impl Textbox {
         )
     }
 
-    /// Compute the `factor_256` decay multiplier for this textbox's current `font_size`. Single source of truth used by both [`Self::glow_bbox`] (to size the bbox padding to the actual ray reach) and the focus-glow render pass (to drive the per-pixel α taper). Matches the chrome shadow's `target_radius`/`drop` formula — RU-invariant since `target_radius` scales with `font_size`.
-    fn glow_factor_256(font_size: f32) -> u32 {
-        let target_radius = (font_size * 3.0).max(8.0);
+    /// Compute the `factor_256` decay multiplier for this textbox's current `font_size`, parameterised by `radius_scale` (the multiplier on `font_size` that defines the half-life-ish reach). Single source of truth for both [`Self::glow_bbox`] (sizing the bbox padding to the actual ray reach) and the focus-glow render pass (driving the per-pixel α taper). Matches the chrome shadow's `target_radius`/`drop` formula — RU-invariant since `target_radius` scales with `font_size`. Smaller `radius_scale` → steeper decay → shorter reach (intensity at each pixel stays the same, gradient just compresses).
+    fn glow_factor_256(font_size: f32, radius_scale: f32) -> u32 {
+        let target_radius = (font_size * radius_scale).max(8.0);
         let drop = (1240.0 / target_radius) as u32;
         (256u32.saturating_sub(drop)).clamp(96, 254)
     }
 
-    /// Larger bbox with the actual focus-glow ray reach added on every side. Horizontal sides use the 0x80 seed reach (the left/right rays' actual decay length); vertical sides use the 0x40 seed reach (the top/bottom rays' shorter decay since they start at half intensity). Both derived from the same `factor_256` the render pass uses so the bbox exactly contains what `apply_textbox_glow_{right,left,top,bottom}` will paint — no early cutoff, no over-clearing. Use this for the focus-on / focus-off transition (glow appearing / disappearing) — the only time we need to repaint the wider halo region. Keep off the per-keystroke hot path.
+    /// Larger bbox with the actual focus-glow ray reach added on every side. Horizontal sides use the 0x80 seed reach with the horizontal radius scale (`1.5`); vertical sides use the 0x40 seed reach with the vertical radius scale (`0.75`, half the horizontal so the top/bottom halo is more contained while keeping the same per-pixel intensity at the boundary). Both derived from the same `factor_256` math the render pass uses, so the bbox exactly contains what `apply_textbox_glow_{right,left,top,bottom}` will paint — no early cutoff, no over-clearing. Use this for the focus-on / focus-off transition (glow appearing / disappearing) — the only time we need to repaint the wider halo region. Keep off the per-keystroke hot path.
     pub fn glow_bbox(&self) -> Region {
-        let factor_256 = Self::glow_factor_256(self.font_size);
-        let horiz_pad = crate::paint::ray_reach_px(0x80, factor_256) as f32;
-        let vert_pad = crate::paint::ray_reach_px(0x40, factor_256) as f32;
+        let horiz_factor = Self::glow_factor_256(self.font_size, 1.5);
+        let vert_factor = Self::glow_factor_256(self.font_size, 0.75);
+        let horiz_pad = crate::paint::ray_reach_px(0x80, horiz_factor) as f32;
+        let vert_pad = crate::paint::ray_reach_px(0x40, vert_factor) as f32;
         Region::new(
             self.center_x - self.width * 0.5 - horiz_pad,
             self.center_y - self.height * 0.5 - vert_pad,
@@ -620,7 +639,7 @@ impl Textbox {
         canvas: &mut crate::canvas::Canvas,
         offset_x: Coord,
         offset_y: Coord,
-        _text: &mut TextRenderer,
+        text: &mut TextRenderer,
         clip: Option<Clip>,
         _mask: Option<&paint::AlphaMask>,
         hit_map: Option<&mut [u8]>,
@@ -634,25 +653,25 @@ impl Textbox {
         if pill_w <= 0 || pill_h <= 0 {
             return;
         }
+        let cw = pill_w as usize;
+        let ch = pill_h as usize;
+        let squirdleyness = 3i32;
+        let stroke_px = (self.stroke_ru * self.font_size) as isize + 1;
 
-        // --- Cache rasterize (full squircle repaint), only when geometry changed ---
-        if self.cache_dirty {
+        // --- Pill cache rasterize (squircle fill + AA edges), only when geometry / zoom changed ---
+        if self.pill_cache_dirty {
             paint::RASTERIZE_OPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            let cw = pill_w as usize;
-            let ch = pill_h as usize;
-            self.cache.clear();
-            self.cache.resize(cw * ch, 0);
-            self.cache_w = cw;
-            self.cache_h = ch;
+            self.pill_cache.clear();
+            self.pill_cache.resize(cw * ch, 0);
+            self.pill_cache_w = cw;
+            self.pill_cache_h = ch;
 
-            let squirdleyness = 3i32;
             let mut cache_damage = crate::canvas::Damage::new();
             let mut cache_canvas = crate::canvas::Canvas::new(
-                &mut self.cache, cw, ch, &mut cache_damage,
+                &mut self.pill_cache, cw, ch, &mut cache_damage,
             );
 
             // Paint into cache at LOCAL coords (origin = 0,0) so it's blit-translatable.
-            let stroke_px = (self.stroke_ru * self.font_size) as isize + 1;
             let inner_x = stroke_px;
             let inner_y = stroke_px;
             let inner_w = (pill_w - 2 * stroke_px).max(0);
@@ -680,17 +699,98 @@ impl Textbox {
                 None,
                 0,
             );
-            self.cache_dirty = false;
+            self.pill_cache_dirty = false;
         }
 
-        self.cache_origin_x = pill_x_target;
-        self.cache_origin_y = pill_y_target;
+        // --- Text cache rasterize (glyphs via TextRenderer), only when text or geometry changed ---
+        if self.text_cache_dirty {
+            paint::RASTERIZE_OPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            self.text_cache.clear();
+            self.text_cache.resize(cw * ch, 0);
+            self.text_cache_w = cw;
+            self.text_cache_h = ch;
 
-        // Cache stays in its base FILL state forever. Hover / focused tints are applied by the host overlay pass against persistent_screen, not here.
+            if !self.chars.is_empty() && self.font_size > 0.0 {
+                // Local x where the text starts (mirrors `text_start_x()` but in LOCAL pill coords).
+                let tw = self.text_width();
+                let uw = self.usable_width();
+                let local_text_start_x = if tw <= uw {
+                    (pill_w as Coord - tw) * 0.5
+                } else {
+                    (pill_w as Coord - tw) * 0.5 + self.scroll_offset
+                };
+                let local_y_center = pill_h as Coord * 0.5;
+                let pad = self.padding() as usize;
+                let clip_x_end = cw.saturating_sub(pad);
+                if pad < clip_x_end {
+                    let inner_clip = paint::Clip::new(pad, 0, clip_x_end, ch);
+                    let mut text_damage = crate::canvas::Damage::new();
+                    let mut text_canvas = crate::canvas::Canvas::new(
+                        &mut self.text_cache, cw, ch, &mut text_damage,
+                    );
+                    let s: String = self.chars.iter().collect();
+                    text.draw_text_left_u32(
+                        &mut text_canvas,
+                        &s,
+                        local_text_start_x,
+                        local_y_center,
+                        self.font_size,
+                        400,
+                        theme::TEXTBOX_TEXT,
+                        self.font,
+                        Some(inner_clip),
+                        None,
+                        None,
+                    );
+                }
+            }
+            self.text_cache_dirty = false;
+        }
+
+        self.pill_cache_origin_x = pill_x_target;
+        self.pill_cache_origin_y = pill_y_target;
+
+        // --- Three-layer composition via under() — topmost first (fluor front-to-back) ---
+        // Step 1: text glyphs (topmost). Opaque glyph pixels claim their cells in target; surrounding empties don't write (α=0 in text_cache). No hit_map writes — pill layer stamps that.
         blit_cache_to_target(
-            &self.cache,
-            self.cache_w,
-            self.cache_h,
+            &self.text_cache,
+            self.text_cache_w,
+            self.text_cache_h,
+            pill_x_target,
+            pill_y_target,
+            canvas,
+            None,
+            0,
+            clip,
+        );
+
+        // Step 2: selection background (middle). Painted as a rect via fill_rect (which uses under() too), so glyph pixels already in target stay put; only empty cells inside the selection's pixel range get the selection colour. Skipped when no selection exists.
+        if let Some((sel_start, sel_end)) = self.selection_range() {
+            let text_start_v = self.text_start_x();
+            let sel_x0 = text_start_v + self.widths[..sel_start].iter().sum::<Coord>();
+            let sel_x1 = text_start_v + self.widths[..sel_end].iter().sum::<Coord>();
+            let sel_y0 = self.center_y - self.font_size * 0.5;
+            let sel_h_actual = self.font_size;
+            let sel_w = sel_x1 - sel_x0;
+            if sel_w > 0.0 && sel_h_actual > 0.0 {
+                paint::fill_rect(
+                    canvas,
+                    (sel_x0 - offset_x) as isize,
+                    (sel_y0 - offset_y) as isize,
+                    sel_w as isize,
+                    sel_h_actual as isize,
+                    theme::TEXTBOX_SELECTION_BG,
+                    clip,
+                    None,
+                );
+            }
+        }
+
+        // Step 3: pill background + AA edges (bottom). Fills the remaining empty cells inside the pill silhouette and stamps hit_map at every opaque pill pixel — so the hit area follows the pill silhouette exactly, regardless of whether each pixel ended up as glyph / selection / pill bg.
+        blit_cache_to_target(
+            &self.pill_cache,
+            self.pill_cache_w,
+            self.pill_cache_h,
             pill_x_target,
             pill_y_target,
             canvas,
@@ -701,9 +801,10 @@ impl Textbox {
 
         // --- Focus glow on target (NOT cached — paints fresh each frame against current chrome) ---
         //
-        // RU-invariant exponential falloff matching the chrome shadow: target_radius derived from font_size (3× font_size as the half-life-ish reach), factor_256 = 256 − 1240/target_radius clamped to [96, 254]. Same curve as paint_shadow; just emitted at 0°/180° (left/right) and 90°/270° (top/bottom) instead of 45° diagonals, and white instead of black. Vertical passes use half-density seed (0x40 vs horizontal 0x80) so the top/bottom halo reads softer.
+        // RU-invariant exponential falloff matching the chrome shadow: horizontal rays reach `1.5 × font_size` (half-life-ish), vertical rays half that (`0.75 × font_size`) so the top/bottom halo is more contained without changing per-pixel intensity. Same curve as paint_shadow; emitted at 0°/180° (left/right) and 90°/270° (top/bottom) instead of 45° diagonals, and white instead of black. Vertical passes also use half-density seed (0x40 vs horizontal 0x80) so the top/bottom halo reads softer.
         if self.focused {
-            let factor_256 = Self::glow_factor_256(self.font_size);
+            let horiz_factor = Self::glow_factor_256(self.font_size, 1.5);
+            let vert_factor = Self::glow_factor_256(self.font_size, 0.75);
             paint::apply_textbox_glow_right(
                 canvas,
                 pill_x_target,
@@ -712,7 +813,7 @@ impl Textbox {
                 pill_h,
                 theme::GLOW_DEFAULT,
                 0x80,
-                factor_256,
+                horiz_factor,
                 clip,
             );
             paint::apply_textbox_glow_left(
@@ -723,7 +824,7 @@ impl Textbox {
                 pill_h,
                 theme::GLOW_DEFAULT,
                 0x80,
-                factor_256,
+                horiz_factor,
                 clip,
             );
             paint::apply_textbox_glow_top(
@@ -734,7 +835,7 @@ impl Textbox {
                 pill_h,
                 theme::GLOW_DEFAULT,
                 0x40,
-                factor_256,
+                vert_factor,
                 clip,
             );
             paint::apply_textbox_glow_bottom(
@@ -745,7 +846,7 @@ impl Textbox {
                 pill_h,
                 theme::GLOW_DEFAULT,
                 0x40,
-                factor_256,
+                vert_factor,
                 clip,
             );
         }
