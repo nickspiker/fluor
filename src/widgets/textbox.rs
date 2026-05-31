@@ -4,7 +4,7 @@
 
 use crate::canvas::PixelRect;
 use crate::coord::Coord;
-use crate::paint::{self, Clip};
+use crate::paint::{self, Clip, HitId};
 use crate::region::Region;
 use crate::text::TextRenderer;
 use crate::theme;
@@ -119,8 +119,8 @@ fn blit_cache_to_target(
     origin_x: isize,
     origin_y: isize,
     canvas: &mut crate::canvas::Canvas,
-    hit_map: Option<&mut [u8]>,
-    hit_id: u8,
+    hit_map: Option<&mut [HitId]>,
+    hit_id: HitId,
     clip: Option<paint::Clip>,
 ) {
     let target_w = canvas.width;
@@ -706,8 +706,8 @@ impl Textbox {
         text: &mut TextRenderer,
         clip: Option<Clip>,
         _mask: Option<&paint::AlphaMask>,
-        hit_map: Option<&mut [u8]>,
-        hit_id: u8,
+        hit_map: Option<&mut [HitId]>,
+        hit_id: HitId,
     ) {
         let pill_x_target = (self.center_x - self.width * 0.5 - offset_x) as isize;
         let pill_y_target = (self.center_y - self.height * 0.5 - offset_y) as isize;

@@ -6,7 +6,9 @@
 //!
 //! Pattern: `chrome.rasterize_bg(|bg, w, h| { /* paint into bg */ });` → `chrome.rasterize_chrome(text);` → `chrome.rasterize_hover();` → `chrome.flatten_into(target, w, h);`. Each rasterize_* checks the layer's dirty bit internally and is a no-op on clean.
 
-use super::chrome::{self, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE};
+use super::chrome::{
+    self, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE, HitId,
+};
 use crate::coord::Coord;
 use crate::geom::Viewport;
 use crate::group::Group;
@@ -19,7 +21,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 /// Map a hit-test ID to the wrap-add hover colour the chrome paints when that button is hovered. Returns `None` for IDs that don't have a hover colour (e.g. `HIT_APP_ICON`, `HIT_NONE`) so the bake/unbake paths can no-op cleanly. Public so consumers can build per-hit overlay delta tables from the same single source of truth.
-pub fn hover_color_for(hit: u8) -> Option<u32> {
+pub fn hover_color_for(hit: HitId) -> Option<u32> {
     let c = match hit {
         chrome::HIT_CLOSE_BUTTON => theme::CLOSE_HOVER,
         chrome::HIT_MAXIMIZE_BUTTON => theme::MAXIMIZE_HOVER,
@@ -34,7 +36,7 @@ pub struct DefaultChrome {
     /// Full-viewport Group with 3 layers (bg, chrome, hover) composed via Stack Notation. Topmost-first: `Push chrome, Push bg, Under(Normal)` for the minimal scaffold; expand to include hover via `Push hover, Push chrome, Under(Add), Push bg, Under(Normal)` as the design grows.
     pub group: Group,
     /// Per-pixel button-id map. `0` = HIT_NONE; non-zero = a chrome button (`HIT_MINIMIZE_BUTTON` / `HIT_MAXIMIZE_BUTTON` / `HIT_CLOSE_BUTTON`). Sized to `width * height` pixels of the current viewport.
-    pub hit_test_map: Vec<u8>,
+    pub hit_test_map: Vec<HitId>,
     /// Window title rendered into the chrome layer (left-aligned in the controls strip). Empty string = skip text rendering.
     pub title: String,
     /// Optional bottom status bar. `None` = no bar, panes/bg fill all the way to the squircle bottom (default behaviour). `Some(text)` = paint a `button_size / 2`-tall band at the bottom with the given text left-aligned. Mutate via [`set_status_text`](Self::set_status_text) to mark the chrome layer dirty automatically.
@@ -46,7 +48,9 @@ pub struct DefaultChrome {
     /// Orb visual state. Default `OrbTint::FollowFocus` makes the orb a window-state indicator; `OrbTint::Custom` lets the app turn it into a network/recording/presence badge. Mutate via [`set_orb_tint`](Self::set_orb_tint) to mark the chrome layer dirty automatically.
     pub orb_tint: chrome::OrbTint,
     /// Currently-hovered button id (HIT_NONE if none). Consumed by the host's overlay pass to derive the visible-RGB tint delta to apply at matching `hit_test_map` pixels in persistent_screen.
-    pub hover_state: u8,
+    pub hover_state: HitId,
+    /// "Full edge" / maximized mode. When `true`, [`Self::rasterize_chrome`] skips [`chrome::draw_window_edges_and_mask`] entirely: no perimeter hairline, no corner cutout in `clip_mask`, no AA fringe — the chrome flows straight to the four screen edges. The OS surface is fullscreen anyway, the WM can't show a shadow against the screen border, and AA on a corner that's flush with the screen is wasted work. Buttons / title / app icon still rasterize as usual. Toggle via [`Self::set_full_edge`]; sync from [`super::app::Context::is_maximized`].
+    pub full_edge: bool,
     /// Last viewport passed to `new` or `resize`. Stored so chrome rasterization can read `effective_span` (= `span * ru`) and pick up the user's zoom multiplier automatically — chrome control sizing scales with the same `ceil(effective_span/32)` formula, so Ctrl+/ Ctrl-/ Ctrl+scroll zoom the chrome together with content.
     viewport: Viewport,
     layer_bg: usize,
@@ -90,6 +94,7 @@ impl DefaultChrome {
             focused: true,
             orb_tint: chrome::OrbTint::FollowFocus,
             hover_state: HIT_NONE,
+            full_edge: false,
             viewport,
             layer_bg,
             layer_chrome,
@@ -240,17 +245,19 @@ impl DefaultChrome {
         };
 
         if !crate::paint::DEBUG_SKIP_CHROME.load(std::sync::atomic::Ordering::Relaxed) {
-            chrome::draw_window_edges_and_mask(
-                chrome_buf,
-                &mut self.hit_test_map,
-                clip_mask,
-                vp_w,
-                vp_h,
-                start,
-                &crossings,
-                edge_light,
-                edge_shadow,
-            );
+            if !self.full_edge {
+                chrome::draw_window_edges_and_mask(
+                    chrome_buf,
+                    &mut self.hit_test_map,
+                    clip_mask,
+                    vp_w,
+                    vp_h,
+                    start,
+                    &crossings,
+                    edge_light,
+                    edge_shadow,
+                );
+            }
             if orb_present {
                 chrome::draw_app_icon(
                     chrome_buf,
@@ -478,7 +485,7 @@ impl DefaultChrome {
     /// Hit query at `(x, y)` in viewport pixel coordinates. Returns the chrome button id (HIT_NONE / HIT_MINIMIZE_BUTTON / HIT_MAXIMIZE_BUTTON / HIT_CLOSE_BUTTON). `(x, y)` outside the viewport returns HIT_NONE.
     ///
     /// **Rule 0 — WHY/PROOF/PREVENTS:** WHY: a negative `x` cast to `usize` wraps to a huge value; without the bound check, indexing `hit_test_map[idx]` panics. PROOF: the host receives cursor coords from winit which can land outside the window during drag-resize. PREVENTS: panic on out-of-window cursor.
-    pub fn hit_at(&self, x: Coord, y: Coord) -> u8 {
+    pub fn hit_at(&self, x: Coord, y: Coord) -> HitId {
         let (w, h) = self.dims();
         let mx = x as i32;
         let my = y as i32;
@@ -502,12 +509,12 @@ impl DefaultChrome {
     }
 
     /// Read-only accessor so the host overlay pass can walk the hit-test map without taking ownership.
-    pub fn hit_test_map(&self) -> &[u8] {
+    pub fn hit_test_map(&self) -> &[HitId] {
         &self.hit_test_map
     }
 
     /// Update the hover state if `new_hit` differs from the current. Returns `true` iff the state changed (so the consumer knows to request a redraw — the host's overlay pass picks up the new state and applies the visible-RGB delta to persistent_screen, no scratch repaint needed).
-    pub fn set_hover(&mut self, new_hit: u8) -> bool {
+    pub fn set_hover(&mut self, new_hit: HitId) -> bool {
         if new_hit == self.hover_state {
             return false;
         }
@@ -521,6 +528,16 @@ impl DefaultChrome {
             return false;
         }
         self.focused = focused;
+        self.group.rpn.layers[self.layer_chrome].dirty = true;
+        true
+    }
+
+    /// Toggle full-edge / maximized rendering. Returns `true` iff the value changed. App calls this from `on_resize` (or right after [`super::app::EventResponse::ToggleMaximized`] takes effect) — read [`super::app::Context::is_maximized`] for the host's source-of-truth state. Marks the chrome layer dirty so the next paint either drops or restores the perimeter hairline.
+    pub fn set_full_edge(&mut self, full_edge: bool) -> bool {
+        if full_edge == self.full_edge {
+            return false;
+        }
+        self.full_edge = full_edge;
         self.group.rpn.layers[self.layer_chrome].dirty = true;
         true
     }

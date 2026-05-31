@@ -268,8 +268,14 @@ pub fn pack_argb(r: u8, g: u8, b: u8, a: u8) -> u32 {
     ((a as u32) << 24) | (((255 - r) as u32) << 16) | (((255 - g) as u32) << 8) | ((255 - b) as u32)
 }
 
+/// Per-pixel hit-test ID type. `u16` gives 65 535 registerable interactive zones — enough for "every list row is a hit zone" patterns without revisiting. Cost vs `u8` at 4 K is +8 MB on a ~100 MB+ render-state footprint, which is well inside the engineering budget for "never have to think about it again." Lives in `paint` because every hit-stamping rasterizer is here; [`crate::host::chrome`] and [`crate::host::app::HitRegistry`] re-export and consume.
+pub type HitId = u16;
+
+/// Reserved "no widget here" ID. Always 0 — registrations start at 1 so the value cannot collide.
+pub const HIT_NONE: HitId = 0;
+
 /// Wrap-add the RGB bytes of `delta_rgb` into `pixels[i]` for every `i` where `hit_map[i] == target_id`. The α byte is preserved. Used to apply a "tint" effect (hover, focus, etc.) on top of an already-painted region whose pixels were stamped with a known hit ID — mirrors the chrome's bake_hover pattern but generic over any hit ID. `wrapping_sub` of the same delta exactly reverses the add, so callers maintain old_delta/new_delta state and unbake/bake atomically.
-pub fn wrap_add_rgb_where(pixels: &mut [u32], hit_map: &[u8], target_id: u8, delta_rgb: u32) {
+pub fn wrap_add_rgb_where(pixels: &mut [u32], hit_map: &[HitId], target_id: HitId, delta_rgb: u32) {
     let dr = ((delta_rgb >> 16) & 0xFF) as u8;
     let dg = ((delta_rgb >> 8) & 0xFF) as u8;
     let db = (delta_rgb & 0xFF) as u8;
@@ -295,18 +301,21 @@ pub fn wrap_add_rgb_where(pixels: &mut [u32], hit_map: &[u8], target_id: u8, del
 /// `win_ox / win_oy` are the screen-space offset of the window's top-left. `hit_test_map` and `scratch` are window-space (both length `win_w × win_h`). Pixels translating outside the screen are skipped.
 ///
 /// Force-α=0xFF on every write is safe because pixels with non-`HIT_NONE` id are always interior to the window shape (corners and the squircle AA rim are stamped `HIT_NONE`), so no clip_mask carve gets stomped.
+///
+/// `deltas` and `last_active` are caller-owned slices the same length, sized to `registry.next_id` (= 1 + number of registered hit zones). With the u16 hit-id widening a fixed `[T; 256]` would either truncate the ID space or balloon to 256 KB per frame; slices keep the per-frame cost proportional to live widget count. IDs past `deltas.len()` are treated as `HIT_NONE` for safety — defensive against a stale paint stamping with an unregistered ID.
 pub fn apply_overlay(
     scratch: &[u32],
     persistent_screen: &mut [u32],
     scr_w: usize,
     win_ox: i32,
     win_oy: i32,
-    hit_test_map: &[u8],
+    hit_test_map: &[HitId],
     win_w: usize,
     win_h: usize,
-    deltas: &[u32; 256],
-    last_active: &mut [bool; 256],
+    deltas: &[u32],
+    last_active: &mut [bool],
 ) {
+    debug_assert_eq!(deltas.len(), last_active.len(), "deltas / last_active must be sized identically to registry.next_id");
     // Quick reject: if no id is currently tinted AND none were tinted last frame, the overlay has zero work.
     let any_current = deltas.iter().any(|&d| d != 0);
     let any_last = last_active.iter().any(|&a| a);
@@ -321,6 +330,7 @@ pub fn apply_overlay(
     {
         return;
     }
+    let table_len = deltas.len();
     let scr_h = persistent_screen.len() / scr_w;
     // Compute the window-space y/x range whose screen coords land inside [0, scr_h) / [0, scr_w).
     let y_lo = ((-win_oy).max(0) as usize).min(win_h);
@@ -328,11 +338,15 @@ pub fn apply_overlay(
     let x_lo = ((-win_ox).max(0) as usize).min(win_w);
     let x_hi = win_w.min(((scr_w as i32) - win_ox).max(0) as usize);
     if y_lo >= y_hi || x_lo >= x_hi {
-        *last_active = [false; 256];
+        for a in last_active.iter_mut() {
+            *a = false;
+        }
         return;
     }
 
-    let mut new_active = [false; 256];
+    // Snapshot prev → new. With u16 IDs the previous fixed `[bool; 256]` swap can't survive, but the table is bounded by registered widget count (~tens, not 65 k) so a per-frame Vec pair is cheap.
+    let prev_active: alloc::vec::Vec<bool> = last_active.to_vec();
+    let mut new_active = alloc::vec![false; table_len];
     for y in y_lo..y_hi {
         let scr_y = (y as i32 + win_oy) as usize;
         let map_row = y * win_w;
@@ -340,8 +354,11 @@ pub fn apply_overlay(
         for x in x_lo..x_hi {
             let map_idx = map_row + x;
             let id = hit_test_map[map_idx] as usize;
+            if id >= table_len {
+                continue;
+            }
             let delta = deltas[id];
-            let was_active = last_active[id];
+            let was_active = prev_active[id];
             // Skip pixels for ids that aren't tinted now AND weren't tinted last frame — nothing to do.
             if delta == 0 && !was_active {
                 continue;
@@ -361,7 +378,7 @@ pub fn apply_overlay(
             persistent_screen[scr_row + scr_x] = 0xFF00_0000 | (r << 16) | (g << 8) | b;
         }
     }
-    *last_active = new_active;
+    last_active.copy_from_slice(&new_active);
 }
 
 /// Compose `src` underneath `dst` where `src` is in *pre-composed* α + darkness form (the result of a chain of `under()` writes starting from empty — so `src.dark` is already attenuated by `src.α`). Unlike [`flatten`] with `BlendMode::Normal`, this kernel scales src's contribution by `(256 − dst.α)` only, NOT by `(256 − dst.α) × src.α`, avoiding the second premult that would dim every AA pixel.
@@ -2737,8 +2754,8 @@ pub fn draw_squircle_pill_two_tone(
     light: u32,
     shadow: u32,
     squirdleyness: i32,
-    hit_map: Option<&mut [u8]>,
-    hit_id: u8,
+    hit_map: Option<&mut [HitId]>,
+    hit_id: HitId,
 ) {
     let buf_w = canvas.width;
     let buf_h = canvas.height;

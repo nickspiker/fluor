@@ -8,7 +8,7 @@
 //! macOS resize uses manual mouse tracking via direct NSEvent polling (photon's approach) because winit stops delivering CursorMoved events once the cursor leaves the window during a resize drag. Linux uses native `drag_resize_window`.
 
 use super::chrome::{
-    self, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE, ResizeEdge,
+    self, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE, HitId, ResizeEdge,
 };
 use crate::Compositor;
 use crate::coord::Coord;
@@ -49,12 +49,12 @@ struct DesktopApp {
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
 
     /// Per-pixel button-id map written by `draw_window_controls` and read on click.
-    hit_test_map: Vec<u8>,
+    hit_test_map: Vec<HitId>,
     cursor_x: Coord,
     cursor_y: Coord,
     modifiers: ModifiersState,
     /// Currently hovered chrome button id (HIT_NONE if none). Drives the hover overlay.
-    hover_state: u8,
+    hover_state: HitId,
     /// Cached pixel list for the currently hovered button — recomputed on hover-state change.
     hover_pixel_list: Vec<usize>,
     /// Font system + glyph cache, lazily initialized on first `resumed`.
@@ -389,7 +389,7 @@ impl DesktopApp {
     /// Look up the chrome hit-id under the current cursor. Cursor coordinates are external input — winit reports positions outside the window during drag-resize and during the moment cursor leaves.
     ///
     /// **Rule 0 — WHY/PROOF/PREVENTS:** WHY: a negative `mx` cast to `usize` wraps to a huge value; without the check, `hit_test_map[idx]` panics. PROOF: indexing past the slice panics. PREVENTS: panic on cursor outside window.
-    fn hit_at_cursor(&self) -> u8 {
+    fn hit_at_cursor(&self) -> HitId {
         let vp = self.compositor.viewport();
         let mx = self.cursor_x as i32;
         let my = self.cursor_y as i32;
@@ -1151,7 +1151,7 @@ fn resize_direction(edge: ResizeEdge) -> Option<winit::window::ResizeDirection> 
     })
 }
 
-fn cursor_for_state(hit: u8, x: Coord, y: Coord, compositor: &Compositor) -> CursorIcon {
+fn cursor_for_state(hit: HitId, x: Coord, y: Coord, compositor: &Compositor) -> CursorIcon {
     match hit {
         HIT_CLOSE_BUTTON | HIT_MINIMIZE_BUTTON | HIT_MAXIMIZE_BUTTON => return CursorIcon::Pointer,
         _ => {}
