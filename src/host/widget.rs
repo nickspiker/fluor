@@ -69,12 +69,13 @@ pub trait Click {
     ) -> crate::host::app::EventResponse;
 }
 
-/// Keyboard handler. Receives the raw winit [`KeyEvent`] (with both the logical key and any text-mode text payload) plus the live modifier state. Widgets that don't care about a key return [`crate::host::app::EventResponse::Pass`] so the host knows the event went unconsumed.
+/// Keyboard handler. Receives the raw winit [`KeyEvent`] (with both the logical key and any text-mode text payload), the live modifier state, and a mutable [`TextRenderer`] for widgets that need to recompute glyph widths after an edit (textbox inserts a character → widths must be re-measured before the next paint can position the cursor). Widgets that don't care about text (chrome buttons) ignore the `text` parameter; widgets that don't care about a key return [`crate::host::app::EventResponse::Pass`] so the host knows the event went unconsumed.
 pub trait Key {
     fn on_key(
         &mut self,
         kev: &KeyEvent,
         mods: ModifiersState,
+        text: &mut TextRenderer,
     ) -> crate::host::app::EventResponse;
 }
 

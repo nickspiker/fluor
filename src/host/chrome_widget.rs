@@ -9,6 +9,9 @@
 use super::chrome::{
     self, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE, HitId,
 };
+use super::app::EventResponse;
+use super::widget::{self, Click, Container, Hover, PaintCtx, Widget};
+use crate::canvas::PixelRect;
 use crate::coord::Coord;
 use crate::geom::Viewport;
 use crate::group::Group;
@@ -19,6 +22,8 @@ use crate::text::TextRenderer;
 use crate::theme;
 use alloc::string::String;
 use alloc::vec::Vec;
+use winit::event::KeyEvent;
+use winit::keyboard::ModifiersState;
 
 /// Map a hit-test ID to the wrap-add hover colour the chrome paints when that button is hovered. Returns `None` for IDs that don't have a hover colour (e.g. `HIT_APP_ICON`, `HIT_NONE`) so the bake/unbake paths can no-op cleanly. Public so consumers can build per-hit overlay delta tables from the same single source of truth.
 pub fn hover_color_for(hit: HitId) -> Option<u32> {
@@ -29,6 +34,107 @@ pub fn hover_color_for(hit: HitId) -> Option<u32> {
         _ => return None,
     };
     if c == 0 { None } else { Some(c) }
+}
+
+/// Action a [`ChromeButton`] dispatches when clicked or activated via keyboard. Closed enum because the four canonical window-frame buttons aren't user-extensible — new chrome elements would be new widget types, not new variants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChromeAction {
+    Minimize,
+    ToggleMaximized,
+    Close,
+    /// The app-icon "orb" slot. Currently a no-op on click but kept in the tab cycle for keyboard-discoverability (apps may eventually wire it to a window menu).
+    AppIcon,
+}
+
+impl ChromeAction {
+    /// The [`EventResponse`] this action emits when the button fires. Centralised so click and keyboard-activate paths can't drift.
+    fn response(&self) -> EventResponse {
+        match self {
+            ChromeAction::Minimize => EventResponse::Minimize,
+            ChromeAction::ToggleMaximized => EventResponse::ToggleMaximized,
+            ChromeAction::Close => EventResponse::Close,
+            ChromeAction::AppIcon => EventResponse::Handled,
+        }
+    }
+}
+
+/// One of the four window-frame buttons (minimize / maximize / close / app icon). Carries the dense hit-id allocated at chrome construction, the click action, and the live focused / hovered state. **Does not paint itself** — [`DefaultChrome::rasterize_chrome`] paints the four buttons collectively in one pass because the hit-fill walls and slot dividers are shared geometry that's painful to split per-button. [`Widget::paint`] is therefore a structural no-op; chrome is still responsible for stamping `self.id` into the hit map at the right pixels via the existing `paint_button_hit_row_scan` helper.
+pub struct ChromeButton {
+    id: HitId,
+    pub action: ChromeAction,
+    pub focused: bool,
+    pub hovered: bool,
+}
+
+impl ChromeButton {
+    fn new(id: HitId, action: ChromeAction) -> Self {
+        Self {
+            id,
+            action,
+            focused: false,
+            hovered: false,
+        }
+    }
+
+    /// The button's hit-id. Mirrors [`Widget::id`] so callers that hold a `&ChromeButton` directly (not through `dyn Widget`) don't need to import the trait.
+    pub fn id(&self) -> HitId {
+        self.id
+    }
+}
+
+impl Widget for ChromeButton {
+    fn id(&self) -> HitId {
+        self.id
+    }
+    fn paint(&mut self, _ctx: &mut PaintCtx<'_, '_>) {
+        // Intentional no-op — chrome paints buttons collectively in `rasterize_chrome`. See struct-level doc for the why.
+    }
+    fn click(&mut self) -> Option<&mut dyn Click> {
+        Some(self)
+    }
+    fn hover(&mut self) -> Option<&mut dyn Hover> {
+        Some(self)
+    }
+    fn focus(&mut self) -> Option<&mut dyn widget::Focus> {
+        Some(self)
+    }
+    fn key(&mut self) -> Option<&mut dyn widget::Key> {
+        Some(self)
+    }
+}
+
+impl Click for ChromeButton {
+    fn on_click(&mut self, _x: Coord, _y: Coord, _mods: ModifiersState) -> EventResponse {
+        self.action.response()
+    }
+}
+
+impl Hover for ChromeButton {
+    fn set_hovered(&mut self, hovered: bool) {
+        self.hovered = hovered;
+    }
+}
+
+impl widget::Focus for ChromeButton {
+    fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+    // focus_bbox returns None — chrome layout is recomputed per-frame; spatial tab-order would need a different shape (query chrome at walk time). Defer.
+}
+
+impl widget::Key for ChromeButton {
+    fn on_key(
+        &mut self,
+        kev: &KeyEvent,
+        _mods: ModifiersState,
+        _text: &mut TextRenderer,
+    ) -> EventResponse {
+        use winit::keyboard::{Key as WKey, NamedKey};
+        match &kev.logical_key {
+            WKey::Named(NamedKey::Enter) | WKey::Named(NamedKey::Space) => self.action.response(),
+            _ => EventResponse::Pass,
+        }
+    }
 }
 
 /// Reusable window frame: controls, edges, hairlines, title, hover overlay.
@@ -56,17 +162,27 @@ pub struct DefaultChrome {
     layer_bg: usize,
     layer_chrome: usize,
     layer_hover: usize,
+    /// Minimize-button widget. ID allocated at chrome construction time. Order matters: min is allocated first so its ID matches the legacy `HIT_MINIMIZE_BUTTON = 1` constant — keeps the panes match-arm working during the staged migration. Same allocation discipline for the other three.
+    pub min_btn: ChromeButton,
+    /// Maximize / restore button. ID = 2 by allocation order (matches `HIT_MAXIMIZE_BUTTON`).
+    pub max_btn: ChromeButton,
+    /// Close button. ID = 3 by allocation order (matches `HIT_CLOSE_BUTTON`).
+    pub close_btn: ChromeButton,
+    /// App-icon orb button. ID = 4 by allocation order (matches `HIT_APP_ICON`).
+    pub app_icon_btn: ChromeButton,
 }
 
 impl DefaultChrome {
     /// Allocate the chrome group + hit_test_map sized to `viewport`. Three layers (bg, chrome, hover) all start dirty so the first frame paints from scratch.
     ///
     /// **Topmost-first scaffold:** the Stack program is the minimal front-to-back composite — `Push chrome, Push bg, Under(Normal)`. Chrome is the topmost layer (controls, edges, hairlines, title), bg is the layer behind it (background_noise + panes). Stack order matches the visual stack: first push lands on the bottom of the eval stack and is the topmost layer; second push goes underneath via `Under`. The hover layer still exists and is rasterized so the API surface is stable; it's omitted from the program until the hover overlay is wired back up via `Push hover, Under(Add)` as the topmost step. Corner knockout (formerly a separate silhouette layer + `Op::Or`) is handled at chrome rasterization time by writing `t=255` directly into the chrome layer's corner pixels — no separate Stack op under the unified Under model.
+    /// Construct. `hit_counter` is the app's monotonic [`HitId`] allocator (see [`super::widget::next_id`]) — chrome registers four IDs (min, max, close, app icon, in that order). Caller must construct chrome BEFORE other widgets so the chrome IDs stay at 1..=4 (matching the legacy `HIT_*_BUTTON` compat constants during the staged migration).
     pub fn new(
         viewport: Viewport,
         title: impl Into<String>,
         app_icon: Option<crate::host::icon::Icon>,
         status_text: Option<String>,
+        hit_counter: &mut HitId,
     ) -> Self {
         let region = Region::new(
             0.0,
@@ -85,6 +201,10 @@ impl DefaultChrome {
             Op::Under(BlendMode::Normal),
         ]);
         let map_len = (viewport.width_px as usize).saturating_mul(viewport.height_px as usize);
+        let min_id = widget::next_id(hit_counter);
+        let max_id = widget::next_id(hit_counter);
+        let close_id = widget::next_id(hit_counter);
+        let app_icon_id = widget::next_id(hit_counter);
         Self {
             group,
             hit_test_map: alloc::vec![HIT_NONE; map_len],
@@ -99,6 +219,10 @@ impl DefaultChrome {
             layer_bg,
             layer_chrome,
             layer_hover,
+            min_btn: ChromeButton::new(min_id, ChromeAction::Minimize),
+            max_btn: ChromeButton::new(max_id, ChromeAction::ToggleMaximized),
+            close_btn: ChromeButton::new(close_id, ChromeAction::Close),
+            app_icon_btn: ChromeButton::new(app_icon_id, ChromeAction::AppIcon),
         }
     }
 
@@ -578,6 +702,16 @@ impl DefaultChrome {
     }
 }
 
+/// Visit the four chrome buttons in tab order (app-icon → minimize → maximize → close). Order is the keyboard-discoverability convention: the orb sits visually leftmost so it leads in left-to-right reading order, then the window controls flow right-to-left from minimize to close. The app's outer [`Container`] decides where the chrome's buttons land in the overall cycle (typically AFTER content widgets like textboxes, matching macOS / GNOME).
+impl Container for DefaultChrome {
+    fn visit(&mut self, f: &mut dyn FnMut(&mut dyn Widget)) {
+        f(&mut self.app_icon_btn);
+        f(&mut self.min_btn);
+        f(&mut self.max_btn);
+        f(&mut self.close_btn);
+    }
+}
+
 /// Compute squircle crossings table for a corner with the given `radius` and `squirdleyness`. Returns `(start, crossings)` where `start` is the distance from the corner-of-corner inward to the curve's first integer-row crossing, and `crossings` is the rev'd table indexed by `i in 0..count` such that at row offset `start + i` the curve is at column `inset_i` with AA values `h_cov_i` and `l_i`. Used for both the window perimeter (radius = span/4) and the controls-strip BL curve (radius = button_size).
 pub(crate) fn compute_squircle_crossings(
     radius: Coord,
@@ -618,7 +752,8 @@ mod tests {
 
     #[test]
     fn new_allocates_full_viewport_buffers() {
-        let chrome = DefaultChrome::new(Viewport::new(800, 600), "test", None, None);
+        let mut counter: HitId = HIT_NONE;
+        let chrome = DefaultChrome::new(Viewport::new(800, 600), "test", None, None, &mut counter);
         assert_eq!(chrome.dims(), (800, 600));
         assert_eq!(chrome.hit_test_map.len(), 800 * 600);
         assert_eq!(chrome.title, "test");
@@ -627,7 +762,8 @@ mod tests {
 
     #[test]
     fn hit_at_outside_viewport_returns_hit_none() {
-        let chrome = DefaultChrome::new(Viewport::new(100, 100), "", None, None);
+        let mut counter: HitId = HIT_NONE;
+        let chrome = DefaultChrome::new(Viewport::new(100, 100), "", None, None, &mut counter);
         assert_eq!(chrome.hit_at(-1.0, 50.0), HIT_NONE);
         assert_eq!(chrome.hit_at(50.0, -1.0), HIT_NONE);
         assert_eq!(chrome.hit_at(101.0, 50.0), HIT_NONE);
@@ -636,7 +772,8 @@ mod tests {
 
     #[test]
     fn set_hover_returns_true_on_change_only() {
-        let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "", None, None);
+        let mut counter: HitId = HIT_NONE;
+        let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "", None, None, &mut counter);
         assert!(chrome.set_hover(chrome::HIT_CLOSE_BUTTON)); // changed
         assert!(!chrome.set_hover(chrome::HIT_CLOSE_BUTTON)); // same
         assert!(chrome.set_hover(HIT_NONE)); // changed back
@@ -644,7 +781,8 @@ mod tests {
 
     #[test]
     fn set_hover_does_not_dirty_chrome_layer() {
-        let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "", None, None);
+        let mut counter: HitId = HIT_NONE;
+        let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "", None, None, &mut counter);
         // Run a flatten cycle so StackCompositor::evaluate clears all initial-dirty flags.
         let mut target = alloc::vec![0u32; 100 * 100];
         chrome.flatten_into(&mut target, 100, 100, None);
@@ -656,7 +794,8 @@ mod tests {
 
     #[test]
     fn resize_marks_layers_dirty_and_resizes_hit_map() {
-        let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "", None, None);
+        let mut counter: HitId = HIT_NONE;
+        let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "", None, None, &mut counter);
         let mut target = alloc::vec![0u32; 100 * 100];
         chrome.flatten_into(&mut target, 100, 100, None);
         chrome.resize(Viewport::new(200, 150));
