@@ -304,6 +304,9 @@ impl FluorApp for PanesDemo {
                     ctx.cursor_y,
                 );
                 if edge != ResizeEdge::None {
+                    // Starting a resize-drag — defensively clear any in-progress selection-drag state so cursor moves during the resize can't bleed into the textbox's "extend selection" path. Host suppresses CursorMoved dispatch during resize, but if `is_dragging_select` was set from a prior interaction that didn't release cleanly, the post-resize state would still have stale drag flags.
+                    self.is_dragging_select = false;
+                    self.selection_scroll_time = None;
                     return EventResponse::StartResize(edge);
                 }
                 let was_focused = self.textbox.focused;
@@ -837,9 +840,9 @@ impl FluorApp for PanesDemo {
                 let speed = 1000.0 * distance_outside / uw;
                 let delta = speed * dt;
                 if ctx.cursor_x < tl {
-                    self.textbox.scroll_offset += delta;
+                    self.textbox.nudge_scroll_offset(delta);
                 } else {
-                    self.textbox.scroll_offset -= delta;
+                    self.textbox.nudge_scroll_offset(-delta);
                 }
                 let clamped_x = ctx.cursor_x.clamp(tl, tr);
                 self.textbox.cursor = self.textbox.cursor_index_from_x(clamped_x);

@@ -34,8 +34,8 @@ pub struct Textbox {
     font: &'static str,
 
     // --- Scroll ---
-    /// Horizontal scroll offset in pixels. Positive = text shifted right (cursor near left edge).
-    pub scroll_offset: Coord,
+    /// Horizontal scroll offset in pixels. Positive = text shifted right (cursor near left edge). Private — access via [`Self::scroll_offset`] / [`Self::set_scroll_offset`] / [`Self::nudge_scroll_offset`] so the text cache invalidates correctly on every change.
+    scroll_offset: Coord,
 
     // --- Blinkey ---
     /// Whether the blinkey is currently drawn (visible half of blink cycle).
@@ -79,6 +79,8 @@ pub struct Textbox {
     last_painted_bbox: Option<PixelRect>,
     /// `focused` value at the time of the last paint — tracks whether the glow was painted last frame, so [`Textbox::damage_rect`] can expand to `glow_bbox` on focus on/off transitions.
     last_painted_focused: bool,
+    /// Selection range `(start, end)` that was painted last frame (or `None` if no selection was visible). Used by [`Textbox::damage_rect`] to detect range changes — selection extends/contracts during drag don't dirty either cache (text content unchanged, pill unchanged), but they DO need the bbox repainted so the selection rect reflects the new range. Compared against the current `selection_range()`; if different, treat as pill-dirty so the host clears + re-renders the bbox.
+    last_painted_selection: Option<(usize, usize)>,
 }
 
 /// Convert a viewport-coord `Region` (Coord f32 rectangle, possibly negative or off-buffer) into a `PixelRect` (usize half-open rect) clamped to the viewport bounds. Used by [`Textbox::damage_rect`] / [`Textbox::record_painted`] to express widget bboxes in the host's pixel-rect language for damage union.
@@ -216,6 +218,7 @@ impl Textbox {
             text_cache_h: 0,
             text_cache_dirty: true,
             last_painted_bbox: None,
+            last_painted_selection: None,
             last_painted_focused: false,
             last_painted_blinkey_on: false,
             last_painted_blinkey_bbox: None,
@@ -233,7 +236,9 @@ impl Textbox {
     /// Picks the right bbox flavor: `glow_bbox` if glow is currently OR was previously painted; `bbox` for the bare-pill steady state. Hover transitions never report damage here — the tint lives in the host overlay pass.
     pub fn damage_rect(&self, viewport_w: usize, viewport_h: usize) -> Option<PixelRect> {
         let focus_changed = self.focused != self.last_painted_focused;
-        let pill_dirty = self.pill_cache_dirty || self.text_cache_dirty || focus_changed;
+        // Selection range change (extend / contract / new / clear) doesn't dirty either cache — pill unchanged, glyphs unchanged — but DOES require the bbox to repaint so the selection rect reflects the new range. Treat as pill-dirty for damage purposes.
+        let selection_changed = self.selection_range() != self.last_painted_selection;
+        let pill_dirty = self.pill_cache_dirty || self.text_cache_dirty || focus_changed || selection_changed;
 
         // Blinkey contribution: if it'll be on this frame OR was on last frame, the cursor_bbox needs to be in damage so it can be redrawn (or cleared). Tiny rect — typically ~16 × font_size.
         let blinkey_want = self.focused && !self.has_selection() && self.blinkey_visible;
@@ -284,6 +289,7 @@ impl Textbox {
         let rect = region_to_pixelrect(region, viewport_w, viewport_h);
         self.last_painted_bbox = if rect.is_empty() { None } else { Some(rect) };
         self.last_painted_focused = self.focused;
+        self.last_painted_selection = self.selection_range();
 
         let blinkey_want = self.focused && !self.has_selection() && self.blinkey_visible;
         self.last_painted_blinkey_on = blinkey_want;
@@ -481,29 +487,54 @@ impl Textbox {
 
     // --- Scrolling ---
 
-    /// Update scroll offset to keep the cursor visible within symmetric margins.
+    /// Current horizontal scroll offset in pixels. Public read-only — use [`Self::set_scroll_offset`] or [`Self::nudge_scroll_offset`] to write so the text cache invalidates correctly.
+    pub fn scroll_offset(&self) -> Coord {
+        self.scroll_offset
+    }
+
+    /// Set the scroll offset directly; marks `text_cache_dirty` if the value changes. Consumers that need to push scroll programmatically (e.g. auto-scroll during a selection drag) should use this instead of writing the field directly.
+    pub fn set_scroll_offset(&mut self, offset: Coord) {
+        if self.scroll_offset != offset {
+            self.scroll_offset = offset;
+            self.text_cache_dirty = true;
+        }
+    }
+
+    /// Add `delta` to the scroll offset; marks `text_cache_dirty` if anything changed. Convenience over `set_scroll_offset(self.scroll_offset() + delta)`.
+    pub fn nudge_scroll_offset(&mut self, delta: Coord) {
+        if delta != 0.0 {
+            self.scroll_offset += delta;
+            self.text_cache_dirty = true;
+        }
+    }
+
+    /// Update scroll offset to keep the cursor visible within symmetric margins. Marks `text_cache_dirty` whenever the offset actually moves, so the cached glyph buffer (which bakes `scroll_offset` into the local text X) re-rasterizes at the new position. Without this, drag-extending the selection past the visible area would shift selection / cursor correctly but leave the text glyphs frozen at the old offset.
     fn update_scroll(&mut self) {
+        let before = self.scroll_offset;
         let tw = self.text_width();
         let uw = self.usable_width();
         if tw <= uw {
             self.scroll_offset = 0.0;
-            return;
+        } else {
+            let margin = uw * 0.05;
+            let usable_half = uw * 0.5;
+            let text_half = tw * 0.5;
+
+            let max_scroll_right = usable_half - margin - text_half;
+            let max_scroll_left = text_half - usable_half + margin;
+            self.scroll_offset = self.scroll_offset.clamp(max_scroll_right, max_scroll_left);
+
+            let cursor_px: Coord = self.widths[..self.cursor].iter().sum();
+            let cursor_in_centered = cursor_px - text_half;
+            let cursor_in_view = cursor_in_centered + self.scroll_offset;
+            if cursor_in_view < -usable_half + margin {
+                self.scroll_offset = -usable_half + margin - cursor_in_centered;
+            } else if cursor_in_view > usable_half - margin {
+                self.scroll_offset = usable_half - margin - cursor_in_centered;
+            }
         }
-        let margin = uw * 0.05;
-        let usable_half = uw * 0.5;
-        let text_half = tw * 0.5;
-
-        let max_scroll_right = usable_half - margin - text_half;
-        let max_scroll_left = text_half - usable_half + margin;
-        self.scroll_offset = self.scroll_offset.clamp(max_scroll_right, max_scroll_left);
-
-        let cursor_px: Coord = self.widths[..self.cursor].iter().sum();
-        let cursor_in_centered = cursor_px - text_half;
-        let cursor_in_view = cursor_in_centered + self.scroll_offset;
-        if cursor_in_view < -usable_half + margin {
-            self.scroll_offset = -usable_half + margin - cursor_in_centered;
-        } else if cursor_in_view > usable_half - margin {
-            self.scroll_offset = usable_half - margin - cursor_in_centered;
+        if self.scroll_offset != before {
+            self.text_cache_dirty = true;
         }
     }
 
