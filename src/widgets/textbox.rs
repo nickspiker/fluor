@@ -337,6 +337,7 @@ impl Textbox {
             && y < self.center_y + half_h
     }
 
+    /// Reposition the pill. Width / height changes don't touch the text's pixel positions (a wider pill just exposes more of the existing text-layout pixel grid), so `scroll_offset` is preserved verbatim — the character that was at the pill centre before still sits there after. The post-geometry clamp prevents an aspect-ratio shift from leaving the text stranded with empty space on one side and overflow on the other.
     pub fn set_rect(&mut self, center_x: Coord, center_y: Coord, width: Coord, height: Coord) {
         if self.center_x != center_x || self.center_y != center_y || self.width != width || self.height != height {
             self.pill_cache_dirty = true;
@@ -346,15 +347,38 @@ impl Textbox {
         self.center_y = center_y;
         self.width = width;
         self.height = height;
+        self.clamp_scroll_to_bounds();
     }
 
+    /// Change the font size. Glyph widths rescale by `font_size_new / font_size_old`, so `scroll_offset` (a pixel value) is scaled by the same factor to keep the character that was at the pill centre still at the pill centre — the visual anchor under the user's eye stays put while the text grows or shrinks around it. Post-clamp keeps the rescaled offset within the new fit / overflow bounds so an aggressive zoom-in can't fling the text past the pill edges.
     pub fn set_font_size(&mut self, font_size: Coord, text: &mut TextRenderer) {
         if self.font_size != font_size {
+            let scale = if self.font_size > 0.0 { font_size / self.font_size } else { 1.0 };
+            if scale != 1.0 && self.scroll_offset != 0.0 {
+                self.scroll_offset *= scale;
+            }
             self.pill_cache_dirty = true;
             self.text_cache_dirty = true;
         }
         self.font_size = font_size;
         self.recalc_widths(text);
+        self.clamp_scroll_to_bounds();
+    }
+
+    /// Constrain `scroll_offset` so the text never shows more than `padding` of empty space on either side when overflowing, and is exactly centred (offset = 0) when it fits. Pure clamp — no cursor visibility chase, so calling this from resize / font-rescale doesn't yank text toward the cursor. The bounds are symmetric: `±(tw − usable_w) / 2`, with the sign convention that positive `scroll_offset` shifts text right.
+    fn clamp_scroll_to_bounds(&mut self) {
+        let before = self.scroll_offset;
+        let tw = self.text_width();
+        let uw = self.usable_width();
+        if tw <= uw {
+            self.scroll_offset = 0.0;
+        } else {
+            let bound = (tw - uw) * 0.5;
+            self.scroll_offset = self.scroll_offset.clamp(-bound, bound);
+        }
+        if self.scroll_offset != before {
+            self.text_cache_dirty = true;
+        }
     }
 
     fn recalc_widths(&mut self, text: &mut TextRenderer) {
@@ -374,21 +398,23 @@ impl Textbox {
         self.widths.iter().sum()
     }
 
-    /// Pixel x of the leftmost glyph baseline (left inset of pill shape).
-    fn text_left(&self) -> Coord {
-        self.center_x - self.width * 0.5 + self.padding()
-    }
-
-    fn text_right(&self) -> Coord {
-        self.center_x + self.width * 0.5 - self.padding()
-    }
-
-    fn padding(&self) -> Coord {
+    /// Symmetric inner padding inside the pill, in pixels. Single source of truth for "how far inside the pill edge the usable text area starts" — every operation that needs to talk about pill-interior space (clamp bounds, click hit math, drag auto-scroll trigger, cursor visibility chase) goes through here. Scales with `font_size` so visual proportions stay constant across zoom levels.
+    pub fn padding(&self) -> Coord {
         self.font_size * 0.4
     }
 
-    /// Usable text area width (pill interior minus padding on both sides).
-    fn usable_width(&self) -> Coord {
+    /// Viewport-space pixel x of the left edge of the usable text area (= pill left + padding). Public so the app's drag-select / auto-scroll bounds are derived from the same padding model the textbox renders against — no duplicated `font_size * 0.4` constants in consumer code.
+    pub fn text_left(&self) -> Coord {
+        self.center_x - self.width * 0.5 + self.padding()
+    }
+
+    /// Viewport-space pixel x of the right edge of the usable text area (= pill right − padding). Counterpart to [`Self::text_left`].
+    pub fn text_right(&self) -> Coord {
+        self.center_x + self.width * 0.5 - self.padding()
+    }
+
+    /// Usable text area width (pill interior minus [`Self::padding`] on both sides). What the scroll clamp uses as the "fit boundary": `text_width ≤ usable_width` ⇒ text fits and centres at `scroll_offset = 0`; otherwise it overflows and `scroll_offset` is bounded to `±(text_width − usable_width) / 2`.
+    pub fn usable_width(&self) -> Coord {
         self.width - self.padding() * 2.0
     }
 
@@ -531,51 +557,55 @@ impl Textbox {
         self.scroll_offset
     }
 
-    /// Set the scroll offset directly; marks `text_cache_dirty` if the value changes. Consumers that need to push scroll programmatically (e.g. auto-scroll during a selection drag) should use this instead of writing the field directly.
+    /// Set the scroll offset; marks `text_cache_dirty` if the value changes. **Clamped** to the valid range (`±(text_width − usable_width) / 2` when overflowing, zero when fitting) so callers can't push the offset off into oblivion — drag auto-scroll, programmatic scroll, anything that goes through here gets edge-bound enforcement for free.
     pub fn set_scroll_offset(&mut self, offset: Coord) {
         if self.scroll_offset != offset {
             self.scroll_offset = offset;
             self.text_cache_dirty = true;
         }
+        self.clamp_scroll_to_bounds();
     }
 
-    /// Add `delta` to the scroll offset; marks `text_cache_dirty` if anything changed. Convenience over `set_scroll_offset(self.scroll_offset() + delta)`.
+    /// Add `delta` to the scroll offset; marks `text_cache_dirty` if anything changed. Clamped via [`Self::set_scroll_offset`] so an aggressive auto-scroll during a selection drag can't carry the text past the pill edges into empty space.
     pub fn nudge_scroll_offset(&mut self, delta: Coord) {
         if delta != 0.0 {
             self.scroll_offset += delta;
             self.text_cache_dirty = true;
+            self.clamp_scroll_to_bounds();
         }
     }
 
-    /// Update scroll offset to keep the cursor visible within symmetric margins. Marks `text_cache_dirty` whenever the offset actually moves, so the cached glyph buffer (which bakes `scroll_offset` into the local text X) re-rasterizes at the new position. Without this, drag-extending the selection past the visible area would shift selection / cursor correctly but leave the text glyphs frozen at the old offset.
+    /// Update scroll offset to keep the cursor visible. Called from text-mutation paths (insert / backspace / arrow / select) where the cursor's position relative to the visible window has just changed and chasing it back into view is the desired behaviour. Uses the same `clamp_scroll_to_bounds` rule as every other write site — single source of truth for scroll limits — so the visual position of `scroll_offset = bound` is identical whether you got there by typing, by drag-select, by resize, or by programmatic set.
     fn update_scroll(&mut self) {
-        let before = self.scroll_offset;
         let tw = self.text_width();
         let uw = self.usable_width();
         if tw <= uw {
-            self.scroll_offset = 0.0;
+            // Text fits — `clamp_scroll_to_bounds` zeros it; cursor is always visible inside the centred text.
+            self.clamp_scroll_to_bounds();
+            return;
+        }
+        let usable_half = uw * 0.5;
+        let text_half = tw * 0.5;
+        let cursor_px: Coord = self.widths[..self.cursor].iter().sum();
+        let cursor_in_centered = cursor_px - text_half;
+        let cursor_in_view = cursor_in_centered + self.scroll_offset;
+        // Cursor visibility chase: if the cursor has slipped past the edge of the visible window, shift `scroll_offset` so the cursor lands exactly at the edge. No extra margin — the edge IS the bound, matching `clamp_scroll_to_bounds`. The final clamp catches the case where the chase overshoots the symmetric bound (cursor outside the cached widths range, e.g. cursor at end of very long text).
+        let target = if cursor_in_view < -usable_half {
+            Some(-usable_half - cursor_in_centered)
+        } else if cursor_in_view > usable_half {
+            Some(usable_half - cursor_in_centered)
         } else {
-            let margin = uw * 0.05;
-            let usable_half = uw * 0.5;
-            let text_half = tw * 0.5;
-
-            let max_scroll_right = usable_half - margin - text_half;
-            let max_scroll_left = text_half - usable_half + margin;
-            self.scroll_offset = self.scroll_offset.clamp(max_scroll_right, max_scroll_left);
-
-            let cursor_px: Coord = self.widths[..self.cursor].iter().sum();
-            let cursor_in_centered = cursor_px - text_half;
-            let cursor_in_view = cursor_in_centered + self.scroll_offset;
-            if cursor_in_view < -usable_half + margin {
-                self.scroll_offset = -usable_half + margin - cursor_in_centered;
-            } else if cursor_in_view > usable_half - margin {
-                self.scroll_offset = usable_half - margin - cursor_in_centered;
+            None
+        };
+        if let Some(t) = target {
+            if self.scroll_offset != t {
+                self.scroll_offset = t;
+                self.text_cache_dirty = true;
             }
         }
-        if self.scroll_offset != before {
-            self.text_cache_dirty = true;
-        }
+        self.clamp_scroll_to_bounds();
     }
+
 
     // --- Click ---
 
@@ -1059,7 +1089,7 @@ impl Textbox {
         self.focused
     }
 
-    /// Set the focused state and side-effects: an unfocused textbox stops the blinkey and drops any pending selection anchor (clicking off should not preserve a half-formed selection). The focus indicator (glow) lights up on `set_focused(true)` because the painter consults `focused` directly on the next render. Caller is responsible for the host-side wake (request_redraw, blink-timer start) — Textbox doesn't reach across into the event loop.
+    /// Set the focused state and side-effects: an unfocused textbox stops the blinkey but PRESERVES its `cursor` and `selection_anchor` — tabbing away and back returns to the same selection state and cursor position, which is the expected behaviour for any form-style multi-textbox UI. (A click that intentionally moves the cursor still goes through [`Self::handle_click`] / the [`Click`] trait impl, which both clear the selection and reposition the cursor.) The focus indicator (glow) lights up on `set_focused(true)` because the painter consults `focused` directly on the next render. Caller is responsible for the host-side wake (request_redraw, blink-timer start) — Textbox doesn't reach across into the event loop.
     pub fn set_focused(&mut self, focused: bool) {
         if focused == self.focused {
             return;
@@ -1070,7 +1100,6 @@ impl Textbox {
             self.blinkey_wave_top = true;
         } else {
             self.blinkey_visible = false;
-            self.selection_anchor = None;
         }
     }
 
