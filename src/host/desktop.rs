@@ -719,9 +719,9 @@ impl ApplicationHandler for DesktopApp {
                     let speed = 1000.0 * distance_outside / uw;
                     let delta = speed * dt;
                     if self.cursor_x < tl {
-                        tb.scroll_offset += delta;
+                        tb.nudge_scroll_offset(delta);
                     } else {
-                        tb.scroll_offset -= delta;
+                        tb.nudge_scroll_offset(-delta);
                     }
                     // Update cursor position for the new scroll state.
                     let clamped_x = self.cursor_x.clamp(tl, tr);
