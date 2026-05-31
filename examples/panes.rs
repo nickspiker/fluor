@@ -134,8 +134,15 @@ impl PanesDemo {
         // Decode the bundled app-icon orb (256×256 uncompressed VSF, hp+hb hashes). Bake-in via include_bytes! so the example is a single-file artefact at runtime — no on-disk asset lookup.
         let orb_bytes = include_bytes!("assets/example_orb.vsf");
         let app_icon = Icon::from_vsf_bytes(orb_bytes).ok();
-        let chrome =
-            DefaultChrome::new(viewport, title.clone(), app_icon, Some("ready".to_string()));
+        // Dense hit-id counter — chrome claims 1..=4 (min, max, close, app icon) because it constructs first; widget constructors that follow (textboxes etc.) get 5..N.
+        let mut hit_counter: HitId = HIT_NONE;
+        let chrome = DefaultChrome::new(
+            viewport,
+            title.clone(),
+            app_icon,
+            Some("ready".to_string()),
+            &mut hit_counter,
+        );
 
         // Placeholder textbox + groups — actual geometry computed in `init`/`on_resize`.
         // Solid-fill-only iteration: textbox_group has just the content layer in its program. We still allocate a glow layer slot so the existing rasterize loop can clear it without panicking, but we don't fold it into the composite — that avoids double premultiplication (an empty glow on top of content via under() premultiplies content once, then `flatten_into` to target premultiplies it again, brightening every AA edge). When we wire glow back in we'll choose a compose that does the math correctly.

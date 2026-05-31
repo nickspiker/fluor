@@ -138,6 +138,8 @@ pub enum EventResponse {
     Close,
     /// Toggle the internal `window_rect` between user-sized and screen-sized. The fullscreen-compositor architecture means the OS surface is always at monitor size; `winit::Window::set_maximized` is a no-op on a borderless fullscreen window. The host owns the actual toggle state — on first invocation it saves the current `window_rect` and resizes to the full screen; on the next, it restores the saved rect. Triggers `on_resize`, full-repaint, and an X11 input-region update under the hood.
     ToggleMaximized,
+    /// Minimize the window. Calls `winit::Window::set_minimized(true)` on the OS surface — works on every platform because minimization is an OS-level operation that doesn't conflict with the fullscreen-compositor model the way maximize did. Exists as a distinct variant (rather than the consumer calling `ctx.window.set_minimized` directly) so chrome's `Minimize`-button widget can return a window-handle-free response.
+    Minimize,
 }
 
 /// What a consumer implements to drive the desktop host.
@@ -702,6 +704,10 @@ impl<A: FluorApp> DesktopShell<A> {
             }
             EventResponse::ToggleMaximized => {
                 self.toggle_maximized(&window);
+                false
+            }
+            EventResponse::Minimize => {
+                window.set_minimized(true);
                 false
             }
         }
