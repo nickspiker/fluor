@@ -67,6 +67,8 @@ pub struct Textbox {
     text_cache_h: usize,
     /// `true` → text glyphs need re-rasterize on the next render. Set by every text-mutating method (insert_char, backspace, etc.) and by geometry / font-size changes.
     text_cache_dirty: bool,
+    /// Single-channel α mask matching `pill_cache`'s dimensions, capturing the inner squircle silhouette (`TEXTBOX_FILL` shape, sampled BEFORE the outer two-tone edges paint). Used as the `AlphaMask` passed to `TextRenderer::draw_text_left_u32` when rebuilding `text_cache` — glyph pixels in the squircle's curved-cap regions get their α multiplied by the mask, fading them out along the squircle's AA boundary instead of poking past the visual pill edge. Rebuilt alongside `pill_cache` (on geometry / font-size changes); cached across text edits since the squircle shape doesn't depend on text content.
+    inner_pill_mask: Vec<u8>,
 
     // --- Blinkey state (paints into scratch each frame as part of render_content_into) ---
     /// Was the blinkey rendered last frame? Used by [`damage_rect`] to union the prior cursor_bbox into this frame's damage so a blink-off transition (or a cursor move while blinking) clears the old position cleanly.
@@ -217,6 +219,7 @@ impl Textbox {
             text_cache_w: 0,
             text_cache_h: 0,
             text_cache_dirty: true,
+            inner_pill_mask: Vec::new(),
             last_painted_bbox: None,
             last_painted_selection: None,
             last_painted_focused: false,
@@ -697,43 +700,62 @@ impl Textbox {
             self.pill_cache_w = cw;
             self.pill_cache_h = ch;
 
-            let mut cache_damage = crate::canvas::Damage::new();
-            let mut cache_canvas = crate::canvas::Canvas::new(
-                &mut self.pill_cache, cw, ch, &mut cache_damage,
-            );
-
             // Paint into cache at LOCAL coords (origin = 0,0) so it's blit-translatable.
             let inner_x = stroke_px;
             let inner_y = stroke_px;
             let inner_w = (pill_w - 2 * stroke_px).max(0);
             let inner_h = (pill_h - 2 * stroke_px).max(0);
-            if inner_w > 0 && inner_h > 0 {
-                paint::draw_squircle_pill(
+            let mut cache_damage = crate::canvas::Damage::new();
+            // Inner squircle (the fill INSIDE the stroke). Scope so cache_canvas drops before the mask read.
+            {
+                let mut cache_canvas = crate::canvas::Canvas::new(
+                    &mut self.pill_cache, cw, ch, &mut cache_damage,
+                );
+                if inner_w > 0 && inner_h > 0 {
+                    paint::draw_squircle_pill(
+                        &mut cache_canvas,
+                        inner_x,
+                        inner_y,
+                        inner_w,
+                        inner_h,
+                        theme::TEXTBOX_FILL,
+                        squirdleyness,
+                    );
+                }
+            }
+            // Text AlphaMask = the inner fill's α channel, taken BEFORE the outer two-tone stroke paints. This is the silhouette text should be clipped to: just inside the stroke. Snapshot AFTER the stroke would let text into the stroke ring (obscuring the edge colour); using the FILLED outer silhouette (cap-to-cap) does the same. The inner-fill silhouette is the cleanest: text fades naturally along the inner squircle's AA boundary, leaving the stroke fully visible around it.
+            self.inner_pill_mask.clear();
+            self.inner_pill_mask.resize(cw * ch, 0);
+            for i in 0..(cw * ch) {
+                self.inner_pill_mask[i] = ((self.pill_cache[i] >> 24) & 0xFF) as u8;
+            }
+            // Outer two-tone stroke painted after the snapshot so it doesn't influence the mask.
+            {
+                let mut cache_canvas = crate::canvas::Canvas::new(
+                    &mut self.pill_cache, cw, ch, &mut cache_damage,
+                );
+                paint::draw_squircle_pill_two_tone(
                     &mut cache_canvas,
-                    inner_x,
-                    inner_y,
-                    inner_w,
-                    inner_h,
-                    theme::TEXTBOX_FILL,
+                    0,
+                    0,
+                    pill_w,
+                    pill_h,
+                    theme::TEXTBOX_LIGHT_EDGE,
+                    theme::TEXTBOX_SHADOW_EDGE,
                     squirdleyness,
+                    None,
+                    0,
                 );
             }
-            paint::draw_squircle_pill_two_tone(
-                &mut cache_canvas,
-                0,
-                0,
-                pill_w,
-                pill_h,
-                theme::TEXTBOX_LIGHT_EDGE,
-                theme::TEXTBOX_SHADOW_EDGE,
-                squirdleyness,
-                None,
-                0,
-            );
             self.pill_cache_dirty = false;
         }
 
-        // --- Text cache rasterize (glyphs via TextRenderer), only when text or geometry changed ---
+        // Selection-only changes (drag-extend, shift+arrow) don't dirty text_cache via the recalc_widths path, so detect here against what was rendered last frame. Selection visual now lives INSIDE text_cache (painted before glyphs), so a selection change is also a text_cache rebuild trigger.
+        if self.selection_range() != self.last_painted_selection {
+            self.text_cache_dirty = true;
+        }
+
+        // --- Text cache rasterize: selection bg first, glyphs on top — both masked by inner_pill_mask in the same buffer so they share the squircle clip exactly ---
         if self.text_cache_dirty {
             paint::RASTERIZE_OPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             self.text_cache.clear();
@@ -741,39 +763,65 @@ impl Textbox {
             self.text_cache_w = cw;
             self.text_cache_h = ch;
 
-            if !self.chars.is_empty() && self.font_size > 0.0 {
-                // Local x where the text starts (mirrors `text_start_x()` but in LOCAL pill coords).
-                let tw = self.text_width();
-                let uw = self.usable_width();
-                let local_text_start_x = if tw <= uw {
-                    (pill_w as Coord - tw) * 0.5
+            // Anchor at the LOCAL pill centre (in cache coords), shifted by scroll_offset. `draw_text_center_u32` keeps text and cursor on the SAME anchor point — the textbox centre — instead of going through a derived text_start_x that depends on the running sum of glyph widths. When the window scales, all the per-glyph widths change and a left-anchored layout would have positions drifting because text_start_x = center_x − tw/2 sees both terms shift. Centre-anchored stays stable. Selection x range uses the same local_text_left math so selection bg lines up with glyph positions exactly.
+            let tw = self.text_width();
+            let local_text_left = pill_w as Coord * 0.5 - tw * 0.5 + self.scroll_offset;
+            let local_center_x = pill_w as Coord * 0.5 + self.scroll_offset;
+            let local_y_center = pill_h as Coord * 0.5;
+            // Pre-compute the selection rect in local coords BEFORE the mutable borrow of self.text_cache starts (selection_range / widths read self).
+            let sel_rect: Option<(isize, isize, isize, isize)> = self.selection_range().and_then(|(sel_start, sel_end)| {
+                let sel_x0 = local_text_left + self.widths[..sel_start].iter().sum::<Coord>();
+                let sel_x1 = local_text_left + self.widths[..sel_end].iter().sum::<Coord>();
+                let sel_y0 = local_y_center - self.font_size * 0.5;
+                let sel_w = sel_x1 - sel_x0;
+                let sel_h_actual = self.font_size;
+                if sel_w > 0.0 && sel_h_actual > 0.0 {
+                    Some((sel_x0 as isize, sel_y0 as isize, sel_w as isize, sel_h_actual as isize))
                 } else {
-                    (pill_w as Coord - tw) * 0.5 + self.scroll_offset
-                };
-                let local_y_center = pill_h as Coord * 0.5;
-                let pad = self.padding() as usize;
-                let clip_x_end = cw.saturating_sub(pad);
-                if pad < clip_x_end {
-                    let inner_clip = paint::Clip::new(pad, 0, clip_x_end, ch);
-                    let mut text_damage = crate::canvas::Damage::new();
-                    let mut text_canvas = crate::canvas::Canvas::new(
-                        &mut self.text_cache, cw, ch, &mut text_damage,
-                    );
-                    let s: String = self.chars.iter().collect();
-                    text.draw_text_left_u32(
-                        &mut text_canvas,
-                        &s,
-                        local_text_start_x,
-                        local_y_center,
-                        self.font_size,
-                        400,
-                        theme::TEXTBOX_TEXT,
-                        self.font,
-                        Some(inner_clip),
-                        None,
-                        None,
-                    );
+                    None
                 }
+            });
+            let s: Option<String> = if !self.chars.is_empty() && self.font_size > 0.0 {
+                Some(self.chars.iter().collect())
+            } else {
+                None
+            };
+
+            let mut text_damage = crate::canvas::Damage::new();
+            let mut text_canvas = crate::canvas::Canvas::new(
+                &mut self.text_cache, cw, ch, &mut text_damage,
+            );
+            let mask_buffer = paint::AlphaMask::new(&self.inner_pill_mask, cw, ch);
+
+            // Front-to-back: TOPMOST paints FIRST in fluor's model. Glyphs are visually topmost (the things you read), so they claim their cells before the selection bg paints into the surrounding empties.
+            if let Some(ref text_str) = s {
+                text.draw_text_center_u32(
+                    &mut text_canvas,
+                    text_str,
+                    local_center_x,
+                    local_y_center,
+                    self.font_size,
+                    400,
+                    theme::TEXTBOX_TEXT,
+                    self.font,
+                    None,
+                    Some(&mask_buffer),
+                    None,
+                );
+            }
+
+            // Selection background (painted AFTER text so it goes UNDER glyphs via under()'s opaque-top early-out — glyph cells stay glyph colour, non-glyph cells inside the selection range get the selection bg). Same mask as text → selection ends fade along the same squircle curve.
+            if let Some((sx, sy, sw, sh)) = sel_rect {
+                paint::fill_rect(
+                    &mut text_canvas,
+                    sx,
+                    sy,
+                    sw,
+                    sh,
+                    theme::TEXTBOX_SELECTION_BG,
+                    None,
+                    Some(&mask_buffer),
+                );
             }
             self.text_cache_dirty = false;
         }
@@ -795,29 +843,7 @@ impl Textbox {
             clip,
         );
 
-        // Step 2: selection background (middle). Painted as a rect via fill_rect (which uses under() too), so glyph pixels already in target stay put; only empty cells inside the selection's pixel range get the selection colour. Skipped when no selection exists.
-        if let Some((sel_start, sel_end)) = self.selection_range() {
-            let text_start_v = self.text_start_x();
-            let sel_x0 = text_start_v + self.widths[..sel_start].iter().sum::<Coord>();
-            let sel_x1 = text_start_v + self.widths[..sel_end].iter().sum::<Coord>();
-            let sel_y0 = self.center_y - self.font_size * 0.5;
-            let sel_h_actual = self.font_size;
-            let sel_w = sel_x1 - sel_x0;
-            if sel_w > 0.0 && sel_h_actual > 0.0 {
-                paint::fill_rect(
-                    canvas,
-                    (sel_x0 - offset_x) as isize,
-                    (sel_y0 - offset_y) as isize,
-                    sel_w as isize,
-                    sel_h_actual as isize,
-                    theme::TEXTBOX_SELECTION_BG,
-                    clip,
-                    None,
-                );
-            }
-        }
-
-        // Step 3: pill background + AA edges (bottom). Fills the remaining empty cells inside the pill silhouette and stamps hit_map at every opaque pill pixel — so the hit area follows the pill silhouette exactly, regardless of whether each pixel ended up as glyph / selection / pill bg.
+        // Step 2: pill background + AA edges (bottom). Fills the remaining empty cells inside the pill silhouette and stamps hit_map at every opaque pill pixel — so the hit area follows the pill silhouette exactly, regardless of whether each pixel ended up as glyph / selection / pill bg.
         blit_cache_to_target(
             &self.pill_cache,
             self.pill_cache_w,

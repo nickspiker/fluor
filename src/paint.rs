@@ -603,15 +603,19 @@ pub fn fill_rect(
             }
         }
         Some(m) => {
-            let colour_opacity = 255 - ((colour >> 24) & 0xFF);
+            // Mask convention matches `TextRenderer::render_buffer_u32`: `effective_α = colour_α × mask_α / 255` (opacity multiplies). Mask=0 → pixel fully clipped; mask=255 → colour passes through at full α. The previous implementation here used `colour_opacity = 255 - α`, which inverted the semantics — for an opaque colour (α=0xFF) the mask was multiplied by zero and had no effect, so masks were silently ineffective on solid fills.
+            let colour_alpha = (colour >> 24) & 0xFF;
             let colour_rgb = colour & 0x00FF_FFFF;
             for row in y_min..y_max {
                 let base = row * buf_w;
                 for col in x_min..x_max {
                     let idx = base + col;
                     let mask_a = m.pixels[idx] as u32;
-                    let effective_opacity = (colour_opacity * mask_a) >> 8;
-                    let masked = colour_rgb | ((255 - effective_opacity) << 24);
+                    let effective_alpha = (colour_alpha * mask_a) / 255;
+                    if effective_alpha == 0 {
+                        continue;
+                    }
+                    let masked = colour_rgb | (effective_alpha << 24);
                     pixels[idx] = pixels[idx].under(masked, BlendMode::Normal);
                 }
             }
