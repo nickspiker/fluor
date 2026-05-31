@@ -85,6 +85,17 @@ pub struct Textbox {
     last_painted_selection: Option<(usize, usize)>,
 }
 
+/// Word-boundary character class. `select_word_at` walks left/right from a probe char, extending the selection while neighbours share this class — so a click in the middle of a word selects the word, a click on whitespace selects the whitespace run, a click on punctuation selects the punctuation run. Matches the standard text-field behaviour where double-click-on-letter selects the word but double-click-on-comma selects just the comma.
+fn char_class(c: char) -> u8 {
+    if c.is_alphanumeric() || c == '_' {
+        0 // word
+    } else if c.is_whitespace() {
+        1 // whitespace
+    } else {
+        2 // punctuation / symbol
+    }
+}
+
 /// Convert a viewport-coord `Region` (Coord f32 rectangle, possibly negative or off-buffer) into a `PixelRect` (usize half-open rect) clamped to the viewport bounds. Used by [`Textbox::damage_rect`] / [`Textbox::record_painted`] to express widget bboxes in the host's pixel-rect language for damage union.
 fn region_to_pixelrect(region: Region, viewport_w: usize, viewport_h: usize) -> PixelRect {
     let vw = viewport_w as f32;
@@ -456,6 +467,26 @@ impl Textbox {
     pub fn select_all(&mut self) {
         self.selection_anchor = Some(0);
         self.cursor = self.chars.len();
+    }
+
+    /// Select the "word" containing or adjacent to `idx`. A word is a maximal run of chars sharing the same class (alphanumeric+underscore / whitespace / punctuation). At end-of-text the probe slides one char left so end-of-text clicks still select the trailing word. Sets `selection_anchor` to the run's start and `cursor` to its end. No-op on empty text.
+    pub fn select_word_at(&mut self, idx: usize) {
+        let n = self.chars.len();
+        if n == 0 {
+            return;
+        }
+        let probe = if idx >= n { n - 1 } else { idx };
+        let cls = char_class(self.chars[probe]);
+        let mut start = probe;
+        while start > 0 && char_class(self.chars[start - 1]) == cls {
+            start -= 1;
+        }
+        let mut end = probe + 1;
+        while end < n && char_class(self.chars[end]) == cls {
+            end += 1;
+        }
+        self.selection_anchor = Some(start);
+        self.cursor = end;
     }
 
     pub fn delete_selection(&mut self, text: &mut TextRenderer) {
