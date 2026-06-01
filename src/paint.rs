@@ -686,14 +686,14 @@ pub fn stroke_rect(
     }
 }
 
-/// Fill the buffer with photon's signature procedural background — symmetric organic noise plus speckle. Rows are RNG-independent (each row reseeds from `logical_row`), so the outer loop parallelizes cleanly via [`crate::par::par_rows`]. Mirrored left/right halves like photon. Set `fullscreen=true` to fill the whole buffer; `false` leaves a 1px border for the window edge stroke. `speckle` is an animation counter (constant 0 for static); `scroll_offset` shifts the texture vertically (for content scroll integration).
+/// Fill the buffer with photon's signature procedural background — symmetric organic noise. Rows are RNG-independent (each row reseeds from `logical_row`), so the outer loop parallelizes cleanly via [`crate::par::par_rows`]. Mirrored left/right halves like photon. Set `fullscreen=true` to fill the whole buffer; `false` leaves a 1px border for the window edge stroke. `shimmer` is mixed into each row's starting colour so animating it cycles the colour bias across rows without changing the noise topology; `scroll_offset` shifts the texture vertically (for content scroll integration). The speckle gate (the rare bright/dim flash branch inside each row) fires at a constant 1/256 rate independent of `shimmer`.
 ///
 /// SIMD inside a row is intentionally not done — the per-pixel RNG (`rng ^= rng.rotate_left(13).wrapping_add(const)`) is a serial dependency chain; vectorizing it would require N independent RNG streams per lane and would change photon's visual pattern. If profiling shows the per-row scalar work still dominating after Rayon, that's the next lever.
 ///
 /// Clip restricts the row range. Mask isn't supported here (background is bg — masking it would mean "draw nothing where mask is zero" which is the same as just clearing afterward; if you need that, do it explicitly).
 pub fn background_noise(
     canvas: &mut Canvas,
-    speckle: usize,
+    shimmer: usize,
     fullscreen: bool,
     scroll_offset: isize,
     clip: Option<Clip>,
@@ -729,7 +729,7 @@ pub fn background_noise(
             buf_h,
             x_start,
             x_end,
-            speckle,
+            shimmer,
         );
     });
 }
@@ -742,14 +742,14 @@ fn background_row(
     height: usize,
     x_start: usize,
     x_end: usize,
-    speckle: usize,
+    shimmer: usize,
 ) {
     use crate::theme::{BG_BASE, BG_MASK, BG_SPECKLE};
     // Noise math runs in visible-RGB space (matching photon's reference). At the store site we flip the visible result to stored darkness via XOR, then OR α=0xFF for opaque. Mask off the top byte first to strip any carry from `wrapping_add`.
     const VISIBLE_TO_DARK_FLIP: u32 = 0x00FFFFFF;
     const RGB_MASK: u32 = 0x00FFFFFF;
     const OPAQUE_ALPHA: u32 = 0xFF000000;
-    // Hybrid 2-pass: pass 1 fills `noise_buf` with the row's chunk of noise values via the serial RNG/colour chain (branches stay scalar — predicating speckle would cost as much as it saves). Pass 2 hands the chunk to the 8-wide SIMD under-blend kernel (`under_chunk_normal_dispatch`), which composites it into row_pixels at ~1 cycle/pixel amortized. Output is bit-identical to the old straight-scalar version.
+    // Hybrid 2-pass: pass 1 fills `noise_buf` with the row's chunk of noise values via the serial RNG/colour chain (branches stay scalar — predicating the speckle gate would cost as much as it saves). Pass 2 hands the chunk to the 8-wide SIMD under-blend kernel (`under_chunk_normal_dispatch`), which composites it into row_pixels at ~1 cycle/pixel amortized. Output is bit-identical to the old straight-scalar version.
     const CHUNK: usize = 64;
     let mut noise_buf = [0u32; CHUNK];
     let ones = 0x0001_0101u32;
@@ -760,14 +760,14 @@ fn background_row(
 
     // Right half — left to right. Noise composes UNDER existing content (topmost-first): an empty pixel gets the noise; a non-empty pixel (e.g. a topmost rect already painted) has the noise blended behind it.
     let mut rng = seed;
-    let mut colour = rng as u32 & BG_MASK;
+    let mut colour = rng.wrapping_add(shimmer) as u32 & BG_MASK;
     let mut x = width / 2;
     while x < x_end {
         let chunk_len = (x_end - x).min(CHUNK);
         for i in 0..chunk_len {
             rng ^= rng.rotate_left(13).wrapping_add(12_345_678_942);
             let adder = rng as u32 & ones;
-            if rng.wrapping_add(speckle) < usize::MAX / 256 {
+            if rng < usize::MAX / 256 {
                 colour = (rng as u32 >> 8) & BG_SPECKLE;
             } else {
                 colour = colour.wrapping_add(adder) & BG_MASK;
@@ -783,7 +783,7 @@ fn background_row(
 
     // Left half — right to left, same RNG seed (mirror), SUB instead of ADD on the rng step. Within each chunk the RNG iterates rightmost-pixel-first; we store into `noise_buf` in left-to-right order (`i = chunk_len-1` down to 0) so the chunk dispatch can scan the buffer sequentially.
     rng = seed;
-    colour = rng as u32 & BG_MASK;
+    let mut colour = rng.wrapping_add(shimmer) as u32 & BG_MASK;
     let mut x_hi = width / 2;
     while x_hi > x_start {
         let chunk_lo = x_hi.saturating_sub(CHUNK).max(x_start);
@@ -791,7 +791,7 @@ fn background_row(
         for i in (0..chunk_len).rev() {
             rng ^= rng.rotate_left(13).wrapping_sub(12_345_678_942);
             let adder = rng as u32 & ones;
-            if rng.wrapping_add(speckle) < usize::MAX / 256 {
+            if rng < usize::MAX / 256 {
                 colour = (rng as u32 >> 8) & BG_SPECKLE;
             } else {
                 colour = colour.wrapping_add(adder) & BG_MASK;
