@@ -157,6 +157,44 @@ pub fn build_overlay_deltas(root: &mut dyn Container, count: usize) -> alloc::ve
     t
 }
 
+/// Deliver a click to the widget with `target_id`, if any. Walks `root` once, finds the widget whose [`Widget::id`] matches, asks for its [`Click`] capability, and invokes [`Click::on_click`] with the given `(x, y, mods)`. Returns the widget's [`crate::host::app::EventResponse`], or [`crate::host::app::EventResponse::Pass`] if no matching widget exists or the matching widget has no [`Click`] capability — same convention as a missing handler so apps can `?`-chain into chrome-button dispatch without special-casing the no-widget arm.
+pub fn dispatch_click(
+    root: &mut dyn Container,
+    target_id: HitId,
+    x: Coord,
+    y: Coord,
+    mods: ModifiersState,
+) -> crate::host::app::EventResponse {
+    let mut response = crate::host::app::EventResponse::Pass;
+    root.visit(&mut |w| {
+        if w.id() == target_id {
+            if let Some(c) = w.click() {
+                response = c.on_click(x, y, mods);
+            }
+        }
+    });
+    response
+}
+
+/// Deliver a key event to the widget with `target_id`, if any. Mirror of [`dispatch_click`] for keyboard input — caller picks the target (typically the currently-focused widget tracked by the app) and this routes the raw [`KeyEvent`] + [`ModifiersState`] + [`TextRenderer`] handle through to the widget's [`Key::on_key`] impl. Returns [`crate::host::app::EventResponse::Pass`] if `target_id` doesn't match any widget or the matching widget doesn't impl [`Key`].
+pub fn dispatch_key(
+    root: &mut dyn Container,
+    target_id: HitId,
+    kev: &KeyEvent,
+    mods: ModifiersState,
+    text: &mut TextRenderer,
+) -> crate::host::app::EventResponse {
+    let mut response = crate::host::app::EventResponse::Pass;
+    root.visit(&mut |w| {
+        if w.id() == target_id {
+            if let Some(k) = w.key() {
+                response = k.on_key(kev, mods, text);
+            }
+        }
+    });
+    response
+}
+
 /// Apply a focus change: call `set_focused(false)` on the old target (if any) and `set_focused(true)` on the new target (if any). Idempotent when `old == new`. Walks `root` once per non-null target so widgets that change visual state on focus transition can mark themselves dirty in the same frame.
 pub fn apply_focus_change(root: &mut dyn Container, old: Option<HitId>, new: Option<HitId>) {
     if old == new {

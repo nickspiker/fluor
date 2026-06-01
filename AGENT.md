@@ -129,6 +129,37 @@ let byte_value = pixel_value as u8;
 
 **The forensic approach:** If the cast wraps/truncates unexpectedly, that exposes the real bug in your math. Fix the math, don't hide the symptoms.
 
+## GUI Continuity: Calculus or Else
+
+**Every visible GUI element must be at least C¹ continuous across all parameters that drive it.** Resize, zoom, hover, focus, theme changes — none of them are allowed to produce a kink, a step, or a discontinuous derivative in the rendered pixels.
+
+### What this rules out:
+
+- `.clamp(a, b)` on the parameter of an interpolation polynomial. clamp's derivative is `0, 1, 0` — a step function. Use a C∞ sigmoid (tanh, logistic, algebraic `x/√(1+x²)`) instead.
+- `min(...)` / `max(...)` to gate animation amplitude. Same problem — kink at the threshold.
+- `if aspect > 2 { layout_a } else { layout_b }` — piecewise layouts with no smoothing.
+- Antialiasing curves whose joins don't match derivatives.
+
+### Why this matters:
+
+Humans *feel* derivative discontinuities. Conscious vision tops out around 8-bit pixel accuracy, but the visual cortex processes motion and gradients as continuous fields — a kink in a curve registers as a micro-jolt the same way a pothole the suspension absorbed still hits your spine. Smooth = massage. Discontinuous = slap. You don't have to *see* the discontinuity to recoil from it; the eye traces the curve and the brain notices that the rate-of-change jumped.
+
+That's why "calculus or else" exists. It isn't about the math being more correct in the abstract — it's that humans physically prefer C¹ surfaces to C⁰ ones, smooth animations to clamped ones, easing to step transitions. Every clamp, every `if`-piecewise, every approximated arc is a tiny papercut to the nervous system. They accumulate.
+
+Fluor derives every curve — squircle corners, AA hairlines, glow falloffs, opacity gradients — from analytical functions that are C¹ (or smoother) at every join, at every precision. Other compositors substitute approximations: circular arcs instead of squircles, gaussian blurs instead of derived falloffs, polynomial-fit AA with mismatched derivatives at the segment joins. They're not *visibly* wrong at typical viewing distance. They just *feel* a little worse. Add up a hundred of them across a UI and the whole product feels cheap without anyone being able to articulate why.
+
+### The test:
+
+If you can compute `d(pixel)/d(parameter)` symbolically and there's an `if`, an `abs`, a clamp, or any non-differentiable function in the result, it's wrong. Use a smooth interpolant.
+
+### Reference shapes:
+
+- **Smoothstep**: C¹ continuous only INSIDE [0,1]; the clamp at the domain is C⁰ at the joins — use only if you've proven the parameter stays in range without clamping.
+- **tanh**: C∞ everywhere, no clamp needed.
+- **Logistic** `1/(1+e^-x)`: C∞ everywhere.
+- **Bump** `exp(-1/x)` for x>0, 0 otherwise: C∞ at every order at x=0 because all derivatives of `exp(-1/x)` vanish there.
+- **Algebraic sigmoid** `x/√(1+x²)`: C∞, no transcendentals.
+
 ## When Unsure
 
 **ASK.** Don't add "defensive" checks. If you're not sure whether a bounds check is needed:
