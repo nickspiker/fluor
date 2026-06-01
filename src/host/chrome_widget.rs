@@ -4,12 +4,11 @@
 //!
 //! Built on the verbatim photon primitives in [`super::chrome`] — `draw_window_controls`, `draw_window_edges_and_mask`, `draw_button_hairlines`, `draw_button_hover_by_pixels`, `pixels_for_button`. Those stay; this module is a stateful wrapper that schedules them against the chrome group's dirty layers.
 //!
-//! Pattern: `chrome.rasterize_bg(|bg, w, h| { /* paint into bg */ });` → `chrome.rasterize_chrome(text);` → `chrome.rasterize_hover();` → `chrome.flatten_into(target, w, h);`. Each rasterize_* checks the layer's dirty bit internally and is a no-op on clean.
+//! Pattern: `chrome.rasterize_bg(|bg, w, h| { /* paint into bg */ });` → `chrome.rasterize_chrome(text);` → `chrome.flatten_into(target, w, h);`. Each rasterize_* checks the layer's dirty bit internally and is a no-op on clean. Hover / focus tint is NOT rasterized — it's applied by the host's post-finalize overlay pass against `persistent_screen` via [`super::widget::build_overlay_deltas`] reading [`Hover::tint_delta`] off each chrome button.
 
 use super::app::EventResponse;
 use super::chrome::{self, HIT_NONE, HitId};
 use super::widget::{self, Click, Container, Hover, PaintCtx, Widget};
-use crate::canvas::PixelRect;
 use crate::coord::Coord;
 use crate::geom::Viewport;
 use crate::group::Group;
@@ -162,7 +161,6 @@ pub struct DefaultChrome {
     viewport: Viewport,
     layer_bg: usize,
     layer_chrome: usize,
-    layer_hover: usize,
     /// Minimize-button widget. ID allocated at chrome construction time. Allocation order (min → max → close → app-icon) is the tab-cycle order chrome exposes via [`Container::visit`]; ids are otherwise opaque — callers query [`Self::owns_hit`] / [`Self::hover_colour_for`] instead of comparing numerically.
     pub min_btn: ChromeButton,
     /// Maximize / restore button.
@@ -194,8 +192,7 @@ impl DefaultChrome {
         let mut group = Group::new(region, BlendMode::Normal);
         let layer_bg = group.new_layer();
         let layer_chrome = group.new_layer();
-        let layer_hover = group.new_layer();
-        // Front-to-back: chrome on top (controls + edges + hairlines + hover tint baked in), bg underneath (panes + background_noise). The hover layer is allocated for forward-compat with future designs that promote it to a separate Stack operand, but it's NOT in the program — hover tint is baked into the chrome layer at rasterization time via `pixels[i].under(tint, Normal)` (which composes correctly because rasterizer's Under expects straight-α bottoms; stacking a separate premultiplied hover layer would re-premultiply chrome's partial-α AA edges and trash them).
+        // Front-to-back: chrome on top (controls + edges + hairlines), bg underneath (panes + background_noise). Hover / focus tint is NOT a separate layer — applied by the host's post-finalize overlay pass against persistent_screen instead of baked into chrome_buf, so chrome's partial-α AA edges stay clean (a separate premultiplied hover layer would re-premultiply them and trash the edge).
         group.set_program(alloc::vec![
             Op::Push(layer_chrome),
             Op::Push(layer_bg),
@@ -219,7 +216,6 @@ impl DefaultChrome {
             viewport,
             layer_bg,
             layer_chrome,
-            layer_hover,
             min_btn: ChromeButton::new(min_id, ChromeAction::Minimize),
             max_btn: ChromeButton::new(max_id, ChromeAction::ToggleMaximized),
             close_btn: ChromeButton::new(close_id, ChromeAction::Close),
@@ -592,9 +588,6 @@ impl DefaultChrome {
         }
     }
 
-    /// **No-op stub.** Kept for source-compat with callers; hover tint lives in the host's post-finalize overlay pass now.
-    pub fn rasterize_hover(&mut self) {}
-
     /// Composite the chrome group (bg + chrome layers via internal Stack `Push chrome, Push bg, Under(Normal)`) and flatten under the present buffer. Front-to-back: chrome's composited result is blended `under` whatever's already in target, so chrome wins where opaque and bg shows through where chrome is transparent.
     ///
     /// `clip`: optional damage-clip in target pixel coords; passed straight through to [`Group::flatten_into`]. `None` = full target (current behavior).
@@ -833,6 +826,7 @@ mod tests {
         assert_eq!(chrome.dims(), (200, 150));
         assert_eq!(chrome.hit_test_map.len(), 200 * 150);
         // Group::resize marks all layers dirty.
-        assert!(chrome.group.rpn.layers[chrome.layer_hover].dirty);
+        assert!(chrome.group.rpn.layers[chrome.layer_bg].dirty);
+        assert!(chrome.group.rpn.layers[chrome.layer_chrome].dirty);
     }
 }

@@ -6,7 +6,7 @@
 //!
 //! Re-execution policy: a per-layer `dirty` flag gates expensive rasterization upstream of the Stack (text shaping, glyph rendering, squircle math). The Stack itself caches the *final* composite from the last `evaluate()`; if no layer is dirty, that cache returns directly without re-running the program. If anything is dirty, the entire program re-runs — no per-instruction snapshot cache. Under-blend's per-pixel early-out (`dst >= 0xFF000000`, i.e. α=0xFF opaque) makes the per-pixel work cheap, and the typical program is short enough (3-5 ops) that running it whole is faster than maintaining intermediate state.
 
-use crate::pixel::{Argb8, Blend, BlendMode};
+use crate::pixel::{Argb8, BlendMode};
 use alloc::vec::Vec;
 
 /// Stack Notation instruction — pushes a buffer onto the eval stack, or folds two buffers via `under`-with-mode.

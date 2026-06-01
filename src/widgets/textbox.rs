@@ -1235,7 +1235,7 @@ mod widget_impls {
             let mut changed = false;
 
             // Shift+arrow / shift+Home / shift+End: extend existing selection or start one from the current cursor. Non-shift movement collapses any selection. Refactor of the per-arrow boilerplate from the old panes match — `start_selection_if_needed` ensures the anchor is set before the cursor moves so a fresh selection actually contains anything.
-            let mut start_selection_if_needed = |slf: &mut Textbox| {
+            let start_selection_if_needed = |slf: &mut Textbox| {
                 if shift && slf.selection_anchor.is_none() {
                     slf.selection_anchor = Some(slf.cursor);
                 } else if !shift {

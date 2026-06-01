@@ -224,24 +224,29 @@ That front to back ordering becomes a security primitive when enforced thru the 
 ## Quick example
 
 ```rust
-use fluor::{Compositor, RuVec2, Viewport};
-use fluor::paint::pack_argb;
+use fluor::coord::Coord;
+use fluor::host::app::{Context, FluorApp, run_app};
+use winit::window::CursorIcon;
+
+struct Hello;
+
+impl FluorApp for Hello {
+    fn render(&mut self, _target: &mut [u32], _ctx: &mut Context) {
+        // Your paint code lives here — fluor hands you a viewport-sized α + darkness scratch
+        // and a Context with the viewport, font cache, clip mask, and damage accumulator.
+        // The host runs finalize → shadow → OS handoff after this returns.
+    }
+    fn cursor_for(&self, _x: Coord, _y: Coord, _ctx: &Context) -> CursorIcon {
+        CursorIcon::Default
+    }
+}
 
 fn main() {
-    // 1280×800 viewport. Center is (0, 0), +x right, +y down, units in RU.
-    let mut compositor = Compositor::new(Viewport::new(1280, 800));
-
-    compositor.insert(
-        RuVec2::new(-0.15, -0.08),       // center in RU
-        RuVec2::new(0.14, 0.10),         // half extent in RU (width = 2 × 0.14)
-        pack_argb(220, 90, 80, 255),     // ARGB background
-    );
-
-    fluor::host::desktop::run(compositor, "fluor panes").expect("event loop");
+    run_app(Hello).expect("event loop");
 }
 ```
 
-Run the bundled demo: `cargo run --example panes`
+That's the floor — an empty window with chrome the host owns. For the full pattern (chrome wiring, multi-widget Container, focus arbitration, Tab cycling, overlay tints) read [`examples/panes.rs`](examples/panes.rs) and run it with `cargo run --example panes`.
 
 ---
 
@@ -269,16 +274,22 @@ fluor (lib)
 ├── theme       : colour constants (visible-RGB literals. `dark()` helper inverts to stored
 │                 darkness + α=0xFF at compile time. Android byte swap behind cfg)
 └── host/
-    ├── chrome  : draw_window_edges_and_mask, draw_strip_curves, draw_strip_hairlines,
-    │             draw_strip_bg, draw_minimize_symbol, draw_maximize_symbol,
-    │             draw_close_symbol, get_resize_edge, hit_test_map
-    └── desktop : winit + softbuffer host (feature `host-winit`, default).
-                  Present buffer initialized to 0x00000000 each frame (calloc free).
-                  Groups flattened topmost first. finalize_for_os does darkness→visible
-                  XOR + clip + premult in a single pass at the OS boundary.
-                  Self driven resize loop owns input → request_inner_size / set_outer_position.
-                  Linux X11: atomic XConfigureWindow via x11rb when both size+pos change.
-                  std::process::exit(0) on close for Killswitch compliance.
+    ├── chrome         : draw_window_edges_and_mask, draw_strip_curves, draw_strip_hairlines,
+    │                    draw_strip_bg, draw_minimize_symbol, draw_maximize_symbol,
+    │                    draw_close_symbol, get_resize_edge — low-level chrome primitives
+    ├── chrome_widget  : DefaultChrome { Group, hit_test_map, four ChromeButton widgets }.
+    │                    Container impl walks the buttons; hover_colour_for / owns_hit query
+    │                    the live ids without exposing constants
+    ├── widget         : Widget + Click / Key / Focus / Hover capability traits. HitId u16
+    │                    dense allocator (`next_id`). linear_tab_next + apply_focus_change
+    │                    + build_overlay_deltas helpers. PaintCtx wraps the per-frame canvas
+    ├── icon           : Icon (vsfimg-decoded raster source for chrome's app-icon orb)
+    ├── os_input       : XSettings polling for OS double-click interval (Linux/X11)
+    └── app            : FluorApp trait + run_app entry point (feature `host-winit`).
+                         winit + softbuffer event loop. finalize_for_os does darkness→visible
+                         XOR + clip + premult in a single pass at the OS boundary. Self-driven
+                         resize / drag-move / maximize. Linux X11 input-region shape via x11rb.
+                         std::process::exit(0) on close for Killswitch compliance.
 ```
 
 Future: `host-bare` (no_std framebuffer for ferros), textbox + widget kit, SIMD kernels, layout VSF persistence.

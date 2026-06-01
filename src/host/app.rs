@@ -19,13 +19,12 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::ModifiersState;
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
-/// X11-only: issue a SINGLE `XConfigureWindow` with all four of `(x, y, width, height)` so the WM applies position AND size atomically — eliminates the visible "first-size-then-position" seam you get when winit's separate `set_outer_position` / `request_inner_size` calls each generate their own ConfigureRequest. Returns `true` if the atomic call succeeded (window is X11 and the request was sent); `false` if the window is Wayland or the X11 connection failed → caller falls back to winit's separate calls (which is the correct path on Wayland anyway, since `set_outer_position` is a no-op there).
+/// X11-only XShape helpers — direct XCB calls that winit doesn't expose. Currently houses [`x11_atomic::set_input_region`] (window-shape input clipping); historically also held an atomic-geometry helper that's gone now. The `x11_atomic` name is retained because the (single) remaining helper still operates on an XCB connection independent of winit's, which is the property the name actually tracks.
 #[cfg(target_os = "linux")]
 mod x11_atomic {
     use std::sync::OnceLock;
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::{ConfigureWindowAux, ConnectionExt};
     use x11rb::rust_connection::RustConnection;
 
     /// Lazily-opened XCB connection, shared across all atomic-geometry calls. Independent of the connection winit holds internally (which we can't access) — the X server doesn't care which client sends the ConfigureRequest as long as we name the right window ID.
@@ -33,30 +32,6 @@ mod x11_atomic {
         static CONN: OnceLock<Option<RustConnection>> = OnceLock::new();
         CONN.get_or_init(|| x11rb::connect(None).ok().map(|(c, _screen)| c))
             .as_ref()
-    }
-
-    pub fn set_geometry(window: &winit::window::Window, x: i32, y: i32, w: u32, h: u32) -> bool {
-        let Ok(handle) = window.window_handle() else {
-            return false;
-        };
-        let xid = match handle.as_raw() {
-            RawWindowHandle::Xcb(h) => h.window.get(),
-            RawWindowHandle::Xlib(h) => h.window as u32,
-            _ => return false, // Wayland or other non-X11 — caller falls back to winit
-        };
-        let Some(conn) = conn() else {
-            return false;
-        };
-        let aux = ConfigureWindowAux::new()
-            .x(Some(x))
-            .y(Some(y))
-            .width(Some(w))
-            .height(Some(h));
-        if conn.configure_window(xid, &aux).is_err() {
-            return false;
-        }
-        let _ = conn.flush();
-        true
     }
 
     /// Restrict the window's INPUT region to the given screen-space rectangle. Clicks outside this rect pass through to whatever window is behind us. Used by the fullscreen-compositor architecture: our OS surface covers the whole screen but the visible window is just a sub-rect, so we tell X11 "I'm only hittable inside that sub-rect" — the rest is mouse-transparent. Call once per `window_rect` change (initial creation, drag-to-move, resize-drag, monitor change).
@@ -458,11 +433,11 @@ impl<A: FluorApp> DesktopShell<A> {
             damage_clip,
         };
 
-        // Per-stage stopwatches. Each Instant brackets one pipeline stage; the strip displays each as FPS so toggling SIMD/Rayon shows which stage actually moves. `buffer.present()` is excluded everywhere because it blocks for vsync, which would pin every reading to the display refresh rate.
-        let mut app_dt = 0.0f32;
-        let mut fill_dt = 0.0f32;
-        let mut finalize_dt = 0.0f32;
-        let mut shadow_dt = 0.0f32;
+        // Per-stage stopwatches. Each Instant brackets one pipeline stage; the strip displays each as FPS so toggling SIMD/Rayon shows which stage actually moves. `buffer.present()` is excluded everywhere because it blocks for vsync, which would pin every reading to the display refresh rate. Each `let` is uninitialized and assigned exactly once below — drops the dead `= 0.0f32` placeholder the compiler used to flag.
+        let app_dt;
+        let fill_dt;
+        let finalize_dt;
+        let shadow_dt;
 
         let app_start = Instant::now();
         self.app.render(&mut self.scratch, &mut ctx);

@@ -41,7 +41,6 @@ fn query_double_click_ms() -> Option<u32> {
 mod linux {
     use std::process::Command;
     use std::sync::OnceLock;
-    use x11rb::connection::Connection;
     use x11rb::protocol::xproto::{AtomEnum, ConnectionExt};
     use x11rb::rust_connection::RustConnection;
 

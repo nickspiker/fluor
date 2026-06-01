@@ -893,7 +893,7 @@ impl FluorApp for PanesDemo {
         let buf_w = ctx.viewport.width_px as usize;
         let buf_h = ctx.viewport.height_px as usize;
 
-        // Hairline + background + hover overlay. Chrome's bg layer gets photon's background_noise; chrome layer gets the perimeter hairline + controls (or stays empty under `[]c`); hover layer gets a partial-α tint over the currently-hovered button (or stays empty if hover_state == HIT_NONE). The chrome group's Stack program (`Push hover, Push chrome, Under(Normal), Push bg, Under(Normal)`) front-to-back-composites them, then flattens under the target. Order matters: rasterize_chrome MUST run before rasterize_hover because hover reads `hit_test_map` which chrome populates.
+        // Hairline + background composite. Chrome's bg layer gets photon's background_noise; chrome layer gets the perimeter hairline + controls (or stays empty under `[]c`). The chrome group's Stack program (`Push chrome, Push bg, Under(Normal)`) front-to-back-composites them, then flattens under the target. Hover / focus tint is handled by the host's post-finalize overlay pass against `persistent_screen` via [`widget::build_overlay_deltas`] — never rasterized into chrome_buf.
         //
         // Shape demos: each paint primitive gets a partial-transparency instance, all painted FIRST
         // (topmost-first doctrine), then noise composes behind via `under()` — scrolled vertically
@@ -973,7 +973,6 @@ impl FluorApp for PanesDemo {
         });
         self.chrome
             .rasterize_chrome(ctx.damage, ctx.text, ctx.clip_mask);
-        self.chrome.rasterize_hover();
 
         // Blinkey is no longer rasterized into a scratch-side cursor_group. It now lives entirely on the host's persistent_screen buffer, painted post-finalize via `FluorApp::paint_screen_overlay` → `Textbox::paint_blinkey_into_screen`. Wrap-add on / wrap-sub off, ~hundreds of bytes touched per blink — no scratch fill, no flatten, no chrome re-composite.
 
