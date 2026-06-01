@@ -7,9 +7,7 @@
 //! Pattern: `chrome.rasterize_bg(|bg, w, h| { /* paint into bg */ });` → `chrome.rasterize_chrome(text);` → `chrome.rasterize_hover();` → `chrome.flatten_into(target, w, h);`. Each rasterize_* checks the layer's dirty bit internally and is a no-op on clean.
 
 use super::app::EventResponse;
-use super::chrome::{
-    self, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE, HitId,
-};
+use super::chrome::{self, HIT_NONE, HitId};
 use super::widget::{self, Click, Container, Hover, PaintCtx, Widget};
 use crate::canvas::PixelRect;
 use crate::coord::Coord;
@@ -25,16 +23,7 @@ use alloc::vec::Vec;
 use winit::event::KeyEvent;
 use winit::keyboard::ModifiersState;
 
-/// Map a hit-test ID to the wrap-add hover colour the chrome paints when that button is hovered. Returns `None` for IDs that don't have a hover colour (e.g. `HIT_APP_ICON`, `HIT_NONE`) so the bake/unbake paths can no-op cleanly. Public so consumers can build per-hit overlay delta tables from the same single source of truth.
-pub fn hover_colour_for(hit: HitId) -> Option<u32> {
-    let c = match hit {
-        chrome::HIT_CLOSE_BUTTON => theme::CLOSE_HOVER,
-        chrome::HIT_MAXIMIZE_BUTTON => theme::MAXIMIZE_HOVER,
-        chrome::HIT_MINIMIZE_BUTTON => theme::MINIMIZE_HOVER,
-        _ => return None,
-    };
-    if c == 0 { None } else { Some(c) }
-}
+// Hover colour mapping moved to [`DefaultChrome::hover_colour_for`] — needs the live button IDs allocated at chrome construction time, so it can no longer be a free function.
 
 /// Action a [`ChromeButton`] dispatches when clicked or activated via keyboard. Closed enum because the four canonical window-frame buttons aren't user-extensible — new chrome elements would be new widget types, not new variants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,6 +102,18 @@ impl Hover for ChromeButton {
     fn set_hovered(&mut self, hovered: bool) {
         self.hovered = hovered;
     }
+    fn tint_delta(&self) -> u32 {
+        if !self.focused && !self.hovered {
+            return 0;
+        }
+        // Theme constants are already pre-baked visible-RGB deltas (wrap-add values), not target colours — keeps chrome's overlay path identical to what [`super::widget::build_overlay_deltas`] expects from any other widget. App-icon orb has no hover tint by convention; tab-focused orb still doesn't show a tint (until / unless we wire an action for it).
+        match self.action {
+            ChromeAction::Close => theme::CLOSE_HOVER,
+            ChromeAction::ToggleMaximized => theme::MAXIMIZE_HOVER,
+            ChromeAction::Minimize => theme::MINIMIZE_HOVER,
+            ChromeAction::AppIcon => 0,
+        }
+    }
 }
 
 impl widget::Focus for ChromeButton {
@@ -141,7 +142,7 @@ impl widget::Key for ChromeButton {
 pub struct DefaultChrome {
     /// Full-viewport Group with 3 layers (bg, chrome, hover) composed via Stack Notation. Topmost-first: `Push chrome, Push bg, Under(Normal)` for the minimal scaffold; expand to include hover via `Push hover, Push chrome, Under(Add), Push bg, Under(Normal)` as the design grows.
     pub group: Group,
-    /// Per-pixel button-id map. `0` = HIT_NONE; non-zero = a chrome button (`HIT_MINIMIZE_BUTTON` / `HIT_MAXIMIZE_BUTTON` / `HIT_CLOSE_BUTTON`). Sized to `width * height` pixels of the current viewport.
+    /// Per-pixel button-id map. `HIT_NONE` (0) for pixels outside any chrome button; otherwise the dense `HitId` of whichever button the pixel belongs to (min / max / close / app-icon — each id is allocated at chrome construction time via [`super::widget::next_id`]). Sized to `width * height` pixels of the current viewport.
     pub hit_test_map: Vec<HitId>,
     /// Window title rendered into the chrome layer (left-aligned in the controls strip). Empty string = skip text rendering.
     pub title: String,
@@ -162,13 +163,13 @@ pub struct DefaultChrome {
     layer_bg: usize,
     layer_chrome: usize,
     layer_hover: usize,
-    /// Minimize-button widget. ID allocated at chrome construction time. Order matters: min is allocated first so its ID matches the legacy `HIT_MINIMIZE_BUTTON = 1` constant — keeps the panes match-arm working during the staged migration. Same allocation discipline for the other three.
+    /// Minimize-button widget. ID allocated at chrome construction time. Allocation order (min → max → close → app-icon) is the tab-cycle order chrome exposes via [`Container::visit`]; ids are otherwise opaque — callers query [`Self::owns_hit`] / [`Self::hover_colour_for`] instead of comparing numerically.
     pub min_btn: ChromeButton,
-    /// Maximize / restore button. ID = 2 by allocation order (matches `HIT_MAXIMIZE_BUTTON`).
+    /// Maximize / restore button.
     pub max_btn: ChromeButton,
-    /// Close button. ID = 3 by allocation order (matches `HIT_CLOSE_BUTTON`).
+    /// Close button.
     pub close_btn: ChromeButton,
-    /// App-icon orb button. ID = 4 by allocation order (matches `HIT_APP_ICON`).
+    /// App-icon orb button.
     pub app_icon_btn: ChromeButton,
 }
 
@@ -176,7 +177,7 @@ impl DefaultChrome {
     /// Allocate the chrome group + hit_test_map sized to `viewport`. Three layers (bg, chrome, hover) all start dirty so the first frame paints from scratch.
     ///
     /// **Topmost-first scaffold:** the Stack program is the minimal front-to-back composite — `Push chrome, Push bg, Under(Normal)`. Chrome is the topmost layer (controls, edges, hairlines, title), bg is the layer behind it (background_noise + panes). Stack order matches the visual stack: first push lands on the bottom of the eval stack and is the topmost layer; second push goes underneath via `Under`. The hover layer still exists and is rasterized so the API surface is stable; it's omitted from the program until the hover overlay is wired back up via `Push hover, Under(Add)` as the topmost step. Corner knockout (formerly a separate silhouette layer + `Op::Or`) is handled at chrome rasterization time by writing `t=255` directly into the chrome layer's corner pixels — no separate Stack op under the unified Under model.
-    /// Construct. `hit_counter` is the app's monotonic [`HitId`] allocator (see [`super::widget::next_id`]) — chrome registers four IDs (min, max, close, app icon, in that order). Caller must construct chrome BEFORE other widgets so the chrome IDs stay at 1..=4 (matching the legacy `HIT_*_BUTTON` compat constants during the staged migration).
+    /// Construct. `hit_counter` is the app's monotonic [`HitId`] allocator (see [`super::widget::next_id`]) — chrome registers four IDs (min, max, close, app icon, in that order). Construction order against the rest of the app is free: ids are opaque and queried through [`Self::owns_hit`] / [`Self::hover_colour_for`], not compared by value.
     pub fn new(
         viewport: Viewport,
         title: impl Into<String>,
@@ -386,6 +387,7 @@ impl DefaultChrome {
                 chrome::draw_app_icon(
                     chrome_buf,
                     Some(&mut self.hit_test_map),
+                    self.app_icon_btn.id(),
                     buf_w,
                     buf_h,
                     orb_cx,
@@ -455,6 +457,9 @@ impl DefaultChrome {
         let div2_col = button_area_x + 2 * button_size;
         let bound_x_min = strip_x;
         let bound_x_max = strip_x + strip_w;
+        let min_id = self.min_btn.id();
+        let max_id = self.max_btn.id();
+        let close_id = self.close_btn.id();
 
         // MIN: anchor just left of div1, scan LEFT toward strip edge / BL curve.
         chrome::paint_button_hit_row_scan(
@@ -464,7 +469,7 @@ impl DefaultChrome {
             buf_w,
             div1_col - 1,
             false,
-            HIT_MINIMIZE_BUTTON,
+            min_id,
             0,
             button_size,
             bound_x_min,
@@ -479,7 +484,7 @@ impl DefaultChrome {
             buf_w,
             div2_col + 1,
             true,
-            HIT_CLOSE_BUTTON,
+            close_id,
             0,
             button_size,
             bound_x_min,
@@ -494,7 +499,7 @@ impl DefaultChrome {
             buf_w,
             div1_col + 1,
             true,
-            HIT_MAXIMIZE_BUTTON,
+            max_id,
             0,
             button_size / 2,
             bound_x_min,
@@ -509,7 +514,7 @@ impl DefaultChrome {
             buf_w,
             div2_col - 1,
             false,
-            HIT_MAXIMIZE_BUTTON,
+            max_id,
             button_size / 2,
             button_size,
             bound_x_min,
@@ -603,7 +608,7 @@ impl DefaultChrome {
         self.group.flatten_into(target, target_w, target_h, clip);
     }
 
-    /// Hit query at `(x, y)` in viewport pixel coordinates. Returns the chrome button id (HIT_NONE / HIT_MINIMIZE_BUTTON / HIT_MAXIMIZE_BUTTON / HIT_CLOSE_BUTTON). `(x, y)` outside the viewport returns HIT_NONE.
+    /// Hit query at `(x, y)` in viewport pixel coordinates. Returns the chrome button id at that pixel (one of `min_btn.id()` / `max_btn.id()` / `close_btn.id()` / `app_icon_btn.id()`) or `HIT_NONE` for pixels outside any chrome button or outside the viewport entirely.
     ///
     /// **Rule 0 — WHY/PROOF/PREVENTS:** WHY: a negative `x` cast to `usize` wraps to a huge value; without the bound check, indexing `hit_test_map[idx]` panics. PROOF: the host receives cursor coords from winit which can land outside the window during drag-resize. PREVENTS: panic on out-of-window cursor.
     pub fn hit_at(&self, x: Coord, y: Coord) -> HitId {
@@ -634,12 +639,41 @@ impl DefaultChrome {
         &self.hit_test_map
     }
 
+    /// Wrap-add hover colour for a chrome button id. Returns `None` for ids that don't belong to chrome, ids that belong to chrome but don't have a hover tint (app-icon orb), or a theme entry of `0`. Single source of truth for the per-id overlay delta — consumers build their `overlay_deltas` table by asking chrome for its tint, then filling in their own widget tints.
+    pub fn hover_colour_for(&self, hit: HitId) -> Option<u32> {
+        let c = if hit == self.close_btn.id() {
+            theme::CLOSE_HOVER
+        } else if hit == self.max_btn.id() {
+            theme::MAXIMIZE_HOVER
+        } else if hit == self.min_btn.id() {
+            theme::MINIMIZE_HOVER
+        } else {
+            return None;
+        };
+        if c == 0 { None } else { Some(c) }
+    }
+
+    /// True when `hit` is one of this chrome's button ids (min / max / close / app-icon). Use to decide chrome-vs-content routing without comparing against four ids manually — for example, panes' `cursor_for` shows the pointer for any chrome button id.
+    pub fn owns_hit(&self, hit: HitId) -> bool {
+        hit != HIT_NONE
+            && (hit == self.min_btn.id()
+                || hit == self.max_btn.id()
+                || hit == self.close_btn.id()
+                || hit == self.app_icon_btn.id())
+    }
+
     /// Update the hover state if `new_hit` differs from the current. Returns `true` iff the state changed (so the consumer knows to request a redraw — the host's overlay pass picks up the new state and applies the visible-RGB delta to persistent_screen, no scratch repaint needed).
+    ///
+    /// Side effect: synchronises each of the four [`ChromeButton`]s' `hovered` field so widget-tree walks (e.g. [`super::widget::build_overlay_deltas`]) can read per-button state directly via [`Hover`]. Without this sync chrome buttons would always report `hovered = false` to the walker.
     pub fn set_hover(&mut self, new_hit: HitId) -> bool {
         if new_hit == self.hover_state {
             return false;
         }
         self.hover_state = new_hit;
+        self.min_btn.hovered = new_hit == self.min_btn.id();
+        self.max_btn.hovered = new_hit == self.max_btn.id();
+        self.close_btn.hovered = new_hit == self.close_btn.id();
+        self.app_icon_btn.hovered = new_hit == self.app_icon_btn.id();
         true
     }
 
@@ -771,8 +805,8 @@ mod tests {
     fn set_hover_returns_true_on_change_only() {
         let mut counter: HitId = HIT_NONE;
         let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "", None, None, &mut counter);
-        assert!(chrome.set_hover(chrome::HIT_CLOSE_BUTTON)); // changed
-        assert!(!chrome.set_hover(chrome::HIT_CLOSE_BUTTON)); // same
+        assert!(chrome.set_hover(chrome.close_btn.id())); // changed
+        assert!(!chrome.set_hover(chrome.close_btn.id())); // same
         assert!(chrome.set_hover(HIT_NONE)); // changed back
     }
 
@@ -784,7 +818,7 @@ mod tests {
         let mut target = alloc::vec![0u32; 100 * 100];
         chrome.flatten_into(&mut target, 100, 100, None);
         assert!(!chrome.group.rpn.layers[chrome.layer_chrome].dirty);
-        chrome.set_hover(chrome::HIT_CLOSE_BUTTON);
+        chrome.set_hover(chrome.close_btn.id());
         // Hover tint lives entirely in the host overlay pass against persistent_screen; no scratch repaint is needed, so the chrome layer must stay clean.
         assert!(!chrome.group.rpn.layers[chrome.layer_chrome].dirty);
     }

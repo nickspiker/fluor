@@ -502,5 +502,16 @@ mod widget_impls {
         fn set_hovered(&mut self, hovered: bool) {
             Button::set_hovered(self, hovered);
         }
+        fn tint_delta(&self) -> u32 {
+            // Same focus = hover convention as [`crate::widgets::textbox::Textbox`]. Both widgets read from the same theme family so a Button beside a Textbox tints identically.
+            if self.is_focused() || self.is_hovered() {
+                crate::paint::wrap_sub_rgb(
+                    crate::theme::TEXTBOX_HOVER,
+                    crate::theme::TEXTBOX_FILL,
+                )
+            } else {
+                0
+            }
+        }
     }
 }

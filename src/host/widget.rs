@@ -90,8 +90,13 @@ pub trait Focus {
 }
 
 /// Hover state delivery. Mirrors [`Focus`] in shape but without the bbox / tab-order side; hover is purely "cursor entered / left me."
+///
+/// `tint_delta` returns the wrap-add visible-RGB delta that the host's overlay pass should apply to every pixel marked with this widget's [`HitId`] in the hit-test map. `0` = no tint (default). Implementers fold their own focused / hovered state into the answer — focus and hover historically used distinct visuals, but the v0 convention is "the focused widget renders the hover tint" so keyboard-only users see which widget owns input.
 pub trait Hover {
     fn set_hovered(&mut self, hovered: bool);
+    fn tint_delta(&self) -> u32 {
+        0
+    }
 }
 
 /// Tree node. The app root is a [`Container`], chrome is a [`Container`], future panes / dialogs are [`Container`]s. The single `visit` method does depth-first traversal handing each leaf widget to the callback. Recursion handles arbitrary nesting depth; the dispatch loop in the app stays one walk regardless of N.
@@ -136,6 +141,20 @@ pub fn linear_tab_next(
         (Some(i), TabDir::Backward) => (i + n - 1) % n,
     };
     Some(focusables[next_idx])
+}
+
+/// Build the per-hit-id overlay delta table by walking the widget tree once and asking every [`Hover`]-capable widget for its [`Hover::tint_delta`]. The returned `Vec<u32>` is sized to `count` (typically `hit_counter + 1` since IDs are 1-indexed with `HIT_NONE = 0` at slot 0). Widgets whose [`HitId`] is `>= count` are silently skipped — keeps the helper safe when an app resizes its registry between frames. Drop-in replacement for the hand-rolled overlay_deltas that panes' demo used pre-walk.
+pub fn build_overlay_deltas(root: &mut dyn Container, count: usize) -> alloc::vec::Vec<u32> {
+    let mut t = alloc::vec![0u32; count];
+    root.visit(&mut |w| {
+        let id = w.id() as usize;
+        if id < t.len() {
+            if let Some(h) = w.hover() {
+                t[id] = h.tint_delta();
+            }
+        }
+    });
+    t
 }
 
 /// Apply a focus change: call `set_focused(false)` on the old target (if any) and `set_focused(true)` on the new target (if any). Idempotent when `old == new`. Walks `root` once per non-null target so widgets that change visual state on focus transition can mark themselves dirty in the same frame.

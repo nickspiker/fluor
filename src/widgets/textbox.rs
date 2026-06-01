@@ -338,7 +338,7 @@ impl Textbox {
         self.text_cache_dirty = true;
     }
 
-    /// True if pixel `(x, y)` is inside the textbox's bare bbox rect (`width × height`, NO glow padding). This is a rectangular check, NOT shape-aware — square bbox corners outside the squircle return `true`. For pill-silhouette-accurate hit testing in a chrome-integrated app, prefer `chrome.hit_at(x, y) == HIT_TEXTBOX` (chrome's hit_test_map is stamped with the actual pill shape by the textbox stroke pass). This method is the fallback for chrome-less consumers and for internal click routing where coarse bbox accuracy is acceptable.
+    /// True if pixel `(x, y)` is inside the textbox's bare bbox rect (`width × height`, NO glow padding). This is a rectangular check, NOT shape-aware — square bbox corners outside the squircle return `true`. For pill-silhouette-accurate hit testing in a chrome-integrated app, prefer matching the hit-map entry against the textbox's registered [`HitId`] (the textbox stamps its actual pill shape into the chrome hit map during its stroke pass). This method is the fallback for chrome-less consumers and for internal click routing where coarse bbox accuracy is acceptable.
     pub fn contains(&self, x: Coord, y: Coord) -> bool {
         let half_w = self.width * 0.5;
         let half_h = self.height * 0.5;
@@ -1204,6 +1204,17 @@ mod widget_impls {
     impl Hover for Textbox {
         fn set_hovered(&mut self, hovered: bool) {
             Textbox::set_hovered(self, hovered);
+        }
+        fn tint_delta(&self) -> u32 {
+            // Focus and hover render the same tint by design — the focused widget gets the hover treatment so keyboard-only users see which widget owns input without needing a separate focus ring (the wider glow halo is the secondary cue for mouse users).
+            if self.is_focused() || self.is_hovered() {
+                crate::paint::wrap_sub_rgb(
+                    crate::theme::TEXTBOX_HOVER,
+                    crate::theme::TEXTBOX_FILL,
+                )
+            } else {
+                0
+            }
         }
     }
 
