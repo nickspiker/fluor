@@ -15,7 +15,7 @@ use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::error::EventLoopError;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
@@ -127,9 +127,17 @@ pub enum EventResponse {
 
 /// What a consumer implements to drive the desktop host.
 pub trait FluorApp {
+    /// Custom user-event payload for cross-thread wake-up. Background tasks (network, file I/O, async ceremonies) clone an [`EventLoopProxy<Self::UserEvent>`] from [`Self::set_event_proxy`] and call `proxy.send_event(payload)` to wake the event loop; the host dispatches the payload back through [`Self::on_user_event`] on the UI thread. Apps that don't need cross-thread wake-up declare `type UserEvent = ();` and skip the two methods.
+    type UserEvent: 'static + Send;
+
     /// Initial window title. Default is empty; override or call `ctx.window.set_title(...)` from `init` if you want it set later.
     fn title(&self) -> &str {
         ""
+    }
+
+    /// Hand off the event-loop proxy ONCE, before [`Self::init`], so the app can clone it for background threads. The proxy outlives the app (winit's `EventLoopProxy` is `Clone + Send + Sync`); a typical implementer stashes its own field for clone-and-ship to spawned tasks. Default no-op for apps that don't need cross-thread wake-up.
+    fn set_event_proxy(&mut self, proxy: EventLoopProxy<Self::UserEvent>) {
+        let _ = proxy;
     }
 
     /// One-shot setup after the window exists. Allocate Groups, widgets, initial geometry. The viewport in `ctx` is the actual physical size the host opened.
@@ -180,11 +188,17 @@ pub trait FluorApp {
         let _ = ctx;
         false
     }
+
+    /// User-event payload arrived from a background thread via [`EventLoopProxy::send_event`]. Typical use: a network task completed, an avatar download finished, a key-ceremony hit a milestone — the task sends the appropriate variant; this method routes it to the right state-machine handler and (usually) calls `ctx.window.request_redraw()` to repaint with the new state. Default no-op for apps that declared `type UserEvent = ()`.
+    fn on_user_event(&mut self, event: Self::UserEvent, ctx: &mut Context) {
+        let _ = (event, ctx);
+    }
 }
 
-/// Run the desktop host until the window closes.
-pub fn run_app<A: FluorApp + 'static>(app: A) -> Result<(), EventLoopError> {
-    let event_loop = EventLoop::new()?;
+/// Run the desktop host until the window closes. Builds an [`EventLoop`] typed on `A::UserEvent` so background-thread wake-ups via [`EventLoopProxy::send_event`] route through [`FluorApp::on_user_event`]. The proxy is created up-front and handed to the app via [`FluorApp::set_event_proxy`] BEFORE the event loop starts, so apps can clone-and-ship it to background tasks during their own constructor or [`FluorApp::init`].
+pub fn run_app<A: FluorApp + 'static>(mut app: A) -> Result<(), EventLoopError> {
+    let event_loop = EventLoop::<A::UserEvent>::with_user_event().build()?;
+    app.set_event_proxy(event_loop.create_proxy());
     let mut shell = DesktopShell::new(app);
     event_loop.run_app(&mut shell)
 }
@@ -953,7 +967,7 @@ impl<A: FluorApp> DesktopShell<A> {
     }
 }
 
-impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
+impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -1354,6 +1368,34 @@ impl<A: FluorApp + 'static> ApplicationHandler for DesktopShell<A> {
                 self.dispatch_event(event);
             }
         }
+    }
+
+    /// Cross-thread user-event payload from [`EventLoopProxy::send_event`]. Builds a [`Context`] over the host's shared resources and hands the typed event to [`FluorApp::on_user_event`]. The consumer typically reads/mutates app state and calls `ctx.window.request_redraw()` if the state change should repaint; if it doesn't request_redraw the next tick still runs normally.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: A::UserEvent) {
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        let Some(text) = self.text.as_mut() else {
+            return;
+        };
+        let mut ctx = Context {
+            viewport: self.viewport,
+            text,
+            clip_mask: &mut self.clip_mask,
+            damage: &mut self.pending_damage,
+            window: &window,
+            modifiers: self.modifiers,
+            cursor_x: self.cursor_x - self.window_rect.x as Coord,
+            cursor_y: self.cursor_y - self.window_rect.y as Coord,
+            is_maximized: self.saved_rect_for_maximize.is_some(),
+            damage_clip: crate::canvas::PixelRect::new(
+                0,
+                0,
+                self.viewport.width_px as usize,
+                self.viewport.height_px as usize,
+            ),
+        };
+        self.app.on_user_event(event, &mut ctx);
     }
 }
 

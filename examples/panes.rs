@@ -356,6 +356,8 @@ impl Container for PanesDemo {
 }
 
 impl FluorApp for PanesDemo {
+    type UserEvent = ();
+
     fn title(&self) -> &str {
         &self.title
     }
