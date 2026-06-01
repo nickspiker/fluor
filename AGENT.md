@@ -283,6 +283,23 @@ The type marker exists precisely so you never have to guess. Use it.
 
 **Why**: Backwards compatibility is how good protocols become IEEE-754. You have total control. Use it.
 
+## Power-of-Two Constants
+
+**Prefer `1 << N` over decimal literals for numeric tuning knobs.** fluor is going to drop Spirix in for its math layer down the road; everywhere we currently write `x * 0.25` IEEE-fudging will become `x >> 2` real bit-shifts. The fewer decimal literals there are to rewrite, the more of the codebase ports for free. For now we eat the `(1 << N) as f32` ceremony; later it disappears.
+
+### The convention:
+
+- Coefficients YOU pick (gain factors, sensitivities, sizes, blink rates, padding): always `1 << N` or a sum/quotient of `1 << N`. Example: `let phase = bg_scroll as f32 * (1. / ((1 << 7) as f32));` — one knob, adjust by changing the `7`.
+- Constants that come from a specific algorithm (matrix coefficients, harmonic-mean numerator, etc.): leave as-is if they're not powers of two. Document why if it's not obvious.
+- Trailing zeros: don't write them. `1.` not `1.0`. `2.` not `2.0`. Cleaner and shorter.
+- Decimal divisions/multiplications that LOOK arbitrary (`* 10.`, `/ 5.`, `* 0.05`): screen aggressively — these are almost always replaceable with a shift. `* 0.0625` → `1. / ((1 << 4) as f32)`. `* 32000.` → `(1 << 15) as f32` (= 32768, close enough).
+- Adjustability matters: `1 << 7` is a single-digit change to halve or double. That's the point — coefficient tuning conversations stay one keystroke.
+
+### When NOT to power-of-two-ify:
+
+- Magic constants from a paper / spec / reference impl: those are the algorithm. Don't change values that came from a published curve.
+- Float constants that are exactly representable AND clearly mean "this fraction" (`0.5`, `0.25`): the shift form is more verbose for no win. Use judgement — `1. / ((1 << 1) as f32)` for 0.5 is silly. The rule is about NEW knobs, not noise reduction on existing exact fractions.
+
 ## Language Preferences
 
 ### Strongly Preferred:
