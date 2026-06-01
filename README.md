@@ -167,6 +167,14 @@ The invariant `dark ≤ α` survives inductively. Empty pixel `(0, 0)` satisfies
 
 Inside the codebase the α byte is named `α` or `alpha` (industry standard direction). The RGB bytes are named `dark_r`, `dark_g`, `dark_b` where the distinction matters. Elsewhere they're just `r`, `g`, `b` since the storage convention is documented at the type level. Theme colour constants are written as human readable visible RGB (`0x00_44_41_37` for a warm gray). A compile time `dark()` helper inverts to stored darkness and sets α=0xFF, so call sites read the colour they expect. The `Blend::under` trait is the only path that composites layers. No painter's algorithm fallback exists anywhere in the rendering pipeline.
 
+### 5. Continuity everywhere, because humans feel it
+
+Every curve in fluor — squircle corner, AA hairline, glow falloff, opacity gradient — is derived from an analytical function that's `C¹` continuous (or smoother) at every join, at every precision. Layout interpolations use tanh, logistic, or algebraic sigmoid (`x / √(1 + x²)`), never `clamp(_, 0, 1)` followed by a polynomial that's only valid inside the clamped domain. Easings have matching first derivatives at their endpoints. No piecewise approximations, no circular arcs masquerading as squircles, no gaussian blurs faking analytical falloffs.
+
+The reason isn't mathematical purity. It's that humans *feel* derivative discontinuities. Conscious vision tops out near 8-bit pixel accuracy, but the visual cortex processes motion and gradients as continuous fields. A kink in a curve registers as a micro-jolt — the same way a pothole the suspension absorbed still hits your spine. You don't have to consciously see the discontinuity to recoil from it. Smooth surfaces feel like a massage; discontinuous ones feel like a slap.
+
+Most compositors substitute approximations because they're easier to implement and look "fine". They're not visibly wrong at typical viewing distance — they just feel bad. Add up a hundred such papercuts across a UI and the whole product feels cheap, with nobody able to articulate why. Fluor pays the math cost up front so micro-jolts never accumulate. The harmonic mean unit (section 2) is the same principle applied to the scaling base; this extends it to every component possible.
+
 ---
 
 ## Why CPU softbuffer rather than GPU
