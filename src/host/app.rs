@@ -181,7 +181,9 @@ pub trait FluorApp {
     fn render(&mut self, target: &mut [u32], ctx: &mut Context);
 
     /// Per-hit-id overlay delta table for THIS frame. The host runs one walk over `hit_test_map()` after finalize+shadow; for each pixel `i`, if `current[id] != last_applied[id]`, it wrap-adds the prior delta back and wrap-subs the current delta in `persistent_screen` (visible-RGB space). Apps return a slice where entry `[id]` is the visible-RGB delta to apply to pixels marked with that hit id this frame (e.g. the hover tint when a button is hovered, zero otherwise). Length must equal `registry.next_id` (= 1 + number of registered hit zones); IDs past the slice are treated as zero-delta. Default impl: empty slice (no overlay tints, no allocations).
-    fn overlay_deltas(&self) -> Vec<u32> {
+    ///
+    /// Takes `&mut self` so apps can build the table by walking their [`crate::host::widget::Container`] (which threads `&mut dyn Widget` through `visit`) — see [`crate::host::widget::build_overlay_deltas`] for the canonical one-liner implementation.
+    fn overlay_deltas(&mut self) -> Vec<u32> {
         Vec::new()
     }
 
@@ -536,8 +538,10 @@ impl<A: FluorApp> DesktopShell<A> {
         shadow_dt = t.elapsed().as_secs_f32();
 
         // Post-finalize, post-shadow overlay pass. For each pixel whose hit id is currently tinted OR was tinted last frame, copy the scratch pixel → XOR to visible → optionally wrap-sub the per-id delta → write to persistent_screen. Restores the scratch baseline on unhover and applies the tint on hover — no diff math, no accumulation, just "copy and conditionally adjust." Runs every frame regardless of damage_clip so hover tints follow the cursor even when nothing else dirtied scratch.
+        //
+        // Order matters: [`FluorApp::overlay_deltas`] takes `&mut self` (so the app can walk its widget tree), so we build the table first and release the borrow before grabbing the shared `hit_test_map` borrow used by `apply_overlay`.
+        let current = self.app.overlay_deltas();
         if let Some((map, hw, hh)) = self.app.hit_test_map() {
-            let current = self.app.overlay_deltas();
             // Match last_overlay_active length to deltas length. Grow with `false` if the app registered new IDs since last frame; shrink if it (rare) collapsed. apply_overlay debug-asserts equal lengths.
             if self.last_overlay_active.len() != current.len() {
                 self.last_overlay_active.resize(current.len(), false);

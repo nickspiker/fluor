@@ -18,13 +18,6 @@ use crate::theme;
 
 pub use crate::paint::{HIT_NONE, HitId};
 
-/// Compatibility constants for the four pre-registry chrome zones. [`super::chrome_widget::DefaultChrome`] now reserves IDs 1–4 in registration order (min, max, close, app icon) so the numeric values match what the [`super::app::HitRegistry`] would have assigned. New code should query the chrome for its registered handlers instead of referencing these constants; they stay only so [`super::desktop`]'s legacy shim and a couple of debug paths in `examples/panes.rs` keep compiling during the photon transition.
-pub const HIT_MINIMIZE_BUTTON: HitId = 1;
-pub const HIT_MAXIMIZE_BUTTON: HitId = 2;
-pub const HIT_CLOSE_BUTTON: HitId = 3;
-pub const HIT_APP_ICON: HitId = 4;
-pub const HIT_TEXTBOX: HitId = 5;
-
 /// Orb visual state. The app sets this to give the orb a meaning beyond window-focus (network indicator, recording badge, presence light). Layered defaults: `FollowFocus` means "ring matches the perimeter, image dims when the window is unfocused" with zero app code; `Custom` lets the app dictate ring colour + brightness regardless of window state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OrbTint {
@@ -384,10 +377,11 @@ pub fn draw_status_bar(
 ///
 /// Pixel sampling is nearest-neighbour from `icon`'s `width × height` source — the source is square in practice (`vsfimg` doesn't reshape) but the math doesn't assume that. Per-pixel cost is one map index + one `under` composite; total work is `O(diameter²)`, well under a millisecond at typical chrome sizes (~30–100 px orbs).
 ///
-/// Hit-test: every pixel inside `r_outer²` (excluding the AA fringe) is tagged `HIT_APP_ICON` so the host can route clicks. Decorative-only consumers can pass `None` for `hit_test_map` to skip the tag.
+/// Hit-test: every pixel inside `r_outer²` (excluding the AA fringe) is tagged with `hit_id` so the host can route clicks to the chrome's app-icon widget. Decorative-only consumers can pass `None` for `hit_test_map` to skip the tag (in which case `hit_id` is ignored).
 pub fn draw_app_icon(
     pixels: &mut [u32],
     hit_test_map: Option<&mut [HitId]>,
+    hit_id: HitId,
     width: usize,
     height: usize,
     cx: isize,
@@ -449,7 +443,7 @@ pub fn draw_app_icon(
 
             if let Some(map) = htm.as_mut() {
                 if dist2 <= r_outer2 {
-                    map[idx] = HIT_APP_ICON;
+                    map[idx] = hit_id;
                 }
             }
 

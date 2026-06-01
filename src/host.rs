@@ -12,9 +12,6 @@ pub mod chrome_widget;
 pub mod app;
 
 #[cfg(feature = "host-winit")]
-pub mod desktop;
-
-#[cfg(feature = "host-winit")]
 pub mod os_input;
 
 #[cfg(feature = "host-winit")]

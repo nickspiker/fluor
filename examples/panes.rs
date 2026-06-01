@@ -8,19 +8,15 @@ use fluor::coord::Coord;
 use fluor::geom::Viewport;
 use fluor::group::Group;
 use fluor::host::app::{Context, EventResponse, FluorApp};
-use fluor::host::chrome::{
-    self, HIT_CLOSE_BUTTON, HIT_MAXIMIZE_BUTTON, HIT_MINIMIZE_BUTTON, HIT_NONE, HIT_TEXTBOX, HitId,
-    ResizeEdge,
-};
+use fluor::host::chrome::{self, HIT_NONE, HitId, ResizeEdge};
 use fluor::host::chrome_widget::DefaultChrome;
 use fluor::host::icon::Icon;
 use fluor::host::os_input;
 use fluor::host::widget::{self as widget, Container, TabDir};
 use fluor::paint::pack_argb;
-use fluor::paint::{self, BlendMode, Transform};
+use fluor::paint::{self, BlendMode};
 use fluor::region::Region;
 use fluor::stack::Op;
-use fluor::theme;
 use fluor::widgets::{BlinkTimer, Button, Textbox};
 use fluor::{Compositor, RuVec2};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -887,39 +883,10 @@ impl FluorApp for PanesDemo {
         Some((self.chrome.hit_test_map(), w, h))
     }
 
-    fn overlay_deltas(&self) -> Vec<u32> {
-        // Per-hit-id tint deltas applied to persistent_screen by the host's overlay pass. Slice sized to the live hit-id count (hit_counter + 1 since IDs are 1-indexed and HIT_NONE = 0 takes slot 0).
-        let mut t = vec![0u32; self.hit_counter as usize + 1];
-        if let Some(c) = fluor::host::chrome_widget::hover_colour_for(self.chrome.hover_state) {
-            t[self.chrome.hover_state as usize] = c;
-        }
-        // Same focus / hover → tint formula applied to each textbox at its own dense hit id. Generalises to a Container walk in Phase 5 once we have a way for widgets to surface their tint contribution through the trait.
-        let tb_tint = |tb: &Textbox| -> u32 {
-            if tb.is_focused() {
-                paint::wrap_sub_rgb(fluor::theme::TEXTBOX_ACTIVE, fluor::theme::TEXTBOX_FILL)
-            } else if tb.is_hovered() {
-                paint::wrap_sub_rgb(fluor::theme::TEXTBOX_HOVER, fluor::theme::TEXTBOX_FILL)
-            } else {
-                0
-            }
-        };
-        for tb in self.textboxes.iter() {
-            t[tb.hit_id() as usize] = tb_tint(tb);
-        }
-        // Buttons share the same fill / hover / active palette in the demo. Both widgets read from the same theme constants so a Button next to a Textbox reads as the same family.
-        let btn_tint = |b: &Button| -> u32 {
-            if b.is_focused() {
-                paint::wrap_sub_rgb(fluor::theme::TEXTBOX_ACTIVE, fluor::theme::TEXTBOX_FILL)
-            } else if b.is_hovered() {
-                paint::wrap_sub_rgb(fluor::theme::TEXTBOX_HOVER, fluor::theme::TEXTBOX_FILL)
-            } else {
-                0
-            }
-        };
-        for btn in self.buttons.iter() {
-            t[btn.hit_id() as usize] = btn_tint(btn);
-        }
-        t
+    fn overlay_deltas(&mut self) -> Vec<u32> {
+        // One walk over every Hover-capable widget in the tree (textboxes + buttons + chrome's four buttons), each returning its own visible-RGB delta via [`widget::Hover::tint_delta`]. Slice sized to `hit_counter + 1` since IDs are 1-indexed and HIT_NONE = 0 takes slot 0. The whole pre-walk hand-rolled match table (chrome by hover_state + per-widget closures) reduces to this line; new widgets get the same treatment for free as soon as they impl Hover.
+        let count = self.hit_counter as usize + 1;
+        widget::build_overlay_deltas(self, count)
     }
 
     fn render(&mut self, target: &mut [u32], ctx: &mut Context) {
@@ -1071,17 +1038,13 @@ impl FluorApp for PanesDemo {
 
     fn cursor_for(&self, x: Coord, y: Coord, ctx: &Context) -> CursorIcon {
         let hit = self.chrome.hit_at(x, y);
-        // Chrome buttons + Button widgets → hand. Iterate self.buttons via the index helper so a new button auto-inherits the hand cursor without touching this method.
-        match hit {
-            HIT_CLOSE_BUTTON | HIT_MINIMIZE_BUTTON | HIT_MAXIMIZE_BUTTON => {
-                return CursorIcon::Pointer;
-            }
-            _ => {}
+        // Chrome buttons (close / min / max — app-icon orb stays as Default) + Button widgets → hand. Chrome answers `owns_hit` for any of its four ids; we narrow to "pressable" by excluding the app-icon orb so its slot keeps the default cursor until it gains a click action.
+        if self.chrome.owns_hit(hit) && hit != self.chrome.app_icon_btn.id() {
+            return CursorIcon::Pointer;
         }
         if self.button_index_by_id(hit).is_some() {
             return CursorIcon::Pointer;
         }
-        // Textbox dispatch via the Vec lookup — the previous `hit == HIT_TEXTBOX` check only matched textbox A by coincidence (compat constant = 5) and left textbox B cursor-less.
         let is_textbox_hover = self.textbox_index_by_id(hit).is_some();
         match chrome::get_resize_edge(ctx.viewport.width_px, ctx.viewport.height_px, x, y) {
             ResizeEdge::Top | ResizeEdge::Bottom => CursorIcon::NsResize,
