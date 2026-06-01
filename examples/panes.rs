@@ -1071,19 +1071,25 @@ impl FluorApp for PanesDemo {
 
     fn cursor_for(&self, x: Coord, y: Coord, ctx: &Context) -> CursorIcon {
         let hit = self.chrome.hit_at(x, y);
+        // Chrome buttons + Button widgets → hand. Iterate self.buttons via the index helper so a new button auto-inherits the hand cursor without touching this method.
         match hit {
             HIT_CLOSE_BUTTON | HIT_MINIMIZE_BUTTON | HIT_MAXIMIZE_BUTTON => {
                 return CursorIcon::Pointer;
             }
             _ => {}
         }
+        if self.button_index_by_id(hit).is_some() {
+            return CursorIcon::Pointer;
+        }
+        // Textbox dispatch via the Vec lookup — the previous `hit == HIT_TEXTBOX` check only matched textbox A by coincidence (compat constant = 5) and left textbox B cursor-less.
+        let is_textbox_hover = self.textbox_index_by_id(hit).is_some();
         match chrome::get_resize_edge(ctx.viewport.width_px, ctx.viewport.height_px, x, y) {
             ResizeEdge::Top | ResizeEdge::Bottom => CursorIcon::NsResize,
             ResizeEdge::Left | ResizeEdge::Right => CursorIcon::EwResize,
             ResizeEdge::TopLeft | ResizeEdge::BottomRight => CursorIcon::NwseResize,
             ResizeEdge::TopRight | ResizeEdge::BottomLeft => CursorIcon::NeswResize,
             ResizeEdge::None => {
-                if hit == HIT_TEXTBOX {
+                if is_textbox_hover {
                     CursorIcon::Text
                 } else {
                     CursorIcon::Default
