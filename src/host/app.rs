@@ -193,6 +193,11 @@ pub trait FluorApp {
     fn on_user_event(&mut self, event: Self::UserEvent, ctx: &mut Context) {
         let _ = (event, ctx);
     }
+
+    /// Initial visible-window size when the app first opens, given the monitor dimensions in pixels. Default returns half the monitor in each axis (the conventional "open at a reasonable fraction of the display, centred" desktop convention) — apps with strong aspect-ratio opinions (Photon's portrait launch window, fixed-aspect editors) override. Return `(width, height)`; the host clamps each to ≥ 1 and centres the window on the monitor.
+    fn initial_size(&self, monitor: (u32, u32)) -> (u32, u32) {
+        (monitor.0 / 2, monitor.1 / 2)
+    }
 }
 
 /// Run the desktop host until the window closes. Builds an [`EventLoop`] typed on `A::UserEvent` so background-thread wake-ups via [`EventLoopProxy::send_event`] route through [`FluorApp::on_user_event`]. The proxy is created up-front and handed to the app via [`FluorApp::set_event_proxy`] BEFORE the event loop starts, so apps can clone-and-ship it to background tasks during their own constructor or [`FluorApp::init`].
@@ -996,9 +1001,10 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
             window.set_has_shadow(false);
         }
 
-        // Initial visible-window size: half the screen in each axis, centred. Matches the desktop convention of "open at a reasonable fraction of the display, centred." User can drag/resize from there.
-        let initial_w = (mon_w / 2).max(1);
-        let initial_h = (mon_h / 2).max(1);
+        // Initial visible-window size: app-supplied (defaults to half the screen in each axis) and centred. Apps with aspect-ratio opinions override [`FluorApp::initial_size`].
+        let (req_w, req_h) = self.app.initial_size((mon_w, mon_h));
+        let initial_w = req_w.max(1).min(mon_w);
+        let initial_h = req_h.max(1).min(mon_h);
         let win_x = ((mon_w as i32) - (initial_w as i32)) / 2;
         let win_y = ((mon_h as i32) - (initial_h as i32)) / 2;
         self.window_rect = WindowRect {
