@@ -19,7 +19,7 @@ pub struct Button {
     label: String,
     font: &'static str,
 
-    /// Stroke thickness in RU (× `font_size`). `0.0` → 1 px minimum via the `+ 1` idiom in render. Matches Textbox's stroke convention so a Button and a Textbox at the same `stroke_ru` render with identical edge weight.
+    /// Stroke thickness as a fraction of `font_size`. Final pixel width = `(stroke_ru × font_size) as isize + 1` — the `+ 1` idiom guarantees a minimum 1 px stroke so the edge never disappears on small displays, and the multiplier scales the stroke up smoothly on big ones. Default `1.0 / (1 << 5)` (= 1/32 of font_size) yields 1 px through typical desktop range and ~2-3 px on 4K + zoom; same convention as Textbox so a Button and Textbox at the same `stroke_ru` render with identical edge weight.
     pub stroke_ru: f32,
     pub center_x: Coord,
     pub center_y: Coord,
@@ -68,7 +68,7 @@ impl Button {
             hit_id: crate::host::widget::next_id(hit_counter),
             label: label.into(),
             font: "Open Sans",
-            stroke_ru: 0.0,
+            stroke_ru: 1.0 / (1 << 5) as f32,
             center_x,
             center_y,
             width,
