@@ -697,6 +697,7 @@ pub fn background_noise(
     fullscreen: bool,
     scroll_offset: isize,
     clip: Option<Clip>,
+    base: Option<u32>,
 ) {
     let buf_w = canvas.width;
     let buf_h = canvas.height;
@@ -720,6 +721,7 @@ pub fn background_noise(
     }
     canvas.damage.add_bounds(x_start, row_start, x_end, row_end);
     let pixels: &mut [u32] = canvas.pixels;
+    let resolved_base = base.unwrap_or(crate::theme::BG_BASE);
     crate::par::par_rows(pixels, buf_w, row_start, row_end, |row_idx, row_pixels| {
         let logical_row = row_idx as isize - scroll_offset;
         background_row(
@@ -730,6 +732,7 @@ pub fn background_noise(
             x_start,
             x_end,
             shimmer,
+            resolved_base,
         );
     });
 }
@@ -743,8 +746,9 @@ fn background_row(
     x_start: usize,
     x_end: usize,
     shimmer: usize,
+    base: u32,
 ) {
-    use crate::theme::{BG_BASE, BG_MASK, BG_SPECKLE};
+    use crate::theme::{BG_MASK, BG_SPECKLE};
     // Noise math runs in visible-RGB space (matching photon's reference). At the store site we flip the visible result to stored darkness via XOR, then OR α=0xFF for opaque. Mask off the top byte first to strip any carry from `wrapping_add`.
     const VISIBLE_TO_DARK_FLIP: u32 = 0x00FFFFFF;
     const RGB_MASK: u32 = 0x00FFFFFF;
@@ -775,7 +779,7 @@ fn background_row(
                 colour = colour.wrapping_sub(subtractor) & BG_MASK;
             }
             noise_buf[i] =
-                ((colour.wrapping_add(BG_BASE) & RGB_MASK) ^ VISIBLE_TO_DARK_FLIP) | OPAQUE_ALPHA;
+                ((colour.wrapping_add(base) & RGB_MASK) ^ VISIBLE_TO_DARK_FLIP) | OPAQUE_ALPHA;
         }
         under_chunk_normal_dispatch(&mut row_pixels[x..x + chunk_len], &noise_buf[..chunk_len]);
         x += chunk_len;
@@ -799,7 +803,7 @@ fn background_row(
                 colour = colour.wrapping_sub(subtractor) & BG_MASK;
             }
             noise_buf[i] =
-                ((colour.wrapping_add(BG_BASE) & RGB_MASK) ^ VISIBLE_TO_DARK_FLIP) | OPAQUE_ALPHA;
+                ((colour.wrapping_add(base) & RGB_MASK) ^ VISIBLE_TO_DARK_FLIP) | OPAQUE_ALPHA;
         }
         under_chunk_normal_dispatch(&mut row_pixels[chunk_lo..x_hi], &noise_buf[..chunk_len]);
         x_hi = chunk_lo;
