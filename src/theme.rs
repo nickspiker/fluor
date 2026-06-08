@@ -72,6 +72,11 @@ pub const TEXTBOX_SHADOW_EDGE: u32 = dark(fmt(0x00_2B_34_37));
 pub const TEXTBOX_TEXT: u32 = dark(fmt(0x00_E0_E0_DC));
 pub const TEXTBOX_SELECTION_BG: u32 = dark(fmt(0x00_3A_5A_8C));
 
+// Button. Distinct from textbox FILL so the eye reads "this is an action surface, not a typing surface" at a glance — slate-grey-blue, noticeably lighter than TEXTBOX_FILL's near-black. Hover lightens further toward a more saturated blue; active (pressed) drops back near TEXTBOX_FILL for the "pressed in" effect that conventionally inverts the normal raised-button shading.
+pub const BUTTON_FILL: u32 = dark(fmt(0x00_1A_22_2E));
+pub const BUTTON_HOVER: u32 = dark(fmt(0x00_28_34_46));
+pub const BUTTON_ACTIVE: u32 = dark(fmt(0x00_0C_10_16));
+
 // Cursor (blinkey).
 pub const CURSOR_BRIGHTNESS: f32 = 100.0;
 
