@@ -310,7 +310,10 @@ impl DefaultChrome {
         let strip_x = buf_w.saturating_sub(strip_w);
 
         // App-icon orb layout: centered in the top-left `button_size`-tall band, mirroring the right-side controls strip. Diameter is half the band height so the orb reads as a tasteful badge rather than a full button. Title text shifts right by the orb's footprint when an icon is present. `draw_app_icon` has an `r < 2` early-return so degenerate sizes pass through without drawing — no min-size guard needed here.
-        let orb_present = self.app_icon.is_some();
+        //
+        // Orb slot is also reserved when `OrbTint::Custom` is active even without an icon — that's the "status badge" use case (network indicator, recording light, presence). `draw_app_icon`'s no-icon path fills the disk with `ring_colour`, so the slot reads as a coloured dot.
+        let orb_present = self.app_icon.is_some()
+            || matches!(self.orb_tint, chrome::OrbTint::Custom { .. });
         let orb_diameter = if orb_present {
             (button_size / 2) as isize
         } else {
