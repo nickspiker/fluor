@@ -267,7 +267,7 @@ impl Button {
                         inner_y,
                         inner_w,
                         inner_h,
-                        theme::TEXTBOX_FILL,
+                        theme::BUTTON_FILL,
                         squirdleyness,
                     );
                 }
@@ -503,11 +503,16 @@ mod widget_impls {
             Button::set_hovered(self, hovered);
         }
         fn tint_delta(&self) -> u32 {
-            // Same focus = hover convention as [`crate::widgets::textbox::Textbox`]. Both widgets read from the same theme family so a Button beside a Textbox tints identically.
-            if self.is_focused() || self.is_hovered() {
+            // Three states from the BUTTON_* palette: idle (no tint, lands on BUTTON_FILL — slate-grey-blue), hovered → BUTTON_HOVER (slightly more saturated blue, signals "clickable"), focused → BUTTON_ACTIVE (darkens back toward TEXTBOX_FILL for the conventional "pressed in" inverse-bevel reading). Focus dominates hover so a focused-and-hovered button stays at ACTIVE rather than flickering to HOVER while the cursor passes over.
+            if self.is_focused() {
                 crate::paint::wrap_sub_rgb(
-                    crate::theme::TEXTBOX_HOVER,
-                    crate::theme::TEXTBOX_FILL,
+                    crate::theme::BUTTON_ACTIVE,
+                    crate::theme::BUTTON_FILL,
+                )
+            } else if self.is_hovered() {
+                crate::paint::wrap_sub_rgb(
+                    crate::theme::BUTTON_HOVER,
+                    crate::theme::BUTTON_FILL,
                 )
             } else {
                 0
