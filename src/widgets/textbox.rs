@@ -22,8 +22,7 @@ pub struct Textbox {
     focused: bool,
     /// `true` while the cursor is hovering over the textbox bbox. Drives the hover fill colour. Mutate via [`Self::set_hovered`] / the [`crate::host::widget::Hover`] trait method.
     hovered: bool,
-    /// Stroke thickness in RU (multiplied by `font_size`). `0.0` → 1px minimum via the photon `+ 1`
-    /// idiom in `render_content_into`. Stroke eats inward from the outer pill silhouette.
+    /// Stroke thickness as a fraction of `font_size`. Final pixel width = `(stroke_ru × font_size) as isize + 1` — the `+ 1` idiom guarantees a minimum 1 px stroke so the edge never disappears on small displays, and the multiplier scales the stroke up smoothly on big ones. Default `1.0 / (1 << 5)` (= 1/32 of font_size) yields 1 px through typical desktop range and ~2-3 px on 4K + zoom; matches Button's convention.
     pub stroke_ru: f32,
     /// Pixel rect (center-anchored).
     pub center_x: Coord,
@@ -218,7 +217,7 @@ impl Textbox {
             hit_id: crate::host::widget::next_id(hit_counter),
             focused: false,
             hovered: false,
-            stroke_ru: 0.0, // → 1 px minimum stroke via the +1 idiom in render_content_into
+            stroke_ru: 1.0 / (1 << 5) as f32, // = 1/32 of font_size; scales 1 px on typical desktop, ~2-3 px on 4K + zoom
             center_x,
             center_y,
             width,
@@ -1206,8 +1205,17 @@ mod widget_impls {
             Textbox::set_hovered(self, hovered);
         }
         fn tint_delta(&self) -> u32 {
-            // Focus and hover render the same tint by design — the focused widget gets the hover treatment so keyboard-only users see which widget owns input without needing a separate focus ring (the wider glow halo is the secondary cue for mouse users).
-            if self.is_focused() || self.is_hovered() {
+            // Three states per the docstring contract on `render_content_into`:
+            //   * focused → land at `TEXTBOX_ACTIVE` (pure black interior — strongest contrast for the typing field, primary signal for keyboard-only users)
+            //   * hovered (not focused) → land at `TEXTBOX_HOVER`
+            //   * neither → no tint
+            // Focus dominates hover so a focused-and-hovered textbox stays at ACTIVE rather than flipping to HOVER while the cursor passes over.
+            if self.is_focused() {
+                crate::paint::wrap_sub_rgb(
+                    crate::theme::TEXTBOX_ACTIVE,
+                    crate::theme::TEXTBOX_FILL,
+                )
+            } else if self.is_hovered() {
                 crate::paint::wrap_sub_rgb(
                     crate::theme::TEXTBOX_HOVER,
                     crate::theme::TEXTBOX_FILL,
