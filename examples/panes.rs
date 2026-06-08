@@ -971,7 +971,7 @@ impl FluorApp for PanesDemo {
                 rot_ellipse_colour,
                 None,
             );
-            paint::background_noise(canvas, 0, true, bg_scroll, None);
+            paint::background_noise(canvas, 0, true, bg_scroll, None, None);
         });
         self.chrome
             .rasterize_chrome(ctx.damage, ctx.text, ctx.clip_mask);
