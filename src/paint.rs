@@ -59,11 +59,7 @@ impl Clip {
         }
     }
 
-    /// Intersect a primitive's `i32` bbox with `opt` (resolved against the buffer extent),
-    /// returning integer pixel bounds suitable for `for` loops. Returns `None` if the
-    /// intersection is empty (whole primitive is offscreen or fully clipped). Used by every
-    /// rasterizer's entry path so the clip story is one call: pass `clip` through, get back
-    /// either `(x_start, y_start, x_end, y_end)` to iterate or an early-return signal.
+    /// Intersect a primitive's `i32` bbox with `opt` (resolved against the buffer extent), returning integer pixel bounds suitable for `for` loops. Returns `None` if the intersection is empty (whole primitive is offscreen or fully clipped). Used by every rasterizer's entry path so the clip story is one call: pass `clip` through, get back either `(x_start, y_start, x_end, y_end)` to iterate or an early-return signal.
     #[inline]
     pub fn intersect_bbox(
         opt: Option<Clip>,
@@ -454,9 +450,7 @@ pub use crate::pixel::BlendMode;
 
 /// Flatten `src` underneath `dst` across the whole slice, pixel-by-pixel, via [`Blend::under`]. `dst` is the partial composite already accumulated above (its α-byte = accumulated opacity); `src` is the new layer going behind. Per-pixel early-out fires when `dst.α == 0xFF`. Both slices must be the same length.
 ///
-/// For `BlendMode::Normal` (the 99% case) the kernel uses 8-wide SIMD + Rayon parallelism.
-/// Other modes fall back to scalar per-pixel with Rayon row-chunking still applied — the math
-/// just stays in the scalar [`Blend::under`] kernel.
+/// For `BlendMode::Normal` (the 99% case) the kernel uses 8-wide SIMD + Rayon parallelism. Other modes fall back to scalar per-pixel with Rayon row-chunking still applied — the math just stays in the scalar [`Blend::under`] kernel.
 #[inline]
 pub fn flatten(dst: &mut [u32], src: &[u32], mode: BlendMode) {
     let n = dst.len().min(src.len());
@@ -481,8 +475,7 @@ pub fn flatten(dst: &mut [u32], src: &[u32], mode: BlendMode) {
     }
 }
 
-/// Per-chunk Normal-under dispatcher: SIMD with the `simd` feature, scalar fallback otherwise.
-/// Output is bit-identical between paths.
+/// Per-chunk Normal-under dispatcher: SIMD with the `simd` feature, scalar fallback otherwise. Output is bit-identical between paths.
 #[inline]
 pub(crate) fn under_chunk_normal_dispatch(dst: &mut [u32], src: &[u32]) {
     #[cfg(feature = "simd")]
@@ -522,10 +515,7 @@ fn under_chunk_normal_scalar(dst: &mut [u32], src: &[u32]) {
     }
 }
 
-/// Per-chunk Normal-under dispatcher for a CONSTANT src pixel — what the rasterizer interior
-/// fast paths need: every dst pixel composes the same `full_pixel` underneath. Saves the cost
-/// of materializing an 8-pixel src array when all lanes are the same value (the SIMD path uses
-/// `u32x8::splat` instead).
+/// Per-chunk Normal-under dispatcher for a CONSTANT src pixel — what the rasterizer interior fast paths need: every dst pixel composes the same `full_pixel` underneath. Saves the cost of materializing an 8-pixel src array when all lanes are the same value (the SIMD path uses `u32x8::splat` instead).
 #[inline]
 pub(crate) fn under_chunk_const_dispatch(dst: &mut [u32], src_const: u32) {
     #[cfg(feature = "simd")]
@@ -538,8 +528,7 @@ pub(crate) fn under_chunk_const_dispatch(dst: &mut [u32], src_const: u32) {
     }
 }
 
-/// 8-wide SIMD constant-src under kernel. `src_const` is broadcast to all 8 lanes once outside
-/// the inner loop. Tail scalar.
+/// 8-wide SIMD constant-src under kernel. `src_const` is broadcast to all 8 lanes once outside the inner loop. Tail scalar.
 #[cfg(feature = "simd")]
 fn under_chunk_const_simd(dst: &mut [u32], src_const: u32) {
     use crate::simd::{LANES, u32x8};
@@ -840,8 +829,7 @@ pub static DEBUG_SKIP_CHROME: std::sync::atomic::AtomicBool =
 pub static DEBUG_SKIP_CONTROLS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Debug toggle that overlays a one-line diagnostic strip across the bottom of the window showing live render-pipeline stats: composite-FPS (= `1.0 / composite_time`, NOT the vsync-capped frame rate) and the cumulative frame counter. Bound to the `[]f` chord. The composite-FPS is the actual headroom — a 144 Hz display showing "1240 FPS" means each composite took ~0.8 ms, leaving 6.1 ms of slack against vsync. `false` by default.
-/// Counter bumped by primitives that perform genuine *rasterize* work (geometric paint, glyph shaping, etc.) — NOT by blits/copies/tint applications. The host reads-and-resets this with `.swap(0, ...)` after `app.render` to decide whether to call `DebugStats::record_rasterize` or only `record_present`. Lets the F (frame) counter climb on hover-only frames while R (rasterize) stays put.
+/// Debug toggle that overlays a one-line diagnostic strip across the bottom of the window showing live render-pipeline stats: composite-FPS (= `1.0 / composite_time`, NOT the vsync-capped frame rate) and the cumulative frame counter. Bound to the `[]f` chord. The composite-FPS is the actual headroom — a 144 Hz display showing "1240 FPS" means each composite took ~0.8 ms, leaving 6.1 ms of slack against vsync. `false` by default. Counter bumped by primitives that perform genuine *rasterize* work (geometric paint, glyph shaping, etc.) — NOT by blits/copies/tint applications. The host reads-and-resets this with `.swap(0, ...)` after `app.render` to decide whether to call `DebugStats::record_rasterize` or only `record_present`. Lets the F (frame) counter climb on hover-only frames while R (rasterize) stays put.
 pub static RASTERIZE_OPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub static DEBUG_SHOW_FPS: std::sync::atomic::AtomicBool =
@@ -971,10 +959,7 @@ pub fn draw_chord_hint(
     draw_rect(canvas, cx, cy, panel_w, panel_h, bg, None);
 }
 
-/// Live diagnostic counters owned by the host's render loop and read by [`draw_debug_strip`].
-/// All fields are simple POD; the host updates them every frame when [`DEBUG_SHOW_FPS`] is on
-/// and the helper renders them as a single line of text into the bottom-of-window scratch
-/// region before the boundary pass runs.
+/// Live diagnostic counters owned by the host's render loop and read by [`draw_debug_strip`]. All fields are simple POD; the host updates them every frame when [`DEBUG_SHOW_FPS`] is on and the helper renders them as a single line of text into the bottom-of-window scratch region before the boundary pass runs.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DebugStats {
     /// Raw work time of the most recent frame, per stage, in seconds. NOT smoothed — each value is exactly the last measurement so SIMD/Rayon toggles produce immediately legible swings. FPS shown in the strip is `1.0 / stage_secs` per stage and `1.0 / sum` for total.
@@ -1024,15 +1009,9 @@ impl DebugStats {
     }
 }
 
-/// Overlay a one-line diagnostic strip across the bottom of `pixels` showing the live stats
-/// in [`DebugStats`]. Gated by [`DEBUG_SHOW_FPS`] — the host should check that flag before
-/// calling. Paints into the α + darkness scratch buffer BEFORE the boundary pass so the strip
-/// flows through `finalize_*` like any other content (no special handling needed downstream).
+/// Overlay a one-line diagnostic strip across the bottom of `pixels` showing the live stats in [`DebugStats`]. Gated by [`DEBUG_SHOW_FPS`] — the host should check that flag before calling. Paints into the α + darkness scratch buffer BEFORE the boundary pass so the strip flows through `finalize_*` like any other content (no special handling needed downstream).
 ///
-/// The strip is `~24` pixels tall, semi-opaque black background, bright green monospace text
-/// (terminal-style for readability against any underlying content). Positioned at the very
-/// bottom of `pixels`; clipped to the buffer if the window is too short to fit the strip
-/// (returns early in that case — diagnostic, not load-bearing).
+/// The strip is `~24` pixels tall, semi-opaque black background, bright green monospace text (terminal-style for readability against any underlying content). Positioned at the very bottom of `pixels`; clipped to the buffer if the window is too short to fit the strip (returns early in that case — diagnostic, not load-bearing).
 ///
 /// `strip_y` is the canvas-relative row where the strip's top edge lands. Callers can pass any value that fits inside the canvas (`strip_y + DEBUG_STRIP_H ≤ canvas.height`); the host typically points the canvas at a dedicated `DEBUG_STRIP_H`-tall staging buffer with `strip_y = 0` so the strip never touches the app's scratch.
 #[cfg(feature = "text")]
@@ -1437,8 +1416,7 @@ mod tests {
 
     #[test]
     fn pack_layout_stores_alpha_in_top_byte() {
-        // α + darkness storage: α = 0x12 in the top byte, RGB stored as darkness (255 − channel).
-        // pack_argb(0xAB, 0xCD, 0xEF, 0x12) → α=0x12, dark=(0x54, 0x32, 0x10).
+        // α + darkness storage: α = 0x12 in the top byte, RGB stored as darkness (255 − channel). pack_argb(0xAB, 0xCD, 0xEF, 0x12) → α=0x12, dark=(0x54, 0x32, 0x10).
         assert_eq!(pack_argb(0xAB, 0xCD, 0xEF, 0x12), 0x12_54_32_10);
     }
 
@@ -1540,8 +1518,7 @@ mod tests {
 
     #[test]
     fn fill_rect_full_buffer() {
-        // Buffer starts EMPTY (α=0, dark=0). Paint opaque visible RGB(0x11,0x22,0x33) under it.
-        // Result: ~opaque colour (1-LSB drift per channel from the >>8 normalization).
+        // Buffer starts EMPTY (α=0, dark=0). Paint opaque visible RGB(0x11,0x22,0x33) under it. Result: ~opaque colour (1-LSB drift per channel from the >>8 normalization).
         let mut buf = vec![0u32; 4 * 4];
         let mut damage = crate::canvas::Damage::new();
         let mut canvas = crate::canvas::Canvas::new(&mut buf, 4, 4, &mut damage);

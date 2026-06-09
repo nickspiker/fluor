@@ -12,11 +12,7 @@ use crate::event::{CursorIcon as FCursorIcon, Event as FEvent, ModifiersState as
 use crate::geom::Viewport;
 use crate::text::TextRenderer;
 use std::time::Instant;
-// `winit::event_loop::EventLoopProxy` is mentioned in `FluorApp::set_event_proxy`'s
-// signature. The host-android feature pulls winit with `default-features = false +
-// rwh_06` (data types only — no event-loop machinery on Android), so the trait shape
-// stays uniform across hosts. Concrete winit machinery (ApplicationHandler, EventLoop,
-// WindowAttributes, etc.) only enters via the desktop_shell sub-module below.
+// `winit::event_loop::EventLoopProxy` is mentioned in `FluorApp::set_event_proxy`'s signature. The host-android feature pulls winit with `default-features = false + rwh_06` (data types only — no event-loop machinery on Android), so the trait shape stays uniform across hosts. Concrete winit machinery (ApplicationHandler, EventLoop, WindowAttributes, etc.) only enters via the desktop_shell sub-module below.
 use winit::event_loop::EventLoopProxy;
 
 #[cfg(feature = "host-winit")]
@@ -211,10 +207,7 @@ pub fn run_app<A: FluorApp + 'static>(mut app: A) -> Result<(), EventLoopError> 
     event_loop.run_app(&mut shell)
 }
 
-// ============================================================================
-// Everything below this point is `host-winit`-only — DesktopShell + winit event loop.
-// AndroidShell lives at [`crate::host::android::shell`].
-// ============================================================================
+// ============================================================================ Everything below this point is `host-winit`-only — DesktopShell + winit event loop. AndroidShell lives at [`crate::host::android::shell`]. ============================================================================
 
 /// Visible-window placement inside the fullscreen screen buffer. fluor now runs as a fullscreen transparent OS window owning the whole display — the "window" the consumer paints into is a sub-rect of that screen buffer at `(x, y)` with `(w, h)` pixels. `(x, y, w, h)` are screen-space pixel coordinates. `(0, 0)` is the top-left of the display. WindowRect is mutated by drag-to-move (changes `x, y`) and resize-drag (changes `w, h`); both are in-buffer operations that don't touch the OS window geometry.
 #[derive(Clone, Copy, Debug)]
@@ -300,9 +293,7 @@ struct DesktopShell<A: FluorApp> {
     /// Tracks `WindowEvent::Focused` so the drop shadow can dim when the window is inactive — focused windows cast a stronger shadow (`SHADOW_SEED_FOCUSED`), unfocused ones use a quarter-strength shadow (`SHADOW_SEED_UNFOCUSED`).
     is_focused: bool,
 
-    /// Live render-pipeline counters. Updated every `render_frame` call (composite-time EMA +
-    /// frame counter); rendered to a bottom-of-window debug strip when [`paint::DEBUG_SHOW_FPS`]
-    /// is set via the `[]f` chord.
+    /// Live render-pipeline counters. Updated every `render_frame` call (composite-time EMA + frame counter); rendered to a bottom-of-window debug strip when [`paint::DEBUG_SHOW_FPS`] is set via the `[]f` chord.
     debug_stats: crate::paint::DebugStats,
 
     /// Frame-level damage accumulator. Reset at the top of each `render_frame`; passed to the consumer via [`Context::damage`]; read back after consumer render to drive damage-clipped composite and the [`paint::DEBUG_SHOW_DAMAGE`] outline overlay.
@@ -1277,9 +1268,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                             self.viewport.height_px as usize,
                         ),
                     };
-                    // Translate winit → fluor at the boundary. Events that don't map
-                    // (decorator/raw-input/etc.) skip app.on_event entirely; the host
-                    // continues handling them internally below as needed.
+                    // Translate winit → fluor at the boundary. Events that don't map (decorator/raw-input/etc.) skip app.on_event entirely; the host continues handling them internally below as needed.
                     let response = match winit_compat::from_winit_event(&event) {
                         Some(fevent) => self.app.on_event(&fevent, &mut ctx),
                         None => EventResponse::Pass,

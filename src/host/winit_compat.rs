@@ -12,9 +12,8 @@ use crate::event::{
 };
 
 // ============================================================================
-// winit → fluor
-// ============================================================================
 
+// winit → fluor ============================================================================
 /// Convert a winit `ModifiersState` to fluor's. Bit-by-bit equivalent.
 pub fn from_winit_mods(m: winit::keyboard::ModifiersState) -> ModifiersState {
     ModifiersState {
@@ -141,9 +140,8 @@ pub fn from_winit_event(event: &winit::event::WindowEvent) -> Option<Event> {
 }
 
 // ============================================================================
-// fluor → winit
-// ============================================================================
 
+// fluor → winit ============================================================================
 /// Convert a fluor `CursorIcon` to winit's. Host calls this before `window.set_cursor`.
 pub fn to_winit_cursor(c: CursorIcon) -> winit::window::CursorIcon {
     match c {

@@ -52,25 +52,15 @@ pub trait Blend {
     ///
     /// Math (all `>> 8`, no `/ 255`, no floats):
     /// ```text
-    /// consumed     = ((256 − top_α) × bot_α) >> 8         (0..=255 − top_α) — amount the new layer contributes
-    /// (mr, mg, mb) = mode_kernel(top_dark, bot_dark)      (0..=255 per channel) in darkness space
-    /// contrib_ch   = (m_ch × consumed) >> 8               (darkness this layer deposits)
-    /// out_dark_ch  = top_dark_ch + contrib_ch             (plain +, bounded ≤ 255 by floor proof)
-    /// new_α        = top_α + consumed                     (plain +, bounded ≤ 255 by floor proof)
+    /// consumed     = ((256 − top_α) × bot_α) >> 8         (0..=255 − top_α) — amount the new layer contributes (mr, mg, mb) = mode_kernel(top_dark, bot_dark)      (0..=255 per channel) in darkness space contrib_ch   = (m_ch × consumed) >> 8               (darkness this layer deposits) out_dark_ch  = top_dark_ch + contrib_ch             (plain +, bounded ≤ 255 by floor proof) new_α        = top_α + consumed                     (plain +, bounded ≤ 255 by floor proof)
     /// ```
     /// Starting from `0x00000000` (no opacity, no darkness), each new layer adds darkness and opacity to the running total. Multi-layer stacking is repeated addition until α saturates or layers exhaust.
     fn under(self, bottom: Argb8, mode: BlendMode) -> Argb8;
 }
 
-/// 8-wide SIMD version of [`Blend::under`] for `BlendMode::Normal` only — the 99% case in
-/// real compositing workloads. Same math as the scalar kernel lane-by-lane, plus a SIMD
-/// version of the `dst >= 0xFF000000` early-out: lanes where `dst.α == 0xFF` keep their
-/// original value via a masked blend with the SIMD result.
+/// 8-wide SIMD version of [`Blend::under`] for `BlendMode::Normal` only — the 99% case in real compositing workloads. Same math as the scalar kernel lane-by-lane, plus a SIMD version of the `dst >= 0xFF000000` early-out: lanes where `dst.α == 0xFF` keep their original value via a masked blend with the SIMD result.
 ///
-/// Other blend modes (Multiply, Screen, Add, Subtract, Overlay, Darken, Lighten) are NOT
-/// covered here — they branch per lane on bot_dark thresholds (Overlay) or call
-/// `saturating_sub` per channel, which doesn't SIMD-vectorize cleanly. Those modes stay on
-/// the scalar [`Blend::under`] kernel; only Normal gets the wide path.
+/// Other blend modes (Multiply, Screen, Add, Subtract, Overlay, Darken, Lighten) are NOT covered here — they branch per lane on bot_dark thresholds (Overlay) or call `saturating_sub` per channel, which doesn't SIMD-vectorize cleanly. Those modes stay on the scalar [`Blend::under`] kernel; only Normal gets the wide path.
 #[cfg(feature = "simd")]
 #[inline]
 pub fn under_x8_normal(dst: wide::u32x8, src: wide::u32x8) -> wide::u32x8 {
@@ -95,8 +85,7 @@ pub fn under_x8_normal(dst: wide::u32x8, src: wide::u32x8) -> wide::u32x8 {
     let na = dst_a + consumed;
     let result: u32x8 = (na << 24) | (nr << 16) | (ng << 8) | nb;
 
-    // SIMD early-out: lanes where dst.α was 0xFF keep dst (top was already opaque, bot
-    // invisible). cmp_eq returns 0xFFFFFFFF for true lanes, 0 for false — bitwise blend.
+    // SIMD early-out: lanes where dst.α was 0xFF keep dst (top was already opaque, bot invisible). cmp_eq returns 0xFFFFFFFF for true lanes, 0 for false — bitwise blend.
     let opaque_mask = dst_a.cmp_eq(mask_ff);
     let not_mask = opaque_mask ^ all_ones;
     (opaque_mask & dst) | (not_mask & result)
@@ -203,8 +192,7 @@ mod tests {
 
     #[test]
     fn under_empty_top_opaque_black_yields_opaque_black() {
-        // Canonical empty (0x00000000 = no opacity, no darkness) + opaque black (α=255, dark=255) → opaque black.
-        // consumed = 255. contrib = (255 × 255) >> 8 = 254. nr ≈ 254 (≈ 255 after rounding). new_α = 255.
+        // Canonical empty (0x00000000 = no opacity, no darkness) + opaque black (α=255, dark=255) → opaque black. consumed = 255. contrib = (255 × 255) >> 8 = 254. nr ≈ 254 (≈ 255 after rounding). new_α = 255.
         let top: Argb8 = 0x00000000;
         let bottom: Argb8 = 0xFF_FF_FF_FF;
         let result = top.under(bottom, BlendMode::Normal);
@@ -216,8 +204,7 @@ mod tests {
 
     #[test]
     fn under_empty_top_opaque_mid_gray_yields_mid_gray() {
-        // Empty + opaque mid-gray (α=255, dark=128 ≈ visible 127 ≈ mid-gray) → ~mid-gray.
-        // consumed = 255. contrib = (128 × 255) >> 8 = 127. nr ≈ 127.
+        // Empty + opaque mid-gray (α=255, dark=128 ≈ visible 127 ≈ mid-gray) → ~mid-gray. consumed = 255. contrib = (128 × 255) >> 8 = 127. nr ≈ 127.
         let top: Argb8 = 0x00000000;
         let bottom: Argb8 = 0xFF_80_80_80;
         let result = top.under(bottom, BlendMode::Normal);
@@ -229,8 +216,7 @@ mod tests {
 
     #[test]
     fn under_empty_top_20pct_opaque_black_yields_20pct_black() {
-        // Empty + 20% opaque pure black (α=51, dark=255) → 20% α, 20% darkness.
-        // consumed = (256 × 51) >> 8 = 51. contrib = (255 × 51) >> 8 = 50. new_α = 51.
+        // Empty + 20% opaque pure black (α=51, dark=255) → 20% α, 20% darkness. consumed = (256 × 51) >> 8 = 51. contrib = (255 × 51) >> 8 = 50. new_α = 51.
         let top: Argb8 = 0x00000000;
         let bottom: Argb8 = 0x33_FF_FF_FF;
         let result = top.under(bottom, BlendMode::Normal);

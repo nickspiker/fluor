@@ -347,8 +347,7 @@ fn draw_squircle_pill_two_tone_with_crossings(
 
 /// Fast-path squircle pill rasterizer. Bounds checks intentionally absent.
 ///
-/// **Rule 0 — WHY/PROOF/PREVENTS:**
-/// CALLER GUARANTEES (verified at dispatch in [`draw_squircle_pill`]):
+/// **Rule 0 — WHY/PROOF/PREVENTS:** CALLER GUARANTEES (verified at dispatch in [`draw_squircle_pill`]):
 ///   - `pill_x + pill_w ≤ buf_w` and `pill_y + pill_h ≤ buf_h` (cast to `usize`).
 ///   - `pill_w ≥ pill_h ≥ 2` (pill geometry: caps don't overlap).
 ///
@@ -438,8 +437,7 @@ fn draw_squircle_pill_unclipped(
 
 /// Slow-path squircle pill rasterizer. Used when the pill partially overhangs the buffer.
 ///
-/// **Rule 0 — WHY/PROOF/PREVENTS for the bounds checks:**
-/// CALLER ALLOWS: `pill_x` may be negative; `pill_x + pill_w` may exceed `buf_w` (same for y). Partial overhang is the design case (scroll-out, resize transitions, off-pane drag).
+/// **Rule 0 — WHY/PROOF/PREVENTS for the bounds checks:** CALLER ALLOWS: `pill_x` may be negative; `pill_x + pill_w` may exceed `buf_w` (same for y). Partial overhang is the design case (scroll-out, resize transitions, off-pane drag).
 ///
 /// PROOF that no closed-form i-range clip suffices: `inset[i]` is non-linear in `i` (squircle curve), so the AA-pixel column `pill_x + inset` can't be cleanly bracketed by a single i-range when the pill straddles `x=0` or `x=buf_w`. Linear-in-`i` coords (rows and `h_col`) ARE clipped at the corner-block level — one branch per corner instead of one per pixel. The inset-dependent AA column gets one inline check.
 ///

@@ -11,8 +11,7 @@ use alloc::string::String;
 
 use crate::coord::Coord;
 
-// ============================================================================
-// Top-level event ============================================================
+// ============================================================================ Top-level event ============================================================
 
 /// A platform-neutral window event delivered to [`crate::host::app::FluorApp::on_event`].
 ///
@@ -54,8 +53,7 @@ pub enum Event {
     Ime(Ime),
 }
 
-// ============================================================================
-// Element state / mouse button ===============================================
+// ============================================================================ Element state / mouse button ===============================================
 
 /// Press / release transition for buttons and keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -74,8 +72,7 @@ pub enum MouseButton {
     Other(u16),
 }
 
-// ============================================================================
-// Scroll delta ===============================================================
+// ============================================================================ Scroll delta ===============================================================
 
 /// Direction + magnitude of a scroll event. Hosts pick whichever unit their platform delivers; consumers typically multiply through the same scaling factor regardless.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -86,8 +83,7 @@ pub enum MouseScrollDelta {
     Pixels(f32, f32),
 }
 
-// ============================================================================
-// Modifier state =============================================================
+// ============================================================================ Modifier state =============================================================
 
 /// Live modifier-key state. All four bits set simultaneously is legal (shift+ctrl+alt+super).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -127,8 +123,7 @@ impl ModifiersState {
     }
 }
 
-// ============================================================================
-// Keys =======================================================================
+// ============================================================================ Keys =======================================================================
 
 /// Logical key value, post-keymap. `Character(c)` carries the character a printable key would produce (one Unicode scalar — IME composed text arrives via [`Event::Ime`], not here). `Named` covers non-printable keys.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -171,8 +166,7 @@ pub struct KeyEvent {
     pub text: Option<String>,
 }
 
-// ============================================================================
-// IME ========================================================================
+// ============================================================================ IME ========================================================================
 
 /// IME composition events. Today we only translate `Commit` (the cross-platform "user accepted this string, type it"); preedit + state changes can land here when we wire IME on desktop or build a fancier Android InputConnection.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,8 +175,7 @@ pub enum Ime {
     Commit(String),
 }
 
-// ============================================================================
-// Cursor icon ================================================================
+// ============================================================================ Cursor icon ================================================================
 
 /// Cursor shape the host should display. Variants are limited to what fluor's chrome + widgets request today; Android stubs all variants to no-ops (no pointer cursor on touchscreens).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

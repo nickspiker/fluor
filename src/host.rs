@@ -14,9 +14,7 @@ pub use window_handle::WindowHandle;
 #[cfg(feature = "text")]
 pub mod chrome_widget;
 
-// `app` contains the `FluorApp` trait + `Context` + (gated below) `DesktopShell`. The trait
-// and Context compile on any host with `text` + `winit` (data types only — see Cargo.toml's
-// host-android comment); DesktopShell + run_app stay host-winit-only.
+// `app` contains the `FluorApp` trait + `Context` + (gated below) `DesktopShell`. The trait and Context compile on any host with `text` + `winit` (data types only — see Cargo.toml's host-android comment); DesktopShell + run_app stay host-winit-only.
 #[cfg(all(feature = "text", any(feature = "host-winit", feature = "host-android")))]
 pub mod app;
 
@@ -34,8 +32,6 @@ pub mod widget;
 #[cfg(all(feature = "host-winit", target_os = "macos"))]
 pub mod renderer_wgpu;
 
-/// Winit ↔ fluor event translation helpers. Used by host-winit's `DesktopShell` to translate
-/// at the event-loop boundary, and by consumers that still receive winit-shaped events from
-/// `FluorApp::on_event` while the trait migration is in flight.
+/// Winit ↔ fluor event translation helpers. Used by host-winit's `DesktopShell` to translate at the event-loop boundary, and by consumers that still receive winit-shaped events from `FluorApp::on_event` while the trait migration is in flight.
 #[cfg(feature = "host-winit")]
 pub mod winit_compat;

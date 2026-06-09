@@ -49,10 +49,7 @@ pub struct Textbox {
     /// If Some, the anchor index where the selection started (shift+click or shift+arrow).
     pub selection_anchor: Option<usize>,
 
-    // --- Three-layer cache (front-to-back composition via under()) ---
-    // Pill bg (bottom): squircle fill + AA edges. Rarely changes (geometry / zoom only).
-    // Text glyphs (top, painted first to claim opaque pixels): per-char rasterized via TextRenderer. Changes on text edits.
-    // Selection bg (middle): painted fresh each frame from the cursor / selection_anchor range — no cache needed, it's just a coloured rect.
+    // --- Three-layer cache (front-to-back composition via under()) --- Pill bg (bottom): squircle fill + AA edges. Rarely changes (geometry / zoom only). Text glyphs (top, painted first to claim opaque pixels): per-char rasterized via TextRenderer. Changes on text edits. Selection bg (middle): painted fresh each frame from the cursor / selection_anchor range — no cache needed, it's just a coloured rect.
     //
     // Composition each frame: text_cache → target via under() (topmost wins on its opaque glyph pixels), selection rect → target via under() (claims empty selection-range cells beneath the glyphs), pill_cache → target via under() (fills remaining empty pill-interior cells beneath both). Result reads as the textbook text-field selection look: glyph colour unchanged over both selection and non-selection backgrounds.
     pill_cache: Vec<u32>,
@@ -730,27 +727,20 @@ impl Textbox {
 
     // --- Rendering ---
 
-    /// Render the textbox interior — two squircle pills stacked (photon avatar-ring pattern, but
-    /// using AA edges instead of a separate stroke line).
+    /// Render the textbox interior — two squircle pills stacked (photon avatar-ring pattern, but using AA edges instead of a separate stroke line).
     ///
-    /// Outer pill: full size, painted in stroke colour with AA at the curve. Outer-pass AA writes
-    /// `(alpha = h_aa, RGB = stroke)` so the layer's outer composite (AlphaOver onto chrome)
-    /// blends stroke into bg for a smooth pill silhouette.
+    /// Outer pill: full size, painted in stroke colour with AA at the curve. Outer-pass AA writes `(alpha = h_aa, RGB = stroke)` so the layer's outer composite (AlphaOver onto chrome) blends stroke into bg for a smooth pill silhouette.
     ///
-    /// Inner pill: inset by `stroke_px` on every side, painted in state-based fill colour. Inner-
-    /// pass AA blends fill_RGB with the underlying outer-stroke RGB at the inner curve, keeping
-    /// alpha = 255 — producing the proper `fill·h + stroke·(1-h)` transition.
+    /// Inner pill: inset by `stroke_px` on every side, painted in state-based fill colour. Inner- pass AA blends fill_RGB with the underlying outer-stroke RGB at the inner curve, keeping alpha = 255 — producing the proper `fill·h + stroke·(1-h)` transition.
     ///
-    /// `stroke_px = (stroke_ru × font_size + 1.0) as isize` — photon's "+1" idiom for 1-px
-    /// minimum stroke when `stroke_ru == 0`.
+    /// `stroke_px = (stroke_ru × font_size + 1.0) as isize` — photon's "+1" idiom for 1-px minimum stroke when `stroke_ru == 0`.
     ///
     /// Fill colour by state:
     ///   - focused (active):  `theme::TEXTBOX_ACTIVE`
     ///   - hovered only:      `theme::TEXTBOX_HOVER`
     ///   - default:           `theme::TEXTBOX_FILL`
     ///
-    /// Squirdleyness = 3 (photon default; adjustable per [`paint::squircle_inset`]). Populates
-    /// `self.mask` (255 inside outer silhouette, AA values on outer curve) for downstream glow.
+    /// Squirdleyness = 3 (photon default; adjustable per [`paint::squircle_inset`]). Populates `self.mask` (255 inside outer silhouette, AA values on outer curve) for downstream glow.
     pub fn render_content_into(
         &mut self,
         canvas: &mut crate::canvas::Canvas,
@@ -947,8 +937,7 @@ impl Textbox {
         self.pill_cache_origin_x = pill_x_target;
         self.pill_cache_origin_y = pill_y_target;
 
-        // --- Three-layer composition via under() — topmost first (fluor front-to-back) ---
-        // Step 1: text glyphs (topmost). Opaque glyph pixels claim their cells in target; surrounding empties don't write (α=0 in text_cache). No hit_map writes — pill layer stamps that.
+        // --- Three-layer composition via under() — topmost first (fluor front-to-back) --- Step 1: text glyphs (topmost). Opaque glyph pixels claim their cells in target; surrounding empties don't write (α=0 in text_cache). No hit_map writes — pill layer stamps that.
         blit_cache_to_target(
             &self.text_cache,
             self.text_cache_w,

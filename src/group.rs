@@ -222,10 +222,7 @@ mod tests {
 
     #[test]
     fn flatten_under_normal_blits_opaque_layer_at_offset() {
-        // Group at (1, 1), 2x2, Normal under-blend, single layer = solid opaque red.
-        // Target is pre-initialized to TRANSPARENT (α=0, dark=0) — the caller-side contract for any
-        // buffer participating in the under-chain. Opaque red bottom blended underneath
-        // transparent target → near-opaque-red lands at the group's pixels (1-LSB drift from the >>8 endpoint).
+        // Group at (1, 1), 2x2, Normal under-blend, single layer = solid opaque red. Target is pre-initialized to TRANSPARENT (α=0, dark=0) — the caller-side contract for any buffer participating in the under-chain. Opaque red bottom blended underneath transparent target → near-opaque-red lands at the group's pixels (1-LSB drift from the >>8 endpoint).
         let mut g = Group::new(Region::new(1.0, 1.0, 2.0, 2.0), BlendMode::Normal);
         let l = g.new_layer();
         g.rpn.layers[l].pixels = alloc::vec![opaque(0xFF0000); 4];
@@ -261,8 +258,7 @@ mod tests {
         let mut target = alloc::vec![TRANSPARENT; 4 * 4];
         g.flatten_into(&mut target, 4, 4, None);
 
-        // Group's (1, 1) lands at target (0, 0); its (3, 3) lands at target (2, 2). target (3, 3) untouched.
-        // Opaque green: α=0xFF, dark=(0xFF, 0, 0xFF). After under from empty: G-darkness near 0 (visible G ≈ 0xFF).
+        // Group's (1, 1) lands at target (0, 0); its (3, 3) lands at target (2, 2). target (3, 3) untouched. Opaque green: α=0xFF, dark=(0xFF, 0, 0xFF). After under from empty: G-darkness near 0 (visible G ≈ 0xFF).
         let g_pixel = target[0 * 4 + 0];
         assert_eq!(
             g_pixel >> 24,
@@ -278,8 +274,7 @@ mod tests {
 
     #[test]
     fn flatten_always_blits_for_double_buffering_safety() {
-        // The host's present buffer may be double-buffered; flatten must always write the
-        // group's content into target even when nothing internal is dirty.
+        // The host's present buffer may be double-buffered; flatten must always write the group's content into target even when nothing internal is dirty.
         let mut g = Group::new(Region::new(0.0, 0.0, 2.0, 1.0), BlendMode::Normal);
         let l = g.new_layer();
         g.rpn.layers[l].pixels = alloc::vec![opaque(0xAABBCC); 2];

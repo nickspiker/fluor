@@ -155,9 +155,7 @@ impl StackCompositor {
                 Op::Under(mode) => {
                     let b = self.stack.pop().expect("Stack underflow on Under");
                     let a = self.stack.last_mut().expect("Stack underflow on Under");
-                    // Full-buffer compose. Use [`crate::paint::flatten`] so the SIMD+Rayon
-                    // path for `Normal` mode (the 99% case) kicks in automatically; other
-                    // blend modes route through scalar with Rayon-only chunking.
+                    // Full-buffer compose. Use [`crate::paint::flatten`] so the SIMD+Rayon path for `Normal` mode (the 99% case) kicks in automatically; other blend modes route through scalar with Rayon-only chunking.
                     crate::paint::flatten(a, &b, mode);
                     self.release_buf(b);
                 }
@@ -204,9 +202,7 @@ mod tests {
 
     #[test]
     fn under_normal_opaque_top_returns_top() {
-        // Topmost (opaque red) above bottom (opaque blue) — top wins via early-out.
-        // Opaque red: α=0xFF, dark=(0,0xFF,0xFF) → visible (0xFF,0,0).
-        // Opaque blue: α=0xFF, dark=(0xFF,0xFF,0) → visible (0,0,0xFF).
+        // Topmost (opaque red) above bottom (opaque blue) — top wins via early-out. Opaque red: α=0xFF, dark=(0,0xFF,0xFF) → visible (0xFF,0,0). Opaque blue: α=0xFF, dark=(0xFF,0xFF,0) → visible (0,0,0xFF).
         let mut stk = make_stack(2);
         let top = stk.new_layer();
         let bot = stk.new_layer();
@@ -223,9 +219,7 @@ mod tests {
 
     #[test]
     fn under_normal_translucent_top_accumulates_opacity() {
-        // Top: 50% α, visible black (= α=128, dark=255 = 0x80_FF_FF_FF).
-        // Bottom: 50% α, visible red (= α=128, dark=(0, 255, 255) = 0x80_00_FF_FF).
-        // consumed = (128 × 128) >> 8 = 64. new_α = 128 + 64 = 192. Porter-Duff over: 1 − 0.5×0.5 = 0.75 ≈ 192/255.
+        // Top: 50% α, visible black (= α=128, dark=255 = 0x80_FF_FF_FF). Bottom: 50% α, visible red (= α=128, dark=(0, 255, 255) = 0x80_00_FF_FF). consumed = (128 × 128) >> 8 = 64. new_α = 128 + 64 = 192. Porter-Duff over: 1 − 0.5×0.5 = 0.75 ≈ 192/255.
         let mut stk = make_stack(1);
         let top = stk.new_layer();
         let bot = stk.new_layer();

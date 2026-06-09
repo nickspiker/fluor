@@ -6,10 +6,7 @@
 //!
 //! The consumer's code IS the tree:
 //! ```ignore
-//! let root = Region::from_viewport(&vp);
-//! let [_, content, _] = root.split_h([1.0, 6.0, 1.0]);
-//! let [header, body, footer] = content.split_v([2.0, 12.0, 2.0]);
-//! let font = header.size(16.0);  // scales with header, not viewport
+//! let root = Region::from_viewport(&vp); let [_, content, _] = root.split_h([1.0, 6.0, 1.0]); let [header, body, footer] = content.split_v([2.0, 12.0, 2.0]); let font = header.size(16.0);  // scales with header, not viewport
 //! ```
 //! Resize = call the function again. No invalidation, no dirty flags.
 
@@ -17,8 +14,7 @@ use crate::coord::Coord;
 use crate::geom::Viewport;
 use crate::paint::Clip;
 
-/// Pixel-space rectangle with region-local harmonic-mean span.
-/// 20 bytes, `Copy`, no lifetimes, no allocator, `no_std`.
+/// Pixel-space rectangle with region-local harmonic-mean span. 20 bytes, `Copy`, no lifetimes, no allocator, `no_std`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Region {
     /// Left edge, pixel coordinates (top-left origin).
@@ -90,9 +86,7 @@ impl Region {
 
     // --- Sizing ---
 
-    /// Derive a size from the region's span: `span / divisor`.
-    /// Use for font sizes, margins, padding, border widths — anything that should
-    /// scale with this region's dimensions.
+    /// Derive a size from the region's span: `span / divisor`. Use for font sizes, margins, padding, border widths — anything that should scale with this region's dimensions.
     #[inline]
     pub fn size(&self, divisor: Coord) -> Coord {
         self.span / divisor
@@ -100,9 +94,7 @@ impl Region {
 
     // --- Subdivision ---
 
-    /// Split into `N` vertical bands (top-to-bottom rows) by proportional weights.
-    /// Each returned Region spans the full width of `self` with height proportional to its weight.
-    /// The last band absorbs rounding so sub-regions tile the parent exactly.
+    /// Split into `N` vertical bands (top-to-bottom rows) by proportional weights. Each returned Region spans the full width of `self` with height proportional to its weight. The last band absorbs rounding so sub-regions tile the parent exactly.
     pub fn split_v<const N: usize>(&self, weights: [Coord; N]) -> [Region; N] {
         let total: Coord = weights.iter().sum();
         let mut result = [*self; N];
@@ -118,9 +110,7 @@ impl Region {
         result
     }
 
-    /// Split into `N` horizontal bands (left-to-right columns) by proportional weights.
-    /// Each returned Region spans the full height of `self` with width proportional to its weight.
-    /// The last band absorbs rounding so sub-regions tile the parent exactly.
+    /// Split into `N` horizontal bands (left-to-right columns) by proportional weights. Each returned Region spans the full height of `self` with width proportional to its weight. The last band absorbs rounding so sub-regions tile the parent exactly.
     pub fn split_h<const N: usize>(&self, weights: [Coord; N]) -> [Region; N] {
         let total: Coord = weights.iter().sum();
         let mut result = [*self; N];
@@ -158,9 +148,7 @@ impl Region {
 
     // --- Reshaping ---
 
-    /// Shrink by `frac` of each dimension on each side.
-    /// `inset(0.1)` removes 10% of width from left AND right (20% total width reduction),
-    /// same for height. `inset(0.0)` returns self. `inset(0.5)` collapses to a point.
+    /// Shrink by `frac` of each dimension on each side. `inset(0.1)` removes 10% of width from left AND right (20% total width reduction), same for height. `inset(0.0)` returns self. `inset(0.5)` collapses to a point.
     #[inline]
     pub fn inset(&self, frac: Coord) -> Region {
         let dx = self.w * frac;
@@ -217,8 +205,7 @@ impl Region {
 
 /// Harmonic mean of two values: `2ab / (a + b)`.
 ///
-/// Use for blending two sizing constraints — e.g., span-based unit vs height-based unit
-/// (photon's `ContactsUnifiedLayout` pattern). Returns 0.0 if both inputs are zero.
+/// Use for blending two sizing constraints — e.g., span-based unit vs height-based unit (photon's `ContactsUnifiedLayout` pattern). Returns 0.0 if both inputs are zero.
 #[inline]
 pub fn harmonic(a: Coord, b: Coord) -> Coord {
     let sum = a + b;
@@ -339,8 +326,7 @@ mod tests {
     fn each_region_has_local_span() {
         let root = Region::new(0.0, 0.0, 1000.0, 500.0);
         let [narrow, wide] = root.split_h([1.0, 9.0]);
-        // narrow is 100x500, wide is 900x500
-        // Their spans should differ because their aspect ratios differ
+        // narrow is 100x500, wide is 900x500 Their spans should differ because their aspect ratios differ
         assert!(narrow.span != wide.span);
         // narrow.span = 2*100*500/(100+500) = 100000/600 ≈ 166.67
         assert!(approx(narrow.span, 2.0 * 100.0 * 500.0 / 600.0));
@@ -360,8 +346,7 @@ mod tests {
     fn inset_shrinks_symmetrically() {
         let r = Region::new(0.0, 0.0, 100.0, 200.0);
         let inset = r.inset(0.1);
-        // 10% of 100 = 10 from each side → x=10, w=80
-        // 10% of 200 = 20 from each side → y=20, h=160
+        // 10% of 100 = 10 from each side → x=10, w=80 10% of 200 = 20 from each side → y=20, h=160
         assert!(approx(inset.x, 10.0));
         assert!(approx(inset.y, 20.0));
         assert!(approx(inset.w, 80.0));

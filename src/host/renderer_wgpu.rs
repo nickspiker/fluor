@@ -1,13 +1,10 @@
 //! macOS renderer — wgpu/Metal backend, no shader.
 //!
-//! CPU buffer → write_texture (memcpy) → copy_texture_to_texture (DMA) → present.
-//! Zero float conversion. Pixels stay as u32 bytes the whole way.
+//! CPU buffer → write_texture (memcpy) → copy_texture_to_texture (DMA) → present. Zero float conversion. Pixels stay as u32 bytes the whole way.
 //!
-//! Pixel layout: `u32` stores `0xAARRGGBB`. Little-endian bytes are [B,G,R,A]
-//! = Bgra8Unorm — direct upload, zero byte-swapping.
+//! Pixel layout: `u32` stores `0xAARRGGBB`. Little-endian bytes are [B,G,R,A] = Bgra8Unorm — direct upload, zero byte-swapping.
 //!
-//! Uses PostMultiplied alpha mode so 0x00000000 pixels composite as fully
-//! transparent — required for squircle window corners.
+//! Uses PostMultiplied alpha mode so 0x00000000 pixels composite as fully transparent — required for squircle window corners.
 
 use winit::window::Window;
 
