@@ -30,6 +30,8 @@ std = []
 host-winit = ["std", "text", "dep:winit", "dep:softbuffer", "dep:wgpu", "dep:pollster", "dep:arboard"]
 host-softbuffer = ["std", "dep:softbuffer"]
 host-bare = []
+# Android backend — ANativeWindow surface + JNI entry points + Choreographer-driven render scheduling. Enabled by the consumer's Android target block (e.g. photon's `[target.'cfg(target_os = "android")'.dependencies]`). text stays required because the chrome paints title glyphs; ndk + ndk-sys + jni + log are the NDK bindings the surface and JNI shims wrap.
+host-android = ["std", "text", "dep:ndk", "dep:ndk-sys", "dep:jni", "dep:log"]
 text = ["std", "dep:cosmic-text", "dep:swash"]
 # Portable SIMD via the `wide` crate. Widens inner loops in rasterizers / boundary passes /
 # the under() kernel to 4–8 pixels per iter. Scalar fallback path is preserved for builds
@@ -70,6 +72,12 @@ cosmic-text = { version = "0.14", optional = true }
 # glyph rasterization (rotated/skewed text). Pinning the same version cosmic-text uses keeps
 # FontRef + ScaleContext interop trivial.
 swash = { version = "0.2", optional = true }
+
+# Android NDK bindings — surface (ANativeWindow), JNI entry points, native logging. Optional at the workspace level (gated on `host-android`) but listed unconditionally here because Cargo doesn't allow `[target.'cfg(target_os = "android")'.dependencies]` entries to mark themselves optional. The feature gate inside `host-android` brings them into the dep graph; consumers without that feature don't compile the host::android module so the deps stay unused.
+ndk = { version = "0.9", features = ["api-level-26"], optional = true }
+ndk-sys = { version = "0.6", optional = true }
+jni = { version = "0.21", optional = true }
+log = { version = "0.4", optional = true }
 
 # x11rb is Linux-only. Used for `xcb_shape_rectangles(SK_INPUT, ...)` to set the click-through input region — the fullscreen transparent surface only accepts clicks inside `window_rect`; everything else passes through to whatever's behind us. `shape` feature pulls in the XShape extension bindings.
 [target.'cfg(target_os = "linux")'.dependencies]
