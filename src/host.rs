@@ -17,6 +17,9 @@ pub mod chrome_widget;
 #[cfg(feature = "host-winit")]
 pub mod app;
 
+#[cfg(all(feature = "host-android", target_os = "android"))]
+pub mod android;
+
 #[cfg(feature = "host-winit")]
 pub mod os_input;
 
