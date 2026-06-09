@@ -10,6 +10,26 @@ use crate::event::{
     CursorIcon, ElementState, Event, Ime, Key, KeyEvent, ModifiersState, MouseButton,
     MouseScrollDelta, NamedKey,
 };
+use crate::host::wake::{WakeError, WakeSender};
+
+/// Wraps a `winit::event_loop::EventLoopProxy<E>` as a fluor [`WakeSender`]. Constructed by `run_app` and handed to the app via `FluorApp::set_event_proxy`; apps clone the `Arc` and ship to background threads, calling `wake.send(payload)` to route a `Self::UserEvent` back through `on_user_event` on the UI thread.
+pub struct WinitWakeSender<E: 'static + Send> {
+    proxy: winit::event_loop::EventLoopProxy<E>,
+}
+
+impl<E: 'static + Send> WinitWakeSender<E> {
+    pub fn new(proxy: winit::event_loop::EventLoopProxy<E>) -> Self {
+        Self { proxy }
+    }
+}
+
+impl<E: 'static + Send> WakeSender<E> for WinitWakeSender<E> {
+    fn send(&self, event: E) -> Result<(), WakeError> {
+        self.proxy.send_event(event).map_err(|_| WakeError {
+            event_type: core::any::type_name::<E>(),
+        })
+    }
+}
 
 // ============================================================================
 

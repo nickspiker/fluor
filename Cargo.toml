@@ -32,8 +32,8 @@ host-softbuffer = ["std", "dep:softbuffer"]
 host-bare = []
 # Android backend — ANativeWindow surface + JNI entry points + Choreographer-driven render scheduling. Enabled by the consumer's Android target block (e.g. photon's `[target.'cfg(target_os = "android")'.dependencies]`). text stays required because the chrome paints title glyphs; ndk + ndk-sys + jni + log are the NDK bindings the surface and JNI shims wrap.
 #
-# Includes `dep:winit` (data-types only — Cargo unions with the consumer's `default-features = false, features = ["rwh_06"]` for Android) so the `FluorApp` trait's `set_event_proxy(EventLoopProxy<Self::UserEvent>)` signature compiles uniformly on every host. winit's actual event loop never runs on Android — Choreographer drives frames through JNI calls into `AndroidShell::draw`.
-host-android = ["std", "text", "dep:ndk", "dep:ndk-sys", "dep:jni", "dep:log", "dep:winit"]
+# winit is intentionally NOT in this feature set — `FluorApp::set_event_proxy` takes a fluor-native `Arc<dyn WakeSender<Self::UserEvent>>` so the trait shape is platform-uniform without dragging winit's data types onto Android. Eliminates the `android-activity` compile-glue dep + the `android_main` linker shim that came along when winit was present on Android.
+host-android = ["std", "text", "dep:ndk", "dep:ndk-sys", "dep:jni", "dep:log"]
 text = ["std", "dep:cosmic-text", "dep:swash"]
 # Portable SIMD via the `wide` crate. Widens inner loops in rasterizers / boundary passes /
 # the under() kernel to 4–8 pixels per iter. Scalar fallback path is preserved for builds

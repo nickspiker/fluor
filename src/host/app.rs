@@ -12,8 +12,7 @@ use crate::event::{CursorIcon as FCursorIcon, Event as FEvent, ModifiersState as
 use crate::geom::Viewport;
 use crate::text::TextRenderer;
 use std::time::Instant;
-// `winit::event_loop::EventLoopProxy` is mentioned in `FluorApp::set_event_proxy`'s signature. The host-android feature pulls winit with `default-features = false + rwh_06` (data types only — no event-loop machinery on Android), so the trait shape stays uniform across hosts. Concrete winit machinery (ApplicationHandler, EventLoop, WindowAttributes, etc.) only enters via the desktop_shell sub-module below.
-use winit::event_loop::EventLoopProxy;
+// FluorApp::set_event_proxy takes a fluor-native `Arc<dyn WakeSender<Self::UserEvent>>`. Concrete winit machinery (ApplicationHandler, EventLoop, EventLoopProxy, WindowAttributes, etc.) only enters via the desktop_shell sub-module below, behind the host-winit feature gate.
 
 #[cfg(feature = "host-winit")]
 use super::chrome::ResizeEdge;
@@ -125,7 +124,7 @@ pub use super::event_response::EventResponse;
 
 /// What a consumer implements to drive the desktop host.
 pub trait FluorApp {
-    /// Custom user-event payload for cross-thread wake-up. Background tasks (network, file I/O, async ceremonies) clone an [`EventLoopProxy<Self::UserEvent>`] from [`Self::set_event_proxy`] and call `proxy.send_event(payload)` to wake the event loop; the host dispatches the payload back through [`Self::on_user_event`] on the UI thread. Apps that don't need cross-thread wake-up declare `type UserEvent = ();` and skip the two methods.
+    /// Custom user-event payload for cross-thread wake-up. Background tasks (network, file I/O, async ceremonies) clone the `Arc<dyn WakeSender<Self::UserEvent>>` from [`Self::set_event_proxy`] and call `proxy.send(payload)` to wake the host; the host dispatches the payload back through [`Self::on_user_event`] on the UI thread. Apps that don't need cross-thread wake-up declare `type UserEvent = ();` and skip the two methods.
     type UserEvent: 'static + Send;
 
     /// Initial window title. Default is empty; override or call `ctx.window.set_title(...)` from `init` if you want it set later.
@@ -133,8 +132,8 @@ pub trait FluorApp {
         ""
     }
 
-    /// Hand off the event-loop proxy ONCE, before [`Self::init`], so the app can clone it for background threads. The proxy outlives the app (winit's `EventLoopProxy` is `Clone + Send + Sync`); a typical implementer stashes its own field for clone-and-ship to spawned tasks. Default no-op for apps that don't need cross-thread wake-up.
-    fn set_event_proxy(&mut self, proxy: EventLoopProxy<Self::UserEvent>) {
+    /// Hand off the host's wake-sender ONCE, before [`Self::init`], so the app can clone it for background threads. host-winit wraps `winit::event_loop::EventLoopProxy`; host-android wraps a JNI callback (or a [`super::NoopWakeSender`] when the app doesn't use cross-thread wake-ups). A typical implementer stashes the `Arc` in its own field and clone-and-ships it to spawned tasks. Default no-op for apps that don't need cross-thread wake-up.
+    fn set_event_proxy(&mut self, proxy: alloc::sync::Arc<dyn super::WakeSender<Self::UserEvent>>) {
         let _ = proxy;
     }
 
@@ -198,11 +197,14 @@ pub trait FluorApp {
     }
 }
 
-/// Run the desktop host until the window closes. Builds an [`EventLoop`] typed on `A::UserEvent` so background-thread wake-ups via [`EventLoopProxy::send_event`] route through [`FluorApp::on_user_event`]. The proxy is created up-front and handed to the app via [`FluorApp::set_event_proxy`] BEFORE the event loop starts, so apps can clone-and-ship it to background tasks during their own constructor or [`FluorApp::init`].
+/// Run the desktop host until the window closes. Builds an `EventLoop` typed on `A::UserEvent` so background-thread wake-ups via the WakeSender route through [`FluorApp::on_user_event`]. The proxy is created up-front, wrapped in a [`winit_compat::WinitWakeSender`], and handed to the app via [`FluorApp::set_event_proxy`] BEFORE the event loop starts, so apps can clone-and-ship the Arc to background tasks during their own constructor or [`FluorApp::init`].
 #[cfg(feature = "host-winit")]
 pub fn run_app<A: FluorApp + 'static>(mut app: A) -> Result<(), EventLoopError> {
     let event_loop = EventLoop::<A::UserEvent>::with_user_event().build()?;
-    app.set_event_proxy(event_loop.create_proxy());
+    let proxy = event_loop.create_proxy();
+    let wake: alloc::sync::Arc<dyn super::WakeSender<A::UserEvent>> =
+        alloc::sync::Arc::new(winit_compat::WinitWakeSender::new(proxy));
+    app.set_event_proxy(wake);
     let mut shell = DesktopShell::new(app);
     event_loop.run_app(&mut shell)
 }

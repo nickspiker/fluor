@@ -25,8 +25,10 @@ use crate::coord::Coord;
 use crate::event::{Event as FEvent, ModifiersState as FModifiersState};
 use crate::geom::Viewport;
 use crate::host::app::{Context, FluorApp};
+use crate::host::wake::NoopWakeSender;
 use crate::host::EventResponse;
 use crate::text::TextRenderer;
+use alloc::sync::Arc;
 
 /// The Android equivalent of `DesktopShell`. Wraps a [`FluorApp`] with the surface + pipeline + input translation needed to drive it from Android's Choreographer + JNI.
 pub struct AndroidShell<A: FluorApp> {
@@ -50,9 +52,12 @@ pub struct AndroidShell<A: FluorApp> {
 }
 
 impl<A: FluorApp> AndroidShell<A> {
-    /// Construct the shell. Caller provides the surface dimensions Android opened the SurfaceView at (typically full-screen). The app's `init` is invoked here once the shell has its viewport + text renderer ready.
+    /// Construct the shell. Caller provides the surface dimensions Android opened the SurfaceView at (typically full-screen). The app's `set_event_proxy` is invoked with a [`NoopWakeSender`] (Android background tasks talk to the UI thread through JNI callbacks, not the proxy) and then `init` runs once the shell has its viewport + text renderer ready — same host contract as `DesktopShell`.
     pub fn new(mut app: A, width: u32, height: u32) -> Self {
         let viewport = Viewport::new(width, height);
+        // Host contract: set_event_proxy fires BEFORE init. On desktop run_app wraps winit's EventLoopProxy; here we hand the app a no-op sender. Apps that override `on_user_event` to react to background-task pings won't see any (background tasks should use JNI callbacks to wake the Activity on Android instead).
+        let wake: Arc<dyn crate::host::wake::WakeSender<A::UserEvent>> = Arc::new(NoopWakeSender);
+        app.set_event_proxy(wake);
         let mut shell = Self {
             app,
             surface: Surface::new(width, height),
