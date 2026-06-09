@@ -195,6 +195,13 @@ pub trait FluorApp {
     fn initial_size(&self, monitor: (u32, u32)) -> (u32, u32) {
         (monitor.0 / 2, monitor.1 / 2)
     }
+
+    /// Whether the currently-focused widget wants the soft keyboard up. Polled by the Android host after each input event so the Activity can raise/dismiss the IME. `Some(true)` = the host should show the keyboard, `Some(false)` = hide, `None` = no change. Default `None` for apps that don't have text input. Desktop hosts ignore this — IME shows whenever a text field is focused on most desktop platforms anyway.
+    ///
+    /// `&mut self` so apps can implement "show on transition" via a one-shot pending flag that this call clears — repeated polls without a focus change return `None` and the Activity doesn't churn the IME.
+    fn wants_keyboard(&mut self) -> Option<bool> {
+        None
+    }
 }
 
 /// Run the desktop host until the window closes. Builds an `EventLoop` typed on `A::UserEvent` so background-thread wake-ups via the WakeSender route through [`FluorApp::on_user_event`]. The proxy is created up-front, wrapped in a [`winit_compat::WinitWakeSender`], and handed to the app via [`FluorApp::set_event_proxy`] BEFORE the event loop starts, so apps can clone-and-ship the Arc to background tasks during their own constructor or [`FluorApp::init`].
