@@ -419,9 +419,8 @@ fn glow_factor_256(font_size: f32, radius_scale: f32) -> u32 {
     (256u32.saturating_sub(drop)).clamp(96, 254)
 }
 
-#[cfg(feature = "host-winit")]
 mod widget_impls {
-    //! [`crate::host::widget`] capability traits for [`Button`]. Mirrors `textbox::widget_impls`: Click increments the action counter, Focus / Hover route through Button's setters, Key activates on Enter / Space.
+    //! [`crate::host::widget`] capability traits for [`Button`]. Mirrors `textbox::widget_impls`: Click increments the action counter, Focus / Hover route through Button's setters, Key activates on Enter / Space. Speaks fluor-native event types so the same impls work on every host (host-winit on desktop, host-android on Android).
 
     use super::Button;
     use crate::coord::Coord;
