@@ -5,8 +5,10 @@
 pub mod chrome;
 pub mod event_response;
 pub mod icon;
+pub mod window_handle;
 
 pub use event_response::EventResponse;
+pub use window_handle::WindowHandle;
 
 // chrome_widget (DefaultChrome + ChromeButton) speaks fluor-native event types ([`crate::event`]) in its capability-trait impls. Still gated on `text` since the chrome paints title glyphs. Available on every supported host now (host-winit, host-android) once the host translates platform input to fluor events at the boundary.
 #[cfg(feature = "text")]
