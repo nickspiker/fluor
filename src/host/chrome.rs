@@ -663,10 +663,7 @@ pub fn draw_strip_curves(
     if start >= button_size {
         return;
     }
-    // Hairline geometry: a 1-pixel line extending inward from the curve into the strip body.
-    //   Outer pixel coverage = 1 − fract → α = l (sqrt-gamma'd, stored directly).
-    //   Inner pixel coverage = fract → α = h_cov (stored directly).
-    // Under composition handles the actual blending with whatever bg is below the chrome layer.
+    // Hairline geometry: a 1-pixel line extending inward from the curve into the strip body. Outer pixel coverage = 1 − fract → α = l (sqrt-gamma'd, stored directly). Inner pixel coverage = fract → α = h_cov (stored directly). Under composition handles the actual blending with whatever bg is below the chrome layer.
     //
     // Two colours: row-walk paints pixels along the curve's *vertical* face (extends UP the strip's left edge — continues the left-of-window light bevel), col-walk paints along the curve's *horizontal* face (extends RIGHT along the strip's bottom — continues the bottom-of-window shadow bevel). Same shape, two colours because two edges meet at this corner.
 

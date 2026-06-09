@@ -10,10 +10,7 @@
 //! - [`jni`] — `#[no_mangle] pub extern "C" fn Java_*` entry points matching PhotonActivity.kt's contract.
 //! - [`lifecycle`] — pause/resume/destroy hooks the Activity invokes during lifecycle transitions.
 //!
-//! Status: Phase 2.3 — events.rs + window.rs + shell.rs all wired. `AndroidShell` is the
-//! entry point; consumers' JNI thin-shims construct one in `nativeInit` and call its
-//! `draw` / `resize` / `on_touch` / `on_text_input` / `on_key_event` / `on_back_pressed` /
-//! `on_scale` methods from the matching `nativeXxx` JNI entry points.
+//! Status: Phase 2.3 — events.rs + window.rs + shell.rs all wired. `AndroidShell` is the entry point; consumers' JNI thin-shims construct one in `nativeInit` and call its `draw` / `resize` / `on_touch` / `on_text_input` / `on_key_event` / `on_back_pressed` / `on_scale` methods from the matching `nativeXxx` JNI entry points.
 
 pub mod events;
 pub mod shell;

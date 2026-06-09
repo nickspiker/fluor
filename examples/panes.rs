@@ -752,8 +752,7 @@ impl FluorApp for PanesDemo {
                 let Some(focus_id) = self.current_focus else {
                     return EventResponse::Pass;
                 };
-                // Enter / Space on a chrome button activates it. The widget's Key::on_key returns the action's EventResponse; we propagate it so the host fires Close / Minimize / ToggleMaximized as if the button were clicked.
-                // Clipboard interception (textbox-focused only). Ctrl+C / Ctrl+X / Ctrl+V need the OS clipboard adapter (arboard) which is a single global resource — threading it through every widget that might want clipboard access would be premature abstraction at one consumer. Apps handle the chord before delivering to the focused widget; the widget never sees Ctrl+C/X/V. Ctrl+A is widget-internal (select-all) and Textbox::on_key handles it.
+                // Enter / Space on a chrome button activates it. The widget's Key::on_key returns the action's EventResponse; we propagate it so the host fires Close / Minimize / ToggleMaximized as if the button were clicked. Clipboard interception (textbox-focused only). Ctrl+C / Ctrl+X / Ctrl+V need the OS clipboard adapter (arboard) which is a single global resource — threading it through every widget that might want clipboard access would be premature abstraction at one consumer. Apps handle the chord before delivering to the focused widget; the widget never sees Ctrl+C/X/V. Ctrl+A is widget-internal (select-all) and Textbox::on_key handles it.
                 let focused_is_textbox = self.textbox_index_by_id(focus_id).is_some();
                 if focused_is_textbox {
                     if let Key::Character(c) = &kev.logical_key {
@@ -897,15 +896,9 @@ impl FluorApp for PanesDemo {
 
         // Hairline + background composite. Chrome's bg layer gets photon's background_noise; chrome layer gets the perimeter hairline + controls (or stays empty under `[]c`). The chrome group's Stack program (`Push chrome, Push bg, Under(Normal)`) front-to-back-composites them, then flattens under the target. Hover / focus tint is handled by the host's post-finalize overlay pass against `persistent_screen` via [`widget::build_overlay_deltas`] — never rasterized into chrome_buf.
         //
-        // Shape demos: each paint primitive gets a partial-transparency instance, all painted FIRST
-        // (topmost-first doctrine), then noise composes behind via `under()` — scrolled vertically
-        // by `self.bg_scroll`. All sizes/positions derive from `viewport.effective_span()` so they
-        // stay RU-coherent across window sizes.
+        // Shape demos: each paint primitive gets a partial-transparency instance, all painted FIRST (topmost-first doctrine), then noise composes behind via `under()` — scrolled vertically by `self.bg_scroll`. All sizes/positions derive from `viewport.effective_span()` so they stay RU-coherent across window sizes.
         //
-        // Rects: 50% cyan rotating + 25% orange aligned overlapping it.
-        // Ellipses: aligned magenta matching the window's aspect ratio, plus a 2:1 yellow rotated
-        // ellipse spinning OPPOSITE the rect at 1/3 speed.
-        // Circle: 50% pink, fixed.
+        // Rects: 50% cyan rotating + 25% orange aligned overlapping it. Ellipses: aligned magenta matching the window's aspect ratio, plus a 2:1 yellow rotated ellipse spinning OPPOSITE the rect at 1/3 speed. Circle: 50% pink, fixed.
         let span = ctx.viewport.effective_span();
         let view_w = ctx.viewport.width_px as Coord;
         let view_h = ctx.viewport.height_px as Coord;

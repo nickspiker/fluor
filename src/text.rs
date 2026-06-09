@@ -741,8 +741,7 @@ impl TextRenderer {
         }
     }
 
-    /// Draw left-aligned text with additive/subtractive compositing (u32 ARGB version)
-    /// Uses wrapping add/sub so it's reversible - subtract same colour to remove text add_mode: true = add colour, false = subtract colour
+    /// Draw left-aligned text with additive/subtractive compositing (u32 ARGB version) Uses wrapping add/sub so it's reversible - subtract same colour to remove text add_mode: true = add colour, false = subtract colour
     pub fn draw_text_left_additive_u32(
         &mut self,
         pixels: &mut [u32],
@@ -791,8 +790,7 @@ impl TextRenderer {
         }
     }
 
-    /// Draw center-aligned text with additive/subtractive compositing (u32 ARGB version)
-    /// Uses wrapping add/sub so it's reversible - subtract same colour to remove text add_mode: true = add colour, false = subtract colour
+    /// Draw center-aligned text with additive/subtractive compositing (u32 ARGB version) Uses wrapping add/sub so it's reversible - subtract same colour to remove text add_mode: true = add colour, false = subtract colour
     pub fn draw_text_center_additive_u32(
         &mut self,
         pixels: &mut [u32],
@@ -841,8 +839,7 @@ impl TextRenderer {
         }
     }
 
-    /// Draw right-aligned text with additive/subtractive compositing (u32 ARGB version)
-    /// Uses wrapping add/sub so it's reversible - subtract same colour to remove text add_mode: true = add colour, false = subtract colour
+    /// Draw right-aligned text with additive/subtractive compositing (u32 ARGB version) Uses wrapping add/sub so it's reversible - subtract same colour to remove text add_mode: true = add colour, false = subtract colour
     pub fn draw_text_right_additive_u32(
         &mut self,
         pixels: &mut [u32],
@@ -1167,8 +1164,7 @@ impl TextRenderer {
         widths
     }
 
-    /// Render a single character with additive blending (reversible with wrapping_add/sub)
-    /// Returns the width of the rendered character in pixels
+    /// Render a single character with additive blending (reversible with wrapping_add/sub) Returns the width of the rendered character in pixels
     pub fn render_char_additive(
         &mut self,
         pixels: &mut [u8],
@@ -1280,8 +1276,7 @@ impl TextRenderer {
         char_width
     }
 
-    /// Draw text range with horizontal scrolling, using additive/subtractive compositing
-    /// Automatically clips using textbox_mask (same as blinkey blinking)
+    /// Draw text range with horizontal scrolling, using additive/subtractive compositing Automatically clips using textbox_mask (same as blinkey blinking)
     pub fn draw_text_scrollable_additive(
         &mut self,
         pixels: &mut [u8],
@@ -1384,9 +1379,7 @@ impl TextRenderer {
                         for cx in 0..glyph_width {
                             let final_x = glyph_x + cx as i32;
                             let final_y = glyph_y + cy as i32;
-                            // WHY: Glyph can be partially off-screen when textbox is scrolled
-                            // PROOF: final_x/final_y are i32, can be negative or exceed bounds
-                            // PREVENTS: Index out of bounds panic on wrapped negative values
+                            // WHY: Glyph can be partially off-screen when textbox is scrolled PROOF: final_x/final_y are i32, can be negative or exceed bounds PREVENTS: Index out of bounds panic on wrapped negative values
                             if final_x < 0
                                 || final_y < 0
                                 || final_x as usize >= width
