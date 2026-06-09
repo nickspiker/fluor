@@ -18,7 +18,11 @@ crate-type = ["rlib"]
 [features]
 # host-bare is the no_std path used by ferros and other bare-metal consumers.
 # host-winit / host-softbuffer / text imply std.
-default = ["std", "host-winit", "simd", "rayon"]
+#
+# `host-winit` is NOT in default — it transitively pulls softbuffer + arboard, neither of which has an Android backend, so a vanilla `default-features = true` fluor dep would break the Android dep graph. Consumers (photon, examples) opt into the host explicitly per target: `features = ["host-winit"]` in the desktop block.
+#
+# `text` IS in default — anything visual needs `TextRenderer`. cosmic-text + swash do compile on Android; if APK size grows uncomfortably the text path can move to a feature gate later (see `host-android` plan).
+default = ["std", "text", "simd", "rayon"]
 std = []
 # host-winit transitively requires text — desktop chrome wants real glyphs out of the box.
 # macOS uses wgpu/Metal for PostMultiplied alpha (transparent squircle corners);

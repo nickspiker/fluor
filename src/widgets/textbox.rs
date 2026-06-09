@@ -1137,19 +1137,17 @@ impl Textbox {
     }
 }
 
-#[cfg(feature = "host-winit")]
 mod widget_impls {
-    //! [`crate::host::widget`] capability-trait implementations for [`Textbox`]. Gated on `host-winit` because the trait signatures reference winit's [`winit::event::KeyEvent`] and [`winit::keyboard::ModifiersState`]; the rest of [`Textbox`] is feature-flag-agnostic and compiles in any build with the `text` feature.
+    //! [`crate::host::widget`] capability-trait implementations for [`Textbox`]. Trait signatures use fluor-native [`crate::event::KeyEvent`] / [`crate::event::ModifiersState`] so the impls compile on every supported host — desktop (host-winit) and Android (host-android) both translate platform input into fluor events at the boundary.
     //!
     //! Click + Focus + Hover + Key make Textbox a first-class participant in the widget tree. Clipboard ops (Ctrl+C / Ctrl+X / Ctrl+V) deliberately stay with the app rather than living on Textbox — the OS clipboard adapter (arboard today) is a single global resource and threading it through every widget that might want it would be premature abstraction. Apps intercept those chords before delivering the key to the focused widget; the widget never sees them.
 
     use super::Textbox;
     use crate::coord::Coord;
+    use crate::event::{ElementState, Key as FKey, KeyEvent, ModifiersState, NamedKey};
     use crate::host::widget::{Click, Focus, Hover, Key, PaintCtx, Widget};
     use crate::paint::HitId;
     use crate::text::TextRenderer;
-    use winit::event::KeyEvent;
-    use winit::keyboard::{Key as WKey, ModifiersState, NamedKey};
 
     impl Widget for Textbox {
         fn id(&self) -> HitId {
@@ -1178,11 +1176,11 @@ mod widget_impls {
             x: Coord,
             _y: Coord,
             _mods: ModifiersState,
-        ) -> crate::host::app::EventResponse {
+        ) -> crate::host::EventResponse {
             // Click on a textbox sets the cursor at the clicked column and clears any prior selection anchor. Focus is set by the dispatch layer AFTER the walk (via [`Focus::set_focused`]) — this method is reached only because the click landed on this widget's stamped hit id, so the focus decision belongs upstream where multiple widgets are arbitrated.
             self.cursor = self.cursor_index_from_x(x);
             self.selection_anchor = None;
-            crate::host::app::EventResponse::Handled
+            crate::host::EventResponse::Handled
         }
     }
 
@@ -1232,10 +1230,10 @@ mod widget_impls {
             kev: &KeyEvent,
             mods: ModifiersState,
             text: &mut TextRenderer,
-        ) -> crate::host::app::EventResponse {
+        ) -> crate::host::EventResponse {
             // Only handle key-down; let the dispatch layer treat key-up as Pass.
-            if kev.state != winit::event::ElementState::Pressed {
-                return crate::host::app::EventResponse::Pass;
+            if kev.state != ElementState::Pressed {
+                return crate::host::EventResponse::Pass;
             }
             let shift = mods.shift_key();
             // `ctrl` covers both Control and Super (Cmd on macOS, Windows key on Windows / Linux) — fluor treats them as equivalent for editing shortcuts because the codebase already does so in the chord-key logic and the panes match arm we're replacing.
@@ -1252,35 +1250,35 @@ mod widget_impls {
             };
 
             match &kev.logical_key {
-                WKey::Named(NamedKey::Backspace) => {
+                FKey::Named(NamedKey::Backspace) => {
                     self.backspace(text);
                     changed = true;
                 }
-                WKey::Named(NamedKey::Delete) => {
+                FKey::Named(NamedKey::Delete) => {
                     self.delete_forward(text);
                     changed = true;
                 }
-                WKey::Named(NamedKey::ArrowLeft) => {
+                FKey::Named(NamedKey::ArrowLeft) => {
                     start_selection_if_needed(self);
                     self.cursor_left();
                     changed = true;
                 }
-                WKey::Named(NamedKey::ArrowRight) => {
+                FKey::Named(NamedKey::ArrowRight) => {
                     start_selection_if_needed(self);
                     self.cursor_right();
                     changed = true;
                 }
-                WKey::Named(NamedKey::Home) => {
+                FKey::Named(NamedKey::Home) => {
                     start_selection_if_needed(self);
                     self.cursor_home();
                     changed = true;
                 }
-                WKey::Named(NamedKey::End) => {
+                FKey::Named(NamedKey::End) => {
                     start_selection_if_needed(self);
                     self.cursor_end();
                     changed = true;
                 }
-                WKey::Character(c) if ctrl && (c == "a" || c == "A") => {
+                FKey::Character(c) if ctrl && (c == "a" || c == "A") => {
                     self.select_all();
                     changed = true;
                 }
@@ -1300,9 +1298,9 @@ mod widget_impls {
             }
 
             if changed {
-                crate::host::app::EventResponse::Handled
+                crate::host::EventResponse::Handled
             } else {
-                crate::host::app::EventResponse::Pass
+                crate::host::EventResponse::Pass
             }
         }
     }
