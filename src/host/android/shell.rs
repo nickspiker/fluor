@@ -54,6 +54,8 @@ pub struct AndroidShell<A: FluorApp> {
 impl<A: FluorApp> AndroidShell<A> {
     /// Construct the shell. Caller provides the surface dimensions Android opened the SurfaceView at (typically full-screen). The app's `set_event_proxy` is invoked with a [`NoopWakeSender`] (Android background tasks talk to the UI thread through JNI callbacks, not the proxy) and then `init` runs once the shell has its viewport + text renderer ready — same host contract as `DesktopShell`.
     pub fn new(mut app: A, width: u32, height: u32) -> Self {
+        // Android writes finalize output directly into an ANativeWindow_lock'd buffer that the SurfaceFlinger compositor consumes after unlockAndPost. Worker-thread writes to that buffer need to be visible to the compositor by the time unlockAndPost runs; rayon's join is a CPU memory barrier but not a guaranteed device-coherent flush across all worker cores. Forcing par_rows / par_chunks sequential keeps writes on the calling thread so unlockAndPost's cache flush covers everything in one shot — eliminates the "horizontal white band at a random row" tear we hit with parallel finalize.
+        crate::par::FORCE_SEQUENTIAL.store(true, core::sync::atomic::Ordering::Relaxed);
         let viewport = Viewport::new(width, height);
         // Host contract: set_event_proxy fires BEFORE init. On desktop run_app wraps winit's EventLoopProxy; here we hand the app a no-op sender. Apps that override `on_user_event` to react to background-task pings won't see any (background tasks should use JNI callbacks to wake the Activity on Android instead).
         let wake: Arc<dyn crate::host::wake::WakeSender<A::UserEvent>> = Arc::new(NoopWakeSender);
