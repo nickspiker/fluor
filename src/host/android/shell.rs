@@ -92,7 +92,6 @@ impl<A: FluorApp> AndroidShell<A> {
 
     /// Render one frame. Returns `true` if anything was actually copied to the ANativeWindow surface (the magic-pixel cache can short-circuit on cached buffers).
     pub fn draw(&mut self, window: &NativeWindow) -> bool {
-        // Drive any per-tick animation state first; apps that return `true` mean "I changed something, please paint." Mark window dirty so the pipeline below runs.
         let now = Instant::now();
         self.last_tick = Some(now);
         let tick_dirty = self.with_context(|app, ctx| app.tick(ctx));
@@ -102,11 +101,9 @@ impl<A: FluorApp> AndroidShell<A> {
 
         let was_dirty = self.window.take_dirty();
         if !was_dirty {
-            // No content change; still post the surface so Choreographer's frame timing continues, but skip the render+copy entirely. surface.present(window, false) tells the magic-pixel cache "no new content" and copies only if the current Android buffer happens to hold stale pixels.
             return self.surface.present(window, false);
         }
 
-        // Compute damage clip — same shape as DesktopShell::render_frame's path.
         let viewport_rect = PixelRect::new(
             0,
             0,
@@ -121,21 +118,17 @@ impl<A: FluorApp> AndroidShell<A> {
             return self.surface.present(window, false);
         }
 
-        // Wipe the scratch region the app is about to paint over.
         clear_scratch_rect(
             &mut self.scratch,
             self.viewport.width_px as usize,
             damage_clip,
         );
-
         self.pending_damage.clear();
-
-        // App renders into scratch (α + darkness format).
         self.with_context_render(damage_clip, |app, scratch, ctx| {
             app.render(scratch, ctx);
         });
 
-        // Finalize scratch (α + darkness) → surface buffer (visible RGB ARGB) at offset (0, 0). On Android the window IS the full surface so there's no window_rect offset, no shadow band, no persistent_screen distinction.
+        // Finalize scratch (α + darkness) → surface buffer (visible RGB ARGB). Treat every frame as a full repaint for now — Android's rotating triple-buffer makes per-frame damage-clipped incremental painting awkward (the locked buffer may be 1-3 frames stale).
         let win_w = self.viewport.width_px as usize;
         let win_h = self.viewport.height_px as usize;
         crate::paint::finalize_into_screen(
@@ -148,44 +141,30 @@ impl<A: FluorApp> AndroidShell<A> {
             0,
             0,
             damage_clip,
-            true, // Treat every frame as a full repaint for now — incremental damage on Android can come later once we benchmark.
+            true,
         );
-
-        // Overlay deltas: walk hit_test_map and apply per-id hover/focus tints. apply_overlay diffs against `last_active` so a stale-active id wraps its delta off; we keep a session-long Vec for that so per-frame allocation stays small. Future work: hoist last_active onto `self` so it survives across draws — for now it's zeroed each frame, which means no flicker (current deltas overwrite cleanly) but each tint toggle re-paints every pixel the first frame it lands.
-        let overlay = self.app.overlay_deltas();
-        if let Some((map, hw, hh)) = self.app.hit_test_map() {
-            let mut last_active = alloc::vec![false; overlay.len()];
-            let buf = self.surface.buffer_mut();
-            crate::paint::apply_overlay(
-                &self.scratch,
-                buf,
-                self.viewport.width_px as usize,
-                0,
-                0,
-                map,
-                hw,
-                hh,
-                &overlay,
-                &mut last_active,
-            );
-        }
 
         self.surface.present(window, true)
     }
 
     /// Touch dispatch from `nativeOnTouch`. Translates Android action codes into one or two fluor events, dispatches each through `app.on_event`. Tracks cursor position on CursorMoved so Context.cursor_x/y stays accurate.
-    pub fn on_touch(&mut self, action: i32, x: f32, y: f32) {
+    ///
+    /// Return value is the Android `nativeOnTouch` ABI: `1` = host should show the soft keyboard (focus moved into a text input), `-1` = hide, `0` = no change. Wraps `FluorApp::wants_keyboard`; the JNI shim passes it straight back to Java.
+    pub fn on_touch(&mut self, action: i32, x: f32, y: f32) -> i32 {
         let (count, evs) = events::translate_touch(action, x as Coord, y as Coord);
         for ev in &evs[..count] {
-            // Track cursor position so subsequent draws/hit-tests see the latest touch.
             if let FEvent::CursorMoved { x: cx, y: cy } = ev {
                 self.cursor_x = *cx;
                 self.cursor_y = *cy;
             }
             let _ = self.dispatch(ev);
         }
-        // Touch always potentially affects visuals (hover state, focus). Mark dirty so the next draw runs the pipeline.
         self.window.mark_dirty();
+        match self.app.wants_keyboard() {
+            Some(true) => 1,
+            Some(false) => -1,
+            None => 0,
+        }
     }
 
     /// Key event from `nativeOnKeyEvent`. Returns true if the host handled it (app's response was `Handled`). Untranslated keys (Key::Unidentified) return false so Android's default behavior runs.
