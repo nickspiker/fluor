@@ -90,7 +90,7 @@ impl<A: FluorApp> AndroidShell<A> {
         self.with_context(|app, ctx| app.on_resize(width, height, ctx));
     }
 
-    /// Render one frame. Returns `true` if anything was actually copied to the ANativeWindow surface (the magic-pixel cache can short-circuit on cached buffers).
+    /// Render one frame. Returns `true` if pixels were actually written to the ANativeWindow surface (the magic-pixel cache can short-circuit on cached buffers).
     pub fn draw(&mut self, window: &NativeWindow) -> bool {
         let now = Instant::now();
         self.last_tick = Some(now);
@@ -99,52 +99,28 @@ impl<A: FluorApp> AndroidShell<A> {
             self.window.mark_dirty();
         }
 
-        let was_dirty = self.window.take_dirty();
-        if !was_dirty {
-            return self.surface.present(window, false);
-        }
-
-        let viewport_rect = PixelRect::new(
-            0,
-            0,
-            self.viewport.width_px as usize,
-            self.viewport.height_px as usize,
-        );
-        let damage_clip = self
-            .app
-            .damage_rect(self.viewport)
-            .unwrap_or(viewport_rect);
-        if damage_clip.is_empty() {
-            return self.surface.present(window, false);
-        }
-
-        clear_scratch_rect(
-            &mut self.scratch,
-            self.viewport.width_px as usize,
-            damage_clip,
-        );
-        self.pending_damage.clear();
-        self.with_context_render(damage_clip, |app, scratch, ctx| {
-            app.render(scratch, ctx);
-        });
-
-        // Finalize scratch (α + darkness) → surface buffer (visible RGB ARGB). Treat every frame as a full repaint for now — Android's rotating triple-buffer makes per-frame damage-clipped incremental painting awkward (the locked buffer may be 1-3 frames stale).
         let win_w = self.viewport.width_px as usize;
         let win_h = self.viewport.height_px as usize;
-        crate::paint::finalize_into_screen(
-            &self.scratch,
-            &self.clip_mask,
-            win_w,
-            win_h,
-            self.surface.buffer_mut(),
-            win_w,
-            0,
-            0,
-            damage_clip,
-            true,
-        );
+        let viewport_rect = PixelRect::new(0, 0, win_w, win_h);
+        let was_dirty = self.window.take_dirty();
 
-        self.surface.present(window, true)
+        if was_dirty {
+            let damage_clip = self
+                .app
+                .damage_rect(self.viewport)
+                .unwrap_or(viewport_rect);
+            if !damage_clip.is_empty() {
+                clear_scratch_rect(&mut self.scratch, win_w, damage_clip);
+                self.pending_damage.clear();
+                self.with_context_render(damage_clip, |app, scratch, ctx| {
+                    app.render(scratch, ctx);
+                });
+            }
+        }
+
+        // Single-pass present: finalize scratch (α + darkness) directly into the locked ANativeWindow bits at the buffer's stride, skipping the intermediate Vec<u32>. The full viewport is passed as the finalize clip — on Android we treat every paint as a full repaint, so on cache-miss frames the locked buffer gets refreshed from scratch's current state regardless of which damage rect drove this frame.
+        self.surface
+            .present(window, &self.scratch, &self.clip_mask, win_w, win_h, viewport_rect, was_dirty)
     }
 
     /// Touch dispatch from `nativeOnTouch`. Translates Android action codes into one or two fluor events, dispatches each through `app.on_event`. Tracks cursor position on CursorMoved so Context.cursor_x/y stays accurate.

@@ -1,11 +1,15 @@
 //! ANativeWindow surface management.
 //!
-//! Path per frame: app renders into `scratch` (α + darkness format); shell calls `fluor::paint::finalize_into_screen` to write scratch → `Surface.buffer` (visible-RGB ARGB); `Surface::present` locks the next ANativeWindow back buffer, memcpys our buffer onto it (or skips via the magic-pixel cache), stamps the magic pixel, unlocks + posts.
+//! Single-pass pipeline per frame: app renders α + darkness into `scratch`; `Surface::present` locks the next ANativeWindow back buffer, runs `finalize_into_screen` directly into the locked bits at the buffer's reported `stride`, stamps the magic pixel, unlocks + posts.
 //!
-//! Magic-pixel triple-buffer optimization: Android rotates three back buffers. Each gets the current `content_version` stamped into the top-right pixel after copy. On the next frame, if the locked buffer's magic pixel already matches the latest `content_version`, the buffer is already up-to-date and we skip the rowwise memcpy. Samsung-mode falls back to unconditional copy because their compositor mutates the magic pixel between lock/unlock cycles.
+//! Magic-pixel triple-buffer optimization: Android rotates ~three back buffers. Each gets the current `content_version` stamped into the top-right pixel after finalize. On the next frame, if the locked buffer's magic pixel already matches the latest `content_version`, the buffer is already up-to-date and we skip the finalize entirely. Samsung-mode falls back to unconditional finalize because their compositor mutates the magic pixel between lock/unlock cycles.
+//!
+//! Idle frames (`dirty = false` and magic-pixel matches) cost one lock + one read + one unlock+post — no per-pixel work. Stale-but-idle frames re-finalize from `scratch` (which retains the last full α + darkness frame), so we converge to the cached state across the buffer rotation without keeping an intermediate `Vec<u32>` cache.
 
 use ndk::native_window::NativeWindow;
 use ndk_sys::{ANativeWindow_Buffer, ANativeWindow_lock, ANativeWindow_unlockAndPost};
+
+use crate::canvas::PixelRect;
 
 /// Samsung-device flag.
 static mut SAMSUNG_MODE: bool = false;
@@ -21,11 +25,10 @@ fn is_samsung() -> bool {
     unsafe { SAMSUNG_MODE }
 }
 
-/// CPU surface backed by a `Vec<u32>` in visible-RGB ARGB format. Shell calls `buffer_mut` to get a `&mut [u32]` to finalize into; then `present` blits that onto the ANativeWindow surface and posts it.
+/// Lightweight surface state: tracks the surface dimensions and the monotonic content-version counter that drives the magic-pixel triple-buffer cache. No intermediate pixel buffer — finalize writes directly into ANativeWindow's locked bits.
 pub struct Surface {
     width: u32,
     height: u32,
-    buffer: Vec<u32>,
     content_version: u32,
 }
 
@@ -34,7 +37,6 @@ impl Surface {
         Self {
             width,
             height,
-            buffer: alloc::vec![0; (width as usize).saturating_mul(height as usize)],
             content_version: 1,
         }
     }
@@ -45,24 +47,31 @@ impl Surface {
         }
         self.width = width;
         self.height = height;
-        self.buffer
-            .resize((width as usize).saturating_mul(height as usize), 0);
         self.content_version = self.content_version.wrapping_add(1);
         if self.content_version == 0 {
             self.content_version = 1;
         }
     }
 
-    pub fn buffer_mut(&mut self) -> &mut [u32] {
-        self.buffer.as_mut_slice()
-    }
-
     pub fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
     }
 
-    /// Lock the next Android triple-buffer, copy our render buffer onto it (or skip via magic-pixel cache), stamp magic, unlock+post.
-    pub fn present(&mut self, window: &NativeWindow, dirty: bool) -> bool {
+    /// Lock the next Android triple-buffer, finalize `scratch` (α + darkness) + `clip_mask` directly into the locked bits at the buffer's stride (skipping a magic-pixel-cache hit), stamp magic, unlock+post.
+    ///
+    /// `dirty = true` means the caller painted new content into `scratch` this frame — we bump `content_version` so any other Android buffer still holding the previous content reads as stale and gets re-finalized when it next rotates in. `dirty = false` means the caller didn't repaint; we still run the lock/unlock cycle to drive Choreographer timing, but skip the finalize entirely when the magic pixel already matches.
+    ///
+    /// Returns `true` if pixels were actually written this frame, `false` if the cache hit and we short-circuited.
+    pub fn present(
+        &mut self,
+        window: &NativeWindow,
+        scratch: &[u32],
+        clip_mask: &[u8],
+        win_w: usize,
+        win_h: usize,
+        damage_clip: PixelRect,
+        dirty: bool,
+    ) -> bool {
         unsafe {
             let mut android_buffer: ANativeWindow_Buffer = core::mem::zeroed();
             if ANativeWindow_lock(
@@ -83,10 +92,6 @@ impl Surface {
                 stride.saturating_mul(dst_height),
             );
 
-            let src_width = self.width as usize;
-            let copy_height = dst_height.min(self.height as usize);
-            let copy_width = dst_width.min(src_width);
-
             if dirty {
                 self.content_version = self.content_version.wrapping_add(1);
                 if self.content_version == 0 {
@@ -94,41 +99,42 @@ impl Surface {
                 }
             }
 
-            let copied = if is_samsung() {
-                copy_rows(&self.buffer, src_width, dst_pixels, stride, copy_width, copy_height);
-                true
+            let magic_idx = dst_width.saturating_sub(1);
+            let buffer_is_current = !is_samsung()
+                && magic_idx < stride
+                && dst_pixels[magic_idx] == self.content_version;
+
+            let wrote = if buffer_is_current {
+                false
             } else {
-                let magic_idx = dst_width.saturating_sub(1);
-                let buffer_is_current =
-                    magic_idx < stride && dst_pixels[magic_idx] == self.content_version;
-                if buffer_is_current {
-                    false
-                } else {
-                    copy_rows(&self.buffer, src_width, dst_pixels, stride, copy_width, copy_height);
-                    if magic_idx < stride {
-                        dst_pixels[magic_idx] = self.content_version;
-                    }
-                    true
+                let copy_width = dst_width.min(win_w);
+                let copy_height = dst_height.min(win_h);
+                let clip = PixelRect::new(
+                    damage_clip.x0.min(copy_width),
+                    damage_clip.y0.min(copy_height),
+                    damage_clip.x1.min(copy_width),
+                    damage_clip.y1.min(copy_height),
+                );
+                crate::paint::finalize_into_screen(
+                    scratch,
+                    clip_mask,
+                    win_w,
+                    win_h,
+                    dst_pixels,
+                    stride,
+                    0,
+                    0,
+                    clip,
+                    true,
+                );
+                if magic_idx < stride {
+                    dst_pixels[magic_idx] = self.content_version;
                 }
+                true
             };
 
             ANativeWindow_unlockAndPost(window.ptr().as_ptr());
-            copied
+            wrote
         }
-    }
-}
-
-fn copy_rows(
-    src: &[u32],
-    src_width: usize,
-    dst: &mut [u32],
-    dst_stride: usize,
-    copy_width: usize,
-    copy_height: usize,
-) {
-    for y in 0..copy_height {
-        let s = y.saturating_mul(src_width);
-        let d = y.saturating_mul(dst_stride);
-        dst[d..d + copy_width].copy_from_slice(&src[s..s + copy_width]);
     }
 }
