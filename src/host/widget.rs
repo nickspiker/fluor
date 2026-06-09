@@ -1,6 +1,6 @@
 //! Widget abstraction — the type-system contract every interactive thing in a fluor app conforms to. First-principles split into capability traits so the type system enforces "you can't deliver a key to something that doesn't impl [`Key`]" rather than discovering the no-op at runtime. See the design plan at `~/.claude/plans/buzzing-puzzling-yao.md` for the full Sweeney critique that drove this shape.
 //!
-//! **Layering.** Lives in `host` because the capability traits reference [`winit::event::KeyEvent`] and [`winit::keyboard::ModifiersState`] directly — defining fluor-native [`KeyInput`] / [`Mods`] mirror types is the right long-term move (decouples core from winit, lets the future bare-metal ferros host plug in), but designing those right is a separate task that shouldn't gate the multi-widget refactor. For now: widgets are host-coupled, same as everything else under `host/`.
+//! **Layering.** Capability traits speak [`crate::event::KeyEvent`] / [`crate::event::ModifiersState`] — fluor-native input types. Hosts translate platform input (winit on desktop, JNI on Android) into those at the boundary, so widgets compile and run on every supported target with the same code.
 //!
 //! **Dense IDs.** [`HitId`] (re-exported from [`crate::paint`]) is allocated by threading a single `&mut HitId` counter through widget constructors at startup. `0` stays reserved as [`HIT_NONE`]; registrations start at `1` and increment sequentially. The denseness is an invariant of the allocation pattern — dispatch can index directly by `id - 1` if it wants (the per-frame walk in the v0 demo is O(N), but an optimised path is one slice-build away once profiling justifies it).
 //!
@@ -8,10 +8,9 @@
 
 use crate::canvas::{Canvas, PixelRect};
 use crate::coord::Coord;
+use crate::event::{KeyEvent, ModifiersState};
 use crate::paint::{Clip, HitId};
 use crate::text::TextRenderer;
-use winit::event::KeyEvent;
-use winit::keyboard::ModifiersState;
 
 pub use crate::paint::HIT_NONE;
 
@@ -66,17 +65,17 @@ pub trait Click {
         x: Coord,
         y: Coord,
         mods: ModifiersState,
-    ) -> crate::host::app::EventResponse;
+    ) -> crate::host::EventResponse;
 }
 
-/// Keyboard handler. Receives the raw winit [`KeyEvent`] (with both the logical key and any text-mode text payload), the live modifier state, and a mutable [`TextRenderer`] for widgets that need to recompute glyph widths after an edit (textbox inserts a character → widths must be re-measured before the next paint can position the cursor). Widgets that don't care about text (chrome buttons) ignore the `text` parameter; widgets that don't care about a key return [`crate::host::app::EventResponse::Pass`] so the host knows the event went unconsumed.
+/// Keyboard handler. Receives the fluor-native [`KeyEvent`] (with both the logical key and any text-mode text payload), the live modifier state, and a mutable [`TextRenderer`] for widgets that need to recompute glyph widths after an edit (textbox inserts a character → widths must be re-measured before the next paint can position the cursor). Widgets that don't care about text (chrome buttons) ignore the `text` parameter; widgets that don't care about a key return [`crate::host::EventResponse::Pass`] so the host knows the event went unconsumed.
 pub trait Key {
     fn on_key(
         &mut self,
         kev: &KeyEvent,
         mods: ModifiersState,
         text: &mut TextRenderer,
-    ) -> crate::host::app::EventResponse;
+    ) -> crate::host::EventResponse;
 }
 
 /// Focus state delivery + spatial geometry. `set_focused(true)` is called once when this widget becomes the focused target; `set_focused(false)` once when it loses focus. Widgets typically use this to start / stop a blinkey, toggle a focus ring, or mark their cache layer dirty for a re-paint.
@@ -157,15 +156,15 @@ pub fn build_overlay_deltas(root: &mut dyn Container, count: usize) -> alloc::ve
     t
 }
 
-/// Deliver a click to the widget with `target_id`, if any. Walks `root` once, finds the widget whose [`Widget::id`] matches, asks for its [`Click`] capability, and invokes [`Click::on_click`] with the given `(x, y, mods)`. Returns the widget's [`crate::host::app::EventResponse`], or [`crate::host::app::EventResponse::Pass`] if no matching widget exists or the matching widget has no [`Click`] capability — same convention as a missing handler so apps can `?`-chain into chrome-button dispatch without special-casing the no-widget arm.
+/// Deliver a click to the widget with `target_id`, if any. Walks `root` once, finds the widget whose [`Widget::id`] matches, asks for its [`Click`] capability, and invokes [`Click::on_click`] with the given `(x, y, mods)`. Returns the widget's [`crate::host::EventResponse`], or [`crate::host::EventResponse::Pass`] if no matching widget exists or the matching widget has no [`Click`] capability — same convention as a missing handler so apps can `?`-chain into chrome-button dispatch without special-casing the no-widget arm.
 pub fn dispatch_click(
     root: &mut dyn Container,
     target_id: HitId,
     x: Coord,
     y: Coord,
     mods: ModifiersState,
-) -> crate::host::app::EventResponse {
-    let mut response = crate::host::app::EventResponse::Pass;
+) -> crate::host::EventResponse {
+    let mut response = crate::host::EventResponse::Pass;
     root.visit(&mut |w| {
         if w.id() == target_id {
             if let Some(c) = w.click() {
@@ -176,15 +175,15 @@ pub fn dispatch_click(
     response
 }
 
-/// Deliver a key event to the widget with `target_id`, if any. Mirror of [`dispatch_click`] for keyboard input — caller picks the target (typically the currently-focused widget tracked by the app) and this routes the raw [`KeyEvent`] + [`ModifiersState`] + [`TextRenderer`] handle through to the widget's [`Key::on_key`] impl. Returns [`crate::host::app::EventResponse::Pass`] if `target_id` doesn't match any widget or the matching widget doesn't impl [`Key`].
+/// Deliver a key event to the widget with `target_id`, if any. Mirror of [`dispatch_click`] for keyboard input — caller picks the target (typically the currently-focused widget tracked by the app) and this routes the fluor-native [`KeyEvent`] + [`ModifiersState`] + [`TextRenderer`] handle through to the widget's [`Key::on_key`] impl. Returns [`crate::host::EventResponse::Pass`] if `target_id` doesn't match any widget or the matching widget doesn't impl [`Key`].
 pub fn dispatch_key(
     root: &mut dyn Container,
     target_id: HitId,
     kev: &KeyEvent,
     mods: ModifiersState,
     text: &mut TextRenderer,
-) -> crate::host::app::EventResponse {
-    let mut response = crate::host::app::EventResponse::Pass;
+) -> crate::host::EventResponse {
+    let mut response = crate::host::EventResponse::Pass;
     root.visit(&mut |w| {
         if w.id() == target_id {
             if let Some(k) = w.key() {

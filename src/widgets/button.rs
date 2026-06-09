@@ -425,11 +425,10 @@ mod widget_impls {
 
     use super::Button;
     use crate::coord::Coord;
+    use crate::event::{ElementState, Key as FKey, KeyEvent, ModifiersState, NamedKey};
     use crate::host::widget::{Click, Focus, Hover, Key, PaintCtx, Widget};
     use crate::paint::HitId;
     use crate::text::TextRenderer;
-    use winit::event::KeyEvent;
-    use winit::keyboard::{Key as WKey, ModifiersState, NamedKey};
 
     impl Widget for Button {
         fn id(&self) -> HitId {
@@ -458,9 +457,9 @@ mod widget_impls {
             _x: Coord,
             _y: Coord,
             _mods: ModifiersState,
-        ) -> crate::host::app::EventResponse {
+        ) -> crate::host::EventResponse {
             self.fire();
-            crate::host::app::EventResponse::Handled
+            crate::host::EventResponse::Handled
         }
     }
 
@@ -470,16 +469,16 @@ mod widget_impls {
             kev: &KeyEvent,
             _mods: ModifiersState,
             _text: &mut TextRenderer,
-        ) -> crate::host::app::EventResponse {
-            if kev.state != winit::event::ElementState::Pressed {
-                return crate::host::app::EventResponse::Pass;
+        ) -> crate::host::EventResponse {
+            if kev.state != ElementState::Pressed {
+                return crate::host::EventResponse::Pass;
             }
             match &kev.logical_key {
-                WKey::Named(NamedKey::Enter) | WKey::Named(NamedKey::Space) => {
+                FKey::Named(NamedKey::Enter) | FKey::Named(NamedKey::Space) => {
                     self.fire();
-                    crate::host::app::EventResponse::Handled
+                    crate::host::EventResponse::Handled
                 }
-                _ => crate::host::app::EventResponse::Pass,
+                _ => crate::host::EventResponse::Pass,
             }
         }
     }

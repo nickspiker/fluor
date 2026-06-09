@@ -6,7 +6,7 @@
 //!
 //! Pattern: `chrome.rasterize_bg(|bg, w, h| { /* paint into bg */ });` → `chrome.rasterize_chrome(text);` → `chrome.flatten_into(target, w, h);`. Each rasterize_* checks the layer's dirty bit internally and is a no-op on clean. Hover / focus tint is NOT rasterized — it's applied by the host's post-finalize overlay pass against `persistent_screen` via [`super::widget::build_overlay_deltas`] reading [`Hover::tint_delta`] off each chrome button.
 
-use super::app::EventResponse;
+use super::EventResponse;
 use super::chrome::{self, HIT_NONE, HitId};
 use super::widget::{self, Click, Container, Hover, PaintCtx, Widget};
 use crate::coord::Coord;
@@ -16,11 +16,10 @@ use crate::paint::BlendMode;
 use crate::region::Region;
 use crate::stack::Op;
 use crate::text::TextRenderer;
+use crate::event::{Key as FKey, KeyEvent, ModifiersState, NamedKey};
 use crate::theme;
 use alloc::string::String;
 use alloc::vec::Vec;
-use winit::event::KeyEvent;
-use winit::keyboard::ModifiersState;
 
 // Hover colour mapping moved to [`DefaultChrome::hover_colour_for`] — needs the live button IDs allocated at chrome construction time, so it can no longer be a free function.
 
@@ -129,9 +128,8 @@ impl widget::Key for ChromeButton {
         _mods: ModifiersState,
         _text: &mut TextRenderer,
     ) -> EventResponse {
-        use winit::keyboard::{Key as WKey, NamedKey};
         match &kev.logical_key {
-            WKey::Named(NamedKey::Enter) | WKey::Named(NamedKey::Space) => self.action.response(),
+            FKey::Named(NamedKey::Enter) | FKey::Named(NamedKey::Space) => self.action.response(),
             _ => EventResponse::Pass,
         }
     }

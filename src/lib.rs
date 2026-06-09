@@ -11,6 +11,7 @@ extern crate alloc;
 
 pub mod canvas;
 pub mod coord;
+pub mod event;
 pub mod geom;
 pub mod group;
 pub mod host;
@@ -28,6 +29,7 @@ pub mod theme;
 #[cfg(feature = "text")]
 pub mod text;
 
+// Widgets (Textbox, Button) speak fluor-native event types ([`crate::event`]) and so compile on every host with `text` enabled. Whichever host is driving (host-winit on desktop, host-android on Android) translates platform input to fluor events at the boundary.
 #[cfg(feature = "text")]
 pub mod widgets;
 
