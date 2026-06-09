@@ -6,7 +6,16 @@
 //!
 //! When rayon is on, rows run on different worker threads and the closure must be safe to call from multiple threads concurrently — that's `Send + Sync`. Rasterizer closures are tiny captures of small `f32` / `u32` / packed-pixel parameters with no interior mutability, so the bound is satisfied trivially. We require it unconditionally (even in sequential builds) so the call-site code is identical across feature combos — no `#[cfg]` per call.
 
-/// Iterate `pixels` row-by-row over `row_start..row_end`, calling `f(row_index, &mut row_slice)` for each row. Each `row_slice` is exactly `width` `u32`s. With `rayon` enabled, rows are dispatched in parallel; without it, sequentially.
+/// Runtime override: when set, [`par_rows`] and [`par_chunks`] run sequentially even with the `rayon` feature enabled. Used by hosts that write into device-coherent memory (e.g. Android's `ANativeWindow_lock` buffer) where worker-thread writes need a single-thread ordering guarantee before `unlockAndPost` hands the buffer to the compositor.
+pub static FORCE_SEQUENTIAL: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn force_sequential() -> bool {
+    FORCE_SEQUENTIAL.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Iterate `pixels` row-by-row over `row_start..row_end`, calling `f(row_index, &mut row_slice)` for each row. Each `row_slice` is exactly `width` `u32`s. With `rayon` enabled and [`FORCE_SEQUENTIAL`] clear, rows are dispatched in parallel; otherwise sequentially.
 ///
 /// Pre-conditions: `pixels.len() >= row_end * width` and `row_start <= row_end`. No internal clamping — the caller (a clipped rasterizer or a boundary pass) is responsible for shaping the range to fit the buffer.
 #[inline]
@@ -20,16 +29,16 @@ where
     let sub = &mut pixels[row_start * width..row_end * width];
     #[cfg(feature = "rayon")]
     {
-        use rayon::prelude::*;
-        sub.par_chunks_mut(width).enumerate().for_each(|(i, row)| {
-            f(row_start + i, row);
-        });
-    }
-    #[cfg(not(feature = "rayon"))]
-    {
-        for (i, row) in sub.chunks_mut(width).enumerate() {
-            f(row_start + i, row);
+        if !force_sequential() {
+            use rayon::prelude::*;
+            sub.par_chunks_mut(width).enumerate().for_each(|(i, row)| {
+                f(row_start + i, row);
+            });
+            return;
         }
+    }
+    for (i, row) in sub.chunks_mut(width).enumerate() {
+        f(row_start + i, row);
     }
 }
 
@@ -44,18 +53,18 @@ where
     }
     #[cfg(feature = "rayon")]
     {
-        use rayon::prelude::*;
-        pixels
-            .par_chunks_mut(chunk_len)
-            .enumerate()
-            .for_each(|(i, chunk)| {
-                f(i * chunk_len, chunk);
-            });
-    }
-    #[cfg(not(feature = "rayon"))]
-    {
-        for (i, chunk) in pixels.chunks_mut(chunk_len).enumerate() {
-            f(i * chunk_len, chunk);
+        if !force_sequential() {
+            use rayon::prelude::*;
+            pixels
+                .par_chunks_mut(chunk_len)
+                .enumerate()
+                .for_each(|(i, chunk)| {
+                    f(i * chunk_len, chunk);
+                });
+            return;
         }
+    }
+    for (i, chunk) in pixels.chunks_mut(chunk_len).enumerate() {
+        f(i * chunk_len, chunk);
     }
 }
