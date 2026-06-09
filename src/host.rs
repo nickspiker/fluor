@@ -14,7 +14,10 @@ pub use window_handle::WindowHandle;
 #[cfg(feature = "text")]
 pub mod chrome_widget;
 
-#[cfg(feature = "host-winit")]
+// `app` contains the `FluorApp` trait + `Context` + (gated below) `DesktopShell`. The trait
+// and Context compile on any host with `text` + `winit` (data types only — see Cargo.toml's
+// host-android comment); DesktopShell + run_app stay host-winit-only.
+#[cfg(all(feature = "text", any(feature = "host-winit", feature = "host-android")))]
 pub mod app;
 
 #[cfg(all(feature = "host-android", target_os = "android"))]
