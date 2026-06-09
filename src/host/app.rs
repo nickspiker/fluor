@@ -6,24 +6,40 @@
 //!
 //! The current `desktop::run(compositor, title)` is a transitional shim that wraps the legacy demo into a `FluorApp`. New code should use [`run_app`] directly.
 
-use super::chrome::ResizeEdge;
-use super::winit_compat;
 use super::WindowHandle;
 use crate::coord::Coord;
 use crate::event::{CursorIcon as FCursorIcon, Event as FEvent, ModifiersState as FModifiersState};
 use crate::geom::Viewport;
 use crate::text::TextRenderer;
-use std::sync::Arc;
 use std::time::Instant;
+// `winit::event_loop::EventLoopProxy` is mentioned in `FluorApp::set_event_proxy`'s
+// signature. The host-android feature pulls winit with `default-features = false +
+// rwh_06` (data types only — no event-loop machinery on Android), so the trait shape
+// stays uniform across hosts. Concrete winit machinery (ApplicationHandler, EventLoop,
+// WindowAttributes, etc.) only enters via the desktop_shell sub-module below.
+use winit::event_loop::EventLoopProxy;
+
+#[cfg(feature = "host-winit")]
+use super::chrome::ResizeEdge;
+#[cfg(feature = "host-winit")]
+use super::winit_compat;
+#[cfg(feature = "host-winit")]
+use std::sync::Arc;
+#[cfg(feature = "host-winit")]
 use winit::application::ApplicationHandler;
+#[cfg(feature = "host-winit")]
 use winit::error::EventLoopError;
+#[cfg(feature = "host-winit")]
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+#[cfg(feature = "host-winit")]
+use winit::event_loop::{ActiveEventLoop, EventLoop};
+#[cfg(feature = "host-winit")]
 use winit::keyboard::ModifiersState;
+#[cfg(feature = "host-winit")]
 use winit::window::{Window, WindowAttributes, WindowId};
 
 /// X11-only XShape helpers — direct XCB calls that winit doesn't expose. Currently houses [`x11_atomic::set_input_region`] (window-shape input clipping); historically also held an atomic-geometry helper that's gone now. The `x11_atomic` name is retained because the (single) remaining helper still operates on an XCB connection independent of winit's, which is the property the name actually tracks.
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "host-winit", target_os = "linux"))]
 mod x11_atomic {
     use std::sync::OnceLock;
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -187,6 +203,7 @@ pub trait FluorApp {
 }
 
 /// Run the desktop host until the window closes. Builds an [`EventLoop`] typed on `A::UserEvent` so background-thread wake-ups via [`EventLoopProxy::send_event`] route through [`FluorApp::on_user_event`]. The proxy is created up-front and handed to the app via [`FluorApp::set_event_proxy`] BEFORE the event loop starts, so apps can clone-and-ship it to background tasks during their own constructor or [`FluorApp::init`].
+#[cfg(feature = "host-winit")]
 pub fn run_app<A: FluorApp + 'static>(mut app: A) -> Result<(), EventLoopError> {
     let event_loop = EventLoop::<A::UserEvent>::with_user_event().build()?;
     app.set_event_proxy(event_loop.create_proxy());
@@ -194,8 +211,14 @@ pub fn run_app<A: FluorApp + 'static>(mut app: A) -> Result<(), EventLoopError> 
     event_loop.run_app(&mut shell)
 }
 
+// ============================================================================
+// Everything below this point is `host-winit`-only — DesktopShell + winit event loop.
+// AndroidShell lives at [`crate::host::android::shell`].
+// ============================================================================
+
 /// Visible-window placement inside the fullscreen screen buffer. fluor now runs as a fullscreen transparent OS window owning the whole display — the "window" the consumer paints into is a sub-rect of that screen buffer at `(x, y)` with `(w, h)` pixels. `(x, y, w, h)` are screen-space pixel coordinates. `(0, 0)` is the top-left of the display. WindowRect is mutated by drag-to-move (changes `x, y`) and resize-drag (changes `w, h`); both are in-buffer operations that don't touch the OS window geometry.
 #[derive(Clone, Copy, Debug)]
+#[cfg(feature = "host-winit")]
 struct WindowRect {
     x: i32,
     y: i32,
@@ -204,6 +227,7 @@ struct WindowRect {
 }
 
 /// Damage-clipped fill(0) — wipes only the `rect` sub-region of `scratch` (viewport-flat slice, row-major width `win_w`). Replaces a full-buffer `fill(0)` so pixels outside the damage rect persist between frames. Each row inside the rect uses the SIMD-friendly slice `fill(0)` so the per-row cost is the same as the full-buffer call, just over fewer rows.
+#[cfg(feature = "host-winit")]
 fn clear_scratch_rect(scratch: &mut [u32], win_w: usize, rect: crate::canvas::PixelRect) {
     if rect.is_empty() {
         return;
@@ -225,6 +249,7 @@ fn clear_scratch_rect(scratch: &mut [u32], win_w: usize, rect: crate::canvas::Pi
 /// The host's adapter — owns platform handles + the consumer's `App`, dispatches events through the trait. Not user-facing; constructed by [`run_app`].
 ///
 /// **Compositor architecture.** The OS window is fullscreen borderless transparent — fluor owns the entire screen buffer. The consumer paints into a window-sized scratch buffer (sized to `viewport` = `window_rect.w × window_rect.h`); the host then blits that scratch into the screen buffer at the `window_rect` offset. Pixels outside the window stay α=0 so the OS compositor shows whatever's behind us. Click-through is via a per-resize input-region call (set later, see step 2 of the fullscreen-compositor pivot) so clicks outside `window_rect` route to whatever's underneath.
+#[cfg(feature = "host-winit")]
 struct DesktopShell<A: FluorApp> {
     app: A,
     window: Option<Arc<Window>>,
@@ -300,6 +325,7 @@ struct DesktopShell<A: FluorApp> {
     strip_buf: Vec<u32>,
 }
 
+#[cfg(feature = "host-winit")]
 impl<A: FluorApp> DesktopShell<A> {
     fn new(app: A) -> Self {
         Self {
@@ -958,6 +984,7 @@ impl<A: FluorApp> DesktopShell<A> {
     }
 }
 
+#[cfg(feature = "host-winit")]
 impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -1397,6 +1424,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
     }
 }
 
+#[cfg(feature = "host-winit")]
 impl<A: FluorApp + 'static> DesktopShell<A> {
     /// Apply a zoom change to `self.viewport.ru` and propagate to the consumer. `steps = Some(s)` adjusts by `s` photon-asymmetric log steps (positive in, negative out); `steps = None` resets to 1.0 (Ctrl+0 binding). Calls `app.on_resize` with unchanged pixel dimensions so the consumer's existing resize path picks up the new `ctx.viewport.ru`, marks chrome / widget layers dirty (via their internal Group resize), and re-rasterizes at the new effective span. No separate `on_zoom` callback needed — the consumer's on_resize is the single "viewport changed" entry point.
     fn apply_zoom_change(&mut self, steps: Option<f32>) {

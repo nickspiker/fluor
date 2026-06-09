@@ -10,6 +10,15 @@
 //! - [`jni`] — `#[no_mangle] pub extern "C" fn Java_*` entry points matching PhotonActivity.kt's contract.
 //! - [`lifecycle`] — pause/resume/destroy hooks the Activity invokes during lifecycle transitions.
 //!
-//! Status: SCAFFOLD. Phase 2.1 of the host-android plan — module structure + Cargo feature in place; surface code ported next; JNI + event loop after that. `AndroidShell` is the entry point that ties everything together once all pieces exist.
+//! Status: Phase 2.3 — events.rs + window.rs + shell.rs all wired. `AndroidShell` is the
+//! entry point; consumers' JNI thin-shims construct one in `nativeInit` and call its
+//! `draw` / `resize` / `on_touch` / `on_text_input` / `on_key_event` / `on_back_pressed` /
+//! `on_scale` methods from the matching `nativeXxx` JNI entry points.
 
+pub mod events;
+pub mod shell;
 pub mod surface;
+pub mod window;
+
+pub use shell::AndroidShell;
+pub use window::AndroidWindow;
