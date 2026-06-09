@@ -7,7 +7,10 @@
 //! The current `desktop::run(compositor, title)` is a transitional shim that wraps the legacy demo into a `FluorApp`. New code should use [`run_app`] directly.
 
 use super::chrome::ResizeEdge;
+use super::winit_compat;
+use super::WindowHandle;
 use crate::coord::Coord;
+use crate::event::{CursorIcon as FCursorIcon, Event as FEvent, ModifiersState as FModifiersState};
 use crate::geom::Viewport;
 use crate::text::TextRenderer;
 use std::sync::Arc;
@@ -17,7 +20,7 @@ use winit::error::EventLoopError;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
-use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
+use winit::window::{Window, WindowAttributes, WindowId};
 
 /// X11-only XShape helpers — direct XCB calls that winit doesn't expose. Currently houses [`x11_atomic::set_input_region`] (window-shape input clipping); historically also held an atomic-geometry helper that's gone now. The `x11_atomic` name is retained because the (single) remaining helper still operates on an XCB connection independent of winit's, which is the property the name actually tracks.
 #[cfg(target_os = "linux")]
@@ -95,10 +98,10 @@ pub struct Context<'a> {
     pub damage: &'a mut crate::canvas::Damage,
     /// The damage clip the host computed for THIS frame, derived from `app.damage_rect(...)` before render. Consumers should thread this through every flatten / blit / glow call as the `clip` parameter so they only touch pixels inside the dirty region. Defaults to the full viewport (legacy apps that don't override `FluorApp::damage_rect` get the current full-redraw behavior).
     pub damage_clip: crate::canvas::PixelRect,
-    /// The host's winit window handle. Use for `set_cursor`, `set_minimized`, `set_maximized`, `request_redraw`, `drag_window`, `set_title`, `outer_position`.
-    pub window: &'a Window,
-    /// Latest tracked modifier state (shift / ctrl / alt / super).
-    pub modifiers: ModifiersState,
+    /// App-facing window handle. `WindowHandle` is intentionally minimal — only `request_redraw` lives there because it's the only window operation real apps invoke from the trait surface. Cursor / drag / maximize / minimize flow through [`EventResponse`] variants instead, so the host's window state stays the single source of truth.
+    pub window: &'a dyn WindowHandle,
+    /// Latest tracked modifier state (shift / ctrl / alt / super) in fluor-native form. Hosts translate from platform input (winit `ModifiersState`, Android JNI mod-key flags) before constructing this.
+    pub modifiers: FModifiersState,
     /// Last known cursor position in viewport pixels (host-tracked across all events).
     pub cursor_x: Coord,
     pub cursor_y: Coord,
@@ -129,8 +132,8 @@ pub trait FluorApp {
     /// The window resized. Resize internal Groups / widget bboxes to match.
     fn on_resize(&mut self, width: u32, height: u32, ctx: &mut Context);
 
-    /// Window event from winit. Consumer returns an [`EventResponse`] telling the host what to do next.
-    fn on_event(&mut self, event: &WindowEvent, ctx: &mut Context) -> EventResponse;
+    /// Window event from the host. Consumer returns an [`EventResponse`] telling the host what to do next. Events are fluor-native [`crate::event::Event`] values — hosts translate platform input at the boundary.
+    fn on_event(&mut self, event: &FEvent, ctx: &mut Context) -> EventResponse;
 
     /// Damage region this app will repaint this frame. Returns `None` if no widget state changed since the last frame — host can persist scratch as-is and skip render entirely. Returns `Some(rect)` to declare the union of all dirty widget bboxes (each widget's `prev ∪ current` from `widget.damage_rect(...)`); host clears scratch in that rect and threads it through `ctx.damage_clip` so the consumer's render call clips every flatten / blit to it.
     ///
@@ -158,8 +161,8 @@ pub trait FluorApp {
         None
     }
 
-    /// Cursor icon at `(x, y)` in viewport pixel coords. Called whenever the cursor moves.
-    fn cursor_for(&self, x: Coord, y: Coord, ctx: &Context) -> CursorIcon;
+    /// Cursor icon at `(x, y)` in viewport pixel coords. Called whenever the cursor moves. Returns a fluor-native [`crate::event::CursorIcon`]; the host translates to its platform's cursor type before calling `set_cursor` on the OS window.
+    fn cursor_for(&self, x: Coord, y: Coord, ctx: &Context) -> FCursorIcon;
 
     /// When to wake up next (animation timers, blinks). `None` = wait for input only. The host calls this once per `about_to_wait` cycle and feeds it into `ControlFlow::WaitUntil`.
     fn wake_at(&self) -> Option<Instant> {
@@ -427,8 +430,8 @@ impl<A: FluorApp> DesktopShell<A> {
             text,
             clip_mask: &mut self.clip_mask,
             damage: &mut self.pending_damage,
-            window: &window,
-            modifiers: self.modifiers,
+            window: &*window,
+            modifiers: winit_compat::from_winit_mods(self.modifiers),
             cursor_x: self.cursor_x - self.window_rect.x as Coord,
             cursor_y: self.cursor_y - self.window_rect.y as Coord,
             is_maximized: self.saved_rect_for_maximize.is_some(),
@@ -766,7 +769,7 @@ impl<A: FluorApp> DesktopShell<A> {
                     clip_mask: &mut self.clip_mask,
                     damage: &mut self.pending_damage,
                     window,
-                    modifiers: self.modifiers,
+                    modifiers: winit_compat::from_winit_mods(self.modifiers),
                     cursor_x: self.cursor_x - self.window_rect.x as Coord,
                     cursor_y: self.cursor_y - self.window_rect.y as Coord,
                     is_maximized: self.saved_rect_for_maximize.is_some(),
@@ -933,8 +936,8 @@ impl<A: FluorApp> DesktopShell<A> {
                     text,
                     clip_mask: &mut self.clip_mask,
                     damage: &mut self.pending_damage,
-                    window: &window,
-                    modifiers: self.modifiers,
+                    window: &*window,
+                    modifiers: winit_compat::from_winit_mods(self.modifiers),
                     cursor_x: self.cursor_x - self.window_rect.x as Coord,
                     cursor_y: self.cursor_y - self.window_rect.y as Coord,
                     is_maximized: self.saved_rect_for_maximize.is_some(),
@@ -1039,8 +1042,8 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 text,
                 clip_mask: &mut self.clip_mask,
                 damage: &mut self.pending_damage,
-                window: &window,
-                modifiers: self.modifiers,
+                window: &*window,
+                modifiers: winit_compat::from_winit_mods(self.modifiers),
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
                 cursor_y: self.cursor_y - self.window_rect.y as Coord,
                 is_maximized: self.saved_rect_for_maximize.is_some(),
@@ -1080,8 +1083,8 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 text,
                 clip_mask: &mut self.clip_mask,
                 damage: &mut self.pending_damage,
-                window: &window,
-                modifiers: self.modifiers,
+                window: &*window,
+                modifiers: winit_compat::from_winit_mods(self.modifiers),
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
                 cursor_y: self.cursor_y - self.window_rect.y as Coord,
                 is_maximized: self.saved_rect_for_maximize.is_some(),
@@ -1171,8 +1174,8 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                                 text,
                                 clip_mask: &mut self.clip_mask,
                                 damage: &mut self.pending_damage,
-                                window: &window,
-                                modifiers: self.modifiers,
+                                window: &*window,
+                                modifiers: winit_compat::from_winit_mods(self.modifiers),
                                 cursor_x: self.cursor_x - new_x as Coord,
                                 cursor_y: self.cursor_y - new_y as Coord,
                                 damage_clip: crate::canvas::PixelRect::new(
@@ -1235,8 +1238,8 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                         text,
                         clip_mask: &mut self.clip_mask,
                         damage: &mut self.pending_damage,
-                        window: &window,
-                        modifiers: self.modifiers,
+                        window: &*window,
+                        modifiers: winit_compat::from_winit_mods(self.modifiers),
                         cursor_x: self.cursor_x - self.window_rect.x as Coord,
                         cursor_y: self.cursor_y - self.window_rect.y as Coord,
                         is_maximized: self.saved_rect_for_maximize.is_some(),
@@ -1247,11 +1250,17 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                             self.viewport.height_px as usize,
                         ),
                     };
-                    let response = self.app.on_event(&event, &mut ctx);
+                    // Translate winit → fluor at the boundary. Events that don't map
+                    // (decorator/raw-input/etc.) skip app.on_event entirely; the host
+                    // continues handling them internally below as needed.
+                    let response = match winit_compat::from_winit_event(&event) {
+                        Some(fevent) => self.app.on_event(&fevent, &mut ctx),
+                        None => EventResponse::Pass,
+                    };
                     // Cursor coords must be window-relative — same translation as Context's cursor_x/y — so the consumer's hit_at sees the chrome at origin (0,0). Raw screen-space coords would miss every button when the window_rect isn't at (0,0).
                     let icon = self.app.cursor_for(ctx.cursor_x, ctx.cursor_y, &ctx);
                     drop(ctx);
-                    window.set_cursor(icon);
+                    window.set_cursor(winit_compat::to_winit_cursor(icon));
                     self.apply_response(response);
                 }
             }
@@ -1372,8 +1381,8 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
             text,
             clip_mask: &mut self.clip_mask,
             damage: &mut self.pending_damage,
-            window: &window,
-            modifiers: self.modifiers,
+            window: &*window,
+            modifiers: winit_compat::from_winit_mods(self.modifiers),
             cursor_x: self.cursor_x - self.window_rect.x as Coord,
             cursor_y: self.cursor_y - self.window_rect.y as Coord,
             is_maximized: self.saved_rect_for_maximize.is_some(),
@@ -1403,8 +1412,8 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
                 text,
                 clip_mask: &mut self.clip_mask,
                 damage: &mut self.pending_damage,
-                window: &window,
-                modifiers: self.modifiers,
+                window: &*window,
+                modifiers: winit_compat::from_winit_mods(self.modifiers),
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
                 cursor_y: self.cursor_y - self.window_rect.y as Coord,
                 is_maximized: self.saved_rect_for_maximize.is_some(),
@@ -1430,8 +1439,8 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
                 text,
                 clip_mask: &mut self.clip_mask,
                 damage: &mut self.pending_damage,
-                window: &window,
-                modifiers: self.modifiers,
+                window: &*window,
+                modifiers: winit_compat::from_winit_mods(self.modifiers),
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
                 cursor_y: self.cursor_y - self.window_rect.y as Coord,
                 is_maximized: self.saved_rect_for_maximize.is_some(),
@@ -1442,7 +1451,10 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
                     self.viewport.height_px as usize,
                 ),
             };
-            let response = self.app.on_event(&event, &mut ctx);
+            let response = match winit_compat::from_winit_event(&event) {
+                Some(fevent) => self.app.on_event(&fevent, &mut ctx),
+                None => EventResponse::Pass,
+            };
             drop(ctx);
             self.apply_response(response);
         }
