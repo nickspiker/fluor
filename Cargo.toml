@@ -85,6 +85,13 @@ log = { version = "0.4", optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["shape"] }
 
+# objc2 + AppKit bindings for macOS click-through: NSEvent global mouse monitor + NSWindow mouseLocationOutsideOfEventStream.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSNotification"] }
+objc2-app-kit = { version = "0.3", features = ["NSEvent", "NSWindow", "NSResponder", "NSView"] }
+
 [dev-dependencies]
 proptest = "1.5"
 
