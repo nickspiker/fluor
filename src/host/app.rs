@@ -411,6 +411,9 @@ impl<A: FluorApp> DesktopShell<A> {
         let should_ignore = alpha < ALPHA_THRESHOLD;
         if should_ignore != self.hittest_off {
             if let Some(window) = self.window.as_ref() {
+                if should_ignore {
+                    window.set_cursor(winit::window::CursorIcon::Default);
+                }
                 let _ = window.set_cursor_hittest(!should_ignore);
                 self.hittest_off = should_ignore;
             }
