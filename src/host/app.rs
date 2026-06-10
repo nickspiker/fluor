@@ -323,6 +323,11 @@ struct DesktopShell<A: FluorApp> {
     last_opaque_scan: bool,
     /// Dedicated staging buffer for the FPS strip (debug). Sized to `win_w × DEBUG_STRIP_H` lazily on first use; the strip rasterizes here in α + darkness and then gets converted + clobbered into persistent_screen. Kept entirely separate from the app's scratch so the strip never contaminates the consumer's render path.
     strip_buf: Vec<u32>,
+    /// macOS click-through: true when we've told the OS to ignore mouse events for this window (cursor is over a transparent area). A global NSEvent monitor polls cursor position to detect re-entry.
+    #[cfg(target_os = "macos")]
+    hittest_off: bool,
+    #[cfg(target_os = "macos")]
+    hittest_monitor: Option<super::macos_hittest::HittestMonitor>,
 }
 
 #[cfg(feature = "host-winit")]
@@ -377,6 +382,38 @@ impl<A: FluorApp> DesktopShell<A> {
             strip_buf: Vec::new(),
             last_overlay_active: Vec::new(),
             saved_rect_for_maximize: None,
+            #[cfg(target_os = "macos")]
+            hittest_off: false,
+            #[cfg(target_os = "macos")]
+            hittest_monitor: None,
+        }
+    }
+
+    /// macOS click-through: check the alpha of the pixel under the cursor in persistent_screen.
+    /// If transparent (alpha < threshold), tell the OS to ignore mouse events so clicks pass
+    /// through to apps behind us. If opaque, ensure we're accepting events.
+    #[cfg(target_os = "macos")]
+    fn update_macos_hittest(&mut self) {
+        const ALPHA_THRESHOLD: u8 = 10;
+        let scr_w = self.screen_size.0 as usize;
+        let scr_h = self.screen_size.1 as usize;
+        let cx = self.cursor_x as usize;
+        let cy = self.cursor_y as usize;
+        if cx >= scr_w || cy >= scr_h {
+            return;
+        }
+        let idx = cy * scr_w + cx;
+        let alpha = if idx < self.persistent_screen.len() {
+            ((self.persistent_screen[idx] >> 24) & 0xFF) as u8
+        } else {
+            0
+        };
+        let should_ignore = alpha < ALPHA_THRESHOLD;
+        if should_ignore != self.hittest_off {
+            if let Some(window) = self.window.as_ref() {
+                let _ = window.set_cursor_hittest(!should_ignore);
+                self.hittest_off = should_ignore;
+            }
         }
     }
 
@@ -635,6 +672,10 @@ impl<A: FluorApp> DesktopShell<A> {
                 );
             }
             let _ = buffer.present();
+            // Update the global mouse monitor's screen pointer so it can check alpha.
+            if let Some(ref monitor) = self.hittest_monitor {
+                monitor.update_screen(&self.persistent_screen, scr_w as u32, scr_h as u32);
+            }
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -1012,6 +1053,8 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
         {
             use winit::platform::macos::WindowExtMacOS;
             window.set_has_shadow(false);
+            self.hittest_monitor =
+                super::macos_hittest::HittestMonitor::install(mon_w, mon_h);
         }
 
         // Initial visible-window size: app-supplied (defaults to half the screen in each axis) and centred. Apps with aspect-ratio opinions override [`FluorApp::initial_size`].
@@ -1230,6 +1273,9 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 self.cursor_x = position.x as Coord;
                 self.cursor_y = position.y as Coord;
 
+                #[cfg(target_os = "macos")]
+                self.update_macos_hittest();
+
                 // During a self-driven resize drag, CursorMoved fires at hundreds of Hz (raw input rate) AND we synthesize more via set_outer_position (window-relative cursor pos changes when the window moves). Doing a full resize+paint+OS-update per event floods X11 (`XIO: fatal IO error 11`) and creates a multi-second backlog of stale requests that play back after release. Coalesce: just stash the new cursor pos and request a redraw — winit caps RedrawRequested to vsync (~60-144 Hz), and the actual drag tick runs there. Skips consumer event dispatch too (consumer doesn't need to see resize-drag cursor moves).
                 if self.is_dragging_resize {
                     if let Some(window) = self.window.as_ref() {
@@ -1376,6 +1422,23 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 self.dispatch_event(event);
             }
             WindowEvent::RedrawRequested => {
+                // macOS click-through: if the global monitor detected the cursor re-entering
+                // an opaque region while hittest was off, flip it back on. While hittest is
+                // off we keep requesting redraws to poll the monitor flag at vsync rate.
+                #[cfg(target_os = "macos")]
+                if self.hittest_off {
+                    if let Some(ref monitor) = self.hittest_monitor {
+                        if monitor.check_reenter() {
+                            if let Some(window) = self.window.as_ref() {
+                                let _ = window.set_cursor_hittest(true);
+                                self.hittest_off = false;
+                            }
+                        } else if let Some(window) = self.window.as_ref() {
+                            // Keep polling — next vsync will check again.
+                            window.request_redraw();
+                        }
+                    }
+                }
                 // Drag-to-move fast path: shift the existing screen pixels by the per-tick delta instead of re-rendering anything. Skips consumer.render(), scratch fill, finalize, and shadow rasterization.
                 if self.is_dragging_move {
                     self.apply_move_drag_shift();

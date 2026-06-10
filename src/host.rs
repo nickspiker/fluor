@@ -37,3 +37,7 @@ pub mod renderer_wgpu;
 /// Winit ↔ fluor event translation helpers. Used by host-winit's `DesktopShell` to translate at the event-loop boundary, and by consumers that still receive winit-shaped events from `FluorApp::on_event` while the trait migration is in flight.
 #[cfg(feature = "host-winit")]
 pub mod winit_compat;
+
+/// macOS click-through: global NSEvent monitor for re-entry detection.
+#[cfg(all(feature = "host-winit", target_os = "macos"))]
+pub(crate) mod macos_hittest;
