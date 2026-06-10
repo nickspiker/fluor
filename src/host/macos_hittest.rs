@@ -1,35 +1,32 @@
 //! macOS global mouse monitor for click-through re-entry detection.
 //!
 //! When `ignoresMouseEvents = true`, macOS stops delivering CursorMoved to our window.
-//! We install a global NSEvent monitor that fires on mouseMoved/mouseEntered globally,
-//! checks the cursor position, and flips hittest back on when the cursor re-enters
-//! an opaque region of our persistent_screen buffer.
+//! We install a global NSEvent monitor that fires on mouseMoved globally, checks the
+//! cursor position against the window rect, and flags re-entry when the cursor moves
+//! back inside.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
 
 /// Shared state between the global monitor callback and the host event loop.
 pub(super) struct HittestMonitor {
-    /// Set by the monitor callback when the cursor is over an opaque pixel.
+    /// Set by the monitor callback when the cursor is inside the window rect.
     pub reenter_flag: Arc<AtomicBool>,
-    /// Screen dimensions for index calculation.
-    pub screen_w: Arc<AtomicU32>,
+    /// Window rect in screen coords (top-left origin, matching winit convention).
+    pub win_x: Arc<AtomicI32>,
+    pub win_y: Arc<AtomicI32>,
+    pub win_w: Arc<AtomicU32>,
+    pub win_h: Arc<AtomicU32>,
+    /// Screen height for Y-flip (NSEvent uses bottom-left origin).
     pub screen_h: Arc<AtomicU32>,
-    /// Pointer to the persistent_screen buffer (raw ptr for cross-thread access).
-    /// Updated each frame by the host. The monitor reads it to check alpha.
-    pub screen_ptr: Arc<AtomicU64>,
-    pub screen_len: Arc<AtomicU64>,
     _monitor: *mut objc2::runtime::AnyObject,
 }
 
-// The monitor handle is an ObjC object we release on drop.
 unsafe impl Send for HittestMonitor {}
 
-use std::sync::atomic::AtomicU64;
-
 impl HittestMonitor {
-    /// Install a global mouse-moved monitor. Returns None if the API call fails.
-    pub fn install(screen_w: u32, screen_h: u32) -> Option<Self> {
+    /// Install a global mouse-moved monitor.
+    pub fn install(screen_h: u32) -> Option<Self> {
         use objc2::rc::Retained;
         use objc2::runtime::AnyObject;
         use objc2_app_kit::NSEvent;
@@ -37,16 +34,18 @@ impl HittestMonitor {
         use objc2_foundation::NSPoint;
 
         let reenter_flag = Arc::new(AtomicBool::new(false));
-        let sw = Arc::new(AtomicU32::new(screen_w));
+        let wx = Arc::new(AtomicI32::new(0));
+        let wy = Arc::new(AtomicI32::new(0));
+        let ww = Arc::new(AtomicU32::new(0));
+        let wh = Arc::new(AtomicU32::new(0));
         let sh = Arc::new(AtomicU32::new(screen_h));
-        let sptr = Arc::new(AtomicU64::new(0));
-        let slen = Arc::new(AtomicU64::new(0));
 
         let flag = reenter_flag.clone();
-        let sw2 = sw.clone();
+        let wx2 = wx.clone();
+        let wy2 = wy.clone();
+        let ww2 = ww.clone();
+        let wh2 = wh.clone();
         let sh2 = sh.clone();
-        let sptr2 = sptr.clone();
-        let slen2 = slen.clone();
 
         let mask = NSEventMask::MouseMoved
             | NSEventMask::LeftMouseDragged
@@ -54,23 +53,18 @@ impl HittestMonitor {
 
         let block = block2::RcBlock::new(move |_event: std::ptr::NonNull<NSEvent>| {
             let loc: NSPoint = NSEvent::mouseLocation();
-            // NSEvent mouseLocation is in screen coords, origin bottom-left.
-            let w = sw2.load(Ordering::Relaxed) as f64;
-            let h = sh2.load(Ordering::Relaxed) as f64;
-            let cx = loc.x as usize;
-            let cy = (h - loc.y) as usize; // flip Y
-            let scr_w = w as usize;
-            if cx < scr_w && cy < (h as usize) {
-                let idx = cy * scr_w + cx;
-                let ptr = sptr2.load(Ordering::Relaxed) as *const u32;
-                let len = slen2.load(Ordering::Relaxed) as usize;
-                if !ptr.is_null() && idx < len {
-                    let pixel = unsafe { *ptr.add(idx) };
-                    let alpha = ((pixel >> 24) & 0xFF) as u8;
-                    if alpha >= 10 {
-                        flag.store(true, Ordering::Relaxed);
-                    }
-                }
+            // NSEvent mouseLocation: bottom-left origin. Flip Y to top-left.
+            let screen_h = sh2.load(Ordering::Relaxed) as f64;
+            let cx = loc.x as i32;
+            let cy = (screen_h - loc.y) as i32;
+
+            let rx = wx2.load(Ordering::Relaxed);
+            let ry = wy2.load(Ordering::Relaxed);
+            let rw = ww2.load(Ordering::Relaxed) as i32;
+            let rh = wh2.load(Ordering::Relaxed) as i32;
+
+            if cx >= rx && cx < rx + rw && cy >= ry && cy < ry + rh {
+                flag.store(true, Ordering::Relaxed);
             }
         });
 
@@ -81,21 +75,22 @@ impl HittestMonitor {
             let raw = Retained::into_raw(m);
             HittestMonitor {
                 reenter_flag,
-                screen_w: sw,
+                win_x: wx,
+                win_y: wy,
+                win_w: ww,
+                win_h: wh,
                 screen_h: sh,
-                screen_ptr: sptr,
-                screen_len: slen,
                 _monitor: raw as *mut AnyObject,
             }
         })
     }
 
-    /// Update the screen buffer pointer (call each frame after finalize).
-    pub fn update_screen(&self, buf: &[u32], w: u32, h: u32) {
-        self.screen_ptr.store(buf.as_ptr() as u64, Ordering::Relaxed);
-        self.screen_len.store(buf.len() as u64, Ordering::Relaxed);
-        self.screen_w.store(w, Ordering::Relaxed);
-        self.screen_h.store(h, Ordering::Relaxed);
+    /// Update the window rect (call after move/resize).
+    pub fn update_rect(&self, x: i32, y: i32, w: u32, h: u32) {
+        self.win_x.store(x, Ordering::Relaxed);
+        self.win_y.store(y, Ordering::Relaxed);
+        self.win_w.store(w, Ordering::Relaxed);
+        self.win_h.store(h, Ordering::Relaxed);
     }
 
     /// Check and clear the re-entry flag.

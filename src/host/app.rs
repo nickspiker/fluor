@@ -389,26 +389,18 @@ impl<A: FluorApp> DesktopShell<A> {
         }
     }
 
-    /// macOS click-through: check the alpha of the pixel under the cursor in persistent_screen.
-    /// If transparent (alpha < threshold), tell the OS to ignore mouse events so clicks pass
-    /// through to apps behind us. If opaque, ensure we're accepting events.
+    /// macOS click-through: only disable hittest when the cursor is outside the window rect.
+    /// Inside the window rect we always accept events — checking alpha per-pixel there is
+    /// too fragile (transparent UI elements, frame transitions, etc. cause false negatives
+    /// that drop clicks to the app behind us).
     #[cfg(target_os = "macos")]
     fn update_macos_hittest(&mut self) {
-        const ALPHA_THRESHOLD: u8 = 10;
-        let scr_w = self.screen_size.0 as usize;
-        let scr_h = self.screen_size.1 as usize;
-        let cx = self.cursor_x as usize;
-        let cy = self.cursor_y as usize;
-        if cx >= scr_w || cy >= scr_h {
-            return;
-        }
-        let idx = cy * scr_w + cx;
-        let alpha = if idx < self.persistent_screen.len() {
-            ((self.persistent_screen[idx] >> 24) & 0xFF) as u8
-        } else {
-            0
-        };
-        let should_ignore = alpha < ALPHA_THRESHOLD;
+        let cx = self.cursor_x as i32;
+        let cy = self.cursor_y as i32;
+        let r = &self.window_rect;
+        let inside = cx >= r.x && cx < r.x + r.w as i32
+                  && cy >= r.y && cy < r.y + r.h as i32;
+        let should_ignore = !inside;
         if should_ignore != self.hittest_off {
             if let Some(window) = self.window.as_ref() {
                 if should_ignore {
@@ -675,9 +667,10 @@ impl<A: FluorApp> DesktopShell<A> {
                 );
             }
             let _ = buffer.present();
-            // Update the global mouse monitor's screen pointer so it can check alpha.
+            // Update the global mouse monitor's window rect for re-entry detection.
             if let Some(ref monitor) = self.hittest_monitor {
-                monitor.update_screen(&self.persistent_screen, scr_w as u32, scr_h as u32);
+                let r = &self.window_rect;
+                monitor.update_rect(r.x, r.y, r.w, r.h);
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -1057,7 +1050,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
             use winit::platform::macos::WindowExtMacOS;
             window.set_has_shadow(false);
             self.hittest_monitor =
-                super::macos_hittest::HittestMonitor::install(mon_w, mon_h);
+                super::macos_hittest::HittestMonitor::install(mon_h);
         }
 
         // Initial visible-window size: app-supplied (defaults to half the screen in each axis) and centred. Apps with aspect-ratio opinions override [`FluorApp::initial_size`].
