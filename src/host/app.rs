@@ -1270,7 +1270,12 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 self.cursor_y = position.y as Coord;
 
                 #[cfg(target_os = "macos")]
-                self.update_macos_hittest();
+                {
+                    self.update_macos_hittest();
+                    if self.hittest_off {
+                        return;
+                    }
+                }
 
                 // During a self-driven resize drag, CursorMoved fires at hundreds of Hz (raw input rate) AND we synthesize more via set_outer_position (window-relative cursor pos changes when the window moves). Doing a full resize+paint+OS-update per event floods X11 (`XIO: fatal IO error 11`) and creates a multi-second backlog of stale requests that play back after release. Coalesce: just stash the new cursor pos and request a redraw — winit caps RedrawRequested to vsync (~60-144 Hz), and the actual drag tick runs there. Skips consumer event dispatch too (consumer doesn't need to see resize-drag cursor moves).
                 if self.is_dragging_resize {
