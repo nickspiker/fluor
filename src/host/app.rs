@@ -1295,6 +1295,9 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                             return;
                         }
                         self.is_dragging_move = true;
+                        if let Some(window) = self.window.as_ref() {
+                            window.set_cursor(winit::window::CursorIcon::Grabbing);
+                        }
                     }
                     self.window_rect.x = self.drag_move_rect_start.0 + dx;
                     self.window_rect.y = self.drag_move_rect_start.1 + dy;
@@ -1417,6 +1420,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                         self.pending_full_repaint = true;
                     }
                     if let Some(window) = self.window.as_ref() {
+                        window.set_cursor(winit::window::CursorIcon::Default);
                         window.request_redraw();
                     }
                 }
