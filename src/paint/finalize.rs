@@ -12,7 +12,7 @@ use super::{
 /// Per pixel:
 /// 1. `v = pixel ^ 0x00FFFFFF` — single XOR flips RGB darkness to visible (255 − dark). α stays as α (already opacity-direction in storage).
 /// 2. `final_α = (α × clip_mask_α) >> 8` — multiply with the window-shape clip; trims to the window's actual shape while preserving any partial α the under-chain produced.
-/// 3. **Linux only**: premultiply RGB by `final_α / 256`. macOS / other platforms get straight-α output and the OS does its own multiply at composite time.
+/// 3. Premultiply RGB by `final_α / 256`. Required on all platforms for clean AA edges.
 /// 4. Pack back into `0xααRRGGBB`.
 ///
 /// Debug toggles:
@@ -39,11 +39,8 @@ pub fn finalize_for_os(pixels: &mut [u32], clip_mask: &[u8]) {
         return;
     }
 
-    // On non-Linux the premult step is a no-op (s = 256 = identity multiply); we route through the same SIMD kernel with `skip_premult = true` so the hot loop is uniform across platforms.
-    #[cfg(target_os = "linux")]
+    // Premultiply RGB by final_α before handing to the OS compositor. Required on both Linux (X11 composite assumes premultiplied) and macOS (Metal PostMultiplied in practice needs it for clean AA edges — without it, edge pixels with fractional α show harsh checkerboard artifacts).
     let skip_premult = DEBUG_SKIP_PREMULT.load(std::sync::atomic::Ordering::Relaxed);
-    #[cfg(not(target_os = "linux"))]
-    let skip_premult = true;
 
     let pixels = &mut pixels[..n];
     let clip = &clip_mask[..n];
@@ -264,10 +261,7 @@ pub fn finalize_into_screen(
         return;
     }
 
-    #[cfg(target_os = "linux")]
     let skip_premult = DEBUG_SKIP_PREMULT.load(std::sync::atomic::Ordering::Relaxed);
-    #[cfg(not(target_os = "linux"))]
-    let skip_premult = true;
 
     let tint_scan = DEBUG_SHOW_OPAQUE_SCAN.load(std::sync::atomic::Ordering::Relaxed);
     if full_repaint {
