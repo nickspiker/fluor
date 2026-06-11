@@ -1340,7 +1340,18 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 }
             }
             WindowEvent::ModifiersChanged(mods) => {
+                let was_zoom = self.modifiers.control_key() || self.modifiers.super_key();
                 self.modifiers = mods.state();
+                let is_zoom = self.modifiers.control_key() || self.modifiers.super_key();
+                if is_zoom != was_zoom {
+                    if let Some(window) = self.window.as_ref() {
+                        if is_zoom {
+                            window.set_cursor(winit::window::CursorIcon::ZoomIn);
+                        } else {
+                            window.set_cursor(winit::window::CursorIcon::Default);
+                        }
+                    }
+                }
                 self.dispatch_event(event);
             }
             WindowEvent::KeyboardInput {
