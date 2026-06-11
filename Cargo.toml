@@ -33,7 +33,7 @@ host-bare = []
 # Android backend — ANativeWindow surface + JNI entry points + Choreographer-driven render scheduling. Enabled by the consumer's Android target block (e.g. photon's `[target.'cfg(target_os = "android")'.dependencies]`). text stays required because the chrome paints title glyphs; ndk + ndk-sys + jni + log are the NDK bindings the surface and JNI shims wrap.
 #
 # winit is intentionally NOT in this feature set — `FluorApp::set_event_proxy` takes a fluor-native `Arc<dyn WakeSender<Self::UserEvent>>` so the trait shape is platform-uniform without dragging winit's data types onto Android. Eliminates the `android-activity` compile-glue dep + the `android_main` linker shim that came along when winit was present on Android.
-host-android = ["std", "text", "dep:ndk", "dep:ndk-sys", "dep:jni", "dep:log"]
+host-android = ["std", "text", "dep:ndk", "dep:ndk-sys", "dep:jni", "dep:log", "dep:libc"]
 text = ["std", "dep:cosmic-text", "dep:swash"]
 # Portable SIMD via the `wide` crate. Widens inner loops in rasterizers / boundary passes /
 # the under() kernel to 4–8 pixels per iter. Scalar fallback path is preserved for builds
@@ -52,7 +52,7 @@ rayon = ["std", "dep:rayon"]
 spirix = { version = "0.0.12", path = "../spirix", default-features = false, features = ["alloc"] }
 
 # vsf decodes the canonical image format used by `host::icon` (orb / app-icon decode). Default features (std + registry) match fluor's host environment.
-vsf = { version = "0.3", path = "../vsf" }
+vsf = "0.8"
 
 # rav1d decodes AV1 OBU bitstreams for icons over `vsfimg`'s UNCOMPRESSED_MAX_DIM. `bitdepth_8` keeps the build slim — fluor's icon path is u8 RGB only.
 rav1d = { version = "1.1", default-features = false, features = ["bitdepth_8"] }
@@ -80,6 +80,8 @@ ndk = { version = "0.9", features = ["api-level-26"], optional = true }
 ndk-sys = { version = "0.6", optional = true }
 jni = { version = "0.21", optional = true }
 log = { version = "0.4", optional = true }
+# libc gives us `dlsym` / `RTLD_DEFAULT` to runtime-resolve NDK symbols added after our `api-level-26` floor (e.g. `ANativeWindow_setBuffersDataSpace` which is API 28+). Without runtime resolution the .so wouldn't even load on 26-27 devices because the dynamic linker resolves all imports eagerly at dlopen time.
+libc = { version = "0.2", optional = true }
 
 # x11rb is Linux-only. Used for `xcb_shape_rectangles(SK_INPUT, ...)` to set the click-through input region — the fullscreen transparent surface only accepts clicks inside `window_rect`; everything else passes through to whatever's behind us. `shape` feature pulls in the XShape extension bindings.
 [target.'cfg(target_os = "linux")'.dependencies]
