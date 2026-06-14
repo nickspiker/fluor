@@ -723,6 +723,17 @@ impl DefaultChrome {
     pub fn invalidate_chrome(&mut self) {
         self.group.rpn.layers[self.layer_chrome].dirty = true;
     }
+
+    /// Set the title-bar text, marking the chrome layer dirty only when it actually changed. Returns `true` if a repaint is needed. Mirrors [`set_status_text`](Self::set_status_text) — the idiomatic way to drive a dynamic title (e.g. a per-screen label) without re-rasterizing chrome every frame.
+    pub fn set_title(&mut self, title: impl Into<String>) -> bool {
+        let title = title.into();
+        if self.title == title {
+            return false;
+        }
+        self.title = title;
+        self.group.rpn.layers[self.layer_chrome].dirty = true;
+        true
+    }
 }
 
 /// Visit the four chrome buttons in tab order (app-icon → minimize → maximize → close). Order is the keyboard-discoverability convention: the orb sits visually leftmost so it leads in left-to-right reading order, then the window controls flow right-to-left from minimize to close. The app's outer [`Container`] decides where the chrome's buttons land in the overall cycle (typically AFTER content widgets like textboxes, matching macOS / GNOME).

@@ -102,6 +102,13 @@ impl Viewport {
             (31.0_f32 / 32.0).powf(-steps)
         };
         self.ru *= factor;
+        // Production zoom clamp (requested + justified by Nick): below 1/8 (12.5%) or above 3× (300%) the layout/scratch math starts to break, so the shipping build pins ru to that range. WHY this clamp is allowed despite AGENT.md Rule 0: it's a user-requested, user-justified bound on EXTERNAL input (scroll/zoom gestures), not defensive masking of internal math — and it's release-gated so it never hides a bug in dev (debug builds stay unclamped so the breakage threshold can still be probed).
+        #[cfg(not(debug_assertions))]
+        {
+            const ZOOM_MIN: f32 = 1.0 / (1 << 3) as f32; // 12.5%
+            const ZOOM_MAX: f32 = 3.0; // 300% — chosen ceiling, deliberately not a power of two
+            self.ru = self.ru.clamp(ZOOM_MIN, ZOOM_MAX);
+        }
     }
 
     /// Reset zoom to 1.0 (bound to `Ctrl/Cmd + 0` in the host).

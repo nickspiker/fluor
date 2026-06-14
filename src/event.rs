@@ -51,6 +51,8 @@ pub enum Event {
     Focused(bool),
     /// IME event — composition preedit or commit. Android `InputConnection` commit text and desktop IME both flow through here.
     Ime(Ime),
+    /// A file was drag-and-dropped onto the window. Carries the OS path as a String (lossy UTF-8); the app reads + interprets it. Desktop only today — winit emits `WindowEvent::DroppedFile`; Android has no equivalent (it uses the system image picker instead).
+    DroppedFile(String),
 }
 
 // ============================================================================ Element state / mouse button ===============================================
