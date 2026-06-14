@@ -1248,14 +1248,40 @@ mod widget_impls {
                     changed = true;
                 }
                 FKey::Named(NamedKey::ArrowLeft) => {
-                    start_selection_if_needed(self);
-                    self.cursor_left();
-                    changed = true;
+                    // Non-shift arrow over an active selection collapses to the selection EDGE (left edge here) without stepping — standard editor behaviour. Stepping from the cursor would land one short of, or past, the edge depending on which end the cursor sat. Shift extends instead, so it falls through to the step path.
+                    if !shift {
+                        if let Some((start, _)) = self.selection_range() {
+                            self.selection_anchor = None;
+                            self.cursor = start;
+                            self.update_scroll();
+                            changed = true;
+                        } else {
+                            self.cursor_left();
+                            changed = true;
+                        }
+                    } else {
+                        start_selection_if_needed(self);
+                        self.cursor_left();
+                        changed = true;
+                    }
                 }
                 FKey::Named(NamedKey::ArrowRight) => {
-                    start_selection_if_needed(self);
-                    self.cursor_right();
-                    changed = true;
+                    // Mirror of ArrowLeft: collapse to the right edge of an active selection without stepping.
+                    if !shift {
+                        if let Some((_, end)) = self.selection_range() {
+                            self.selection_anchor = None;
+                            self.cursor = end;
+                            self.update_scroll();
+                            changed = true;
+                        } else {
+                            self.cursor_right();
+                            changed = true;
+                        }
+                    } else {
+                        start_selection_if_needed(self);
+                        self.cursor_right();
+                        changed = true;
+                    }
                 }
                 FKey::Named(NamedKey::Home) => {
                     start_selection_if_needed(self);

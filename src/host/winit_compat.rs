@@ -155,6 +155,7 @@ pub fn from_winit_event(event: &winit::event::WindowEvent) -> Option<Event> {
         W::ModifiersChanged(m) => Some(Event::ModifiersChanged(from_winit_mods(m.state()))),
         W::Focused(f) => Some(Event::Focused(*f)),
         W::Ime(i) => from_winit_ime(i).map(Event::Ime),
+        W::DroppedFile(path) => Some(Event::DroppedFile(path.to_string_lossy().into_owned())),
         _ => None,
     }
 }
