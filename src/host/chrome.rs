@@ -49,9 +49,9 @@ pub enum ResizeEdge {
 
 /// Classify a cursor position as one of nine resize zones (or None for the window interior). Geometry only — no rasterization. Edge band thickness derived from harmonic-mean span so the hit zone scales with viewport size.
 pub fn get_resize_edge(window_width: u32, window_height: u32, x: Coord, y: Coord) -> ResizeEdge {
-    let span = 2.0 * window_width as Coord * window_height as Coord
+    let span = 2. * window_width as Coord * window_height as Coord
         / (window_width as Coord + window_height as Coord);
-    let resize_border = math::ceil(span / 32.0);
+    let resize_border = math::ceil(span / 32.);
 
     let at_left = x < resize_border;
     let at_right = x > (window_width as Coord - resize_border);
@@ -99,20 +99,11 @@ pub fn draw_window_edges_and_mask(
     light: u32,
     shadow: u32,
 ) {
-    let _ = hit_test_map;
-    if width < 2 || height < 2 {
-        return;
-    }
     let w = width as usize;
     let h = height as usize;
-    if start * 2 >= w || start * 2 >= h {
-        return;
-    }
+
     let count = crossings.len();
     let cap = start + count;
-    if cap * 2 >= w || cap * 2 >= h {
-        return;
-    }
 
     // Straight edges — opaque chrome composed via Under. Clip mask along these edges stays at the host's 255 default (fully visible).
     for x in cap..(w - cap) {
@@ -373,11 +364,16 @@ pub fn draw_status_bar(
     );
 }
 
-/// Rasterize the top-left app-icon orb: a circular sample of `icon` clipped to `radius`, wrapped in an optional 1-px AA ring stroked in `ring_colour`. Topology mirrors [`draw_window_edges_and_mask`]'s two-sided AA: ring is 1px solid + 1px inner-AA + 1px outer-AA. `cx`/`cy` give the orb centre in pixel coords; `radius` is the icon sampling radius (ring extends outward from it). Without an `icon`, the interior fills with `ring_colour` (treated as a solid dark disk). Without a `ring_colour`, the orb is just the icon clipped to a circle (1-pixel outer-AA against the chrome).
+/// Rasterize the top-left app-icon orb: a circular sample of `icon` clipped to `radius`, wrapped in an optional ring stroked in `ring_colour`. The ring is a thin hairline — the icon fills crisply to `r−1`, then a `stroke_width + 1`-px solid band (1px when `stroke_width` is 0), then a 1px outer AA against the chrome. The icon/ring seam is opaque→opaque so it needs no AA; only the outer silhouette is anti-aliased. `cx`/`cy` give the orb centre in pixel coords; `radius` is the icon sampling radius (ring extends outward from it). Without an `icon`, the interior fills with `ring_colour` (treated as a solid dark disk). Without a `ring_colour`, the orb is just the icon clipped to a circle (1-pixel outer-AA against the chrome).
 ///
 /// Pixel sampling is nearest-neighbour from `icon`'s `width × height` source — the source is square in practice (`vsfimg` doesn't reshape) but the math doesn't assume that. Per-pixel cost is one map index + one `under` composite; total work is `O(diameter²)`, well under a millisecond at typical chrome sizes (~30–100 px orbs).
 ///
 /// Hit-test: every pixel inside `r_outer²` (excluding the AA fringe) is tagged with `hit_id` so the host can route clicks to the chrome's app-icon widget. Decorative-only consumers can pass `None` for `hit_test_map` to skip the tag (in which case `hit_id` is ignored).
+/// Rasterize the top-left app-icon orb: the icon sampled into a circle of radius `r−1`, wrapped in a thin ring of `ring_colour`. Integer `dist²` bands — same approach as the avatar / window-edge rasterizers: icon interior (`≤ (r−1)²`), then a `stroke_width`-px solid ring, then a 1-px outer AA against the chrome (`(r_aa²−dist²) << 8 / diff`). No floating point, no sqrt.
+///
+/// `stroke_width = (r >> 5) + 1`: the `+1` is the textbox "minimum 1-px stroke" idiom (an additive floor, not a clamp), and `r >> 5` adds a proportional pixel only on large / zoomed orbs.
+///
+/// Precondition: the orb is the fixed top-left chrome badge, always fully on-screen (`cx, cy ≥ r_aa` and `cx+r_aa, cy+r_aa < dims` for the chrome's `button_size/2`-centred, `button_size/4`-radius orb), so the bbox is in-bounds by construction — no clamping. A violated precondition wraps a `usize` and panics on the index (fail loud). Without an `icon`, the interior fills with `ring_colour` as a solid disk; `hit_test_map` (when present) tags every pixel inside the solid ring with `hit_id`.
 pub fn draw_app_icon(
     pixels: &mut [u32],
     hit_test_map: Option<&mut [HitId]>,
@@ -393,92 +389,46 @@ pub fn draw_app_icon(
     brighten: bool,
 ) {
     let r = radius;
-    if r < 2 {
-        return;
-    }
-    // Stroke matches photon: `r / 16` with no floor. At small orbs (r < 16) this is 0 — the ring degrades to just the 1-px outer-AA edge instead of a forced 2-px band, so the orb stays proportional at chrome-button sizes.
-    let stroke_width = r / 16;
-
-    let r_inner = r - 1;
-    let r_inner2 = r_inner * r_inner;
-    let r_inner_inner = r - 2;
-    let r_inner_inner2 = r_inner_inner * r_inner_inner;
-    let r_outer = r + stroke_width;
-    let r_outer2 = r_outer * r_outer;
-    let r_outer_outer = r_outer + 1;
-    let r_outer_outer2 = r_outer_outer * r_outer_outer;
-    // diff_inner = r_inner² − r_inner_inner² = (r−1)² − (r−2)² = 2r − 3, which is ≥ 1 given the `r < 2` early return above. diff_outer = (r+sw+1)² − (r+sw)² = 2(r+sw) + 1 ≥ 5. Both are safe divisors; no max() guard needed.
-    let diff_inner = r_inner2 - r_inner_inner2;
-    let diff_outer = r_outer_outer2 - r_outer2;
-
-    // BBox intersection with screen. WHY: caller can pass any (cx, cy) — orb may be partially or fully off-screen (e.g. scroll offsets in a future viewport). PROOF: clip the circle bounding box to `[0, width) × [0, height)`, returning early if the intersection is empty. PREVENTS: a negative isize converting to usize would wrap to a huge value and the iteration would index well past the buffer end (out-of-bounds → panic, or in release with overflow-checks=false → undefined behaviour).
-    let max_r = if ring_colour.is_some() {
-        r_outer_outer
-    } else {
-        r_inner
-    };
-    let y_min_i = (cy - max_r).max(0);
-    let y_max_i = (cy + max_r + 1).min(height as isize);
-    let x_min_i = (cx - max_r).max(0);
-    let x_max_i = (cx + max_r + 1).min(width as isize);
-    if y_max_i <= y_min_i || x_max_i <= x_min_i {
-        return;
-    }
-    let (y_min, y_max, x_min, x_max) = (
-        y_min_i as usize,
-        y_max_i as usize,
-        x_min_i as usize,
-        x_max_i as usize,
-    );
+    let stroke_width = (r >> 5) + 1;
+    let r_icon2 = (r - 1) * (r - 1);
+    let r_ring = r - 1 + stroke_width;
+    let r_ring2 = r_ring * r_ring;
+    let r_aa = r_ring + 1;
+    let r_aa2 = r_aa * r_aa;
+    let diff = r_aa2 - r_ring2; // = 2·r_ring + 1
 
     let mut htm = hit_test_map;
+    let y0 = (cy - r_aa) as usize;
+    let y1 = (cy + r_aa + 1) as usize;
+    let x0 = (cx - r_aa) as usize;
+    let x1 = (cx + r_aa + 1) as usize;
 
-    for y in y_min..y_max {
+    for y in y0..y1 {
         let dy = y as isize - cy;
         let dy2 = dy * dy;
-        for x in x_min..x_max {
+        for x in x0..x1 {
             let dx = x as isize - cx;
             let dist2 = dx * dx + dy2;
             let idx = y * width + x;
 
             if let Some(map) = htm.as_mut() {
-                if dist2 <= r_outer2 {
+                if dist2 <= r_ring2 {
                     map[idx] = hit_id;
                 }
             }
 
-            if let Some(ring) = ring_colour {
-                let ring_rgb = ring & 0x00FFFFFF;
-                if dist2 <= r_inner_inner2 {
-                    let top = sample_icon(icon, dx, dy, r, ring, darken, brighten);
-                    pixels[idx] = pixels[idx].under(top, BlendMode::Normal);
-                } else if dist2 < r_inner2 {
-                    let icon_pixel = sample_icon(icon, dx, dy, r, ring, darken, brighten);
-                    // dist2 ∈ (r_inner_inner², r_inner²) (strict on both sides). numerator < diff_inner, (numerator << 8) < diff_inner << 8, division < 256 — fits a u8 cleanly with no clamp.
-                    let t = ((dist2 - r_inner_inner2) << 8) / diff_inner;
-                    let mixed = mix_rgb(icon_pixel, 0xFF000000 | ring_rgb, t as u32);
-                    pixels[idx] = pixels[idx].under(mixed, BlendMode::Normal);
-                } else if dist2 <= r_outer2 {
-                    pixels[idx] = pixels[idx].under(0xFF000000 | ring_rgb, BlendMode::Normal);
-                } else if dist2 <= r_outer_outer2 {
-                    // dist2 ∈ (r_outer², r_outer_outer²]. numerator ∈ [0, diff_outer), (numerator << 8) < diff_outer << 8, division < 256.
-                    let edge_a = ((r_outer_outer2 - dist2) << 8) / diff_outer;
-                    let top = ((edge_a as u32) << 24) | ring_rgb;
-                    pixels[idx] = pixels[idx].under(top, BlendMode::Normal);
-                }
-            } else {
-                if dist2 > r_inner2 {
-                    continue;
-                }
-                if dist2 <= r_inner_inner2 {
-                    let top = sample_icon(icon, dx, dy, r, 0, darken, brighten);
-                    pixels[idx] = pixels[idx].under(top, BlendMode::Normal);
-                } else {
-                    let icon_pixel = sample_icon(icon, dx, dy, r, 0, darken, brighten);
-                    // dist2 ∈ (r_inner_inner², r_inner²]. r_inner² − dist2 ∈ [0, diff_inner), so (numerator << 8)/diff_inner < 256 — fits u8 with no clamp.
-                    let edge_a = ((r_inner2 - dist2) << 8) / diff_inner;
-                    let top = ((edge_a as u32) << 24) | (icon_pixel & 0x00FFFFFF);
-                    pixels[idx] = pixels[idx].under(top, BlendMode::Normal);
+            if dist2 <= r_icon2 {
+                let top = sample_icon(icon, dx, dy, r, ring_colour.unwrap_or(0), darken, brighten);
+                pixels[idx] = pixels[idx].under(top, BlendMode::Normal);
+            } else if let Some(ring) = ring_colour {
+                let ring_rgb = ring & 0x00FF_FFFF;
+                if dist2 <= r_ring2 {
+                    pixels[idx] = pixels[idx].under(0xFF00_0000 | ring_rgb, BlendMode::Normal);
+                } else if dist2 <= r_aa2 {
+                    let alpha = (((r_aa2 - dist2) << 8) / diff) as u32;
+                    if alpha != 0 {
+                        pixels[idx] = pixels[idx].under((alpha << 24) | ring_rgb, BlendMode::Normal);
+                    }
                 }
             }
         }
@@ -487,7 +437,7 @@ pub fn draw_app_icon(
 
 /// Nearest-neighbour fetch from `icon` for offset `(dx, dy)` from the orb centre, scaled to fit `radius`. Returns an opaque α + darkness pixel after applying `brighten` (photon's 3/2 visible-RGB lift) and `darken` (linear blend toward mid-grey: 0 = icon as-is, 255 = fully grey). Falls back to a solid `fallback_ring` (or dark grey) when no icon is present.
 ///
-/// Precondition: caller only invokes this when `dx² + dy² ≤ r_inner² = (r−1)²`, so `|dx|, |dy| ≤ r−1` and `u = (dx+r+0.5)/(2r) ∈ (0, 1)` strictly — `sx = (u * img.width) as usize` is therefore `< img.width`. Violating that precondition panics on the index (fail loud).
+/// Precondition: caller only invokes this when `dx² + dy² ≤ (r−1)²`, so `|dx|, |dy| ≤ r−1`, giving `2(dx+r)+1 ∈ [3, 4r−1]` and therefore `sx = (2(dx+r)+1)·width / 4r ∈ [0, width)`. Violating that precondition panics on the index (fail loud).
 fn sample_icon(
     icon: Option<&Icon>,
     dx: isize,
@@ -498,11 +448,10 @@ fn sample_icon(
     brighten: bool,
 ) -> u32 {
     let raw = if let Some(img) = icon {
-        let diameter = (radius * 2) as f32;
-        let u = ((dx + radius) as f32 + 0.5) / diameter;
-        let v = ((dy + radius) as f32 + 0.5) / diameter;
-        let sx = (u * img.width as f32) as usize;
-        let sy = (v * img.height as f32) as usize;
+        // Integer nearest-neighbour: the float map `((d+r)+0.5)/(2r)·dim` doubled is `(2(d+r)+1)·dim / (4r)`, exact in integers. The precondition |dx|,|dy| ≤ r−1 keeps `sx, sy ∈ [0, dim)`.
+        let denom = 4 * radius;
+        let sx = ((2 * (dx + radius) + 1) * img.width as isize / denom) as usize;
+        let sy = ((2 * (dy + radius) + 1) * img.height as isize / denom) as usize;
         img.pixels[sy * img.width as usize + sx]
     } else if fallback_ring != 0 {
         0xFF000000 | (fallback_ring & 0x00FFFFFF)
@@ -539,21 +488,6 @@ fn modulate_icon_pixel(pixel: u32, darken: u8, brighten: bool) -> u32 {
     (pixel & 0xFF000000) | (dr << 16) | (dg << 8) | db
 }
 
-/// Per-channel linear interpolation in darkness space: `t = 0` returns `a`, `t = 255` returns `b`. Keeps the α byte from `a`. Used for blending the icon with the ring across the inner-AA edge.
-fn mix_rgb(a: u32, b: u32, t: u32) -> u32 {
-    let inv = 256 - t;
-    let alpha = a & 0xFF000000;
-    let ar = (a >> 16) & 0xFF;
-    let ag = (a >> 8) & 0xFF;
-    let ab = a & 0xFF;
-    let br = (b >> 16) & 0xFF;
-    let bg = (b >> 8) & 0xFF;
-    let bb = b & 0xFF;
-    let r = (ar * inv + br * t) >> 8;
-    let g = (ag * inv + bg * t) >> 8;
-    let bch = (ab * inv + bb * t) >> 8;
-    alpha | (r << 16) | (g << 8) | bch
-}
 
 /// Strip geometry consumed by the three `draw_strip_*` functions. Returns `None` if the strip can't fit in the viewport.
 fn strip_layout(
@@ -944,31 +878,9 @@ pub fn draw_maximize_symbol(
     }
 }
 
-/// Distance from `(px, py)` to the capsule (rounded-line) `[(x1,y1)..(x2,y2)]` with radius `rad`. Negative inside, positive outside. Used by [`draw_close_symbol`] to rasterize the two diagonals.
-fn distance_to_capsule(px: f32, py: f32, x1: f32, y1: f32, x2: f32, y2: f32, rad: f32) -> f32 {
-    let dx = x2 - x1;
-    let dy = y2 - y1;
-    let len_sq = dx * dx + dy * dy;
-    let t = if len_sq > 0.0 {
-        let raw = ((px - x1) * dx + (py - y1) * dy) / len_sq;
-        if raw < 0.0 {
-            0.0
-        } else if raw > 1.0 {
-            1.0
-        } else {
-            raw
-        }
-    } else {
-        0.0
-    };
-    let cx = x1 + t * dx;
-    let cy = y1 + t * dy;
-    let ddx = px - cx;
-    let ddy = py - cy;
-    math::sqrt(ddx * ddx + ddy * ddy) - rad
-}
-
-/// Rasterize the close glyph (an X made of two diagonal capsules) centered at `(cx, cy)` with arm half-length `r`. Top-down per-pixel inside the X's bounding box.
+/// Rasterize the close glyph — an ✕ of two 45° diagonal capsules — centred at `(cx, cy)` with arm radius `r`. Integer math, same spirit as [`draw_minimize_symbol`]/[`draw_maximize_symbol`]: per pixel, the squared distance to the relevant diagonal is compared against the stroke radius in a scaled (`×8`) integer domain, with a 1-pixel AA band. No floating point, no `sqrt`.
+///
+/// Coordinates run in a doubled, pixel-centred frame (`ax = 2·dx + 1 = 2·x_actual`), so the half-pixel sample offset and the diagonal's `1/√2` factor fall out as exact integers: a diagonal's perpendicular squared distance is `perp²/8` of the true value and a cap endpoint's is `[(ax−epx)²+(ay−epy)²]/4`. Multiplying through by 8 (`d8`) clears both, so every test is against `radius²·8 = 2·rad²`. The only division is the AA ramp, whose divisor `denom = 8·rad ≥ 8` is provably non-zero and whose result is provably `< 256` in the ramp branch (there `d8 > inner8`, so `outer8 − d8 < denom`).
 pub fn draw_close_symbol(
     pixels: &mut [u32],
     width: usize,
@@ -979,63 +891,59 @@ pub fn draw_close_symbol(
     stroke: u32,
     bg: u32,
 ) {
-    let r = r + 1;
-    let thickness = ((r / 3).max(1)) as f32;
-    let radius = thickness * 0.5;
-    let end = (r * 2) as f32 / 3.0;
-    let cxf = cx as f32;
-    let cyf = cy as f32;
-    let x1s = cxf - end;
-    let y1s = cyf - end;
-    let x1e = cxf + end;
-    let y1e = cyf + end;
-    let x2s = cxf + end;
-    let y2s = cyf - end;
-    let x2e = cxf - end;
-    let y2e = cyf + end;
-    let stroke_rgb = (
-        ((stroke >> 16) & 0xFF) as u32,
-        ((stroke >> 8) & 0xFF) as u32,
-        (stroke & 0xFF) as u32,
-    );
     let _ = bg;
-    let _ = stroke_rgb;
+    let r = r + 1;
+    // Doubled-frame stroke half-width (`rad = thickness`, since rad = 2·radius_actual) and arm half-length (`end = 2·(2r/3)`). `thickness ≥ 1` is a visible-stroke floor — a 0-px glyph draws nothing — not a degenerate-input guard.
+    let thickness = (r / 3).max(1) as isize;
+    let rad = thickness;
+    let end = (4 * r / 3) as isize;
+    let cxi = cx as isize;
+    let cyi = cy as isize;
 
-    let min_x = cx.saturating_sub(r);
-    let max_x = (cx + r).min(width);
-    let min_y = cy.saturating_sub(r);
-    let max_y = (cy + r).min(height);
+    // AA band straddling the stroke surface (±0.5 px = ±1 in the doubled frame), in the ×8 squared-distance domain.
+    let inner8 = 2 * (rad - 1) * (rad - 1);
+    let outer8 = 2 * (rad + 1) * (rad + 1);
+    let denom = outer8 - inner8; // = 8·rad ≥ 8
 
-    for py in min_y..max_y {
-        for px in min_x..max_x {
-            let pxf = px as f32 + 0.5;
-            let pyf = py as f32 + 0.5;
-            // Choose the diagonal whose orientation matches this quadrant.
-            let use_d1 = (px >= cx && py >= cy) || (px < cx && py < cy);
-            let dist = if use_d1 {
-                distance_to_capsule(pxf, pyf, x1s, y1s, x1e, y1e, radius)
+    let r_i = r as isize;
+    let x0 = (cxi - r_i).max(0) as usize;
+    let x1 = ((cxi + r_i + 1).max(0) as usize).min(width);
+    let y0 = (cyi - r_i).max(0) as usize;
+    let y1 = ((cyi + r_i + 1).max(0) as usize).min(height);
+
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let ax = 2 * (px as isize - cxi) + 1;
+            let ay = 2 * (py as isize - cyi) + 1;
+            // ╲ diagonal for the TL/BR quadrants, ╱ for TR/BL. `perp` = across-stroke axis, `along` = down-stroke axis.
+            let backslash = (px >= cx && py >= cy) || (px < cx && py < cy);
+            let (perp, along) = if backslash {
+                (ax - ay, ax + ay)
             } else {
-                distance_to_capsule(pxf, pyf, x2s, y2s, x2e, y2e, radius)
+                (ax + ay, ax - ay)
             };
-            let alpha_f = if dist < -0.5 {
-                1.0
-            } else if dist < 0.5 {
-                0.5 - dist
+            let d8 = if along.abs() <= 2 * end {
+                perp * perp // beside the segment — distance is purely perpendicular
             } else {
-                0.0
+                // past a cap — distance to the rounded endpoint at (±end, ±end).
+                let s = if along > 0 { 1 } else { -1 };
+                let (epx, epy) = if backslash { (s * end, s * end) } else { (s * end, -s * end) };
+                2 * ((ax - epx) * (ax - epx) + (ay - epy) * (ay - epy))
             };
-            if alpha_f <= 0.0 {
+            if d8 > outer8 {
+                continue;
+            }
+            let alpha = if d8 <= inner8 {
+                255u32
+            } else {
+                (((outer8 - d8) << 8) / denom) as u32
+            };
+            if alpha == 0 {
                 continue;
             }
             let idx = py * width + px;
-            // AA via α-byte: opacity = alpha_f (clamped to 1.0 = fully opaque).
-            let opacity = (alpha_f * 256.0).min(256.0) as u32;
-            if opacity == 0 {
-                continue;
-            }
-            let chrome_alpha = opacity.min(255);
-            let value = (stroke & 0x00FFFFFF) | (chrome_alpha << 24);
-            pixels[idx] = pixels[idx].under(value, BlendMode::Normal);
+            pixels[idx] =
+                pixels[idx].under((stroke & 0x00FF_FFFF) | (alpha << 24), BlendMode::Normal);
         }
     }
 }
