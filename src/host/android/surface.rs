@@ -7,9 +7,51 @@
 //! Idle frames (`dirty = false` and magic-pixel matches) cost one lock + one read + one unlock+post — no per-pixel work. Stale-but-idle frames re-finalize from `scratch` (which retains the last full α + darkness frame), so we converge to the cached state across the buffer rotation without keeping an intermediate `Vec<u32>` cache.
 
 use ndk::native_window::NativeWindow;
-use ndk_sys::{ANativeWindow_Buffer, ANativeWindow_lock, ANativeWindow_unlockAndPost};
+use ndk_sys::{ADataSpace, ANativeWindow_Buffer, ANativeWindow_lock, ANativeWindow_unlockAndPost};
 
 use crate::canvas::PixelRect;
+
+/// `ANativeWindow_setBuffersDataSpace` resolved at runtime via `dlsym`. Required because the symbol was added in NDK API 28 — linking it as a strong import would prevent the .so from loading at all on devices below 28 (the dynamic linker resolves all imports eagerly at `dlopen` time). Resolving via `dlsym` keeps the binary compatible with our `api-level-26` floor: on 26-27 the symbol comes back null and we silently skip the dataspace tag (the buffer stays at the compositor's default — sRGB — which is the correct fallback). On 28+ we get the proper Display-P3 tagging.
+type SetBuffersDataSpaceFn =
+    unsafe extern "C" fn(*mut ndk_sys::ANativeWindow, i32) -> i32;
+
+fn lookup_set_buffers_data_space() -> Option<SetBuffersDataSpaceFn> {
+    use core::sync::atomic::{AtomicPtr, Ordering};
+    static CACHED: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(core::ptr::null_mut());
+    // Sentinel: we use 1 as "lookup done, symbol not present" so a non-zero non-1 value means "valid function pointer". This keeps the load-acquire path branch-free in the common case.
+    const NOT_PRESENT: *mut core::ffi::c_void = 1 as *mut _;
+    let cached = CACHED.load(Ordering::Acquire);
+    if cached == NOT_PRESENT {
+        return None;
+    }
+    if !cached.is_null() {
+        return Some(unsafe { core::mem::transmute::<*mut core::ffi::c_void, SetBuffersDataSpaceFn>(cached) });
+    }
+    // RTLD_DEFAULT doesn't find post-link-time NDK symbols on Android (the dynamic linker namespaces hide libandroid.so from the default search). Explicitly dlopen libandroid.so first, then dlsym off that handle.
+    unsafe {
+        let libname = c"libandroid.so";
+        let lib = libc::dlopen(libname.as_ptr(), libc::RTLD_NOW | libc::RTLD_NOLOAD);
+        let lib = if lib.is_null() {
+            // RTLD_NOLOAD returned null — try a real load.
+            libc::dlopen(libname.as_ptr(), libc::RTLD_NOW)
+        } else {
+            lib
+        };
+        if lib.is_null() {
+            CACHED.store(NOT_PRESENT, Ordering::Release);
+            return None;
+        }
+        let name = c"ANativeWindow_setBuffersDataSpace";
+        let handle = libc::dlsym(lib, name.as_ptr());
+        let to_store = if handle.is_null() { NOT_PRESENT } else { handle };
+        CACHED.store(to_store, Ordering::Release);
+        if handle.is_null() {
+            None
+        } else {
+            Some(core::mem::transmute::<*mut core::ffi::c_void, SetBuffersDataSpaceFn>(handle))
+        }
+    }
+}
 
 /// Samsung-device flag.
 static mut SAMSUNG_MODE: bool = false;
@@ -25,11 +67,13 @@ fn is_samsung() -> bool {
     unsafe { SAMSUNG_MODE }
 }
 
-/// Lightweight surface state: tracks the surface dimensions and the monotonic content-version counter that drives the magic-pixel triple-buffer cache. No intermediate pixel buffer — finalize writes directly into ANativeWindow's locked bits.
+/// Lightweight surface state: tracks the surface dimensions, the monotonic content-version counter that drives the magic-pixel triple-buffer cache, and a one-shot flag that marks whether the ANativeWindow buffer dataspace has been pushed to `ADATASPACE_DISPLAY_P3` yet. No intermediate pixel buffer — finalize writes directly into ANativeWindow's locked bits.
 pub struct Surface {
     width: u32,
     height: u32,
     content_version: u32,
+    /// True once `ANativeWindow_setBuffersDataSpace(ADATASPACE_DISPLAY_P3)` has been called for the current `NativeWindow`. Combined with the Activity's `colorMode = WIDE_COLOR_GAMUT` + `preferMinimalPostProcessing`, this gives the consumer pipeline a display-native target: the bytes we write are taken as Display-P3 ARGB and land on the panel without an sRGB clamp or vendor saturation pass. Photon does its own colour-management later on the theme constants + chromatic wave, so any OS-side clamp would be actively destructive. Reset to `false` on resize because Android may re-create the buffer queue under a new geometry and lose the dataspace setting.
+    dataspace_set: bool,
 }
 
 impl Surface {
@@ -38,6 +82,7 @@ impl Surface {
             width,
             height,
             content_version: 1,
+            dataspace_set: false,
         }
     }
 
@@ -51,6 +96,8 @@ impl Surface {
         if self.content_version == 0 {
             self.content_version = 1;
         }
+        // Force re-push of the Display-P3 dataspace next frame — surfaceChanged on Android can recreate the back-buffer queue, and a fresh queue defaults back to the implicit sRGB dataspace.
+        self.dataspace_set = false;
     }
 
     pub fn dimensions(&self) -> (u32, u32) {
@@ -73,6 +120,36 @@ impl Surface {
         dirty: bool,
     ) -> bool {
         unsafe {
+            // One-shot per buffer-queue lifetime: declare our pixels are in Display P3, not sRGB. Without this, the compositor treats the bytes we write as sRGB and runs them through an sRGB→panel-native colour transform — exactly the desaturation/wash the photon pipeline is going to fight by doing its own colour management on theme + spectrum colours later. Resolved via dlsym (see [`lookup_set_buffers_data_space`]) so the binary stays loadable on pre-API-28 devices that don't ship the symbol.
+            if !self.dataspace_set {
+                match lookup_set_buffers_data_space() {
+                    Some(set_ds) => {
+                        // PHOTON COLOUR PIPELINE ON ANDROID. Photon writes γ=2.0 BT.2020 RGB into the buffer. We tag the buffer as γ=2.2 BT.2020 because γ=2.2 is the closest named transfer Android offers — there is no `TRANSFER_GAMMA2_0` constant and no way to pass a custom transfer function to SurfaceFlinger. The mismatch (we say γ=2.2, we send γ=2.0) means the panel renders slightly darker than authored because SF interprets each stored value as `code^2.2` when in fact we stored `code^2.0`. This trade-off is intentional and load-bearing: photon's pipeline uses square / sqrt for encode / decode at 2-4 CPU cycles per pixel; replacing them with `powf(x, 1.0/2.2)` or worse the sRGB piecewise transfer would cost 50-100 cycles per pixel running on every rasterizer, every glyph, every overlay — flatly unacceptable, and fractional gammas are numerically miserable to invert and compose. We pick γ=2.0 once at architecture time and stick with it. Users who want exact-correct rendering need to be on ferros (our own host, which we build to honour γ=2.0 end-to-end) or a non-Android platform — the slight darkness on Android is the documented cost of shipping on a platform whose colour-management API has no γ=2.0 entry; if a user complains, file a feature request against Android for `TRANSFER_GAMMA2_0`. BT.2020 primaries because photon's spectral pipeline can synthesize colours wider than P3 and we'd rather tag them honestly (and let SF tonemap into the display gamut) than clip into a narrower gamut ourselves. Constructed by OR since there's no matching `ADATASPACE_*` named constant for BT2020 + GAMMA2_2: layout 6<<16 | 4<<22 | 1<<27 = 151388160.
+                        const STANDARD_BT2020: i32 = 6 << 16;
+                        const TRANSFER_GAMMA2_2: i32 = 4 << 22;
+                        const RANGE_FULL: i32 = 1 << 27;
+                        let custom_dataspace = STANDARD_BT2020 | TRANSFER_GAMMA2_2 | RANGE_FULL;
+                        let rc = set_ds(window.ptr().as_ptr(), custom_dataspace);
+                        if rc == 0 {
+                            log::info!(
+                                "fluor::host::android::surface: setBuffersDataSpace(BT2020 | GAMMA2_2 | FULL = {}) ok",
+                                custom_dataspace
+                            );
+                        } else {
+                            log::warn!(
+                                "fluor::host::android::surface: setBuffersDataSpace(BT2020 | GAMMA2_2 | FULL) returned {} — staying on compositor default",
+                                rc
+                            );
+                        }
+                    }
+                    None => log::warn!(
+                        "fluor::host::android::surface: ANativeWindow_setBuffersDataSpace symbol not found (API < 28); P3 tag not applied"
+                    ),
+                }
+                // Set the flag whether or not the call succeeded so we don't retry every frame.
+                self.dataspace_set = true;
+            }
+
             let mut android_buffer: ANativeWindow_Buffer = core::mem::zeroed();
             if ANativeWindow_lock(
                 window.ptr().as_ptr(),

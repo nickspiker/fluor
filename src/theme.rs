@@ -4,8 +4,37 @@
 //!
 //! At the OS boundary, [`crate::paint::finalize_for_os`] does a single `pixel ^= 0x00FFFFFF` that flips RGB darkness back to visible; α passes through (already opacity-direction in storage) — putting the pixel in the format the host compositor wants.
 
+/// Display colour-space matrix slot.
+///
+/// On Android, photon's Activity queries `display.preferredWideGamutColorSpace` and pushes the panel's RGB→CIE-XYZ-D50 3x3 matrix here through a JNI shim. Consumers (chromatic_wave, future LMS-based painters) read it via [`display_rgb_to_xyz`] and compose with their own LMS→XYZ matrix to land samples in the actual device's primaries instead of falling through a hardcoded REC2020 approximation. `None` until the JNI shim fires, and on desktop builds; consumers fall back to whatever default they want in that case.
+static DISPLAY_RGB_TO_XYZ: std::sync::Mutex<Option<[f32; 9]>> = std::sync::Mutex::new(None);
+
+/// Display chromaticity primaries (R, G, B as 1931-xy pairs — 6 floats: Rx Ry Gx Gy Bx By). Companion to [`display_rgb_to_xyz`]; useful when a consumer wants to do its own gamut mapping rather than going through XYZ.
+static DISPLAY_PRIMARIES: std::sync::Mutex<Option<[f32; 6]>> = std::sync::Mutex::new(None);
+
+/// Push the device's display colour-space data. Called from the JNI shim on Android after the Activity's display is available. Idempotent — safe to call multiple times (e.g. on display reconfiguration).
+pub fn set_display_color_space(rgb_to_xyz: [f32; 9], primaries: [f32; 6]) {
+    if let Ok(mut g) = DISPLAY_RGB_TO_XYZ.lock() {
+        *g = Some(rgb_to_xyz);
+    }
+    if let Ok(mut g) = DISPLAY_PRIMARIES.lock() {
+        *g = Some(primaries);
+    }
+}
+
+/// Read the device's display RGB→XYZ matrix if available. Consumers fall back to a hardcoded approximation (REC2020 in chromatic_wave's case) when this returns `None`.
+pub fn display_rgb_to_xyz() -> Option<[f32; 9]> {
+    DISPLAY_RGB_TO_XYZ.lock().ok().and_then(|g| *g)
+}
+
+/// Read the device's display chromaticity primaries `[Rx, Ry, Gx, Gy, Bx, By]` if available.
+pub fn display_primaries() -> Option<[f32; 6]> {
+    DISPLAY_PRIMARIES.lock().ok().and_then(|g| *g)
+}
+
+/// Platform-aware byte-order pack: identity on desktop, R↔B swap on Android (the ANativeWindow buffer is RGBA_8888, which reads as `0xAABBGGRR` when interpreted as a little-endian u32, so theme constants written in canonical `0xAARRGGBB` order need their R and B bytes swapped at compile time to land in the right slots without a per-pixel runtime swap). Pub so downstream crates (photon's chromatic-wave + per-screen colour constants) can adopt the same convention.
 #[cfg(target_os = "android")]
-const fn fmt(trgb: u32) -> u32 {
+pub const fn fmt(trgb: u32) -> u32 {
     let t = (trgb >> 24) & 0xFF;
     let r = (trgb >> 16) & 0xFF;
     let g = (trgb >> 8) & 0xFF;
@@ -14,12 +43,12 @@ const fn fmt(trgb: u32) -> u32 {
 }
 
 #[cfg(not(target_os = "android"))]
-const fn fmt(trgb: u32) -> u32 {
+pub const fn fmt(trgb: u32) -> u32 {
     trgb
 }
 
 /// Compile-time visible-RGB → stored α + darkness conversion: flips the RGB bytes (`255 − R, 255 − G, 255 − B`) AND sets α=0xFF (opaque). Theme colour constants default to OPAQUE since most use sites paint them as solid fills; partial-α sites (AA edges, glow accumulation) explicitly mask α off first via `(theme_const & 0x00FFFFFF) | (modulated_α << 24)`. Glow colour constants use [`dark_rgb_only`] to keep α=0 since the glow function sets α per pixel.
-const fn dark(trgb: u32) -> u32 {
+pub const fn dark(trgb: u32) -> u32 {
     (trgb ^ 0x00FFFFFF) | 0xFF000000
 }
 
