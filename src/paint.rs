@@ -596,6 +596,8 @@ fn clip_rect(
 ///
 /// Per-pixel: `pixels[idx] = pixels[idx].under(effective_colour, BlendMode::Normal)`. The dst-opaque early-out fires automatically where a topmost paint has already claimed the pixel (`dst.α == 0xFF`), so the topmost-first doctrine is honored without callers having to think about z-order.
 ///
+/// **Hairline convention:** a `0` width or height means "1 pixel thick" along that axis — pass `rect_h = 0` for a horizontal hairline, `rect_w = 0` for a vertical one, both `0` for a single-pixel dot. This lets callers draw rules/dividers without inventing a thickness; for a thicker line pass the real pixel count. (Negative dimensions stay a no-op.)
+///
 /// `mask: Some(&AlphaMask)` multiplies each pixel's mask alpha into `colour`'s opacity (`effective_opacity = colour_opacity * mask_alpha >> 8`) — used for shaped textbox interiors, scroll fades, etc. `mask: None` skips that math entirely.
 pub fn fill_rect(
     canvas: &mut Canvas,
@@ -607,6 +609,9 @@ pub fn fill_rect(
     clip: Option<Clip>,
     mask: Option<&AlphaMask>,
 ) {
+    // 0 → 1-pixel hairline along that axis (both 0 = single-pixel dot). Coerce before clipping so the rect always covers at least one pixel line.
+    let rect_w = if rect_w == 0 { 1 } else { rect_w };
+    let rect_h = if rect_h == 0 { 1 } else { rect_h };
     let buf_w = canvas.width;
     let buf_h = canvas.height;
     let clip = Clip::resolve(clip, buf_w, buf_h);
