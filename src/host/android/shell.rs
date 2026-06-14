@@ -78,7 +78,7 @@ impl<A: FluorApp> AndroidShell<A> {
         shell
     }
 
-    /// Resize the surface + viewport + scratch + clip_mask. Called from `nativeResize`.
+    /// Resize the surface + viewport + scratch + clip_mask. Called from `nativeResize` on surfaceChanged (IME show/hide, screen orientation change). The Activity drives orientation itself via `setRequestedOrientation`, so a tilt arrives here as a regular resize with swapped (w, h) — photon's existing resize codepath reflows the layout automatically.
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -121,8 +121,15 @@ impl<A: FluorApp> AndroidShell<A> {
         }
 
         // Single-pass present: finalize scratch (α + darkness) directly into the locked ANativeWindow bits at the buffer's stride, skipping the intermediate Vec<u32>. The full viewport is passed as the finalize clip — on Android we treat every paint as a full repaint, so on cache-miss frames the locked buffer gets refreshed from scratch's current state regardless of which damage rect drove this frame.
-        self.surface
-            .present(window, &self.scratch, &self.clip_mask, win_w, win_h, viewport_rect, was_dirty)
+        self.surface.present(
+            window,
+            &self.scratch,
+            &self.clip_mask,
+            win_w,
+            win_h,
+            viewport_rect,
+            was_dirty,
+        )
     }
 
     /// Touch dispatch from `nativeOnTouch`. Translates Android action codes into one or two fluor events, dispatches each through `app.on_event`. Tracks cursor position on CursorMoved so Context.cursor_x/y stays accurate.
@@ -138,6 +145,11 @@ impl<A: FluorApp> AndroidShell<A> {
             let _ = self.dispatch(ev);
         }
         self.window.mark_dirty();
+        self.poll_keyboard()
+    }
+
+    /// Poll `FluorApp::wants_keyboard` and map its one-shot Option to the Android IME-action ABI (`1` = show, `-1` = hide, `0` = no change). Called from both `on_touch` (focus changes driven by user taps) and the JNI shim's per-frame `nativePollKeyboard` hook so app-driven focus changes (e.g. `change_focus(None)` from `submit_handle` while the user is just watching the "Attesting…" spinner) propagate to the Activity without waiting for the next touch.
+    pub fn poll_keyboard(&mut self) -> i32 {
         match self.app.wants_keyboard() {
             Some(true) => 1,
             Some(false) => -1,
