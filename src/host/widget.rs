@@ -2,7 +2,7 @@
 //!
 //! **Layering.** Capability traits speak [`crate::event::KeyEvent`] / [`crate::event::ModifiersState`] — fluor-native input types. Hosts translate platform input (winit on desktop, JNI on Android) into those at the boundary, so widgets compile and run on every supported target with the same code.
 //!
-//! **Dense IDs.** [`HitId`] (re-exported from [`crate::paint`]) is allocated by threading a single `&mut HitId` counter through widget constructors at startup. `0` stays reserved as [`HIT_NONE`]; registrations start at `1` and increment sequentially. The denseness is an invariant of the allocation pattern — dispatch can index directly by `id - 1` if it wants (the per-frame walk in the v0 demo is O(N), but an optimised path is one slice-build away once profiling justifies it).
+//! **Dense IDs.** [`HitId`] (re-exported from [`crate::paint`]) is allocated by threading a single `&mut HitId` counter thru widget constructors at startup. `0` stays reserved as [`HIT_NONE`]; registrations start at `1` and increment sequentially. The denseness is an invariant of the allocation pattern — dispatch can index directly by `id - 1` if it wants (the per-frame walk in the v0 demo is O(N), but an optimised path is one slice-build away once profiling justifies it).
 //!
 //! **Dispatch.** An app implements [`Container`] (the recursive `visit` walk) so click / key / hover / focus events can be routed by walking the tree once and asking each widget for the matching capability. No match arms, no back-references, no lifetimes outlasting the frame. See [`linear_tab_next`] for the canonical "registration-order tab cycle" helper apps that want spatial or modal-stack-aware navigation write their own helper against the same `Container` shape.
 
@@ -14,7 +14,7 @@ use crate::text::TextRenderer;
 
 pub use crate::paint::HIT_NONE;
 
-/// Allocate the next dense hit ID. Threaded through widget constructors at app startup — `let mut counter: HitId = HIT_NONE; let id = next_id(&mut counter);`. Increments first, returns the post-increment value, so the first call yields `1` (never `HIT_NONE`). 65 535-call ceiling at the [`HitId`] type's `u16` width; panics on overflow because exceeding 65 535 interactive zones in one app is a design error, not something to silently wrap and corrupt dispatch.
+/// Allocate the next dense hit ID. Threaded thru widget constructors at app startup — `let mut counter: HitId = HIT_NONE; let id = next_id(&mut counter);`. Increments first, returns the post-increment value, so the first call yields `1` (never `HIT_NONE`). 65 535-call ceiling at the [`HitId`] type's `u16` width; panics on overflow because exceeding 65 535 interactive zones in one app is a design error, not something to silently wrap and corrupt dispatch.
 pub fn next_id(counter: &mut HitId) -> HitId {
     *counter = counter
         .checked_add(1)
@@ -175,7 +175,7 @@ pub fn dispatch_click(
     response
 }
 
-/// Deliver a key event to the widget with `target_id`, if any. Mirror of [`dispatch_click`] for keyboard input — caller picks the target (typically the currently-focused widget tracked by the app) and this routes the fluor-native [`KeyEvent`] + [`ModifiersState`] + [`TextRenderer`] handle through to the widget's [`Key::on_key`] impl. Returns [`crate::host::EventResponse::Pass`] if `target_id` doesn't match any widget or the matching widget doesn't impl [`Key`].
+/// Deliver a key event to the widget with `target_id`, if any. Mirror of [`dispatch_click`] for keyboard input — caller picks the target (typically the currently-focused widget tracked by the app) and this routes the fluor-native [`KeyEvent`] + [`ModifiersState`] + [`TextRenderer`] handle thru to the widget's [`Key::on_key`] impl. Returns [`crate::host::EventResponse::Pass`] if `target_id` doesn't match any widget or the matching widget doesn't impl [`Key`].
 pub fn dispatch_key(
     root: &mut dyn Container,
     target_id: HitId,

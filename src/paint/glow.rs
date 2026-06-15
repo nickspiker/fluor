@@ -330,7 +330,7 @@ pub fn apply_textbox_glow_bottom(
 
 /// Paint a 4-directional blur glow around a textbox pill silhouette.
 ///
-/// Loop structure + adder/intensity math ported from photon's `apply_textbox_glow` (`compositing.rs:4479`). Pixel writes compose UNDER whatever's already in the buffer via [`Blend::under`] (Normal) — same kernel as every other fluor primitive. Caller paints squircle FIRST (topmost), then this; the squircle's opaque interior takes the under() early-out so glow stays outside the silhouette, AA-edge pixels (α<255) let glow bleed through the soft transition.
+/// Loop structure + adder/intensity math ported from photon's `apply_textbox_glow` (`compositing.rs:4479`). Pixel writes compose UNDER whatever's already in the buffer via [`Blend::under`] (Normal) — same kernel as every other fluor primitive. Caller paints squircle FIRST (topmost), then this; the squircle's opaque interior takes the under() early-out so glow stays outside the silhouette, AA-edge pixels (α<255) let glow bleed thru the soft transition.
 pub fn apply_textbox_glow(
     canvas: &mut Canvas,
     mask: &[u8],

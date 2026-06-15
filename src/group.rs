@@ -22,13 +22,13 @@ pub struct Group {
     pub region: Region,
     /// Internal RGB compositing — bbox-sized layer buffers + Stack program.
     pub rpn: StackCompositor,
-    /// Binary hit mask (group-local, one byte per pixel, 0 or 1). `None` = decorative; clicks pass through.
+    /// Binary hit mask (group-local, one byte per pixel, 0 or 1). `None` = decorative; clicks pass thru.
     pub hitmask: Option<Vec<u8>>,
     /// Per-pixel alpha mask consumed by text rasterizers drawing into this group's RGB layers (group-local). `None` = no soft clip.
     pub text_clip: Option<Vec<u8>>,
     /// How this group's flatten composites onto the target buffer.
     pub blend: BlendMode,
-    /// Default hit id this Group contributes when it is the topmost non-transparent contributor at a queried pixel and either no hitmask is enabled or the hitmask byte at this pixel is 0. A group with `id == 0` and no hitmask contributes pixels but is "decorative" for hit dispatch (clicks fall through). Consumers assign meaningful ids per Group (e.g., chrome=1, textbox=3, cursor=4).
+    /// Default hit id this Group contributes when it is the topmost non-transparent contributor at a queried pixel and either no hitmask is enabled or the hitmask byte at this pixel is 0. A group with `id == 0` and no hitmask contributes pixels but is "decorative" for hit dispatch (clicks fall thru). Consumers assign meaningful ids per Group (e.g., chrome=1, textbox=3, cursor=4).
     pub id: u16,
 }
 
@@ -291,7 +291,7 @@ mod tests {
 
         // Simulate a back-buffer swap: target is now TRANSPARENT again (the OTHER frame buffer).
         target.fill(TRANSPARENT);
-        // Flatten must still write our content even though no layer is dirty.
+        // Flatten must still write our content even tho no layer is dirty.
         g.flatten_into(&mut target, 2, 2, None);
         let second = target[0];
         assert_eq!(

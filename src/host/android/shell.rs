@@ -8,7 +8,7 @@
 //! - No clip_mask carving (no rounded window corners on Android).
 //! - Choreographer-driven scheduling, not winit's event loop.
 //! - Skip render entirely when the AndroidWindow dirty flag is false (saves the ANativeWindow
-//!   lock/copy cycle on idle frames, though Choreographer still advances).
+//!   lock/copy cycle on idle frames, tho Choreographer still advances).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -52,7 +52,7 @@ pub struct AndroidShell<A: FluorApp> {
 }
 
 impl<A: FluorApp> AndroidShell<A> {
-    /// Construct the shell. Caller provides the surface dimensions Android opened the SurfaceView at (typically full-screen). The app's `set_event_proxy` is invoked with a [`NoopWakeSender`] (Android background tasks talk to the UI thread through JNI callbacks, not the proxy) and then `init` runs once the shell has its viewport + text renderer ready — same host contract as `DesktopShell`.
+    /// Construct the shell. Caller provides the surface dimensions Android opened the SurfaceView at (typically full-screen). The app's `set_event_proxy` is invoked with a [`NoopWakeSender`] (Android background tasks talk to the UI thread thru JNI callbacks, not the proxy) and then `init` runs once the shell has its viewport + text renderer ready — same host contract as `DesktopShell`.
     pub fn new(mut app: A, width: u32, height: u32) -> Self {
         // Android writes finalize output directly into an ANativeWindow_lock'd buffer that the SurfaceFlinger compositor consumes after unlockAndPost. Worker-thread writes to that buffer need to be visible to the compositor by the time unlockAndPost runs; rayon's join is a CPU memory barrier but not a guaranteed device-coherent flush across all worker cores. Forcing par_rows / par_chunks sequential keeps writes on the calling thread so unlockAndPost's cache flush covers everything in one shot — eliminates the "horizontal white band at a random row" tear we hit with parallel finalize.
         crate::par::FORCE_SEQUENTIAL.store(true, core::sync::atomic::Ordering::Relaxed);
@@ -132,7 +132,7 @@ impl<A: FluorApp> AndroidShell<A> {
         )
     }
 
-    /// Touch dispatch from `nativeOnTouch`. Translates Android action codes into one or two fluor events, dispatches each through `app.on_event`. Tracks cursor position on CursorMoved so Context.cursor_x/y stays accurate.
+    /// Touch dispatch from `nativeOnTouch`. Translates Android action codes into one or two fluor events, dispatches each thru `app.on_event`. Tracks cursor position on CursorMoved so Context.cursor_x/y stays accurate.
     ///
     /// Return value is the Android `nativeOnTouch` ABI: `1` = host should show the soft keyboard (focus moved into a text input), `-1` = hide, `0` = no change. Wraps `FluorApp::wants_keyboard`; the JNI shim passes it straight back to Java.
     pub fn on_touch(&mut self, action: i32, x: f32, y: f32) -> i32 {

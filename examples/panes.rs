@@ -84,7 +84,7 @@ struct PanesDemo {
     cursor_group: Group,
     /// Currently focused widget id, or `None` for "nothing focused" (background click, Esc, no prior focus). Source of truth for keyboard delivery and Tab cycling — widgets' internal `focused` flags are derived state set by `apply_focus_change` after this field updates.
     current_focus: Option<HitId>,
-    /// Monotonic dense-ID counter shared across chrome + textboxes. Chrome claims 1..=4 at construction; textbox_a gets 5, textbox_b gets 6. Stored on the demo so future runtime widget creation (e.g. a popup) can keep allocating without re-threading the counter through constructors.
+    /// Monotonic dense-ID counter shared across chrome + textboxes. Chrome claims 1..=4 at construction; textbox_a gets 5, textbox_b gets 6. Stored on the demo so future runtime widget creation (e.g. a popup) can keep allocating without re-threading the counter thru constructors.
     hit_counter: HitId,
     /// Rotation demo text — full-viewport AlphaOver group, re-rasterized only when aspect changes.
     rotation_group: Group,
@@ -595,7 +595,7 @@ impl FluorApp for PanesDemo {
                             self.chord_rb_release = Some(now);
                         }
                         (_, ElementState::Pressed) if !kev.repeat => {
-                            // Only fire on the user's actual press, not on auto-repeat ticks. brackets_held is the only gate — the dispatch chain below decides what each letter does, and unknown letters fall through to `else { acted = false; }` as a no-op. No whitelist here: a second gating layer would just mean every new chord has to be added in two places, which silently breaks bindings when one is missed.
+                            // Only fire on the user's actual press, not on auto-repeat ticks. brackets_held is the only gate — the dispatch chain below decides what each letter does, and unknown letters fall thru to `else { acted = false; }` as a no-op. No whitelist here: a second gating layer would just mean every new chord has to be added in two places, which silently breaks bindings when one is missed.
                             if self.brackets_held(now) {
                                 action_char = c.to_ascii_lowercase().chars().next();
                             }
@@ -752,7 +752,7 @@ impl FluorApp for PanesDemo {
                 let Some(focus_id) = self.current_focus else {
                     return EventResponse::Pass;
                 };
-                // Enter / Space on a chrome button activates it. The widget's Key::on_key returns the action's EventResponse; we propagate it so the host fires Close / Minimize / ToggleMaximized as if the button were clicked. Clipboard interception (textbox-focused only). Ctrl+C / Ctrl+X / Ctrl+V need the OS clipboard adapter (arboard) which is a single global resource — threading it through every widget that might want clipboard access would be premature abstraction at one consumer. Apps handle the chord before delivering to the focused widget; the widget never sees Ctrl+C/X/V. Ctrl+A is widget-internal (select-all) and Textbox::on_key handles it.
+                // Enter / Space on a chrome button activates it. The widget's Key::on_key returns the action's EventResponse; we propagate it so the host fires Close / Minimize / ToggleMaximized as if the button were clicked. Clipboard interception (textbox-focused only). Ctrl+C / Ctrl+X / Ctrl+V need the OS clipboard adapter (arboard) which is a single global resource — threading it thru every widget that might want clipboard access would be premature abstraction at one consumer. Apps handle the chord before delivering to the focused widget; the widget never sees Ctrl+C/X/V. Ctrl+A is widget-internal (select-all) and Textbox::on_key handles it.
                 let focused_is_textbox = self.textbox_index_by_id(focus_id).is_some();
                 if focused_is_textbox {
                     if let Key::Character(c) = &kev.logical_key {

@@ -49,7 +49,7 @@ pub enum Event {
     ModifiersChanged(ModifiersState),
     /// Window focus gained or lost. `true` = focused.
     Focused(bool),
-    /// IME event — composition preedit or commit. Android `InputConnection` commit text and desktop IME both flow through here.
+    /// IME event — composition preedit or commit. Android `InputConnection` commit text and desktop IME both flow thru here.
     Ime(Ime),
     /// A file was drag-and-dropped onto the window. Carries the OS path as a String (lossy UTF-8); the app reads + interprets it. Desktop only today — winit emits `WindowEvent::DroppedFile`; Android has no equivalent (it uses the system image picker instead).
     DroppedFile(String),
@@ -76,7 +76,7 @@ pub enum MouseButton {
 
 // ============================================================================ Scroll delta ===============================================================
 
-/// Direction + magnitude of a scroll event. Hosts pick whichever unit their platform delivers; consumers typically multiply through the same scaling factor regardless.
+/// Direction + magnitude of a scroll event. Hosts pick whichever unit their platform delivers; consumers typically multiply thru the same scaling factor regardless.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MouseScrollDelta {
     /// Discrete steps (mouse wheel notches). `(x, y)` — positive `y` scrolls content up.
@@ -164,7 +164,7 @@ pub struct KeyEvent {
     pub logical_key: Key,
     pub state: ElementState,
     pub repeat: bool,
-    /// Text the keystroke would produce if accepted (printable character). `None` on releases, non-printable keys, modifier presses, and IME-composed text (IME flows through [`Event::Ime`]).
+    /// Text the keystroke would produce if accepted (printable character). `None` on releases, non-printable keys, modifier presses, and IME-composed text (IME flows thru [`Event::Ime`]).
     pub text: Option<String>,
 }
 

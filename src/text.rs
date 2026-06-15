@@ -501,7 +501,7 @@ impl TextRenderer {
             _ => (anchor_x, anchor_y),
         };
 
-        // Topmost-first: split colour into its α channel (combined with per-pixel glyph coverage and optional mask to form the glyph pixel's effective α) and its RGB-darkness payload (passed straight through to under()). Replaces the legacy SWAR over-blend — text now composites with the same under() kernel as every other rasterizer.
+        // Topmost-first: split colour into its α channel (combined with per-pixel glyph coverage and optional mask to form the glyph pixel's effective α) and its RGB-darkness payload (passed straight thru to under()). Replaces the legacy SWAR over-blend — text now composites with the same under() kernel as every other rasterizer.
         let colour_alpha = (colour >> 24) & 0xFF;
         let colour_dark = colour & 0x00FF_FFFF;
 

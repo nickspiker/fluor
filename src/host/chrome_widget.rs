@@ -63,7 +63,7 @@ impl ChromeButton {
         }
     }
 
-    /// The button's hit-id. Mirrors [`Widget::id`] so callers that hold a `&ChromeButton` directly (not through `dyn Widget`) don't need to import the trait.
+    /// The button's hit-id. Mirrors [`Widget::id`] so callers that hold a `&ChromeButton` directly (not thru `dyn Widget`) don't need to import the trait.
     pub fn id(&self) -> HitId {
         self.id
     }
@@ -172,7 +172,7 @@ pub struct DefaultChrome {
 impl DefaultChrome {
     /// Allocate the chrome group + hit_test_map sized to `viewport`. Three layers (bg, chrome, hover) all start dirty so the first frame paints from scratch.
     ///
-    /// **Topmost-first scaffold:** the Stack program is the minimal front-to-back composite — `Push chrome, Push bg, Under(Normal)`. Chrome is the topmost layer (controls, edges, hairlines, title), bg is the layer behind it (background_noise + panes). Stack order matches the visual stack: first push lands on the bottom of the eval stack and is the topmost layer; second push goes underneath via `Under`. The hover layer still exists and is rasterized so the API surface is stable; it's omitted from the program until the hover overlay is wired back up via `Push hover, Under(Add)` as the topmost step. Corner knockout (formerly a separate silhouette layer + `Op::Or`) is handled at chrome rasterization time by writing `t=255` directly into the chrome layer's corner pixels — no separate Stack op under the unified Under model. Construct. `hit_counter` is the app's monotonic [`HitId`] allocator (see [`super::widget::next_id`]) — chrome registers four IDs (min, max, close, app icon, in that order). Construction order against the rest of the app is free: ids are opaque and queried through [`Self::owns_hit`] / [`Self::hover_colour_for`], not compared by value.
+    /// **Topmost-first scaffold:** the Stack program is the minimal front-to-back composite — `Push chrome, Push bg, Under(Normal)`. Chrome is the topmost layer (controls, edges, hairlines, title), bg is the layer behind it (background_noise + panes). Stack order matches the visual stack: first push lands on the bottom of the eval stack and is the topmost layer; second push goes underneath via `Under`. The hover layer still exists and is rasterized so the API surface is stable; it's omitted from the program until the hover overlay is wired back up via `Push hover, Under(Add)` as the topmost step. Corner knockout (formerly a separate silhouette layer + `Op::Or`) is handled at chrome rasterization time by writing `t=255` directly into the chrome layer's corner pixels — no separate Stack op under the unified Under model. Construct. `hit_counter` is the app's monotonic [`HitId`] allocator (see [`super::widget::next_id`]) — chrome registers four IDs (min, max, close, app icon, in that order). Construction order against the rest of the app is free: ids are opaque and queried thru [`Self::owns_hit`] / [`Self::hover_colour_for`], not compared by value.
     pub fn new(
         viewport: Viewport,
         title: impl Into<String>,
@@ -259,7 +259,7 @@ impl DefaultChrome {
 
     /// **Scaffold step 1 (top of stack: AA rounded hairline only):** paint the squircle-cornered window-perimeter hairline into the chrome layer via [`chrome::draw_window_edges_and_mask`]. Chrome layer carries OPAQUE RGB only at the hairline; partial-α window-shape coverage (corner curve AA + outside-curve cutout) is written into `clip_mask` so the OS boundary can fold it into the final alpha in one pass.
     ///
-    /// `text` is used by the title text rasterization pass (Open Sans, span-relative font size, left-aligned in the area to the left of the controls strip). `damage` is the frame-level accumulator; chrome routes its migrated rasterizers (title text, status bar) through Canvas instances backed by it, so chrome's contribution to the damage rect flows to the host.
+    /// `text` is used by the title text rasterization pass (Open Sans, span-relative font size, left-aligned in the area to the left of the controls strip). `damage` is the frame-level accumulator; chrome routes its migrated rasterizers (title text, status bar) thru Canvas instances backed by it, so chrome's contribution to the damage rect flows to the host.
     pub fn rasterize_chrome(
         &mut self,
         damage: &mut crate::canvas::Damage,
@@ -283,7 +283,7 @@ impl DefaultChrome {
         self.hit_test_map.fill(HIT_NONE);
 
         let chrome_buf = &mut self.group.rpn.layers[self.layer_chrome].pixels;
-        // α + darkness: transparent init (α=0, dark=0) so the bg shows through everywhere except the hairline + AA pixels.
+        // α + darkness: transparent init (α=0, dark=0) so the bg shows thru everywhere except the hairline + AA pixels.
         chrome_buf.fill(0);
 
         if vp_w < 2 || vp_h < 2 {
@@ -306,7 +306,7 @@ impl DefaultChrome {
         let strip_w = button_size * 7 / 2;
         let strip_x = buf_w.saturating_sub(strip_w);
 
-        // App-icon orb layout: centered in the top-left `button_size`-tall band, mirroring the right-side controls strip. Diameter is half the band height so the orb reads as a tasteful badge rather than a full button. Title text shifts right by the orb's footprint when an icon is present. `draw_app_icon` has an `r < 2` early-return so degenerate sizes pass through without drawing — no min-size guard needed here.
+        // App-icon orb layout: centered in the top-left `button_size`-tall band, mirroring the right-side controls strip. Diameter is half the band height so the orb reads as a tasteful badge rather than a full button. Title text shifts right by the orb's footprint when an icon is present. `draw_app_icon` has an `r < 2` early-return so degenerate sizes pass thru without drawing — no min-size guard needed here.
         //
         // Orb slot is also reserved when `OrbTint::Custom` is active even without an icon — that's the "status badge" use case (network indicator, recording light, presence). `draw_app_icon`'s no-icon path fills the disk with `ring_colour`, so the slot reads as a coloured dot.
         let orb_present = self.app_icon.is_some()
@@ -395,7 +395,7 @@ impl DefaultChrome {
                 );
             }
             {
-                // Title-text rasterization through the frame-level damage accumulator. Other chrome rasterizers (perimeter, app icon, button glyphs) still write into `chrome_buf` directly without damage tracking — they'll migrate when the rest of the chrome surface gets the Canvas treatment.
+                // Title-text rasterization thru the frame-level damage accumulator. Other chrome rasterizers (perimeter, app icon, button glyphs) still write into `chrome_buf` directly without damage tracking — they'll migrate when the rest of the chrome surface gets the Canvas treatment.
                 let mut canvas = crate::canvas::Canvas::new(chrome_buf, buf_w, buf_h, damage);
                 chrome::draw_title_text(
                     &mut canvas,
@@ -587,9 +587,9 @@ impl DefaultChrome {
         }
     }
 
-    /// Composite the chrome group (bg + chrome layers via internal Stack `Push chrome, Push bg, Under(Normal)`) and flatten under the present buffer. Front-to-back: chrome's composited result is blended `under` whatever's already in target, so chrome wins where opaque and bg shows through where chrome is transparent.
+    /// Composite the chrome group (bg + chrome layers via internal Stack `Push chrome, Push bg, Under(Normal)`) and flatten under the present buffer. Front-to-back: chrome's composited result is blended `under` whatever's already in target, so chrome wins where opaque and bg shows thru where chrome is transparent.
     ///
-    /// `clip`: optional damage-clip in target pixel coords; passed straight through to [`Group::flatten_into`]. `None` = full target (current behavior).
+    /// `clip`: optional damage-clip in target pixel coords; passed straight thru to [`Group::flatten_into`]. `None` = full target (current behavior).
     pub fn flatten_into(
         &mut self,
         target: &mut [u32],

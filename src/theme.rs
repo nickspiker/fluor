@@ -2,14 +2,14 @@
 //!
 //! Colour layout: `0xααRRGGBB` (fluor internal format — top byte is α opacity, `α=0xFF` opaque; RGB bytes are DARKNESS, `0 = white potential, 255 = black`). The `0x00_xx_yy_zz` literals here are written with `t = 0` (which would have been opaque under the old convention) and visible RGB; [`fmt`] handles platform byte-swap and [`dark`] inverts the RGB at compile time. Constants here keep `α = 0` — colour palette only; the α-byte is set per-pixel at the use site (`opacity << 24 | dark(theme_const)`).
 //!
-//! At the OS boundary, [`crate::paint::finalize_for_os`] does a single `pixel ^= 0x00FFFFFF` that flips RGB darkness back to visible; α passes through (already opacity-direction in storage) — putting the pixel in the format the host compositor wants.
+//! At the OS boundary, [`crate::paint::finalize_for_os`] does a single `pixel ^= 0x00FFFFFF` that flips RGB darkness back to visible; α passes thru (already opacity-direction in storage) — putting the pixel in the format the host compositor wants.
 
 /// Display colour-space matrix slot.
 ///
-/// On Android, photon's Activity queries `display.preferredWideGamutColorSpace` and pushes the panel's RGB→CIE-XYZ-D50 3x3 matrix here through a JNI shim. Consumers (chromatic_wave, future LMS-based painters) read it via [`display_rgb_to_xyz`] and compose with their own LMS→XYZ matrix to land samples in the actual device's primaries instead of falling through a hardcoded REC2020 approximation. `None` until the JNI shim fires, and on desktop builds; consumers fall back to whatever default they want in that case.
+/// On Android, photon's Activity queries `display.preferredWideGamutColorSpace` and pushes the panel's RGB→CIE-XYZ-D50 3x3 matrix here thru a JNI shim. Consumers (chromatic_wave, future LMS-based painters) read it via [`display_rgb_to_xyz`] and compose with their own LMS→XYZ matrix to land samples in the actual device's primaries instead of falling thru a hardcoded REC2020 approximation. `None` until the JNI shim fires, and on desktop builds; consumers fall back to whatever default they want in that case.
 static DISPLAY_RGB_TO_XYZ: std::sync::Mutex<Option<[f32; 9]>> = std::sync::Mutex::new(None);
 
-/// Display chromaticity primaries (R, G, B as 1931-xy pairs — 6 floats: Rx Ry Gx Gy Bx By). Companion to [`display_rgb_to_xyz`]; useful when a consumer wants to do its own gamut mapping rather than going through XYZ.
+/// Display chromaticity primaries (R, G, B as 1931-xy pairs — 6 floats: Rx Ry Gx Gy Bx By). Companion to [`display_rgb_to_xyz`]; useful when a consumer wants to do its own gamut mapping rather than going thru XYZ.
 static DISPLAY_PRIMARIES: std::sync::Mutex<Option<[f32; 6]>> = std::sync::Mutex::new(None);
 
 /// Push the device's display colour-space data. Called from the JNI shim on Android after the Activity's display is available. Idempotent — safe to call multiple times (e.g. on display reconfiguration).

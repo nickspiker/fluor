@@ -1,10 +1,10 @@
 //! [`WakeSender`] — host-agnostic cross-thread wake-up.
 //!
-//! Apps stash an `Arc<dyn WakeSender<UserEvent>>` and clone it across background threads (network workers, IO tasks, async ceremonies). When a background task wants the UI to repaint with a result, it calls `wake.send(payload)`; the concrete impl routes the payload back through `FluorApp::on_user_event` on the UI thread.
+//! Apps stash an `Arc<dyn WakeSender<UserEvent>>` and clone it across background threads (network workers, IO tasks, async ceremonies). When a background task wants the UI to repaint with a result, it calls `wake.send(payload)`; the concrete impl routes the payload back thru `FluorApp::on_user_event` on the UI thread.
 //!
 //! Hosts provide concrete impls: host-winit wraps `winit::event_loop::EventLoopProxy` (in [`super::winit_compat`]); host-android wires JNI callbacks (or a no-op proxy if the app doesn't use cross-thread wake-ups — the Activity polls via Choreographer).
 //!
-//! This decouples `FluorApp` from winit's `EventLoopProxy` type, which is what made winit a transitive dep on Android even though we never run winit's event loop there.
+//! This decouples `FluorApp` from winit's `EventLoopProxy` type, which is what made winit a transitive dep on Android even tho we never run winit's event loop there.
 
 use core::any::type_name;
 

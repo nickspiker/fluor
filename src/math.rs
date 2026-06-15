@@ -1,6 +1,6 @@
 //! Thin wrappers around `libm` free functions so `f32` math works in `no_std`.
 //!
-//! In `std` builds these compile down to the same instructions as the inherent methods (the compiler sees through the `libm` call). In `no_std` builds they provide software implementations of the standard math functions.
+//! In `std` builds these compile down to the same instructions as the inherent methods (the compiler sees thru the `libm` call). In `no_std` builds they provide software implementations of the standard math functions.
 
 #[inline]
 pub fn ceil(x: f32) -> f32 {
