@@ -1,6 +1,6 @@
 //! Android host — fluor's compositor wired to ANativeWindow + Choreographer + JNI input.
 //!
-//! Architecture mirrors `host-winit` (which translates `winit::WindowEvent` to fluor events and presents via softbuffer): on Android the surface backend is `ANativeWindow_lock` / `unlockAndPost`, the event loop is the Activity's `Choreographer.postFrameCallback` driving JNI `nativeDraw` calls, and input arrives through JNI entry points (`nativeOnTouch`, `nativeOnKeyEvent`, `nativeOnTextInput`).
+//! Architecture mirrors `host-winit` (which translates `winit::WindowEvent` to fluor events and presents via softbuffer): on Android the surface backend is `ANativeWindow_lock` / `unlockAndPost`, the event loop is the Activity's `Choreographer.postFrameCallback` driving JNI `nativeDraw` calls, and input arrives thru JNI entry points (`nativeOnTouch`, `nativeOnKeyEvent`, `nativeOnTextInput`).
 //!
 //! Consumer model: app implements `FluorApp` once, then on Android creates a `AndroidShell<A>` and ferries it across the JNI boundary as an opaque `jlong`. PhotonActivity.kt holds that pointer and calls fluor's JNI entry points; fluor takes the lock/draw/dispatch path and returns to Java.
 //!

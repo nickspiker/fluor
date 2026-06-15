@@ -2,7 +2,7 @@
 //!
 //! Internal to fluor's render pipeline. Per `## API / Implementation Separation` in AGENT.md, these are not part of the consumer-facing API: future SIMD kernels (NEON, SSE2) will dispatch thru the same entry points without changing call sites in `pane` or `Compositor`.
 //!
-//! Blend model is α + darkness front-to-back: `dst` is the partial composite already accumulated above (its α-byte = accumulated opacity, RGB = accumulated darkness), `src` is the new layer going behind. Per-pixel early-out fires when `dst >= 0xFF000000` (dst α saturated = opaque) via a single u32 compare. Math throughout is `>> 8` with the `(256 − top_α)` trick — never `/ 255`, never floats in the inner loop. Multi-layer composition is additive on BOTH halves (α adds, darkness adds); the buffer carries the accumulator state across Group boundaries so the early-out chain survives between flatten passes.
+//! Blend model is α + darkness front-to-back: `dst` is the partial composite already accumulated above (its α-byte = accumulated opacity, RGB = accumulated darkness), `src` is the new layer going behind. Per-pixel early-out fires when `dst >= 0xFF000000` (dst α saturated = opaque) via a single u32 compare. Math thruout is `>> 8` with the `(256 − top_α)` trick — never `/ 255`, never floats in the inner loop. Multi-layer composition is additive on BOTH halves (α adds, darkness adds); the buffer carries the accumulator state across Group boundaries so the early-out chain survives between flatten passes.
 //!
 //! Every blending primitive accepts an optional [`Clip`] (defaults to full buffer when `None`) and an optional [`AlphaMask`] (full-frame, multiplies into per-pixel alpha for soft clipping — rounded textboxes, squircle pane corners, scroll fades). The clip is resolved once at entry into `(x_min, y_min, x_max, y_max)` loop bounds, so the inner loops carry **zero per-pixel bounds checks** — the math at the entry is the proof. AlphaMask dimensions must equal the buffer's `(buf_w, buf_h)`; mismatches panic per AGENT.md "fail loud."
 
@@ -59,7 +59,7 @@ impl Clip {
         }
     }
 
-    /// Intersect a primitive's `i32` bbox with `opt` (resolved against the buffer extent), returning integer pixel bounds suitable for `for` loops. Returns `None` if the intersection is empty (whole primitive is offscreen or fully clipped). Used by every rasterizer's entry path so the clip story is one call: pass `clip` through, get back either `(x_start, y_start, x_end, y_end)` to iterate or an early-return signal.
+    /// Intersect a primitive's `i32` bbox with `opt` (resolved against the buffer extent), returning integer pixel bounds suitable for `for` loops. Returns `None` if the intersection is empty (whole primitive is offscreen or fully clipped). Used by every rasterizer's entry path so the clip story is one call: pass `clip` thru, get back either `(x_start, y_start, x_end, y_end)` to iterate or an early-return signal.
     #[inline]
     pub fn intersect_bbox(
         opt: Option<Clip>,
@@ -435,7 +435,7 @@ pub fn wrap_sub_rgb(a: u32, b: u32) -> u32 {
         | (ab.wrapping_sub(bb) & 0xFF)
 }
 
-/// Unpack a fluor internal pixel into `(r, g, b, a)` with visible RGB and opacity α — the inverse of [`pack_argb`]. Flips darkness back to visible RGB; α passes through.
+/// Unpack a fluor internal pixel into `(r, g, b, a)` with visible RGB and opacity α — the inverse of [`pack_argb`]. Flips darkness back to visible RGB; α passes thru.
 #[inline]
 pub fn unpack_argb(packed: u32) -> (u8, u8, u8, u8) {
     let a = (packed >> 24) as u8;
@@ -632,7 +632,7 @@ pub fn fill_rect(
             }
         }
         Some(m) => {
-            // Mask convention matches `TextRenderer::render_buffer_u32`: `effective_α = colour_α × mask_α / 255` (opacity multiplies). Mask=0 → pixel fully clipped; mask=255 → colour passes through at full α. The previous implementation here used `colour_opacity = 255 - α`, which inverted the semantics — for an opaque colour (α=0xFF) the mask was multiplied by zero and had no effect, so masks were silently ineffective on solid fills.
+            // Mask convention matches `TextRenderer::render_buffer_u32`: `effective_α = colour_α × mask_α / 255` (opacity multiplies). Mask=0 → pixel fully clipped; mask=255 → colour passes thru at full α. The previous implementation here used `colour_opacity = 255 - α`, which inverted the semantics — for an opaque colour (α=0xFF) the mask was multiplied by zero and had no effect, so masks were silently ineffective on solid fills.
             let colour_alpha = (colour >> 24) & 0xFF;
             let colour_rgb = colour & 0x00FF_FFFF;
             for row in y_min..y_max {
@@ -808,13 +808,13 @@ fn background_row(
 pub static DEBUG_SKIP_PREMULT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Debug cycle bound to the `[]a` chord. Three states (rotate each press): `0` = off (normal boundary conversion), `1` = α-as-grayscale (replace each pixel with `(final_α, final_α, final_α, 0xFF)` — inspect alpha distribution), `2` = force-opaque (force every pixel's α to 255 and pass the visible RGB through unmodified — inspect what the kernel produced BEFORE the clip mask + premultiply trimmed it).
+/// Debug cycle bound to the `[]a` chord. Three states (rotate each press): `0` = off (normal boundary conversion), `1` = α-as-grayscale (replace each pixel with `(final_α, final_α, final_α, 0xFF)` — inspect alpha distribution), `2` = force-opaque (force every pixel's α to 255 and pass the visible RGB thru unmodified — inspect what the kernel produced BEFORE the clip mask + premultiply trimmed it).
 pub static DEBUG_SHOW_ALPHA: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 pub const DEBUG_SHOW_ALPHA_OFF: u8 = 0;
 pub const DEBUG_SHOW_ALPHA_GRAYSCALE: u8 = 1;
 pub const DEBUG_SHOW_ALPHA_FORCE_OPAQUE: u8 = 2;
 
-/// Debug toggle bound to the `[]h` chord. When set, `finalize_into_screen` routes through the FORCE_OPAQUE debug branch (XOR darkness → visible RGB, ignore clip_mask trim, force α=0xFF, skip premult) so the per-id colours the consumer paints into scratch land in `persistent_screen` exactly as written — no AA edges, no corner cutouts, no shadow boost on the perimeter. The host additionally skips `paint_shadow` while this is on so the band outside the window doesn't disturb the hit-id view at the chrome edge.
+/// Debug toggle bound to the `[]h` chord. When set, `finalize_into_screen` routes thru the FORCE_OPAQUE debug branch (XOR darkness → visible RGB, ignore clip_mask trim, force α=0xFF, skip premult) so the per-id colours the consumer paints into scratch land in `persistent_screen` exactly as written — no AA edges, no corner cutouts, no shadow boost on the perimeter. The host additionally skips `paint_shadow` while this is on so the band outside the window doesn't disturb the hit-id view at the chrome edge.
 pub static DEBUG_SHOW_HITMASK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -840,7 +840,7 @@ pub static RASTERIZE_OPS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 pub static DEBUG_SHOW_FPS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Debug toggle that overlays a 1-px magenta hairline around the damage rect the host repaints this frame. Bound to the `[]w` chord ("Where"). Drawn directly into the platform back buffer AFTER `persistent_screen` has been copied in, BEFORE `present()`. The outline never enters `persistent_screen`, never flows through finalize, and never survives more than one frame — so toggling it on/off needs no full-repaint promotion and there is no stale-bbox state to carry between frames. `false` by default.
+/// Debug toggle that overlays a 1-px magenta hairline around the damage rect the host repaints this frame. Bound to the `[]w` chord ("Where"). Drawn directly into the platform back buffer AFTER `persistent_screen` has been copied in, BEFORE `present()`. The outline never enters `persistent_screen`, never flows thru finalize, and never survives more than one frame — so toggling it on/off needs no full-repaint promotion and there is no stale-bbox state to carry between frames. `false` by default.
 pub static DEBUG_SHOW_DAMAGE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -1014,7 +1014,7 @@ impl DebugStats {
     }
 }
 
-/// Overlay a one-line diagnostic strip across the bottom of `pixels` showing the live stats in [`DebugStats`]. Gated by [`DEBUG_SHOW_FPS`] — the host should check that flag before calling. Paints into the α + darkness scratch buffer BEFORE the boundary pass so the strip flows through `finalize_*` like any other content (no special handling needed downstream).
+/// Overlay a one-line diagnostic strip across the bottom of `pixels` showing the live stats in [`DebugStats`]. Gated by [`DEBUG_SHOW_FPS`] — the host should check that flag before calling. Paints into the α + darkness scratch buffer BEFORE the boundary pass so the strip flows thru `finalize_*` like any other content (no special handling needed downstream).
 ///
 /// The strip is `~24` pixels tall, semi-opaque black background, bright green monospace text (terminal-style for readability against any underlying content). Positioned at the very bottom of `pixels`; clipped to the buffer if the window is too short to fit the strip (returns early in that case — diagnostic, not load-bearing).
 ///

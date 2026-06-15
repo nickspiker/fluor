@@ -120,7 +120,7 @@ impl Surface {
         dirty: bool,
     ) -> bool {
         unsafe {
-            // One-shot per buffer-queue lifetime: declare our pixels are in Display P3, not sRGB. Without this, the compositor treats the bytes we write as sRGB and runs them through an sRGB→panel-native colour transform — exactly the desaturation/wash the photon pipeline is going to fight by doing its own colour management on theme + spectrum colours later. Resolved via dlsym (see [`lookup_set_buffers_data_space`]) so the binary stays loadable on pre-API-28 devices that don't ship the symbol.
+            // One-shot per buffer-queue lifetime: declare our pixels are in Display P3, not sRGB. Without this, the compositor treats the bytes we write as sRGB and runs them thru an sRGB→panel-native colour transform — exactly the desaturation/wash the photon pipeline is going to fight by doing its own colour management on theme + spectrum colours later. Resolved via dlsym (see [`lookup_set_buffers_data_space`]) so the binary stays loadable on pre-API-28 devices that don't ship the symbol.
             if !self.dataspace_set {
                 match lookup_set_buffers_data_space() {
                     Some(set_ds) => {

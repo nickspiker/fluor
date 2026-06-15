@@ -83,11 +83,11 @@ log = { version = "0.4", optional = true }
 # libc gives us `dlsym` / `RTLD_DEFAULT` to runtime-resolve NDK symbols added after our `api-level-26` floor (e.g. `ANativeWindow_setBuffersDataSpace` which is API 28+). Without runtime resolution the .so wouldn't even load on 26-27 devices because the dynamic linker resolves all imports eagerly at dlopen time.
 libc = { version = "0.2", optional = true }
 
-# x11rb is Linux-only. Used for `xcb_shape_rectangles(SK_INPUT, ...)` to set the click-through input region — the fullscreen transparent surface only accepts clicks inside `window_rect`; everything else passes through to whatever's behind us. `shape` feature pulls in the XShape extension bindings.
+# x11rb is Linux-only. Used for `xcb_shape_rectangles(SK_INPUT, ...)` to set the click-thru input region — the fullscreen transparent surface only accepts clicks inside `window_rect`; everything else passes thru to whatever's behind us. `shape` feature pulls in the XShape extension bindings.
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["shape"] }
 
-# objc2 + AppKit bindings for macOS click-through: NSEvent global mouse monitor + NSWindow mouseLocationOutsideOfEventStream.
+# objc2 + AppKit bindings for macOS click-thru: NSEvent global mouse monitor + NSWindow mouseLocationOutsideOfEventStream.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 block2 = "0.6"

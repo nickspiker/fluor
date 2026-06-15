@@ -4,7 +4,7 @@
 
 use super::chrome::ResizeEdge;
 
-/// What the consumer wants the host to do after a widget click / key / `FluorApp::on_event`. Pass-through behaviour lets the consumer ignore events they don't care about; the explicit variants override the host's default for that event.
+/// What the consumer wants the host to do after a widget click / key / `FluorApp::on_event`. Pass-thru behaviour lets the consumer ignore events they don't care about; the explicit variants override the host's default for that event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventResponse {
     /// Consumer handled the event; host does nothing more.

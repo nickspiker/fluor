@@ -1,6 +1,6 @@
 //! Stack Notation compositing engine — layers as operands, blend ops as operators.
 //!
-//! "Stack Notation" describes the mechanism directly: data flows through a stack in execution order, operators are stack transformations. No precedence tables, no ambiguity. (Often called "RPN" in calculator history; that name carries decades of irrelevant baggage and the geographic branding of its inventor — neither describes what it actually does. Contrast with "Infix Notation" — the broken sibling whose arbitrary operator placement creates all the precedence/associativity problems Stack Notation sidesteps.)
+//! "Stack Notation" describes the mechanism directly: data flows thru a stack in execution order, operators are stack transformations. No precedence tables, no ambiguity. (Often called "RPN" in calculator history; that name carries decades of irrelevant baggage and the geographic branding of its inventor — neither describes what it actually does. Contrast with "Infix Notation" — the broken sibling whose arbitrary operator placement creates all the precedence/associativity problems Stack Notation sidesteps.)
 //!
 //! `Push` loads a layer's pixel buffer onto the evaluation stack; `Under(mode)` pops two operands (the second-from-top is the partial composite from layers above, the top is the new layer going behind) and folds them via [`crate::pixel::Blend::under`] with the chosen [`BlendMode`]. The same evaluator handles simple ordered stacks (`Push top, Push next_behind, Under(Normal)`) and complex expressions (`Push 0, Push 1, Under(Multiply), Push 2, Under(Add)`).
 //!
@@ -16,7 +16,7 @@ pub enum Op {
     Push(usize),
     /// Push a solid-colour buffer (all pixels same value).
     Constant(Argb8),
-    /// Pop two operands; the second-from-top is `top` (partial composite from above), the top-of-stack is `bottom` (new layer going behind). Apply `top.under(bottom, mode)` per pixel and push the result. The single compositing primitive — every blend mode flows through here.
+    /// Pop two operands; the second-from-top is `top` (partial composite from above), the top-of-stack is `bottom` (new layer going behind). Apply `top.under(bottom, mode)` per pixel and push the result. The single compositing primitive — every blend mode flows thru here.
     Under(BlendMode),
 }
 
@@ -155,7 +155,7 @@ impl StackCompositor {
                 Op::Under(mode) => {
                     let b = self.stack.pop().expect("Stack underflow on Under");
                     let a = self.stack.last_mut().expect("Stack underflow on Under");
-                    // Full-buffer compose. Use [`crate::paint::flatten`] so the SIMD+Rayon path for `Normal` mode (the 99% case) kicks in automatically; other blend modes route through scalar with Rayon-only chunking.
+                    // Full-buffer compose. Use [`crate::paint::flatten`] so the SIMD+Rayon path for `Normal` mode (the 99% case) kicks in automatically; other blend modes route thru scalar with Rayon-only chunking.
                     crate::paint::flatten(a, &b, mode);
                     self.release_buf(b);
                 }

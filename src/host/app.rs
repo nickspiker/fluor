@@ -1,6 +1,6 @@
 //! `FluorApp` trait + entry point for consumer-driven desktop apps.
 //!
-//! Consumers implement [`FluorApp`] and pass the impl to [`run_app`]. The host opens a window, runs the event loop, presents the buffer, and dispatches events through the trait. All visible content (chrome, widgets, panes) is the consumer's responsibility — the host owns no domain state.
+//! Consumers implement [`FluorApp`] and pass the impl to [`run_app`]. The host opens a window, runs the event loop, presents the buffer, and dispatches events thru the trait. All visible content (chrome, widgets, panes) is the consumer's responsibility — the host owns no domain state.
 //!
 //! Compose [`super::chrome_widget::DefaultChrome`] for the borderless window frame, [`crate::widgets::Textbox`] / [`crate::widgets::BlinkTimer`] for the textbox + blinking-cursor pattern, [`crate::Group`] for sub-viewport composite caching. The [`Context`] struct exposes the host's shared resources (viewport, text renderer, window handle, modifier state) to the consumer for the duration of each callback.
 //!
@@ -48,7 +48,7 @@ mod x11_atomic {
             .as_ref()
     }
 
-    /// Restrict the window's INPUT region to the given screen-space rectangle. Clicks outside this rect pass through to whatever window is behind us. Used by the fullscreen-compositor architecture: our OS surface covers the whole screen but the visible window is just a sub-rect, so we tell X11 "I'm only hittable inside that sub-rect" — the rest is mouse-transparent. Call once per `window_rect` change (initial creation, drag-to-move, resize-drag, monitor change).
+    /// Restrict the window's INPUT region to the given screen-space rectangle. Clicks outside this rect pass thru to whatever window is behind us. Used by the fullscreen-compositor architecture: our OS surface covers the whole screen but the visible window is just a sub-rect, so we tell X11 "I'm only hittable inside that sub-rect" — the rest is mouse-transparent. Call once per `window_rect` change (initial creation, drag-to-move, resize-drag, monitor change).
     ///
     /// The rect is in window-relative coordinates (= screen coords when the OS window is fullscreen at the screen origin). Negative offsets get clamped to 0 since XShape rectangles must be unsigned. Returns `true` if the call was sent successfully, `false` if the window isn't X11 or the connection failed.
     pub fn set_input_region(
@@ -107,9 +107,9 @@ pub struct Context<'a> {
     pub clip_mask: &'a mut [u8],
     /// Frame-level damage accumulator owned by the host. Consumers paint into Canvas instances backed by this accumulator (`Canvas::new(target, w, h, ctx.damage)`); every rasterizer reports its painted bbox into it. The host reads it after `app.render` to know exactly what changed this frame — drives the optional damage-rect outline overlay today and (eventually) damage-clipped composite + present.
     pub damage: &'a mut crate::canvas::Damage,
-    /// The damage clip the host computed for THIS frame, derived from `app.damage_rect(...)` before render. Consumers should thread this through every flatten / blit / glow call as the `clip` parameter so they only touch pixels inside the dirty region. Defaults to the full viewport (legacy apps that don't override `FluorApp::damage_rect` get the current full-redraw behavior).
+    /// The damage clip the host computed for THIS frame, derived from `app.damage_rect(...)` before render. Consumers should thread this thru every flatten / blit / glow call as the `clip` parameter so they only touch pixels inside the dirty region. Defaults to the full viewport (legacy apps that don't override `FluorApp::damage_rect` get the current full-redraw behavior).
     pub damage_clip: crate::canvas::PixelRect,
-    /// App-facing window handle. `WindowHandle` is intentionally minimal — only `request_redraw` lives there because it's the only window operation real apps invoke from the trait surface. Cursor / drag / maximize / minimize flow through [`EventResponse`] variants instead, so the host's window state stays the single source of truth.
+    /// App-facing window handle. `WindowHandle` is intentionally minimal — only `request_redraw` lives there because it's the only window operation real apps invoke from the trait surface. Cursor / drag / maximize / minimize flow thru [`EventResponse`] variants instead, so the host's window state stays the single source of truth.
     pub window: &'a dyn WindowHandle,
     /// Latest tracked modifier state (shift / ctrl / alt / super) in fluor-native form. Hosts translate from platform input (winit `ModifiersState`, Android JNI mod-key flags) before constructing this.
     pub modifiers: FModifiersState,
@@ -124,7 +124,7 @@ pub use super::event_response::EventResponse;
 
 /// What a consumer implements to drive the desktop host.
 pub trait FluorApp {
-    /// Custom user-event payload for cross-thread wake-up. Background tasks (network, file I/O, async ceremonies) clone the `Arc<dyn WakeSender<Self::UserEvent>>` from [`Self::set_event_proxy`] and call `proxy.send(payload)` to wake the host; the host dispatches the payload back through [`Self::on_user_event`] on the UI thread. Apps that don't need cross-thread wake-up declare `type UserEvent = ();` and skip the two methods.
+    /// Custom user-event payload for cross-thread wake-up. Background tasks (network, file I/O, async ceremonies) clone the `Arc<dyn WakeSender<Self::UserEvent>>` from [`Self::set_event_proxy`] and call `proxy.send(payload)` to wake the host; the host dispatches the payload back thru [`Self::on_user_event`] on the UI thread. Apps that don't need cross-thread wake-up declare `type UserEvent = ();` and skip the two methods.
     type UserEvent: 'static + Send;
 
     /// Initial window title. Default is empty; override or call `ctx.window.set_title(...)` from `init` if you want it set later.
@@ -146,7 +146,7 @@ pub trait FluorApp {
     /// Window event from the host. Consumer returns an [`EventResponse`] telling the host what to do next. Events are fluor-native [`crate::event::Event`] values — hosts translate platform input at the boundary.
     fn on_event(&mut self, event: &FEvent, ctx: &mut Context) -> EventResponse;
 
-    /// Damage region this app will repaint this frame. Returns `None` if no widget state changed since the last frame — host can persist scratch as-is and skip render entirely. Returns `Some(rect)` to declare the union of all dirty widget bboxes (each widget's `prev ∪ current` from `widget.damage_rect(...)`); host clears scratch in that rect and threads it through `ctx.damage_clip` so the consumer's render call clips every flatten / blit to it.
+    /// Damage region this app will repaint this frame. Returns `None` if no widget state changed since the last frame — host can persist scratch as-is and skip render entirely. Returns `Some(rect)` to declare the union of all dirty widget bboxes (each widget's `prev ∪ current` from `widget.damage_rect(...)`); host clears scratch in that rect and threads it thru `ctx.damage_clip` so the consumer's render call clips every flatten / blit to it.
     ///
     /// Default impl returns `Some(full viewport)` — safe fallback that preserves today's full-redraw behavior. Apps opt into differential rendering by overriding this to union their widget damage rects.
     ///
@@ -157,12 +157,12 @@ pub trait FluorApp {
         Some(crate::canvas::PixelRect::new(0, 0, w, h))
     }
 
-    /// Per-frame paint into the host's CPU present buffer. Flatten owned Groups onto `target`. The damage clip computed pre-render is in `ctx.damage_clip`; thread it through every flatten / blit / glow call to skip pixels outside the dirty region.
+    /// Per-frame paint into the host's CPU present buffer. Flatten owned Groups onto `target`. The damage clip computed pre-render is in `ctx.damage_clip`; thread it thru every flatten / blit / glow call to skip pixels outside the dirty region.
     fn render(&mut self, target: &mut [u32], ctx: &mut Context);
 
     /// Per-hit-id overlay delta table for THIS frame. The host runs one walk over `hit_test_map()` after finalize+shadow; for each pixel `i`, if `current[id] != last_applied[id]`, it wrap-adds the prior delta back and wrap-subs the current delta in `persistent_screen` (visible-RGB space). Apps return a slice where entry `[id]` is the visible-RGB delta to apply to pixels marked with that hit id this frame (e.g. the hover tint when a button is hovered, zero otherwise). Length must equal `registry.next_id` (= 1 + number of registered hit zones); IDs past the slice are treated as zero-delta. Default impl: empty slice (no overlay tints, no allocations).
     ///
-    /// Takes `&mut self` so apps can build the table by walking their [`crate::host::widget::Container`] (which threads `&mut dyn Widget` through `visit`) — see [`crate::host::widget::build_overlay_deltas`] for the canonical one-liner implementation.
+    /// Takes `&mut self` so apps can build the table by walking their [`crate::host::widget::Container`] (which threads `&mut dyn Widget` thru `visit`) — see [`crate::host::widget::build_overlay_deltas`] for the canonical one-liner implementation.
     fn overlay_deltas(&mut self) -> Vec<u32> {
         Vec::new()
     }
@@ -204,7 +204,7 @@ pub trait FluorApp {
     }
 }
 
-/// Run the desktop host until the window closes. Builds an `EventLoop` typed on `A::UserEvent` so background-thread wake-ups via the WakeSender route through [`FluorApp::on_user_event`]. The proxy is created up-front, wrapped in a [`winit_compat::WinitWakeSender`], and handed to the app via [`FluorApp::set_event_proxy`] BEFORE the event loop starts, so apps can clone-and-ship the Arc to background tasks during their own constructor or [`FluorApp::init`].
+/// Run the desktop host until the window closes. Builds an `EventLoop` typed on `A::UserEvent` so background-thread wake-ups via the WakeSender route thru [`FluorApp::on_user_event`]. The proxy is created up-front, wrapped in a [`winit_compat::WinitWakeSender`], and handed to the app via [`FluorApp::set_event_proxy`] BEFORE the event loop starts, so apps can clone-and-ship the Arc to background tasks during their own constructor or [`FluorApp::init`].
 #[cfg(feature = "host-winit")]
 pub fn run_app<A: FluorApp + 'static>(mut app: A) -> Result<(), EventLoopError> {
     let event_loop = EventLoop::<A::UserEvent>::with_user_event().build()?;
@@ -248,9 +248,9 @@ fn clear_scratch_rect(scratch: &mut [u32], win_w: usize, rect: crate::canvas::Pi
     }
 }
 
-/// The host's adapter — owns platform handles + the consumer's `App`, dispatches events through the trait. Not user-facing; constructed by [`run_app`].
+/// The host's adapter — owns platform handles + the consumer's `App`, dispatches events thru the trait. Not user-facing; constructed by [`run_app`].
 ///
-/// **Compositor architecture.** The OS window is fullscreen borderless transparent — fluor owns the entire screen buffer. The consumer paints into a window-sized scratch buffer (sized to `viewport` = `window_rect.w × window_rect.h`); the host then blits that scratch into the screen buffer at the `window_rect` offset. Pixels outside the window stay α=0 so the OS compositor shows whatever's behind us. Click-through is via a per-resize input-region call (set later, see step 2 of the fullscreen-compositor pivot) so clicks outside `window_rect` route to whatever's underneath.
+/// **Compositor architecture.** The OS window is fullscreen borderless transparent — fluor owns the entire screen buffer. The consumer paints into a window-sized scratch buffer (sized to `viewport` = `window_rect.w × window_rect.h`); the host then blits that scratch into the screen buffer at the `window_rect` offset. Pixels outside the window stay α=0 so the OS compositor shows whatever's behind us. Click-thru is via a per-resize input-region call (set later, see step 2 of the fullscreen-compositor pivot) so clicks outside `window_rect` route to whatever's underneath.
 #[cfg(feature = "host-winit")]
 struct DesktopShell<A: FluorApp> {
     app: A,
@@ -323,7 +323,7 @@ struct DesktopShell<A: FluorApp> {
     last_opaque_scan: bool,
     /// Dedicated staging buffer for the FPS strip (debug). Sized to `win_w × DEBUG_STRIP_H` lazily on first use; the strip rasterizes here in α + darkness and then gets converted + clobbered into persistent_screen. Kept entirely separate from the app's scratch so the strip never contaminates the consumer's render path.
     strip_buf: Vec<u32>,
-    /// macOS click-through: true when we've told the OS to ignore mouse events for this window (cursor is over a transparent area). A global NSEvent monitor polls cursor position to detect re-entry.
+    /// macOS click-thru: true when we've told the OS to ignore mouse events for this window (cursor is over a transparent area). A global NSEvent monitor polls cursor position to detect re-entry.
     #[cfg(target_os = "macos")]
     hittest_off: bool,
     #[cfg(target_os = "macos")]
@@ -389,7 +389,7 @@ impl<A: FluorApp> DesktopShell<A> {
         }
     }
 
-    /// macOS click-through: only disable hittest when the cursor is outside the window rect.
+    /// macOS click-thru: only disable hittest when the cursor is outside the window rect.
     /// Inside the window rect we always accept events — checking alpha per-pixel there is
     /// too fragile (transparent UI elements, frame transitions, etc. cause false negatives
     /// that drop clicks to the app behind us).
@@ -433,7 +433,7 @@ impl<A: FluorApp> DesktopShell<A> {
         // Reset the frame's damage accumulator before the consumer paints. Every Canvas the consumer constructs against `ctx.damage` will union into this; after `app.render` returns we have the bounding rect of everything touched this frame.
         self.pending_damage.clear();
 
-        // Two render modes, chosen by an explicit host flag (NOT by comparing damage_clip's geometry to viewport_rect). `pending_full_repaint` is set by events that destroy the chrome perimeter + shadow band in persistent_screen — drag release, resize, zoom, focus change. Debug-toggle transitions (hitmask / alpha mode / FPS strip) also promote to a full repaint here because those flags change either finalize's branch or what's overlaid post-finalize, and need a clean window to flow through. On those frames we wipe persistent_screen, reset overlay state, set damage_clip = viewport, and finalize copies every pixel (including AA edges); paint_shadow then casts ONCE into the freshly-zero band (and only when hitmask is off). On every other frame, damage_clip is whatever app.damage_rect returns (typically a small interior region or empty); finalize is narrowed AND skips non-opaque source pixels so the AA hairline pixels at the window perimeter stay untouched, and paint_shadow is NOT called so it never compounds.
+        // Two render modes, chosen by an explicit host flag (NOT by comparing damage_clip's geometry to viewport_rect). `pending_full_repaint` is set by events that destroy the chrome perimeter + shadow band in persistent_screen — drag release, resize, zoom, focus change. Debug-toggle transitions (hitmask / alpha mode / FPS strip) also promote to a full repaint here because those flags change either finalize's branch or what's overlaid post-finalize, and need a clean window to flow thru. On those frames we wipe persistent_screen, reset overlay state, set damage_clip = viewport, and finalize copies every pixel (including AA edges); paint_shadow then casts ONCE into the freshly-zero band (and only when hitmask is off). On every other frame, damage_clip is whatever app.damage_rect returns (typically a small interior region or empty); finalize is narrowed AND skips non-opaque source pixels so the AA hairline pixels at the window perimeter stay untouched, and paint_shadow is NOT called so it never compounds.
         let hitmask_now =
             crate::paint::DEBUG_SHOW_HITMASK.load(std::sync::atomic::Ordering::Relaxed);
         let alpha_mode_now =
@@ -473,7 +473,7 @@ impl<A: FluorApp> DesktopShell<A> {
         };
         // Strip is painted in a clobber pass AFTER finalize + overlay — it does NOT contribute to damage_clip and does NOT bump damage_pct.
 
-        // Damage outline overlay (`[]w`). Sampled once here so the post-finalize stamp uses a stable value for this frame. The outline is stamped DIRECTLY into the platform back buffer between the persistent_screen copy and `present()`, so it never enters persistent_screen, never flows through finalize, and never carries state between frames.
+        // Damage outline overlay (`[]w`). Sampled once here so the post-finalize stamp uses a stable value for this frame. The outline is stamped DIRECTLY into the platform back buffer between the persistent_screen copy and `present()`, so it never enters persistent_screen, never flows thru finalize, and never carries state between frames.
         let outline_active =
             crate::paint::DEBUG_SHOW_DAMAGE.load(std::sync::atomic::Ordering::Relaxed);
 
@@ -711,7 +711,7 @@ impl<A: FluorApp> DesktopShell<A> {
         self.debug_stats.record_present(damage_pct);
     }
 
-    /// Drag-tick fast path: shift the screen buffer in place by the delta since the last paint, push the input region update, and present. Skips consumer render, scratch fill, finalize, and shadow rasterization entirely — the existing chrome pixels just slide through the screen buffer, with anything that falls off any edge wrapping to the opposite side. On drag release, a normal `render_frame` overwrites the wrap artefacts in one clean frame.
+    /// Drag-tick fast path: shift the screen buffer in place by the delta since the last paint, push the input region update, and present. Skips consumer render, scratch fill, finalize, and shadow rasterization entirely — the existing chrome pixels just slide thru the screen buffer, with anything that falls off any edge wrapping to the opposite side. On drag release, a normal `render_frame` overwrites the wrap artefacts in one clean frame.
     fn apply_move_drag_shift(&mut self) {
         let dx = self.window_rect.x - self.last_painted_rect.x;
         let dy = self.window_rect.y - self.last_painted_rect.y;
@@ -866,7 +866,7 @@ impl<A: FluorApp> DesktopShell<A> {
         self.drag_start_cursor_screen_pos = (self.cursor_x as i32, self.cursor_y as i32);
     }
 
-    /// Apply one tick of the self-driven resize drag — in-buffer. Called from `RedrawRequested` when `is_dragging_resize` (throttled to vsync). Updates `window_rect` directly (no OS round-trip — the OS window is fullscreen and request_inner_size / set_outer_position are no-ops). When the size changed, resizes `scratch` + `clip_mask` to the new dimensions and calls the consumer's `on_resize` so they can reflow. Always pushes a new XShape input region so click-through follows the visible window. The subsequent `render_frame` paints at the new geometry into the screen buffer.
+    /// Apply one tick of the self-driven resize drag — in-buffer. Called from `RedrawRequested` when `is_dragging_resize` (throttled to vsync). Updates `window_rect` directly (no OS round-trip — the OS window is fullscreen and request_inner_size / set_outer_position are no-ops). When the size changed, resizes `scratch` + `clip_mask` to the new dimensions and calls the consumer's `on_resize` so they can reflow. Always pushes a new XShape input region so click-thru follows the visible window. The subsequent `render_frame` paints at the new geometry into the screen buffer.
     fn apply_resize_drag(&mut self) {
         let Some(window) = self.window.as_ref().cloned() else {
             return;
@@ -1015,7 +1015,7 @@ impl<A: FluorApp> DesktopShell<A> {
             }
         }
 
-        // Update click-through region so the OS routes clicks based on the new rect.
+        // Update click-thru region so the OS routes clicks based on the new rect.
         #[cfg(target_os = "linux")]
         x11_atomic::set_input_region(&window, new_x, new_y, new_w, new_h);
     }
@@ -1127,7 +1127,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
         // Surface is created at the requested monitor size — we can paint immediately. The Resized handler still flips this flag if it sees a different first size, but with the non-fullscreen approach we expect the surface to come up at the right size on the first frame.
         self.surface_ready = true;
 
-        // Click-through: tell X11 our hittable area is just `window_rect`. Clicks outside the rect pass through to whatever app is beneath us. Drag-to-move + resize-drag steps will re-call this on every rect change. No-op on non-X11 platforms; macOS/Windows passthrough handling lands in their own backend modules later.
+        // Click-thru: tell X11 our hittable area is just `window_rect`. Clicks outside the rect pass thru to whatever app is beneath us. Drag-to-move + resize-drag steps will re-call this on every rect change. No-op on non-X11 platforms; macOS/Windows passthrough handling lands in their own backend modules later.
         #[cfg(target_os = "linux")]
         x11_atomic::set_input_region(
             &window,
@@ -1427,7 +1427,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 self.dispatch_event(event);
             }
             WindowEvent::RedrawRequested => {
-                // macOS click-through: if the global monitor detected the cursor re-entering
+                // macOS click-thru: if the global monitor detected the cursor re-entering
                 // an opaque region while hittest was off, flip it back on. While hittest is
                 // off we keep requesting redraws to poll the monitor flag at vsync rate.
                 #[cfg(target_os = "macos")]

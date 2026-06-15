@@ -14,7 +14,7 @@
 //!
 //! # The unified `Blend::under` kernel
 //!
-//! Every compositing op in fluor — Normal source-under, Multiply, Screen, Add, Subtract, Overlay, Darken, Lighten — flows through one trait method: `top.under(bottom, mode)`. `top` is the partial composite already accumulated above (its α-byte = opacity so far; its RGB = darkness accumulated so far, with the canonical empty value `0x00000000` representing "nothing here yet"). `bottom` is the new layer going behind. The mode shapes only how `bottom`'s darkness is interpreted before contributing.
+//! Every compositing op in fluor — Normal source-under, Multiply, Screen, Add, Subtract, Overlay, Darken, Lighten — flows thru one trait method: `top.under(bottom, mode)`. `top` is the partial composite already accumulated above (its α-byte = opacity so far; its RGB = darkness accumulated so far, with the canonical empty value `0x00000000` representing "nothing here yet"). `bottom` is the new layer going behind. The mode shapes only how `bottom`'s darkness is interpreted before contributing.
 //!
 //! Convention: each new layer ADDS darkness to the buffer at `mod_dark × consumed >> 8` per channel, where `consumed = ((256 − top_α) × bot_α) >> 8` (how much of the remaining opacity budget the new layer fills). The opacity accumulates as `new_α = top_α + consumed`. Mode kernels operate in *darkness space* but preserve the *visible-space* semantic the mode name promises (e.g., `BlendMode::Multiply` still darkens the visible result like Photoshop multiply).
 
@@ -23,12 +23,12 @@ pub type Argb8 = u32;
 
 /// How `bottom`'s darkness is mixed into the partial composite `top` when composing front-to-back.
 ///
-/// Each mode is a pure channel-wise function of `(top_dark, bottom_dark)` that produces a "modulated bottom darkness" `(mr, mg, mb)`. The opacity-accumulator math around it is identical across all modes — see [`Blend::under`]. Mode names describe the *visible-space* semantic (e.g., "Multiply" darkens like Photoshop multiply on visible RGB); the formulas below operate on darkness operands and produce darkness output that round-trips through the OS XOR boundary to match the named visible-space behavior.
+/// Each mode is a pure channel-wise function of `(top_dark, bottom_dark)` that produces a "modulated bottom darkness" `(mr, mg, mb)`. The opacity-accumulator math around it is identical across all modes — see [`Blend::under`]. Mode names describe the *visible-space* semantic (e.g., "Multiply" darkens like Photoshop multiply on visible RGB); the formulas below operate on darkness operands and produce darkness output that round-trips thru the OS XOR boundary to match the named visible-space behavior.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlendMode {
-    /// Source-under: bottom passes through unchanged. `mr = bd`. Standard front-to-back compositing.
+    /// Source-under: bottom passes thru unchanged. `mr = bd`. Standard front-to-back compositing.
     Normal,
-    /// Visible-multiply (darken-darken): `mr = 255 − (((255 − td) × (255 − bd)) >> 8)`. Bottom is "filtered through" top's intensity in visible space.
+    /// Visible-multiply (darken-darken): `mr = 255 − (((255 − td) × (255 − bd)) >> 8)`. Bottom is "filtered thru" top's intensity in visible space.
     Multiply,
     /// Visible-screen (brighten-brighten): `mr = (td × bd) >> 8`. The darkness-space dual of visible-multiply.
     Screen,

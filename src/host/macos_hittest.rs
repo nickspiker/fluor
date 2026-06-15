@@ -1,4 +1,4 @@
-//! macOS global mouse monitor for click-through re-entry detection.
+//! macOS global mouse monitor for click-thru re-entry detection.
 //!
 //! When `ignoresMouseEvents = true`, macOS stops delivering CursorMoved to our window.
 //! We install a global NSEvent monitor that fires on mouseMoved globally, checks the

@@ -1,6 +1,6 @@
 //! Window chrome — minimal top-down rasterization. Each pixel in the chrome layer is written by exactly one site. No painter's algorithm anywhere.
 //!
-//! Currently scoped to **window perimeter hairline** with squircle corner AA. The chrome layer starts at the canonical empty value (`0x00000000` = α=0 transparent, darkness=0); this function paints only the hairline pixels. Everywhere else in the chrome layer stays transparent so panes / bg can pass through the chrome group's Stack composition. Buttons, glyphs, title text, hover overlay — all deferred to subsequent scaffold steps; reintroduce them only when each can be added without overwriting earlier writes within this same layer.
+//! Currently scoped to **window perimeter hairline** with squircle corner AA. The chrome layer starts at the canonical empty value (`0x00000000` = α=0 transparent, darkness=0); this function paints only the hairline pixels. Everywhere else in the chrome layer stays transparent so panes / bg can pass thru the chrome group's Stack composition. Buttons, glyphs, title text, hover overlay — all deferred to subsequent scaffold steps; reintroduce them only when each can be added without overwriting earlier writes within this same layer.
 //!
 //! Hit-test IDs and the `ResizeEdge` enum live here so the desktop host's mouse routing can reference them without depending on the (future, larger) controls implementation.
 //!
@@ -144,7 +144,7 @@ pub fn draw_window_edges_and_mask(
     // Curve rows AND curve cols: the squircle is symmetric under x↔y swap, so the same crossings table walks both axes. The row-walk handles the corner's near-vertical segment (one row, two-pixel hairline at the curve crossing); the col-walk handles the near-horizontal segment (one col, two-pixel hairline). Both walks together fully cover the corner — without the col-walk, the near-horizontal portion of the corner (where the curve travels many cols per row) shows visible gaps.
     for (i, &(inset_raw, l, h_cov)) in crossings.iter().enumerate() {
         let inset = inset_raw as usize;
-        // Guard: in degenerate geometries the curve terminal can sit past the cap boundary. Skip those only. Letting `inset+1 == cap` through is required — that's the curve's natural last hairline pixel meeting the straight edge at the cap join.
+        // Guard: in degenerate geometries the curve terminal can sit past the cap boundary. Skip those only. Letting `inset+1 == cap` thru is required — that's the curve's natural last hairline pixel meeting the straight edge at the cap join.
         if inset >= cap {
             continue;
         }
@@ -389,19 +389,26 @@ pub fn draw_app_icon(
     brighten: bool,
 ) {
     let r = radius;
+    if r < 2 {
+        return; // Contract relied on by chrome_widget.rs:309 — degenerate sizes pass thru without drawing, so the layout needs no min-size guard. r ≥ 2 keeps (r-2) non-negative below.
+    }
     let stroke_width = (r >> 5) + 1;
-    let r_icon2 = (r - 1) * (r - 1);
+    // TOP-DOWN, not partitioned. The icon is the top layer; the ring sits beneath it. Paint the icon FIRST with a soft edge, then fill the ring as a FULL disk underneath. Under-blend is "topmost paints first, the layer beneath shows thru", so the ring bleeds thru the icon's partial-alpha rim → the icon↔ring boundary anti-aliases with no hard step; the background, painted under the whole orb afterward, gives the outer AA.
+    //
+    // Each edge is a 1-px coverage ramp biased INWARD, not centred and not a band tacked outside. From d ≈ R + (dist²−R²)/2R, coverage = (R²−dist²)/(2R−1): full (255) at dist²=(R−1)², zero at dist²=R², the single AA pixel landing at R. Biasing inward (rather than half-straddling R) lands the edge cleanly on the grid with no 50%-at-the-radius pixel and pulls the solid radius in by 1. BOTH edges are biased the same way so the icon reaches 0 exactly where the ring is still solid — two straddling ramps would overlap into a translucent dip (a see-thru ring) at the boundary. The icon image is unchanged: same sampling, just a clean AA rim.
+    let r_icon = r - 1;
+    let r_icon2 = r_icon * r_icon;
+    let two_icon = 2 * r_icon - 1; // ramp denominator for the icon edge: (R²)−(R−1)²
     let r_ring = r - 1 + stroke_width;
     let r_ring2 = r_ring * r_ring;
-    let r_aa = r_ring + 1;
-    let r_aa2 = r_aa * r_aa;
-    let diff = r_aa2 - r_ring2; // = 2·r_ring + 1
+    let two_ring = 2 * r_ring - 1; // ramp denominator for the ring edge
+    let r_bbox = r_ring; // the inward ramp reaches 0 at r_ring², so the disk never paints beyond r_ring
 
     let mut htm = hit_test_map;
-    let y0 = (cy - r_aa) as usize;
-    let y1 = (cy + r_aa + 1) as usize;
-    let x0 = (cx - r_aa) as usize;
-    let x1 = (cx + r_aa + 1) as usize;
+    let y0 = (cy - r_bbox) as usize;
+    let y1 = (cy + r_bbox + 1) as usize;
+    let x0 = (cx - r_bbox) as usize;
+    let x1 = (cx + r_bbox + 1) as usize;
 
     for y in y0..y1 {
         let dy = y as isize - cy;
@@ -409,25 +416,42 @@ pub fn draw_app_icon(
         for x in x0..x1 {
             let dx = x as isize - cx;
             let dist2 = dx * dx + dy2;
+            if dist2 > r_ring2 {
+                continue; // beyond the ring edge — a bbox corner, not part of the disk
+            }
             let idx = y * width + x;
 
             if let Some(map) = htm.as_mut() {
-                if dist2 <= r_ring2 {
-                    map[idx] = hit_id;
-                }
+                map[idx] = hit_id; // dist2 ≤ r_ring2 here by the continue above
             }
 
-            if dist2 <= r_icon2 {
-                let top = sample_icon(icon, dx, dy, r, ring_colour.unwrap_or(0), darken, brighten);
-                pixels[idx] = pixels[idx].under(top, BlendMode::Normal);
-            } else if let Some(ring) = ring_colour {
-                let ring_rgb = ring & 0x00FF_FFFF;
-                if dist2 <= r_ring2 {
-                    pixels[idx] = pixels[idx].under(0xFF00_0000 | ring_rgb, BlendMode::Normal);
-                } else if dist2 <= r_aa2 {
-                    let alpha = (((r_aa2 - dist2) << 8) / diff) as u32;
-                    if alpha != 0 {
-                        pixels[idx] = pixels[idx].under((alpha << 24) | ring_rgb, BlendMode::Normal);
+            // Icon, topmost: inward 1-px coverage ramp on r_icon. Sample only fires while a_icon ≠ 0, i.e. dist2 < r_icon² = (r-1)² → sample_icon's |dx|,|dy| ≤ r-2 precondition holds with margin.
+            let num_icon = r_icon2 - dist2;
+            let a_icon: u32 = if num_icon <= 0 {
+                0
+            } else if num_icon >= two_icon {
+                255
+            } else {
+                (num_icon * 255 / two_icon) as u32
+            };
+            if a_icon != 0 {
+                let s = sample_icon(icon, dx, dy, r, ring_colour.unwrap_or(0), darken, brighten);
+                pixels[idx] = pixels[idx].under((a_icon << 24) | (s & 0x00FF_FFFF), BlendMode::Normal);
+            }
+            // Ring, painted UNDER the icon: inward 1-px coverage ramp on r_ring, full disk within. Skipped where the icon is fully opaque (invisible there anyway); where the icon's rim is partial it shows thru → the inner-boundary AA. The ring is solid out to (r_ring−1)² ≥ r_icon², so it backs the entire icon rim — no translucent gap.
+            if a_icon != 255 {
+                if let Some(ring) = ring_colour {
+                    let num_ring = r_ring2 - dist2;
+                    let a_ring: u32 = if num_ring <= 0 {
+                        0
+                    } else if num_ring >= two_ring {
+                        255
+                    } else {
+                        (num_ring * 255 / two_ring) as u32
+                    };
+                    if a_ring != 0 {
+                        pixels[idx] =
+                            pixels[idx].under((a_ring << 24) | (ring & 0x00FF_FFFF), BlendMode::Normal);
                     }
                 }
             }
@@ -507,7 +531,7 @@ fn strip_layout(
     }
     let strip_x = w - strip_w;
     let button_area_offset = button_size / 4;
-    // saturating_sub keeps button_size=0 from underflowing; all the `for ... in 0..button_size` loops fall through naturally with empty range.
+    // saturating_sub keeps button_size=0 from underflowing; all the `for ... in 0..button_size` loops fall thru naturally with empty range.
     let last_row = button_size.saturating_sub(1);
     Some((w, strip_w, strip_x, button_area_offset, last_row, h))
 }
@@ -880,7 +904,7 @@ pub fn draw_maximize_symbol(
 
 /// Rasterize the close glyph — an ✕ of two 45° diagonal capsules — centred at `(cx, cy)` with arm radius `r`. Integer math, same spirit as [`draw_minimize_symbol`]/[`draw_maximize_symbol`]: per pixel, the squared distance to the relevant diagonal is compared against the stroke radius in a scaled (`×8`) integer domain, with a 1-pixel AA band. No floating point, no `sqrt`.
 ///
-/// Coordinates run in a doubled, pixel-centred frame (`ax = 2·dx + 1 = 2·x_actual`), so the half-pixel sample offset and the diagonal's `1/√2` factor fall out as exact integers: a diagonal's perpendicular squared distance is `perp²/8` of the true value and a cap endpoint's is `[(ax−epx)²+(ay−epy)²]/4`. Multiplying through by 8 (`d8`) clears both, so every test is against `radius²·8 = 2·rad²`. The only division is the AA ramp, whose divisor `denom = 8·rad ≥ 8` is provably non-zero and whose result is provably `< 256` in the ramp branch (there `d8 > inner8`, so `outer8 − d8 < denom`).
+/// Coordinates run in a doubled, pixel-centred frame (`ax = 2·dx + 1 = 2·x_actual`), so the half-pixel sample offset and the diagonal's `1/√2` factor fall out as exact integers: a diagonal's perpendicular squared distance is `perp²/8` of the true value and a cap endpoint's is `[(ax−epx)²+(ay−epy)²]/4`. Multiplying thru by 8 (`d8`) clears both, so every test is against `radius²·8 = 2·rad²`. The only division is the AA ramp, whose divisor `denom = 8·rad ≥ 8` is provably non-zero and whose result is provably `< 256` in the ramp branch (there `d8 > inner8`, so `outer8 − d8 < denom`).
 pub fn draw_close_symbol(
     pixels: &mut [u32],
     width: usize,

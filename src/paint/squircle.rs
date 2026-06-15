@@ -40,7 +40,7 @@ pub fn draw_squircle_pill_f(
     draw_squircle_pill_with_crossings(canvas, pill_x, pill_y, pill_w, pill_h, colour, &crossings);
 }
 
-/// Shared rasterizer body for [`draw_squircle_pill`] and [`draw_squircle_pill_f`]. Takes pre-computed `crossings` so the two entry points can dispatch through one painting kernel — the integer / fractional choice lives entirely in which crossings generator the caller used.
+/// Shared rasterizer body for [`draw_squircle_pill`] and [`draw_squircle_pill_f`]. Takes pre-computed `crossings` so the two entry points can dispatch thru one painting kernel — the integer / fractional choice lives entirely in which crossings generator the caller used.
 fn draw_squircle_pill_with_crossings(
     canvas: &mut Canvas,
     pill_x: isize,
@@ -118,7 +118,7 @@ fn draw_squircle_pill_with_crossings(
     }
 }
 
-/// Two-tone variant of [`draw_squircle_pill`] — "football seam" split. EVERY pixel in the pill (interior + AA edges) picks `light` vs `shadow` by comparing its row against a piecewise seam anchored at TR and BL corners: 45° down-left from TR through the right cap (`seam_y = pill_w − 1 − dx` for `dx ≥ pill_w − 1 − pill_h/2`), flat along the centerline through the rectangular middle (`seam_y = pill_h/2`), then 45° down-left to BL through the left cap (`seam_y = pill_h − 1 − dx` for `dx ≤ pill_h − 1 − pill_h/2`). `dy ≤ seam_y` → light, else shadow. The light region encloses TL; the shadow region encloses BR. Pixel-aligned, symmetric, never slices the squircle curve at an off-angle.
+/// Two-tone variant of [`draw_squircle_pill`] — "football seam" split. EVERY pixel in the pill (interior + AA edges) picks `light` vs `shadow` by comparing its row against a piecewise seam anchored at TR and BL corners: 45° down-left from TR thru the right cap (`seam_y = pill_w − 1 − dx` for `dx ≥ pill_w − 1 − pill_h/2`), flat along the centerline thru the rectangular middle (`seam_y = pill_h/2`), then 45° down-left to BL thru the left cap (`seam_y = pill_h − 1 − dx` for `dx ≤ pill_h − 1 − pill_h/2`). `dy ≤ seam_y` → light, else shadow. The light region encloses TL; the shadow region encloses BR. Pixel-aligned, symmetric, never slices the squircle curve at an off-angle.
 ///
 /// For square pills (`pill_w == pill_h`) the flat middle collapses and the seam becomes the bbox anti-diagonal (TR→BL) — natural degenerate case.
 ///

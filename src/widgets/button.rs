@@ -19,7 +19,7 @@ pub struct Button {
     label: String,
     font: &'static str,
 
-    /// Stroke thickness as a fraction of `font_size`. Final pixel width = `(stroke_ru × font_size) as isize + 1` — the `+ 1` idiom guarantees a minimum 1 px stroke so the edge never disappears on small displays, and the multiplier scales the stroke up smoothly on big ones. Default `1.0 / (1 << 5)` (= 1/32 of font_size) yields 1 px through typical desktop range and ~2-3 px on 4K + zoom; same convention as Textbox so a Button and Textbox at the same `stroke_ru` render with identical edge weight.
+    /// Stroke thickness as a fraction of `font_size`. Final pixel width = `(stroke_ru × font_size) as isize + 1` — the `+ 1` idiom guarantees a minimum 1 px stroke so the edge never disappears on small displays, and the multiplier scales the stroke up smoothly on big ones. Default `1.0 / (1 << 5)` (= 1/32 of font_size) yields 1 px thru typical desktop range and ~2-3 px on 4K + zoom; same convention as Textbox so a Button and Textbox at the same `stroke_ru` render with identical edge weight.
     pub stroke_ru: f32,
     pub center_x: Coord,
     pub center_y: Coord,
@@ -167,7 +167,7 @@ impl Button {
         self.click_counter
     }
 
-    /// Mark the click counter advanced. Called from the Click trait impl; pub(crate) so internal consumers can fire it without going through the trait if they need to (e.g. a hypothetical keyboard accelerator outside Key::on_key).
+    /// Mark the click counter advanced. Called from the Click trait impl; pub(crate) so internal consumers can fire it without going thru the trait if they need to (e.g. a hypothetical keyboard accelerator outside Key::on_key).
     pub(crate) fn fire(&mut self) {
         self.click_counter = self.click_counter.wrapping_add(1);
     }
@@ -241,7 +241,7 @@ impl Button {
         }
         let cw = pill_w as usize;
         let ch = pill_h as usize;
-        // Fractional squirdleyness — slots between an ellipse (2) and a diamond (1). `1.5` reads as a noticeably-rounder, slightly-faceted pill: distinctly more curved than the textbox's `3.0` "slightly squared" but not as soft as a full ellipse. Routes through paint's `_f` (powf) variant; the textbox / chrome keep the integer (powi) fast path. Adjustable per-instance via this constant; future API could expose it as a Button field if more shapes are desired.
+        // Fractional squirdleyness — slots between an ellipse (2) and a diamond (1). `1.5` reads as a noticeably-rounder, slightly-faceted pill: distinctly more curved than the textbox's `3.0` "slightly squared" but not as soft as a full ellipse. Routes thru paint's `_f` (powf) variant; the textbox / chrome keep the integer (powi) fast path. Adjustable per-instance via this constant; future API could expose it as a Button field if more shapes are desired.
         let squirdleyness = 1.75;
         let stroke_px = (self.stroke_ru * self.font_size) as isize + 1;
 
@@ -420,7 +420,7 @@ fn glow_factor_256(font_size: f32, radius_scale: f32) -> u32 {
 }
 
 mod widget_impls {
-    //! [`crate::host::widget`] capability traits for [`Button`]. Mirrors `textbox::widget_impls`: Click increments the action counter, Focus / Hover route through Button's setters, Key activates on Enter / Space. Speaks fluor-native event types so the same impls work on every host (host-winit on desktop, host-android on Android).
+    //! [`crate::host::widget`] capability traits for [`Button`]. Mirrors `textbox::widget_impls`: Click increments the action counter, Focus / Hover route thru Button's setters, Key activates on Enter / Space. Speaks fluor-native event types so the same impls work on every host (host-winit on desktop, host-android on Android).
 
     use super::Button;
     use crate::coord::Coord;

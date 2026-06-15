@@ -38,6 +38,6 @@ pub mod renderer_wgpu;
 #[cfg(feature = "host-winit")]
 pub mod winit_compat;
 
-/// macOS click-through: global NSEvent monitor for re-entry detection.
+/// macOS click-thru: global NSEvent monitor for re-entry detection.
 #[cfg(all(feature = "host-winit", target_os = "macos"))]
 pub(crate) mod macos_hittest;

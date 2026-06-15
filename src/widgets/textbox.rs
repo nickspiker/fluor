@@ -22,7 +22,7 @@ pub struct Textbox {
     focused: bool,
     /// `true` while the cursor is hovering over the textbox bbox. Drives the hover fill colour. Mutate via [`Self::set_hovered`] / the [`crate::host::widget::Hover`] trait method.
     hovered: bool,
-    /// Stroke thickness as a fraction of `font_size`. Final pixel width = `(stroke_ru × font_size) as isize + 1` — the `+ 1` idiom guarantees a minimum 1 px stroke so the edge never disappears on small displays, and the multiplier scales the stroke up smoothly on big ones. Default `1.0 / (1 << 5)` (= 1/32 of font_size) yields 1 px through typical desktop range and ~2-3 px on 4K + zoom; matches Button's convention.
+    /// Stroke thickness as a fraction of `font_size`. Final pixel width = `(stroke_ru × font_size) as isize + 1` — the `+ 1` idiom guarantees a minimum 1 px stroke so the edge never disappears on small displays, and the multiplier scales the stroke up smoothly on big ones. Default `1.0 / (1 << 5)` (= 1/32 of font_size) yields 1 px thru typical desktop range and ~2-3 px on 4K + zoom; matches Button's convention.
     pub stroke_ru: f32,
     /// Pixel rect (center-anchored).
     pub center_x: Coord,
@@ -413,7 +413,7 @@ impl Textbox {
         self.widths.iter().sum()
     }
 
-    /// Symmetric inner padding inside the pill, in pixels. Single source of truth for "how far inside the pill edge the usable text area starts" — every operation that needs to talk about pill-interior space (clamp bounds, click hit math, drag auto-scroll trigger, cursor visibility chase) goes through here. Scales with `font_size` so visual proportions stay constant across zoom levels.
+    /// Symmetric inner padding inside the pill, in pixels. Single source of truth for "how far inside the pill edge the usable text area starts" — every operation that needs to talk about pill-interior space (clamp bounds, click hit math, drag auto-scroll trigger, cursor visibility chase) goes thru here. Scales with `font_size` so visual proportions stay constant across zoom levels.
     pub fn padding(&self) -> Coord {
         self.font_size * 0.4
     }
@@ -572,7 +572,7 @@ impl Textbox {
         self.scroll_offset
     }
 
-    /// Set the scroll offset; marks `text_cache_dirty` if the value changes. **Clamped** to the valid range (`±(text_width − usable_width) / 2` when overflowing, zero when fitting) so callers can't push the offset off into oblivion — drag auto-scroll, programmatic scroll, anything that goes through here gets edge-bound enforcement for free.
+    /// Set the scroll offset; marks `text_cache_dirty` if the value changes. **Clamped** to the valid range (`±(text_width − usable_width) / 2` when overflowing, zero when fitting) so callers can't push the offset off into oblivion — drag auto-scroll, programmatic scroll, anything that goes thru here gets edge-bound enforcement for free.
     pub fn set_scroll_offset(&mut self, offset: Coord) {
         if self.scroll_offset != offset {
             self.scroll_offset = offset;
@@ -834,7 +834,7 @@ impl Textbox {
             self.text_cache_w = cw;
             self.text_cache_h = ch;
 
-            // Anchor at the LOCAL pill centre (in cache coords), shifted by scroll_offset. `draw_text_center_u32` keeps text and cursor on the SAME anchor point — the textbox centre — instead of going through a derived text_start_x that depends on the running sum of glyph widths. When the window scales, all the per-glyph widths change and a left-anchored layout would have positions drifting because text_start_x = center_x − tw/2 sees both terms shift. Centre-anchored stays stable. Selection x range uses the same local_text_left math so selection bg lines up with glyph positions exactly.
+            // Anchor at the LOCAL pill centre (in cache coords), shifted by scroll_offset. `draw_text_center_u32` keeps text and cursor on the SAME anchor point — the textbox centre — instead of going thru a derived text_start_x that depends on the running sum of glyph widths. When the window scales, all the per-glyph widths change and a left-anchored layout would have positions drifting because text_start_x = center_x − tw/2 sees both terms shift. Centre-anchored stays stable. Selection x range uses the same local_text_left math so selection bg lines up with glyph positions exactly.
             let tw = self.text_width();
             let local_text_left = pill_w as Coord * 0.5 - tw * 0.5 + self.scroll_offset;
             let local_y_center = pill_h as Coord * 0.5;
@@ -857,7 +857,7 @@ impl Textbox {
                         None
                     }
                 });
-            // Pre-trim: only shape the substring that's actually visible in this frame's cache buffer (plus 3 chars of padding on each side for kerning context with the nearest off-screen char). For a 100K-char string scrolled to show 50 chars, this drops shaping cost from "shape all 100K" to "shape ~56" — orders of magnitude faster, makes drag-scrolling through long content interactive. Forward scan accumulating widths to find first/last visible char indices; for typical UI text (~200 chars) this is trivial, and for long content the early-out on `char_left >= cw` keeps it bounded.
+            // Pre-trim: only shape the substring that's actually visible in this frame's cache buffer (plus 3 chars of padding on each side for kerning context with the nearest off-screen char). For a 100K-char string scrolled to show 50 chars, this drops shaping cost from "shape all 100K" to "shape ~56" — orders of magnitude faster, makes drag-scrolling thru long content interactive. Forward scan accumulating widths to find first/last visible char indices; for typical UI text (~200 chars) this is trivial, and for long content the early-out on `char_left >= cw` keeps it bounded.
             const PAD_CHARS: usize = 3;
             let s: Option<(String, Coord)> = if !self.chars.is_empty() && self.font_size > 0.0 {
                 let cw_f = cw as Coord;
@@ -1101,7 +1101,7 @@ impl Textbox {
         self.focused
     }
 
-    /// Set the focused state and side-effects: an unfocused textbox stops the blinkey but PRESERVES its `cursor` and `selection_anchor` — tabbing away and back returns to the same selection state and cursor position, which is the expected behaviour for any form-style multi-textbox UI. (A click that intentionally moves the cursor still goes through [`Self::handle_click`] / the [`Click`] trait impl, which both clear the selection and reposition the cursor.) The focus indicator (glow) lights up on `set_focused(true)` because the painter consults `focused` directly on the next render. Caller is responsible for the host-side wake (request_redraw, blink-timer start) — Textbox doesn't reach across into the event loop.
+    /// Set the focused state and side-effects: an unfocused textbox stops the blinkey but PRESERVES its `cursor` and `selection_anchor` — tabbing away and back returns to the same selection state and cursor position, which is the expected behaviour for any form-style multi-textbox UI. (A click that intentionally moves the cursor still goes thru [`Self::handle_click`] / the [`Click`] trait impl, which both clear the selection and reposition the cursor.) The focus indicator (glow) lights up on `set_focused(true)` because the painter consults `focused` directly on the next render. Caller is responsible for the host-side wake (request_redraw, blink-timer start) — Textbox doesn't reach across into the event loop.
     pub fn set_focused(&mut self, focused: bool) {
         if focused == self.focused {
             return;
@@ -1129,7 +1129,7 @@ impl Textbox {
 mod widget_impls {
     //! [`crate::host::widget`] capability-trait implementations for [`Textbox`]. Trait signatures use fluor-native [`crate::event::KeyEvent`] / [`crate::event::ModifiersState`] so the impls compile on every supported host — desktop (host-winit) and Android (host-android) both translate platform input into fluor events at the boundary.
     //!
-    //! Click + Focus + Hover + Key make Textbox a first-class participant in the widget tree. Clipboard ops (Ctrl+C / Ctrl+X / Ctrl+V) deliberately stay with the app rather than living on Textbox — the OS clipboard adapter (arboard today) is a single global resource and threading it through every widget that might want it would be premature abstraction. Apps intercept those chords before delivering the key to the focused widget; the widget never sees them.
+    //! Click + Focus + Hover + Key make Textbox a first-class participant in the widget tree. Clipboard ops (Ctrl+C / Ctrl+X / Ctrl+V) deliberately stay with the app rather than living on Textbox — the OS clipboard adapter (arboard today) is a single global resource and threading it thru every widget that might want it would be premature abstraction. Apps intercept those chords before delivering the key to the focused widget; the widget never sees them.
 
     use super::Textbox;
     use crate::coord::Coord;
@@ -1248,7 +1248,7 @@ mod widget_impls {
                     changed = true;
                 }
                 FKey::Named(NamedKey::ArrowLeft) => {
-                    // Non-shift arrow over an active selection collapses to the selection EDGE (left edge here) without stepping — standard editor behaviour. Stepping from the cursor would land one short of, or past, the edge depending on which end the cursor sat. Shift extends instead, so it falls through to the step path.
+                    // Non-shift arrow over an active selection collapses to the selection EDGE (left edge here) without stepping — standard editor behaviour. Stepping from the cursor would land one short of, or past, the edge depending on which end the cursor sat. Shift extends instead, so it falls thru to the step path.
                     if !shift {
                         if let Some((start, _)) = self.selection_range() {
                             self.selection_anchor = None;

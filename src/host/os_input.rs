@@ -4,7 +4,7 @@
 //!
 //! Fallback ladder per platform:
 //! * **Linux X11** — read the XSettings `Net/DoubleClickTime` property from the XSettings selection owner. This is what GTK, Qt5, and most toolkits honor on X11. Returns the value verbatim if present.
-//! * **Linux Wayland (or X11 with no XSettings manager)** — shell out to `gsettings get org.gnome.desktop.peripherals.mouse double-click`. Works on GNOME and derivatives; on KDE/sway/etc. without GSettings installed this returns `None` and we fall through to the default.
+//! * **Linux Wayland (or X11 with no XSettings manager)** — shell out to `gsettings get org.gnome.desktop.peripherals.mouse double-click`. Works on GNOME and derivatives; on KDE/sway/etc. without GSettings installed this returns `None` and we fall thru to the default.
 //! * **macOS** — TODO: `NSEvent.doubleClickInterval` (seconds, f64). Needs an objc2 dep; not yet wired since fluor's macOS host is wgpu-only and macOS-specific input plumbing is still ahead.
 //! * **Windows** — TODO: `GetDoubleClickTime()` from user32. Needs a windows-sys dep; same status as macOS.
 //! * **Default** — 400 ms. The middle of the typical OS-default range (250–500 ms) and what GTK ships when no user override is set.
@@ -33,7 +33,7 @@ fn query_double_click_ms() -> Option<u32> {
 
 #[cfg(not(target_os = "linux"))]
 fn query_double_click_ms() -> Option<u32> {
-    // TODO: macOS via objc2 (NSEvent.doubleClickInterval — seconds f64) and Windows via windows-sys (GetDoubleClickTime — milliseconds u32). Neither dep is in fluor yet; until the macOS/Windows hosts grow native input plumbing, fall through to DEFAULT_DOUBLE_CLICK_MS.
+    // TODO: macOS via objc2 (NSEvent.doubleClickInterval — seconds f64) and Windows via windows-sys (GetDoubleClickTime — milliseconds u32). Neither dep is in fluor yet; until the macOS/Windows hosts grow native input plumbing, fall thru to DEFAULT_DOUBLE_CLICK_MS.
     None
 }
 
