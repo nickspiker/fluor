@@ -83,6 +83,9 @@ pub const TEXT_COLOUR: u32 = dark(fmt(0x00_E8_E8_E8));
 pub const TEXT_COLOUR_UNFOCUSED: u32 = dark(fmt(0x00_6A_6A_6A));
 pub const LABEL_COLOUR: u32 = dark(fmt(0x00_80_80_80));
 
+// Hint / placeholder text — pure white at 1/4 opacity (α=64), stored directly in α+darkness format (the version watermark is the same treatment at 1/8). Glyph coverage multiplies into this α, so every hint reads as faint light over the dark background rather than flat ink — the eye reads real content first, the hint only on attention. One colour for every hint, by design.
+pub const HINT_COLOUR: u32 = 0x40_00_00_00;
+
 // Orb image desaturation factor applied when an unfocused window uses `OrbTint::FollowFocus`. `0 = full colour`, `255 = fully grey`. 128 = 50% lerp toward mid-grey — visibly quieted without losing app recognition. `Custom` orb tints ignore this (apps use the orb as a status indicator and want it stable).
 pub const ORB_DARKEN_UNFOCUSED: u8 = 128;
 

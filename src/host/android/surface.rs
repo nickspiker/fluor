@@ -11,7 +11,7 @@ use ndk_sys::{ADataSpace, ANativeWindow_Buffer, ANativeWindow_lock, ANativeWindo
 
 use crate::canvas::PixelRect;
 
-/// `ANativeWindow_setBuffersDataSpace` resolved at runtime via `dlsym`. Required because the symbol was added in NDK API 28 — linking it as a strong import would prevent the .so from loading at all on devices below 28 (the dynamic linker resolves all imports eagerly at `dlopen` time). Resolving via `dlsym` keeps the binary compatible with our `api-level-26` floor: on 26-27 the symbol comes back null and we silently skip the dataspace tag (the buffer stays at the compositor's default — sRGB — which is the correct fallback). On 28+ we get the proper Display-P3 tagging.
+/// `ANativeWindow_setBuffersDataSpace` resolved at runtime via `dlsym`. Required because the symbol was added in NDK API 28 — linking it as a strong import would prevent the .so from loading at all on devices below 28 (the dynamic linker resolves all imports eagerly at `dlopen` time). Resolving via `dlsym` keeps the binary compatible with our `api-level-26` floor: on 26-27 the symbol comes back null and we silently skip the dataspace tag (the buffer stays at the compositor's default — sRGB — which is the correct fallback). On 28+ we get the proper BT.2020 tagging.
 type SetBuffersDataSpaceFn =
     unsafe extern "C" fn(*mut ndk_sys::ANativeWindow, i32) -> i32;
 
@@ -67,12 +67,12 @@ fn is_samsung() -> bool {
     unsafe { SAMSUNG_MODE }
 }
 
-/// Lightweight surface state: tracks the surface dimensions, the monotonic content-version counter that drives the magic-pixel triple-buffer cache, and a one-shot flag that marks whether the ANativeWindow buffer dataspace has been pushed to `ADATASPACE_DISPLAY_P3` yet. No intermediate pixel buffer — finalize writes directly into ANativeWindow's locked bits.
+/// Lightweight surface state: tracks the surface dimensions, the monotonic content-version counter that drives the magic-pixel triple-buffer cache, and a one-shot flag that marks whether the ANativeWindow buffer dataspace has been pushed to BT.2020 yet. No intermediate pixel buffer — finalize writes directly into ANativeWindow's locked bits.
 pub struct Surface {
     width: u32,
     height: u32,
     content_version: u32,
-    /// True once `ANativeWindow_setBuffersDataSpace(ADATASPACE_DISPLAY_P3)` has been called for the current `NativeWindow`. Combined with the Activity's `colorMode = WIDE_COLOR_GAMUT` + `preferMinimalPostProcessing`, this gives the consumer pipeline a display-native target: the bytes we write are taken as Display-P3 ARGB and land on the panel without an sRGB clamp or vendor saturation pass. Photon does its own colour-management later on the theme constants + chromatic wave, so any OS-side clamp would be actively destructive. Reset to `false` on resize because Android may re-create the buffer queue under a new geometry and lose the dataspace setting.
+    /// True once `ANativeWindow_setBuffersDataSpace(BT2020 | GAMMA2_2 | FULL)` has been called for the current `NativeWindow`. Combined with the Activity's `colorMode = WIDE_COLOR_GAMUT` + `preferMinimalPostProcessing`, this gives the consumer pipeline a display-native target: the bytes we write are taken as BT.2020 RGB and land on the panel without an sRGB clamp or vendor saturation pass. Photon does its own colour-management later on the theme constants + chromatic wave, so any OS-side clamp would be actively destructive. Reset to `false` on resize because Android may re-create the buffer queue under a new geometry and lose the dataspace setting.
     dataspace_set: bool,
 }
 
@@ -96,7 +96,7 @@ impl Surface {
         if self.content_version == 0 {
             self.content_version = 1;
         }
-        // Force re-push of the Display-P3 dataspace next frame — surfaceChanged on Android can recreate the back-buffer queue, and a fresh queue defaults back to the implicit sRGB dataspace.
+        // Force re-push of the BT.2020 dataspace next frame — surfaceChanged on Android can recreate the back-buffer queue, and a fresh queue defaults back to the implicit sRGB dataspace.
         self.dataspace_set = false;
     }
 
@@ -120,7 +120,7 @@ impl Surface {
         dirty: bool,
     ) -> bool {
         unsafe {
-            // One-shot per buffer-queue lifetime: declare our pixels are in Display P3, not sRGB. Without this, the compositor treats the bytes we write as sRGB and runs them thru an sRGB→panel-native colour transform — exactly the desaturation/wash the photon pipeline is going to fight by doing its own colour management on theme + spectrum colours later. Resolved via dlsym (see [`lookup_set_buffers_data_space`]) so the binary stays loadable on pre-API-28 devices that don't ship the symbol.
+            // One-shot per buffer-queue lifetime: declare our pixels are in BT.2020, not sRGB. Without this, the compositor treats the bytes we write as sRGB and runs them thru an sRGB→panel-native colour transform — exactly the desaturation/wash the photon pipeline is going to fight by doing its own colour management on theme + spectrum colours later. Resolved via dlsym (see [`lookup_set_buffers_data_space`]) so the binary stays loadable on pre-API-28 devices that don't ship the symbol.
             if !self.dataspace_set {
                 match lookup_set_buffers_data_space() {
                     Some(set_ds) => {
@@ -143,7 +143,7 @@ impl Surface {
                         }
                     }
                     None => log::warn!(
-                        "fluor::host::android::surface: ANativeWindow_setBuffersDataSpace symbol not found (API < 28); P3 tag not applied"
+                        "fluor::host::android::surface: ANativeWindow_setBuffersDataSpace symbol not found (API < 28); BT.2020 tag not applied"
                     ),
                 }
                 // Set the flag whether or not the call succeeded so we don't retry every frame.
