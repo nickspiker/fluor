@@ -516,6 +516,16 @@ impl Textbox {
         self.cursor = self.chars.len();
     }
 
+    /// Remove all text, reset cursor and selection to zero, and invalidate the render cache.
+    pub fn clear(&mut self) {
+        self.chars.clear();
+        self.widths.clear();
+        self.cursor = 0;
+        self.selection_anchor = None;
+        self.scroll_offset = 0.0;
+        self.invalidate_cache();
+    }
+
     /// Select the "word" containing or adjacent to `idx`. A word is a maximal run of chars sharing the same class (alphanumeric+underscore / whitespace / punctuation). At end-of-text the probe slides one char left so end-of-text clicks still select the trailing word. Sets `selection_anchor` to the run's start and `cursor` to its end. No-op on empty text.
     pub fn select_word_at(&mut self, idx: usize) {
         let n = self.chars.len();
