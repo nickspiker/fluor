@@ -334,6 +334,16 @@ Pixel convention: `0xααRRGGBB`. α byte is opacity (industry standard directio
 
 ---
 
+## Terminology
+
+- **α + darkness** — fluor's pixel format: opacity in the top byte, the bitwise complement of visible RGB ("darkness") in the low three. Both halves accumulate from zero, so the blend kernel is pure addition and the done-check is one compare.
+- **under kernel** — the single front-to-back compositing operation: a new layer lands *under* what has already accumulated.
+- **harmonic mean unit** — the relative layout unit `2wh / (w + h)`, centred on the viewport origin, so layout is resolution-independent.
+
+fluor carries no identity vocabulary of its own; the rest of the stack's terms live in the cross-stack glossary: `GLOSSARY.md` in the ferros repo.
+
+---
+
 ## License
 
 MIT OR Apache-2.0, at your option.
