@@ -31,6 +31,8 @@ pub struct Button {
     focused: bool,
     /// `true` while the cursor is over the button. Drives the hover fill colour via the host's overlay-delta pipe (Button doesn't bake hover into its own cache — same pattern as Textbox).
     hovered: bool,
+    /// `true` (default) while the button accepts input. When `false` the [`crate::host::widget::Widget`] capability accessors return `None`, so dispatch + tab-cycle skip it — the "frozen sibling" of a disabled textbox (an Attest / plus button that goes inert while its query is in flight). Visual unchanged; inert, not greyed. Toggle via [`Self::set_enabled`].
+    enabled: bool,
 
     /// Number of times [`Click::on_click`] has fired since construction. Monotonic. Consumers compare against [`Self::last_seen_click_counter`] via [`Self::take_click`] to know "has this button fired since I last looked."
     click_counter: u32,
@@ -76,6 +78,7 @@ impl Button {
             font_size,
             focused: false,
             hovered: false,
+            enabled: true,
             click_counter: 0,
             last_seen_click_counter: 0,
             pill_cache: Vec::new(),
@@ -114,8 +117,29 @@ impl Button {
     }
 
     pub fn set_hovered(&mut self, hovered: bool) {
+        // No-op while disabled: the disabled button still stamps its hit silhouette, so a hover over it must not re-light it.
+        if !self.enabled {
+            return;
+        }
         if hovered != self.hovered {
             self.hovered = hovered;
+        }
+    }
+
+    /// `true` (default) while the button accepts input.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Enable / disable input. Disabling drops the button out of click / key / focus / hover dispatch (the [`crate::host::widget::Widget`] accessors return `None`) and clears `focused` + `hovered`. As with [`Textbox::set_enabled`], move focus elsewhere first if this button currently holds it.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        if enabled == self.enabled {
+            return;
+        }
+        self.enabled = enabled;
+        if !enabled {
+            self.focused = false;
+            self.hovered = false;
         }
     }
 
@@ -436,17 +460,18 @@ mod widget_impls {
         fn paint(&mut self, _ctx: &mut PaintCtx<'_, '_>) {
             // No-op for the same reason Textbox's is: panes drives the actual render via [`Button::render_content_into`] with its ad-hoc parameter list. The trait makes Button a participant in dispatch (click / focus / hover / key) without forcing every consumer onto PaintCtx today.
         }
+        // Disabled → every accessor returns `None`, so dispatch + tab-cycle skip the button (see the matching note on Textbox's Widget impl).
         fn click(&mut self) -> Option<&mut dyn Click> {
-            Some(self)
+            self.enabled.then_some(self as &mut dyn Click)
         }
         fn key(&mut self) -> Option<&mut dyn Key> {
-            Some(self)
+            self.enabled.then_some(self as &mut dyn Key)
         }
         fn focus(&mut self) -> Option<&mut dyn Focus> {
-            Some(self)
+            self.enabled.then_some(self as &mut dyn Focus)
         }
         fn hover(&mut self) -> Option<&mut dyn Hover> {
-            Some(self)
+            self.enabled.then_some(self as &mut dyn Hover)
         }
     }
 
