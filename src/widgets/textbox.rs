@@ -22,6 +22,8 @@ pub struct Textbox {
     focused: bool,
     /// `true` while the cursor is hovering over the textbox bbox. Drives the hover fill colour. Mutate via [`Self::set_hovered`] / the [`crate::host::widget::Hover`] trait method.
     hovered: bool,
+    /// `true` (default) while the textbox accepts input. When `false` the [`crate::host::widget::Widget`] capability accessors (`click`/`key`/`focus`/`hover`) return `None`, so the host's dispatch + tab-cycle helpers skip it for free — the canonical "this field is busy / frozen" state (a query in flight). The visual is intentionally unchanged: disabled means inert, not dimmed; the app's own in-flight cue (a spinner / "Working…" line) signals busy. Toggle via [`Self::set_enabled`].
+    enabled: bool,
     /// Stroke thickness as a fraction of `font_size`. Final pixel width = `(stroke_ru × font_size) as isize + 1` — the `+ 1` idiom guarantees a minimum 1 px stroke so the edge never disappears on small displays, and the multiplier scales the stroke up smoothly on big ones. Default `1.0 / (1 << 5)` (= 1/32 of font_size) yields 1 px thru typical desktop range and ~2-3 px on 4K + zoom; matches Button's convention.
     pub stroke_ru: f32,
     /// Pixel rect (center-anchored).
@@ -214,6 +216,7 @@ impl Textbox {
             hit_id: crate::host::widget::next_id(hit_counter),
             focused: false,
             hovered: false,
+            enabled: true,
             stroke_ru: 1.0 / (1 << 5) as f32, // = 1/32 of font_size; scales 1 px on typical desktop, ~2-3 px on 4K + zoom
             center_x,
             center_y,
@@ -1130,9 +1133,30 @@ impl Textbox {
         self.hovered
     }
 
-    /// Set the hovered state. Idempotent — caller drives the host-side dirty / redraw decision off whether the value actually changed (compare `is_hovered()` before + after if it matters).
+    /// Set the hovered state. Idempotent — caller drives the host-side dirty / redraw decision off whether the value actually changed (compare `is_hovered()` before + after if it matters). No-op while disabled: a frozen field's hit silhouette is still stamped, so a `CursorMoved` over it would otherwise re-light a busy textbox.
     pub fn set_hovered(&mut self, hovered: bool) {
+        if !self.enabled {
+            return;
+        }
         self.hovered = hovered;
+    }
+
+    /// `true` (default) while the textbox accepts input.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Enable / disable input. Disabling drops the textbox out of click / key / focus / hover dispatch (the [`crate::host::widget::Widget`] accessors return `None` while disabled) and clears `focused` + `hovered` so a re-enable starts clean. The caller is responsible for first moving focus elsewhere (so the host's `focused`-id tracker doesn't dangle on a now-unfocusable widget) — disabling the currently-focused field without a prior `change_focus(None)` leaves the host pointing at an id whose `Focus` impl is no longer reachable. Visual is unchanged; "disabled" means inert, not greyed.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        if enabled == self.enabled {
+            return;
+        }
+        self.enabled = enabled;
+        if !enabled {
+            self.focused = false;
+            self.blinkey_visible = false;
+            self.hovered = false;
+        }
     }
 }
 
@@ -1155,17 +1179,21 @@ mod widget_impls {
         fn paint(&mut self, _ctx: &mut PaintCtx<'_, '_>) {
             // Intentional no-op — panes still drives Textbox rendering via [`Textbox::render_content_into`] with its existing ad-hoc parameter list (sub-canvas offset, optional AlphaMask, etc. that don't fit PaintCtx today). Phase 5 will reshape the paint contract once the host's overall paint orchestration grows around the widget tree. The Widget trait impl here makes Textbox a participant in click / focus / hover dispatch in the meantime.
         }
+        // A disabled textbox returns `None` from every capability accessor, so the host's
+        // dispatch (`dispatch_click`/`dispatch_key`), tab cycle (`linear_tab_next`), focus
+        // (`apply_focus_change`), and hover-overlay (`build_overlay_deltas`) helpers all skip
+        // it without any per-handler `enabled` check — the canonical "frozen field" behaviour.
         fn click(&mut self) -> Option<&mut dyn Click> {
-            Some(self)
+            self.enabled.then_some(self as &mut dyn Click)
         }
         fn key(&mut self) -> Option<&mut dyn Key> {
-            Some(self)
+            self.enabled.then_some(self as &mut dyn Key)
         }
         fn focus(&mut self) -> Option<&mut dyn Focus> {
-            Some(self)
+            self.enabled.then_some(self as &mut dyn Focus)
         }
         fn hover(&mut self) -> Option<&mut dyn Hover> {
-            Some(self)
+            self.enabled.then_some(self as &mut dyn Hover)
         }
     }
 

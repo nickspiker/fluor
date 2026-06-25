@@ -19,15 +19,16 @@ crate-type = ["rlib"]
 # host-bare is the no_std path used by ferros and other bare-metal consumers.
 # host-winit / host-softbuffer / text imply std.
 #
-# `host-winit` is NOT in default — it transitively pulls softbuffer + arboard, neither of which has an Android backend, so a vanilla `default-features = true` fluor dep would break the Android dep graph. Consumers (photon, examples) opt into the host explicitly per target: `features = ["host-winit"]` in the desktop block.
+# `host-winit` is NOT in default — it pulls winit + softbuffer, which have no Android backend, so a vanilla `default-features = true` fluor dep would break the Android dep graph. Consumers (photon, examples) opt into the host explicitly per target: `features = ["host-winit"]` in the desktop block.
 #
 # `text` IS in default — anything visual needs `TextRenderer`. cosmic-text + swash do compile on Android; if APK size grows uncomfortably the text path can move to a feature gate later (see `host-android` plan).
 default = ["std", "text", "simd", "rayon"]
 std = []
 # host-winit transitively requires text — desktop chrome wants real glyphs out of the box.
 # macOS uses wgpu/Metal for PostMultiplied alpha (transparent squircle corners);
-# Linux/Windows use softbuffer (CPU blit, no GPU dependency).
-host-winit = ["std", "text", "dep:winit", "dep:softbuffer", "dep:wgpu", "dep:pollster", "dep:arboard"]
+# Linux/Windows/Redox use softbuffer (CPU blit, no GPU dependency).
+# wgpu + pollster (macOS-only) and arboard (clipboard; every desktop EXCEPT Redox, which has no arboard backend) are NOT in this set — they're pulled by the per-target dependency blocks below so a host-winit build for Redox (winit's Orbital backend + softbuffer, both of which support Redox) doesn't drag in deps that won't compile there. The non-macOS softbuffer present path in host/app.rs is `cfg(not(target_os = "macos"))`, so it already covers Redox with zero source changes.
+host-winit = ["std", "text", "dep:winit", "dep:softbuffer"]
 host-softbuffer = ["std", "dep:softbuffer"]
 host-bare = []
 # Android backend — ANativeWindow surface + JNI entry points + Choreographer-driven render scheduling. Enabled by the consumer's Android target block (e.g. photon's `[target.'cfg(target_os = "android")'.dependencies]`). text stays required because the chrome paints title glyphs; ndk + ndk-sys + jni + log are the NDK bindings the surface and JNI shims wrap.
@@ -64,11 +65,9 @@ wide = { version = "0.7", optional = true }
 # Work-stealing thread pool for data-parallel outer loops. Gated by the `rayon` feature
 # (which itself requires `std`).
 rayon = { version = "1", optional = true }
-arboard = { version = "3", optional = true }
+# winit + softbuffer are cross-platform (incl. Redox/Orbital), so they stay top-level under the host-winit feature. wgpu + pollster (macOS GPU present) and arboard (clipboard, non-Redox) are declared in the per-target blocks below instead — keeps them off the Redox dep graph.
 winit = { version = "0.30", optional = true }
 softbuffer = { version = "0.4", optional = true }
-wgpu = { version = "28", default-features = false, features = ["metal"], optional = true }
-pollster = { version = "0.4", optional = true }
 cosmic-text = { version = "0.14", optional = true }
 # swash is pulled in transitively by cosmic-text but we use it directly for transform-aware
 # glyph rasterization (rotated/skewed text). Pinning the same version cosmic-text uses keeps
@@ -87,8 +86,10 @@ libc = { version = "0.2", optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["shape"] }
 
-# objc2 + AppKit bindings for macOS click-thru: NSEvent global mouse monitor + NSWindow mouseLocationOutsideOfEventStream.
+# objc2 + AppKit bindings for macOS click-thru: NSEvent global mouse monitor + NSWindow mouseLocationOutsideOfEventStream. wgpu/Metal + pollster live here too — the GPU present path is macOS-only (host/app.rs gates it on `cfg(target_os = "macos")`), so no other target compiles wgpu.
 [target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "28", default-features = false, features = ["metal"] }
+pollster = "0.4"
 objc2 = "0.6"
 block2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSNotification"] }

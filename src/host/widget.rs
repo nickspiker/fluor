@@ -228,6 +228,8 @@ mod tests {
         id: HitId,
         focusable: bool,
         focused: bool,
+        enabled: bool,
+        clicks: u32,
     }
 
     impl Widget for TestWidget {
@@ -235,14 +237,30 @@ mod tests {
             self.id
         }
         fn paint(&mut self, _ctx: &mut PaintCtx<'_, '_>) {}
+        // Mirrors the real widgets: a disabled widget vanishes from every capability accessor, so the dispatch + tab-cycle helpers skip it without per-handler checks.
         fn focus(&mut self) -> Option<&mut dyn Focus> {
-            if self.focusable { Some(self) } else { None }
+            (self.focusable && self.enabled).then_some(self as &mut dyn Focus)
+        }
+        fn click(&mut self) -> Option<&mut dyn Click> {
+            self.enabled.then_some(self as &mut dyn Click)
         }
     }
 
     impl Focus for TestWidget {
         fn set_focused(&mut self, focused: bool) {
             self.focused = focused;
+        }
+    }
+
+    impl Click for TestWidget {
+        fn on_click(
+            &mut self,
+            _x: Coord,
+            _y: Coord,
+            _mods: ModifiersState,
+        ) -> crate::host::EventResponse {
+            self.clicks += 1;
+            crate::host::EventResponse::Handled
         }
     }
 
@@ -273,17 +291,23 @@ mod tests {
                 TestWidget {
                     id: 1,
                     focusable: true,
-                    focused: false
+                    focused: false,
+                    enabled: true,
+                    clicks: 0
                 },
                 TestWidget {
                     id: 2,
                     focusable: false,
-                    focused: false
+                    focused: false,
+                    enabled: true,
+                    clicks: 0
                 },
                 TestWidget {
                     id: 3,
                     focusable: true,
-                    focused: false
+                    focused: false,
+                    enabled: true,
+                    clicks: 0
                 },
             ],
         };
@@ -298,12 +322,16 @@ mod tests {
                 TestWidget {
                     id: 1,
                     focusable: true,
-                    focused: false
+                    focused: false,
+                    enabled: true,
+                    clicks: 0
                 },
                 TestWidget {
                     id: 2,
                     focusable: true,
-                    focused: false
+                    focused: false,
+                    enabled: true,
+                    clicks: 0
                 },
             ],
         };
@@ -318,12 +346,16 @@ mod tests {
                 TestWidget {
                     id: 1,
                     focusable: true,
-                    focused: false
+                    focused: false,
+                    enabled: true,
+                    clicks: 0
                 },
                 TestWidget {
                     id: 2,
                     focusable: true,
-                    focused: false
+                    focused: false,
+                    enabled: true,
+                    clicks: 0
                 },
             ],
         };
@@ -338,12 +370,16 @@ mod tests {
                 TestWidget {
                     id: 5,
                     focusable: true,
-                    focused: false
+                    focused: false,
+                    enabled: true,
+                    clicks: 0
                 },
                 TestWidget {
                     id: 7,
                     focusable: true,
-                    focused: false
+                    focused: false,
+                    enabled: true,
+                    clicks: 0
                 },
             ],
         };
@@ -358,12 +394,16 @@ mod tests {
                 TestWidget {
                     id: 5,
                     focusable: true,
-                    focused: false
+                    focused: false,
+                    enabled: true,
+                    clicks: 0
                 },
                 TestWidget {
                     id: 7,
                     focusable: true,
-                    focused: false
+                    focused: false,
+                    enabled: true,
+                    clicks: 0
                 },
             ],
         };
@@ -386,12 +426,16 @@ mod tests {
                 TestWidget {
                     id: 1,
                     focusable: true,
-                    focused: true
+                    focused: true,
+                    enabled: true,
+                    clicks: 0
                 },
                 TestWidget {
                     id: 2,
                     focusable: true,
-                    focused: false
+                    focused: false,
+                    enabled: true,
+                    clicks: 0
                 },
             ],
         };
@@ -406,10 +450,62 @@ mod tests {
             widgets: alloc::vec![TestWidget {
                 id: 1,
                 focusable: true,
-                focused: true
+                focused: true,
+                enabled: true,
+                clicks: 0
             }],
         };
         apply_focus_change(&mut root, Some(1), Some(1));
         assert!(root.widgets[0].focused);
+    }
+
+    // --- Disabled widgets drop out of dispatch + tab cycle via their `None` capability accessors ---
+
+    #[test]
+    fn linear_tab_skips_disabled() {
+        let mut root = TestRoot {
+            widgets: alloc::vec![
+                TestWidget {
+                    id: 1,
+                    focusable: true,
+                    focused: false,
+                    enabled: true,
+                    clicks: 0
+                },
+                TestWidget {
+                    id: 2,
+                    focusable: true,
+                    focused: false,
+                    enabled: false, // disabled → focus() returns None → skipped by the cycle
+                    clicks: 0
+                },
+                TestWidget {
+                    id: 3,
+                    focusable: true,
+                    focused: false,
+                    enabled: true,
+                    clicks: 0
+                },
+            ],
+        };
+        // Tab from 1 lands on 3, not the disabled 2.
+        assert_eq!(linear_tab_next(&mut root, Some(1), TabDir::Forward), Some(3));
+    }
+
+    #[test]
+    fn dispatch_click_skips_disabled() {
+        let mut root = TestRoot {
+            widgets: alloc::vec![TestWidget {
+                id: 1,
+                focusable: true,
+                focused: false,
+                enabled: false, // disabled → click() returns None
+                clicks: 0
+            }],
+        };
+        let resp = dispatch_click(&mut root, 1, 0.0, 0.0, ModifiersState::default());
+        // No Click capability is exposed, so the click goes unconsumed and never fires.
+        assert_eq!(resp, crate::host::EventResponse::Pass);
+        assert_eq!(root.widgets[0].clicks, 0);
     }
 }
