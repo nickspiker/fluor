@@ -102,6 +102,30 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
+        // Tag the Metal layer with sRGB so macOS color-manages correctly on wide-gamut displays
+        // (without this, untagged buffers are interpreted in the display's native gamut — P3 on
+        // Pro/XDR — shifting all colours). The CAMetalLayer is the root layer of the NSView that
+        // wgpu attached to during create_surface.
+        {
+            use winit::raw_window_handle::HasWindowHandle;
+            if let Ok(handle) = window.window_handle() {
+                if let winit::raw_window_handle::RawWindowHandle::AppKit(appkit) = handle.as_raw() {
+                    use objc2::msg_send;
+                    use objc2::runtime::AnyObject;
+                    use objc2_core_graphics::CGColorSpace;
+                    let ns_view = appkit.ns_view.as_ptr() as *mut AnyObject;
+                    unsafe {
+                        let layer: *mut AnyObject = msg_send![ns_view, layer];
+                        if !layer.is_null() {
+                            if let Some(cs) = CGColorSpace::with_name(Some(objc2_core_graphics::kCGColorSpaceSRGB)) {
+                                let () = msg_send![layer, setColorspace: &*cs];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let frame_texture = Self::make_texture(&device, width, height);
         let cpu_buffer = vec![0u32; (width * height) as usize];
 
