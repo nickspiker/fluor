@@ -102,10 +102,11 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        // Tag the Metal layer with sRGB so macOS color-manages correctly on wide-gamut displays
-        // (without this, untagged buffers are interpreted in the display's native gamut — P3 on
-        // Pro/XDR — shifting all colours). The CAMetalLayer is the root layer of the NSView that
-        // wgpu attached to during create_surface.
+        // Tag the Metal layer with VSF RGB (703/523/462nm primaries, Illuminant E, γ=2.0)
+        // so macOS color-manages correctly on every display. Without tagging, untagged buffers
+        // are interpreted in the display's native gamut (P3 on Pro/XDR), shifting all colours.
+        // The 312-byte ICC profile encodes VSF's spectral primaries and γ=2.0 TRC; macOS handles
+        // the conversion to the display's native profile — zero software conversion needed.
         {
             use winit::raw_window_handle::HasWindowHandle;
             if let Ok(handle) = window.window_handle() {
@@ -113,11 +114,16 @@ impl Renderer {
                     use objc2::msg_send;
                     use objc2::runtime::AnyObject;
                     use objc2_core_graphics::CGColorSpace;
+                    use objc2_foundation::NSData;
                     let ns_view = appkit.ns_view.as_ptr() as *mut AnyObject;
                     unsafe {
                         let layer: *mut AnyObject = msg_send![ns_view, layer];
                         if !layer.is_null() {
-                            if let Some(cs) = CGColorSpace::with_name(Some(objc2_core_graphics::kCGColorSpaceSRGB)) {
+                            let icc = include_bytes!("vsf_rgb.icc");
+                            let data = NSData::with_bytes(icc);
+                            // NSData is toll-free bridged to CFData
+                            let cf_data = &*(data.as_ref() as *const NSData as *const objc2_core_foundation::CFData);
+                            if let Some(cs) = CGColorSpace::with_icc_profile(Some(cf_data)) {
                                 let () = msg_send![layer, setColorspace: &*cs];
                             }
                         }
