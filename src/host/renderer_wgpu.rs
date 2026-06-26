@@ -41,6 +41,9 @@ pub struct Renderer {
     cpu_buffer: Vec<u32>,
     width: u32,
     height: u32,
+    /// Raw NSView pointer for deferred colorspace tagging (done on first render, not init, because init runs inside a nounwind C callback where panics abort).
+    ns_view_ptr: *mut std::ffi::c_void,
+    colorspace_tagged: bool,
 }
 
 impl Renderer {
@@ -102,8 +105,14 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        // Tag the Metal layer with VSF RGB (703/523/462nm, Illuminant E, γ=2.0) via a 312-byte ICC profile so macOS color-manages to the display's native profile automatically. Non-fatal: if anything goes wrong we just skip tagging and fall back to untagged (display-native).
-        Self::tag_vsf_colorspace(window);
+        // Capture the NSView pointer for deferred colorspace tagging (first render, not here — init runs inside a nounwind C callback).
+        let ns_view_ptr = {
+            use winit::raw_window_handle::HasWindowHandle;
+            window.window_handle().ok().and_then(|h| match h.as_raw() {
+                winit::raw_window_handle::RawWindowHandle::AppKit(a) => Some(a.ns_view.as_ptr()),
+                _ => None,
+            }).unwrap_or(std::ptr::null_mut())
+        };
 
         let frame_texture = Self::make_texture(&device, width, height);
         let cpu_buffer = vec![0u32; (width * height) as usize];
@@ -117,25 +126,21 @@ impl Renderer {
             cpu_buffer,
             width,
             height,
+            ns_view_ptr,
+            colorspace_tagged: false,
         }
     }
 
-    fn tag_vsf_colorspace(window: &'static Window) {
-        use winit::raw_window_handle::HasWindowHandle;
-        let ns_view_ptr = match window.window_handle() {
-            Ok(h) => match h.as_raw() {
-                winit::raw_window_handle::RawWindowHandle::AppKit(a) => a.ns_view.as_ptr(),
-                _ => return,
-            },
-            Err(_) => return,
-        };
+    fn tag_vsf_colorspace(ns_view_ptr: *mut std::ffi::c_void) {
+        if ns_view_ptr.is_null() { return; }
+        use std::ffi::c_void;
         unsafe {
             unsafe extern "C" {
-                fn CFDataCreate(allocator: *const std::ffi::c_void, bytes: *const u8, length: isize) -> *const std::ffi::c_void;
-                fn CGColorSpaceCreateWithICCData(data: *const std::ffi::c_void) -> *const std::ffi::c_void;
-                fn CFRelease(cf: *const std::ffi::c_void);
-                fn objc_msgSend(receiver: *mut std::ffi::c_void, sel: *const std::ffi::c_void, ...) -> *mut std::ffi::c_void;
-                fn sel_registerName(name: *const u8) -> *const std::ffi::c_void;
+                fn CFDataCreate(allocator: *const c_void, bytes: *const u8, length: isize) -> *const c_void;
+                fn CGColorSpaceCreateWithICCData(data: *const c_void) -> *const c_void;
+                fn CFRelease(cf: *const c_void);
+                fn objc_msgSend(receiver: *mut c_void, sel: *const c_void, ...) -> *mut c_void;
+                fn sel_registerName(name: *const u8) -> *const c_void;
             }
             let layer = objc_msgSend(ns_view_ptr as *mut _, sel_registerName(b"layer\0".as_ptr()));
             if layer.is_null() { return; }
@@ -144,9 +149,9 @@ impl Renderer {
             if cf_data.is_null() { return; }
             let cs = CGColorSpaceCreateWithICCData(cf_data);
             if !cs.is_null() {
-                objc_msgSend(layer, sel_registerName(b"setColorspace:\0".as_ptr()), cs);
+                let _: *mut c_void = objc_msgSend(layer, sel_registerName(b"setColorspace:\0".as_ptr()), cs);
+                CFRelease(cs);
             }
-            if !cs.is_null() { CFRelease(cs); }
             CFRelease(cf_data);
         }
     }
@@ -182,6 +187,10 @@ impl Renderer {
     }
 
     pub fn lock_buffer(&mut self) -> WgpuBuffer<'_> {
+        if !self.colorspace_tagged {
+            self.colorspace_tagged = true;
+            Self::tag_vsf_colorspace(self.ns_view_ptr);
+        }
         WgpuBuffer { inner: self }
     }
 
