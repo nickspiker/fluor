@@ -102,29 +102,31 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        // Tag the Metal layer with VSF RGB (703/523/462nm primaries, Illuminant E, γ=2.0)
-        // so macOS color-manages correctly on every display. Without tagging, untagged buffers
-        // are interpreted in the display's native gamut (P3 on Pro/XDR), shifting all colours.
-        // The 312-byte ICC profile encodes VSF's spectral primaries and γ=2.0 TRC; macOS handles
-        // the conversion to the display's native profile — zero software conversion needed.
+        // Tag the Metal layer with VSF RGB (703/523/462nm, Illuminant E, γ=2.0) via a 312-byte ICC profile so macOS color-manages to the display's native profile automatically.
         {
             use winit::raw_window_handle::HasWindowHandle;
             if let Ok(handle) = window.window_handle() {
                 if let winit::raw_window_handle::RawWindowHandle::AppKit(appkit) = handle.as_raw() {
                     use objc2::msg_send;
                     use objc2::runtime::AnyObject;
-                    use objc2_core_graphics::CGColorSpace;
-                    use objc2_foundation::NSData;
                     let ns_view = appkit.ns_view.as_ptr() as *mut AnyObject;
                     unsafe {
                         let layer: *mut AnyObject = msg_send![ns_view, layer];
                         if !layer.is_null() {
+                            unsafe extern "C" {
+                                fn CFDataCreate(allocator: *const std::ffi::c_void, bytes: *const u8, length: isize) -> *const std::ffi::c_void;
+                                fn CGColorSpaceCreateWithICCData(data: *const std::ffi::c_void) -> *const std::ffi::c_void;
+                                fn CFRelease(cf: *const std::ffi::c_void);
+                            }
                             let icc = include_bytes!("vsf_rgb.icc");
-                            let data = NSData::with_bytes(icc);
-                            // NSData is toll-free bridged to CFData
-                            let cf_data = &*(data.as_ref() as *const NSData as *const objc2_core_foundation::CFData);
-                            if let Some(cs) = CGColorSpace::with_icc_profile(Some(cf_data)) {
-                                let () = msg_send![layer, setColorspace: &*cs];
+                            let cf_data = CFDataCreate(std::ptr::null(), icc.as_ptr(), icc.len() as isize);
+                            if !cf_data.is_null() {
+                                let cs = CGColorSpaceCreateWithICCData(cf_data);
+                                if !cs.is_null() {
+                                    let () = msg_send![layer, setColorspace: cs];
+                                    CFRelease(cs);
+                                }
+                                CFRelease(cf_data);
                             }
                         }
                     }
