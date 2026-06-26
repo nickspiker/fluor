@@ -133,23 +133,34 @@ impl Renderer {
 
     fn tag_vsf_colorspace(ns_view_ptr: *mut std::ffi::c_void) {
         if ns_view_ptr.is_null() { return; }
-        use std::ffi::c_void;
+        use objc2::runtime::{AnyClass, AnyObject, Sel};
         unsafe {
             unsafe extern "C" {
-                fn CFDataCreate(allocator: *const c_void, bytes: *const u8, length: isize) -> *const c_void;
-                fn CGColorSpaceCreateWithICCData(data: *const c_void) -> *const c_void;
-                fn CFRelease(cf: *const c_void);
-                fn objc_msgSend(receiver: *mut c_void, sel: *const c_void, ...) -> *mut c_void;
-                fn sel_registerName(name: *const u8) -> *const c_void;
+                fn CFDataCreate(allocator: *const std::ffi::c_void, bytes: *const u8, length: isize) -> *const std::ffi::c_void;
+                fn CGColorSpaceCreateWithICCData(data: *const std::ffi::c_void) -> *const std::ffi::c_void;
+                fn CFRelease(cf: *const std::ffi::c_void);
             }
-            let layer = objc_msgSend(ns_view_ptr as *mut _, sel_registerName(b"layer\0".as_ptr()));
+            let view = ns_view_ptr as *mut AnyObject;
+            let sel_layer = Sel::register(c"layer");
+            let sel_set_cs = Sel::register(c"setColorspace:");
+            let sel_is_kind = Sel::register(c"isKindOfClass:");
+            let ca_metal_layer_class = AnyClass::get(c"CAMetalLayer");
+            // Get the view's layer
+            let layer: *mut AnyObject = objc2::msg_send![&*view, layer];
             if layer.is_null() { return; }
+            // Verify it's a CAMetalLayer
+            if let Some(cls) = ca_metal_layer_class {
+                let is_metal: bool = objc2::msg_send![&*layer, isKindOfClass: cls];
+                if !is_metal { return; }
+            }
             let icc = include_bytes!("vsf_rgb.icc");
             let cf_data = CFDataCreate(std::ptr::null(), icc.as_ptr(), icc.len() as isize);
             if cf_data.is_null() { return; }
             let cs = CGColorSpaceCreateWithICCData(cf_data);
             if !cs.is_null() {
-                let _: *mut c_void = objc_msgSend(layer, sel_registerName(b"setColorspace:\0".as_ptr()), cs);
+                // setColorspace: takes a CGColorSpaceRef (which is a CFTypeRef / *const c_void). We pass it as a raw pointer argument via msg_send.
+                let cs_obj = cs as *mut AnyObject;
+                let () = objc2::msg_send![&*layer, setColorspace: &*cs_obj];
                 CFRelease(cs);
             }
             CFRelease(cf_data);
