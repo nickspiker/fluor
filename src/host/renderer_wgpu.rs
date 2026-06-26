@@ -102,37 +102,8 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        // Tag the Metal layer with VSF RGB (703/523/462nm, Illuminant E, γ=2.0) via a 312-byte ICC profile so macOS color-manages to the display's native profile automatically.
-        {
-            use winit::raw_window_handle::HasWindowHandle;
-            if let Ok(handle) = window.window_handle() {
-                if let winit::raw_window_handle::RawWindowHandle::AppKit(appkit) = handle.as_raw() {
-                    use objc2::msg_send;
-                    use objc2::runtime::AnyObject;
-                    let ns_view = appkit.ns_view.as_ptr() as *mut AnyObject;
-                    unsafe {
-                        let layer: *mut AnyObject = msg_send![ns_view, layer];
-                        if !layer.is_null() {
-                            unsafe extern "C" {
-                                fn CFDataCreate(allocator: *const std::ffi::c_void, bytes: *const u8, length: isize) -> *const std::ffi::c_void;
-                                fn CGColorSpaceCreateWithICCData(data: *const std::ffi::c_void) -> *const std::ffi::c_void;
-                                fn CFRelease(cf: *const std::ffi::c_void);
-                            }
-                            let icc = include_bytes!("vsf_rgb.icc");
-                            let cf_data = CFDataCreate(std::ptr::null(), icc.as_ptr(), icc.len() as isize);
-                            if !cf_data.is_null() {
-                                let cs = CGColorSpaceCreateWithICCData(cf_data);
-                                if !cs.is_null() {
-                                    let () = msg_send![layer, setColorspace: cs];
-                                    CFRelease(cs);
-                                }
-                                CFRelease(cf_data);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Tag the Metal layer with VSF RGB (703/523/462nm, Illuminant E, γ=2.0) via a 312-byte ICC profile so macOS color-manages to the display's native profile automatically. Non-fatal: if anything goes wrong we just skip tagging and fall back to untagged (display-native).
+        Self::tag_vsf_colorspace(window);
 
         let frame_texture = Self::make_texture(&device, width, height);
         let cpu_buffer = vec![0u32; (width * height) as usize];
@@ -146,6 +117,37 @@ impl Renderer {
             cpu_buffer,
             width,
             height,
+        }
+    }
+
+    fn tag_vsf_colorspace(window: &'static Window) {
+        use winit::raw_window_handle::HasWindowHandle;
+        let ns_view_ptr = match window.window_handle() {
+            Ok(h) => match h.as_raw() {
+                winit::raw_window_handle::RawWindowHandle::AppKit(a) => a.ns_view.as_ptr(),
+                _ => return,
+            },
+            Err(_) => return,
+        };
+        unsafe {
+            unsafe extern "C" {
+                fn CFDataCreate(allocator: *const std::ffi::c_void, bytes: *const u8, length: isize) -> *const std::ffi::c_void;
+                fn CGColorSpaceCreateWithICCData(data: *const std::ffi::c_void) -> *const std::ffi::c_void;
+                fn CFRelease(cf: *const std::ffi::c_void);
+                fn objc_msgSend(receiver: *mut std::ffi::c_void, sel: *const std::ffi::c_void, ...) -> *mut std::ffi::c_void;
+                fn sel_registerName(name: *const u8) -> *const std::ffi::c_void;
+            }
+            let layer = objc_msgSend(ns_view_ptr as *mut _, sel_registerName(b"layer\0".as_ptr()));
+            if layer.is_null() { return; }
+            let icc = include_bytes!("vsf_rgb.icc");
+            let cf_data = CFDataCreate(std::ptr::null(), icc.as_ptr(), icc.len() as isize);
+            if cf_data.is_null() { return; }
+            let cs = CGColorSpaceCreateWithICCData(cf_data);
+            if !cs.is_null() {
+                objc_msgSend(layer, sel_registerName(b"setColorspace:\0".as_ptr()), cs);
+            }
+            if !cs.is_null() { CFRelease(cs); }
+            CFRelease(cf_data);
         }
     }
 
