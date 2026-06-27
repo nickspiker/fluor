@@ -966,6 +966,9 @@ impl FluorApp for PanesDemo {
             );
             paint::background_noise(canvas, 0, true, bg_scroll, None, None);
         });
+        // Window-perimeter hairline + clip_mask carve FIRST, straight into `target` — fluor is under-blend only, so the hairline must be the first writer at the window edge to survive over content the consumer draws into `target` afterward (textbox squircle, chord hint). The chrome group (buttons / orb / strip) still composites under content via the flatten below.
+        self.chrome
+            .rasterize_perimeter(target, buf_w, buf_h, ctx.clip_mask);
         self.chrome
             .rasterize_chrome(ctx.damage, ctx.text, ctx.clip_mask);
 

@@ -257,7 +257,69 @@ impl DefaultChrome {
         paint(&mut canvas);
     }
 
-    /// **Scaffold step 1 (top of stack: AA rounded hairline only):** paint the squircle-cornered window-perimeter hairline into the chrome layer via [`chrome::draw_window_edges_and_mask`]. Chrome layer carries OPAQUE RGB only at the hairline; partial-α window-shape coverage (corner curve AA + outside-curve cutout) is written into `clip_mask` so the OS boundary can fold it into the final alpha in one pass.
+    /// Paint the window-perimeter hairline DIRECTLY into the consumer's `target` buffer and (re)carve the window-shape `clip_mask` — the first writer of the frame, run BEFORE the consumer paints any content into `target`.
+    ///
+    /// **Why this is split out of [`rasterize_chrome`]:** fluor is under-blend only ("topmost paints first wins"). The chrome group composites UNDER `target` at [`flatten_into`](Self::flatten_into) time (`target.under(chrome)`), so any content the consumer draws directly into `target` ALWAYS wins over chrome at shared edge pixels — burying the perimeter hairline wherever full-bleed content reaches the window edge. Painting the hairline into `target` first makes it the top of the under-chain at those edge pixels: content then composes UNDER it and the hairline survives. Buttons / orb / controls-strip / title stay in the chrome group (they never sit at the window edge, so no content conflicts there) and keep compositing under content as before.
+    ///
+    /// **clip_mask ownership moved here.** The `clip_mask.fill(255)` reset and the corner cutout carve (a side effect of [`chrome::draw_window_edges_and_mask`]) are inseparable — same pixels, one pass — so they MUST stay on the same cycle. This pass owns BOTH now and runs **every frame** (not dirty-gated): the consumer overwrites `target`'s edge pixels each frame, so the hairline must be repainted each frame, and the mask is recomputed identically each frame (it's a pure function of viewport + zoom), keeping it coherent with the dirty-gated `hit_test_map` that [`rasterize_chrome`] stamps against it. The single window-shape α-trim still happens exactly once, at the OS boundary in [`crate::paint::finalize_for_os`] — this pass only writes the mask, never multiplies it into α.
+    ///
+    /// `full_edge` / `DEBUG_SKIP_CHROME` skip the hairline + carve entirely, leaving `clip_mask` at 255 (rectangular window) — same contract as the old in-chrome path.
+    pub fn rasterize_perimeter(
+        &mut self,
+        target: &mut [u32],
+        target_w: usize,
+        target_h: usize,
+        clip_mask: &mut [u8],
+    ) {
+        let (buf_w, buf_h) = self.dims();
+        let vp_w = buf_w as u32;
+        let vp_h = buf_h as u32;
+
+        // Reset clip_mask to 255 (fully visible) BEFORE re-carving — the carve is a side effect of `draw_window_edges_and_mask`, so the reset rides the same pass. Recomputed identically every frame so it never desyncs from the dirty-gated hit_test_map in `rasterize_chrome`.
+        clip_mask.fill(255);
+
+        if vp_w < 2 || vp_h < 2 || target_w != buf_w || target_h != buf_h {
+            return;
+        }
+        if self.full_edge || crate::paint::DEBUG_SKIP_CHROME.load(std::sync::atomic::Ordering::Relaxed) {
+            return; // rectangular window: no perimeter hairline, no corner cutout
+        }
+
+        // Geometry shared with `rasterize_chrome` (recomputed here so the perimeter is self-contained per frame). `effective_span` folds in the user's zoom so the corners scale with Ctrl+/Ctrl-/Ctrl+scroll.
+        let span = self.viewport.effective_span();
+        let (start, crossings) = compute_squircle_crossings(span / 4.0, 24);
+        if crossings.is_empty() {
+            return;
+        }
+        let (start_big, crossings_big) = compute_squircle_crossings(span / 2.0, 24);
+
+        // Same focus-driven bevel palette as `rasterize_chrome` — top/left light, bottom/right shadow, dimmed when unfocused.
+        let (edge_light, edge_shadow) = if self.focused {
+            (theme::WINDOW_LIGHT_EDGE, theme::WINDOW_SHADOW_EDGE)
+        } else {
+            (
+                theme::WINDOW_LIGHT_EDGE_UNFOCUSED,
+                theme::WINDOW_SHADOW_EDGE_UNFOCUSED,
+            )
+        };
+
+        // Hairline RGB lands in `target` (NOT chrome_buf) so it wins the under-chain over content drawn afterward; the window-shape cutout + AA coverage lands in `clip_mask`. The `hit_test_map` argument is passed thru untouched — `draw_window_edges_and_mask` never writes it (the trailing `let _ = hit_test_map;` in that function proves it), so handing it the chrome's own map is harmless and avoids allocating a throwaway.
+        chrome::draw_window_edges_and_mask(
+            target,
+            &mut self.hit_test_map,
+            clip_mask,
+            vp_w,
+            vp_h,
+            start_big,
+            &crossings_big,
+            start,
+            &crossings,
+            edge_light,
+            edge_shadow,
+        );
+    }
+
+    /// **Scaffold step 1 (top of stack: AA rounded hairline only):** paint the controls strip, buttons, app-icon orb and title text into the chrome layer. The window-perimeter hairline + window-shape `clip_mask` carve were split out into [`rasterize_perimeter`](Self::rasterize_perimeter) (which must run BEFORE the consumer's content so the hairline wins the under-chain); this pass assumes `clip_mask` is already carved and only READS it (button hit-scan walls, silhouette restriction).
     ///
     /// `text` is used by the title text rasterization pass (Open Sans, span-relative font size, left-aligned in the area to the left of the controls strip). `damage` is the frame-level accumulator; chrome routes its migrated rasterizers (title text, status bar) thru Canvas instances backed by it, so chrome's contribution to the damage rect flows to the host.
     pub fn rasterize_chrome(
@@ -278,8 +340,7 @@ impl DefaultChrome {
         }
         crate::paint::RASTERIZE_OPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
-        // Reset clip_mask to 255 (fully visible) BEFORE re-carving. The corner cutout is a side effect of `chrome::draw_window_edges_and_mask`, so it MUST run on the same dirty-cycle that resets the mask — otherwise the old (larger or smaller) carving persists. Done here (inside the dirty check) rather than in the host's render_frame, because a per-frame reset there would wipe the carving on frames where chrome is clean and never re-carve, producing rectangular windows whenever the cursor is idle for a tick.
-        clip_mask.fill(255);
+        // clip_mask is owned + carved by `rasterize_perimeter` (runs before content, every frame). This pass only READS it (button hit-scan walls below, silhouette restriction post-pass). hit_test_map is still owned here — wiped on each dirty cycle before re-stamping the buttons.
         self.hit_test_map.fill(HIT_NONE);
 
         let chrome_buf = &mut self.group.rpn.layers[self.layer_chrome].pixels;
@@ -302,8 +363,7 @@ impl DefaultChrome {
             return;
         }
 
-        // Asymmetric window-perimeter corners: the TR+BL diagonal keeps the original radius (span/4, the same curve as the controls strip — it reuses the base `start`/`crossings` computed above), the TL+BR diagonal is a literal 2× of it (span/2). Same curve generator and squirdleyness, so the curvature is identical to the original corners — TL/BR are just the same shape at double scale. Only the big table is new here.
-        let (start_big, crossings_big) = compute_squircle_crossings(span / 2.0, 24);
+        // (Asymmetric window-perimeter corners — the TL+BR span/2 big table — moved with the perimeter into `rasterize_perimeter`. The strip's BL curve still reuses the base `start`/`crossings` computed above.)
 
         // Controls-strip layout. Computed early so the title text pass can clip against `strip_x` (title shouldn't paint over the buttons even at long titles or narrow windows). The strip lives in the top-right `button_size`-tall band, `strip_w` wide.
         let strip_w = button_size * 7 / 2;
@@ -377,21 +437,7 @@ impl DefaultChrome {
         };
 
         if !crate::paint::DEBUG_SKIP_CHROME.load(std::sync::atomic::Ordering::Relaxed) {
-            if !self.full_edge {
-                chrome::draw_window_edges_and_mask(
-                    chrome_buf,
-                    &mut self.hit_test_map,
-                    clip_mask,
-                    vp_w,
-                    vp_h,
-                    start_big,
-                    &crossings_big,
-                    start,
-                    &crossings,
-                    edge_light,
-                    edge_shadow,
-                );
-            }
+            // Window perimeter hairline + clip_mask carve moved to `rasterize_perimeter` (runs into `target` before content so the hairline wins the under-chain). This pass paints only the chrome-group elements (orb, title, strip, buttons).
             if orb_present {
                 chrome::draw_app_icon(
                     chrome_buf,
