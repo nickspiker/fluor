@@ -909,8 +909,8 @@ pub fn draw_chord_hint(
     if hints.is_empty() || canvas.width < 200 || canvas.height < 120 {
         return;
     }
-    // RU-coherent typography. `font_size = span × 0.014` lands at ~14 px at span ≈ 1000, ~28 px at 2000, etc. Vertical rhythm + padding follow as ratios of the font size so the panel scales as one unit.
-    let font_size = (span * 0.014).max(11.0);
+    // RU-coherent typography. `font_size = span × 0.014` lands at ~14 px at span ≈ 1000, ~28 px at 2000, etc. Vertical rhythm + padding follow as ratios of the font size so the panel scales as one unit. No pixel floor — span already scales with the viewport, and a hardcoded minimum would break resolution independence (and desync from photon's matching bbox math).
+    let font_size = span * 0.014;
     let header_size = font_size * 1.18;
     let line_h = font_size * 1.55;
     let pad = font_size * 1.25;
