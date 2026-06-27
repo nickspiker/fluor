@@ -295,12 +295,15 @@ impl DefaultChrome {
         // Span-relative: button height is span/32, where span is the harmonic mean of viewport dims times zoom. Strip layout bails downstream if the result is too small to render glyphs.
         let button_size = crate::math::ceil(span / 32.0) as usize;
 
-        // Single squircle (radius = span/4, squirdleyness 24) shared by the window perimeter AND the controls-strip BL curve — same shape as photon. At typical viewport sizes the curve is too big to fit in the strip and degrades to a rectangular bottom; at high zoom it appears.
+        // Base squircle (radius = span/4, squirdleyness 24) — the controls-strip BL curve still uses this symmetric shape. At typical viewport sizes the curve is too big to fit in the strip and degrades to a rectangular bottom; at high zoom it appears.
         let (start, crossings) = compute_squircle_crossings(span / 4.0, 24);
         // No curve to draw — bail. start=0 is fine (just means the corner-of-corner cutout is empty); curve walks handle it.
         if crossings.is_empty() {
             return;
         }
+
+        // Asymmetric window-perimeter corners: the TR+BL diagonal keeps the original radius (span/4, the same curve as the controls strip — it reuses the base `start`/`crossings` computed above), the TL+BR diagonal is a literal 2× of it (span/2). Same curve generator and squirdleyness, so the curvature is identical to the original corners — TL/BR are just the same shape at double scale. Only the big table is new here.
+        let (start_big, crossings_big) = compute_squircle_crossings(span / 2.0, 24);
 
         // Controls-strip layout. Computed early so the title text pass can clip against `strip_x` (title shouldn't paint over the buttons even at long titles or narrow windows). The strip lives in the top-right `button_size`-tall band, `strip_w` wide.
         let strip_w = button_size * 7 / 2;
@@ -311,18 +314,27 @@ impl DefaultChrome {
         // Orb slot is also reserved when `OrbTint::Custom` is active even without an icon — that's the "status badge" use case (network indicator, recording light, presence). `draw_app_icon`'s no-icon path fills the disk with `ring_colour`, so the slot reads as a coloured dot.
         let orb_present = self.app_icon.is_some()
             || matches!(self.orb_tint, chrome::OrbTint::Custom { .. });
+        // Orb diameter is a full `button_size` (2× the original button_size/2) to match the fatter 2× TL corner.
         let orb_diameter = if orb_present {
-            (button_size / 2) as isize
+            button_size as isize
         } else {
             0
         };
         let orb_radius = orb_diameter / 2;
-        let orb_cx = (button_size / 2) as isize;
-        let orb_cy = (button_size / 2) as isize;
+        // Orb centre sits one full `button_size` in from the top-left (2× the old button_size/2 offset), tucking it into the now-2×-larger TL squircle corner instead of the old half-band inset.
+        let orb_cx = button_size as isize;
+        let orb_cy = button_size as isize;
+        // Title clears the orb's actual right edge. `draw_title_text`'s base left margin is `button_size/2`, so `left_extra` is the extra push needed to land the title just past `orb_cx + orb_radius` (plus a `button_size/4` gap). Tracks the orb wherever it sits, so moving the orb right keeps the title from sliding under it.
         let title_left_extra = if orb_present {
-            orb_diameter as usize
+            ((orb_cx + orb_radius) as usize + button_size / 4).saturating_sub(button_size / 2)
         } else {
             0
+        };
+        // Title row: level with the orb when one is present, else the original top-band centre.
+        let title_y_center = if orb_present {
+            orb_cy as Coord
+        } else {
+            button_size as Coord * 0.5
         };
 
         // Front-to-back chrome rendering. Earliest writers WIN — `pixels[i].under(...)`'s opaque-top early-out makes later writes a no-op on pixels a previous step already claimed opaque.
@@ -372,6 +384,8 @@ impl DefaultChrome {
                     clip_mask,
                     vp_w,
                     vp_h,
+                    start_big,
+                    &crossings_big,
                     start,
                     &crossings,
                     edge_light,
@@ -404,6 +418,7 @@ impl DefaultChrome {
                     button_size,
                     strip_x,
                     title_left_extra,
+                    title_y_center,
                     title_colour,
                 );
             }
