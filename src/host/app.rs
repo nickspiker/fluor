@@ -1386,6 +1386,14 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 }
                 self.dispatch_event(event);
             }
+            // Plain (non-zoom) wheel — the consumer scrolls its content. Scrolling MOVES content under a stationary cursor, so it's a content-moving event exactly like resize / zoom / drag-release: the incremental opaque-only finalize would leave stale AA pixels (avatar rims, glyph edges, dividers) at the pre-scroll positions, and the post-finalize hover overlay would then tint the current hit-map over that stale content (the "hover fill in the wrong spot" on scroll). Promote to a full repaint so the whole window re-finalizes at the new positions, AA pixels included, and the overlay reads coherent content. Dispatch to the consumer first so it updates its scroll offset, then repaint.
+            WindowEvent::MouseWheel { .. } => {
+                self.dispatch_event(event);
+                self.pending_full_repaint = true;
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
+            }
             WindowEvent::Focused(focused) => {
                 let focused = *focused;
                 self.is_focused = focused;
