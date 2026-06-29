@@ -41,3 +41,7 @@ pub mod winit_compat;
 /// macOS click-thru: global NSEvent monitor for re-entry detection.
 #[cfg(all(feature = "host-winit", target_os = "macos"))]
 pub(crate) mod macos_hittest;
+
+/// Windows present path: layered-window per-pixel alpha + click-thru via UpdateLayeredWindow.
+#[cfg(all(feature = "host-winit", target_os = "windows"))]
+pub(crate) mod windows_layered;
