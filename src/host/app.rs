@@ -673,7 +673,30 @@ impl<A: FluorApp> DesktopShell<A> {
                 monitor.update_rect(r.x, r.y, r.w, r.h);
             }
         }
-        #[cfg(not(target_os = "macos"))]
+        // Windows: present the owned screen buffer through the layered window (per-pixel alpha +
+        // click-thru on α=0). The damage outline (a dev overlay) is stamped into a scratch copy first
+        // so it lives one frame and never touches persistent_screen, matching the softbuffer path.
+        #[cfg(target_os = "windows")]
+        {
+            let (sw, sh) = self.screen_size;
+            if let Some(window) = self.window.as_ref() {
+                if outline_active && !damage_clip.is_empty() {
+                    let mut scratch_screen = self.persistent_screen.clone();
+                    crate::paint::stamp_damage_outline_visible(
+                        &mut scratch_screen,
+                        scr_w,
+                        scr_h,
+                        damage_clip,
+                        rect_x,
+                        rect_y,
+                    );
+                    super::windows_layered::present(window, &scratch_screen, sw, sh);
+                } else {
+                    super::windows_layered::present(window, &self.persistent_screen, sw, sh);
+                }
+            }
+        }
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
         {
             let Some(surface) = self.surface.as_mut() else {
                 return;
@@ -732,7 +755,16 @@ impl<A: FluorApp> DesktopShell<A> {
             crate::paint::shift_screen_wrap(&mut buffer, scr_w, scr_h, dx, dy);
             let _ = buffer.present();
         }
-        #[cfg(not(target_os = "macos"))]
+        // Windows: no softbuffer surface — shift our owned persistent_screen and re-present it through
+        // the layered window. (The layered window already moves with window_rect via the α channel, so
+        // there's no OS input-region call to push like X11 does below.)
+        #[cfg(target_os = "windows")]
+        {
+            crate::paint::shift_screen_wrap(&mut self.persistent_screen, scr_w, scr_h, dx, dy);
+            let (sw, sh) = self.screen_size;
+            super::windows_layered::present(&window, &self.persistent_screen, sw, sh);
+        }
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
         {
             let Some(surface) = self.surface.as_mut() else {
                 return;
@@ -1053,6 +1085,12 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 super::macos_hittest::HittestMonitor::install(mon_h);
         }
 
+        // Windows: make the OS window LAYERED so UpdateLayeredWindow can present per-pixel alpha (and
+        // route clicks thru the α=0 region). winit's `with_transparent(true)` alone gives an opaque
+        // softbuffer surface on Windows — the layered style is what the fullscreen compositor needs.
+        #[cfg(target_os = "windows")]
+        super::windows_layered::make_layered(&window);
+
         // Initial visible-window size: app-supplied (defaults to half the screen in each axis) and centred. Apps with aspect-ratio opinions override [`FluorApp::initial_size`].
         let (req_w, req_h) = self.app.initial_size((mon_w, mon_h));
         let initial_w = req_w.max(1).min(mon_w);
@@ -1075,7 +1113,10 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 self.screen_size.1,
             ));
         }
-        #[cfg(not(target_os = "macos"))]
+        // Windows presents via UpdateLayeredWindow from `persistent_screen` directly (softbuffer's
+        // BitBlt present is opaque), so it needs no softbuffer surface. Every other non-macOS target
+        // (Linux/X11, Redox/Orbital) uses softbuffer.
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
         {
             use std::num::NonZeroU32;
             let context =
