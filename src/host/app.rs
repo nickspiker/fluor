@@ -1250,10 +1250,27 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                     }
                 }
 
-                // Re-centre + clamp window_rect to the current screen. Keeps the visible window at half-screen size, centred, on every screen size change (initial fullscreen, monitor switch, etc.). Skip during an active drag — the user is steering the rect themselves.
+                // Re-centre + clamp window_rect to the current screen on every screen-size change
+                // (initial fullscreen, monitor switch, etc.). Skip during an active drag — the user is
+                // steering the rect themselves.
+                //
+                // SIZE comes from the app: on the FIRST real surface (before surface_ready) we (re)apply
+                // `FluorApp::initial_size` now that the true screen size is known — `resumed` set it
+                // against the monitor we *expected*, and Windows in particular reports a different size
+                // here (DPI virtualization), so deriving it again keeps the app's aspect (e.g. Photon's
+                // tall portrait window) instead of the old hardcoded screen/2 that made the window
+                // "supa fat". On LATER resizes we PRESERVE the current window size (the user may have
+                // resized it) and only re-centre + clamp.
                 if !self.is_dragging_resize && !self.is_dragging_move {
-                    let new_w = (size.width / 2).max(1).min(size.width);
-                    let new_h = (size.height / 2).max(1).min(size.height);
+                    let (new_w, new_h) = if !self.surface_ready {
+                        let (rw, rh) = self.app.initial_size((size.width, size.height));
+                        (rw.max(1).min(size.width), rh.max(1).min(size.height))
+                    } else {
+                        (
+                            self.window_rect.w.max(1).min(size.width),
+                            self.window_rect.h.max(1).min(size.height),
+                        )
+                    };
                     let new_x = ((size.width as i32) - (new_w as i32)) / 2;
                     let new_y = ((size.height as i32) - (new_h as i32)) / 2;
                     let rect_changed = new_w != self.window_rect.w
