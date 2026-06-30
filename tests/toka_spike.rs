@@ -53,9 +53,7 @@ fn filled_rect_lands_opaque_at_centre() {
     draw_rect(&mut canvas, 32.0, 32.0, 20.0, 20.0, blue, None);
 
     let rgba = to_rgba(&pixels);
-    // fluor's blend deposits `(255 × consumed) >> 8 = 254` darkness for an opaque
-    // layer — a documented ±1 floor of the integer `>>8` kernel — so an "opaque
-    // black" channel reads 1, not 0, after the output flip. Tolerate ≤1.
+    // fluor's blend deposits `(255 × consumed) >> 8 = 254` darkness for an opaque layer — a documented ±1 floor of the integer `>>8` kernel — so an "opaque black" channel reads 1, not 0, after the output flip. Tolerate ≤1.
     let (r, g, b) = px(&rgba, 32, 32);
     assert!(r <= 1 && g <= 1 && b >= 254, "centre is ~blue fill, got ({r},{g},{b})");
     assert_eq!(px(&rgba, 0, 0), (255, 255, 255), "corner is bg (white)");
@@ -82,9 +80,7 @@ fn zero_dimension_rect_is_a_one_pixel_line() {
     let mut damage = Damage::new();
     let mut canvas = Canvas::new(&mut pixels, W, H, &mut damage);
 
-    // Centre the hairline ON pixel row 20 — pixel centres sit at y+0.5, so cy=20.5
-    // puts the 1px coverage band fully inside row 20 (cy=20.0 would split it 50/50
-    // across rows 19 and 20, which is correct AA but not what a crisp grid line wants).
+    // Centre the hairline ON pixel row 20 — pixel centres sit at y+0.5, so cy=20.5 puts the 1px coverage band fully inside row 20 (cy=20.0 would split it 50/50 across rows 19 and 20, which is correct AA but not what a crisp grid line wants).
     let black = pack_argb(0, 0, 0, 255);
     draw_rect(&mut canvas, 32.0, 20.5, 40.0, 0.0, black, None);
 

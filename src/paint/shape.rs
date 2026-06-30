@@ -44,9 +44,7 @@ pub fn draw_rect(
     if rect_w < 0.0 || rect_h < 0.0 || width == 0 || height == 0 {
         return;
     }
-    // A zero (or sub-pixel) dimension is a 1px line: floor the half-extent to 0.5
-    // so the coverage band spans exactly one pixel centred on the axis. This is
-    // fluor's line primitive — `draw_rect(.., w, 0.0, ..)` is a horizontal hairline.
+    // A zero (or sub-pixel) dimension is a 1px line: floor the half-extent to 0.5 so the coverage band spans exactly one pixel centred on the axis. This is fluor's line primitive — `draw_rect(.., w, 0.0, ..)` is a horizontal hairline.
     let hw = (rect_w * 0.5).max(0.5);
     let hh = (rect_h * 0.5).max(0.5);
     let x_min = (cx - hw - 0.5) as i32;

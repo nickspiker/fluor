@@ -2,8 +2,7 @@
 //!
 //! The current API exposes [`double_click_interval`]; future additions will cover key-repeat rate, scroll-wheel acceleration, etc. Results are cached per-process — these settings change rarely enough that a once-per-session read is correct, and the cost of re-reading on every press would be significant (XSettings round-trip / `gsettings` subprocess).
 //!
-//! Fallback ladder per platform:
-//! * **Linux X11** — read the XSettings `Net/DoubleClickTime` property from the XSettings selection owner. This is what GTK, Qt5, and most toolkits honor on X11. Returns the value verbatim if present.
+//! Fallback ladder per platform: * **Linux X11** — read the XSettings `Net/DoubleClickTime` property from the XSettings selection owner. This is what GTK, Qt5, and most toolkits honor on X11. Returns the value verbatim if present.
 //! * **Linux Wayland (or X11 with no XSettings manager)** — shell out to `gsettings get org.gnome.desktop.peripherals.mouse double-click`. Works on GNOME and derivatives; on KDE/sway/etc. without GSettings installed this returns `None` and we fall thru to the default.
 //! * **macOS** — TODO: `NSEvent.doubleClickInterval` (seconds, f64). Needs an objc2 dep; not yet wired since fluor's macOS host is wgpu-only and macOS-specific input plumbing is still ahead.
 //! * **Windows** — TODO: `GetDoubleClickTime()` from user32. Needs a windows-sys dep; same status as macOS.

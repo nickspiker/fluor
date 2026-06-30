@@ -1179,10 +1179,7 @@ mod widget_impls {
         fn paint(&mut self, _ctx: &mut PaintCtx<'_, '_>) {
             // Intentional no-op — panes still drives Textbox rendering via [`Textbox::render_content_into`] with its existing ad-hoc parameter list (sub-canvas offset, optional AlphaMask, etc. that don't fit PaintCtx today). Phase 5 will reshape the paint contract once the host's overall paint orchestration grows around the widget tree. The Widget trait impl here makes Textbox a participant in click / focus / hover dispatch in the meantime.
         }
-        // A disabled textbox returns `None` from every capability accessor, so the host's
-        // dispatch (`dispatch_click`/`dispatch_key`), tab cycle (`linear_tab_next`), focus
-        // (`apply_focus_change`), and hover-overlay (`build_overlay_deltas`) helpers all skip
-        // it without any per-handler `enabled` check — the canonical "frozen field" behaviour.
+        // A disabled textbox returns `None` from every capability accessor, so the host's dispatch (`dispatch_click`/`dispatch_key`), tab cycle (`linear_tab_next`), focus (`apply_focus_change`), and hover-overlay (`build_overlay_deltas`) helpers all skip it without any per-handler `enabled` check — the canonical "frozen field" behaviour.
         fn click(&mut self) -> Option<&mut dyn Click> {
             self.enabled.then_some(self as &mut dyn Click)
         }
@@ -1230,11 +1227,7 @@ mod widget_impls {
             Textbox::set_hovered(self, hovered);
         }
         fn tint_delta(&self) -> u32 {
-            // Three states per the docstring contract on `render_content_into`:
-            //   * focused → land at `TEXTBOX_ACTIVE` (pure black interior — strongest contrast for the typing field, primary signal for keyboard-only users)
-            //   * hovered (not focused) → land at `TEXTBOX_HOVER`
-            //   * neither → no tint
-            // Focus dominates hover so a focused-and-hovered textbox stays at ACTIVE rather than flipping to HOVER while the cursor passes over.
+            // Three states per the docstring contract on `render_content_into`: * focused → land at `TEXTBOX_ACTIVE` (pure black interior — strongest contrast for the typing field, primary signal for keyboard-only users) * hovered (not focused) → land at `TEXTBOX_HOVER` * neither → no tint Focus dominates hover so a focused-and-hovered textbox stays at ACTIVE rather than flipping to HOVER while the cursor passes over.
             if self.is_focused() {
                 crate::paint::wrap_sub_rgb(
                     crate::theme::TEXTBOX_ACTIVE,

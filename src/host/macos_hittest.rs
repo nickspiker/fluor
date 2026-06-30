@@ -1,9 +1,7 @@
 //! macOS global mouse monitor for click-thru re-entry detection.
 //!
 //! When `ignoresMouseEvents = true`, macOS stops delivering CursorMoved to our window.
-//! We install a global NSEvent monitor that fires on mouseMoved globally, checks the
-//! cursor position against the window rect, and flags re-entry when the cursor moves
-//! back inside.
+//! We install a global NSEvent monitor that fires on mouseMoved globally, checks the cursor position against the window rect, and flags re-entry when the cursor moves back inside.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;

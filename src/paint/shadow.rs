@@ -239,8 +239,7 @@ pub fn paint_shadow(
     let _ = scr_h;
 }
 
-/// Cast one DR shadow ray. Flat loop, single zero check on shadow_alpha or screen edge. Per cell:
-///   * α > 0 (chrome AA) → under-blend black: α += shadow_alpha * (256 - α) >> 8; chrome RGB stays (shadow's premult RGB is 0 since visible black).
+/// Cast one DR shadow ray. Flat loop, single zero check on shadow_alpha or screen edge. Per cell: * α > 0 (chrome AA) → under-blend black: α += shadow_alpha * (256 - α) >> 8; chrome RGB stays (shadow's premult RGB is 0 since visible black).
 ///   * α == 0 (transparent) → direct-assign black premult: (shadow_alpha << 24), RGB all zero.
 /// Decay shadow_alpha by factor_256 each step.
 fn cast_shadow_ray(

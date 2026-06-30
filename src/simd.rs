@@ -8,10 +8,8 @@ pub use wide::u32x8;
 
 /// SIMD lane count used by every hot-path vectorized op in fluor.
 ///
-/// 8 is the sweet spot:
-/// * Fits in one AVX2 register (256 bits = 8 × f32 or 8 × u32).
+/// 8 is the sweet spot: * Fits in one AVX2 register (256 bits = 8 × f32 or 8 × u32).
 /// * Degrades cleanly to two 128-bit SSE ops on pre-AVX2 hardware via `wide`'s internal split.
 /// * Matches typical AA-band width (1-2 pixels) so under-utilization at the boundary is rare.
-/// * One cache line of u32 pixels = 16, so each cache line holds exactly 2 lanes — clean
-///   sequential prefetch behavior with no straddling.
+/// * One cache line of u32 pixels = 16, so each cache line holds exactly 2 lanes — clean sequential prefetch behavior with no straddling.
 pub const LANES: usize = 8;

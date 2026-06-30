@@ -15,8 +15,7 @@ use super::{
 /// 3. Premultiply RGB by `final_α / 256`. Required on all platforms for clean AA edges.
 /// 4. Pack back into `0xααRRGGBB`.
 ///
-/// Debug toggles:
-/// * `DEBUG_SHOW_ALPHA` (`[]a`): replace each pixel with `(final_α, final_α, final_α, 0xFF)` — grayscale α visualization, opaque so the OS shows it.
+/// Debug toggles: * `DEBUG_SHOW_ALPHA` (`[]a`): replace each pixel with `(final_α, final_α, final_α, 0xFF)` — grayscale α visualization, opaque so the OS shows it.
 /// * `DEBUG_SKIP_PREMULT` (`[]p`): skip the Linux RGB×α step.
 pub fn finalize_for_os(pixels: &mut [u32], clip_mask: &[u8]) {
     let alpha_mode = DEBUG_SHOW_ALPHA.load(std::sync::atomic::Ordering::Relaxed);

@@ -7,8 +7,7 @@
 //! - No persistent_screen distinction (window_rect = full surface = same buffer).
 //! - No clip_mask carving (no rounded window corners on Android).
 //! - Choreographer-driven scheduling, not winit's event loop.
-//! - Skip render entirely when the AndroidWindow dirty flag is false (saves the ANativeWindow
-//!   lock/copy cycle on idle frames, tho Choreographer still advances).
+//! - Skip render entirely when the AndroidWindow dirty flag is false (saves the ANativeWindow lock/copy cycle on idle frames, tho Choreographer still advances).
 
 use alloc::string::String;
 use alloc::vec::Vec;

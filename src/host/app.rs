@@ -390,9 +390,7 @@ impl<A: FluorApp> DesktopShell<A> {
     }
 
     /// macOS click-thru: only disable hittest when the cursor is outside the window rect.
-    /// Inside the window rect we always accept events — checking alpha per-pixel there is
-    /// too fragile (transparent UI elements, frame transitions, etc. cause false negatives
-    /// that drop clicks to the app behind us).
+    /// Inside the window rect we always accept events — checking alpha per-pixel there is too fragile (transparent UI elements, frame transitions, etc. cause false negatives that drop clicks to the app behind us).
     #[cfg(target_os = "macos")]
     fn update_macos_hittest(&mut self) {
         let cx = self.cursor_x as i32;
@@ -673,9 +671,7 @@ impl<A: FluorApp> DesktopShell<A> {
                 monitor.update_rect(r.x, r.y, r.w, r.h);
             }
         }
-        // Windows: present the owned screen buffer through the layered window (per-pixel alpha +
-        // click-thru on α=0). The damage outline (a dev overlay) is stamped into a scratch copy first
-        // so it lives one frame and never touches persistent_screen, matching the softbuffer path.
+        // Windows: present the owned screen buffer through the layered window (per-pixel alpha + click-thru on α=0). The damage outline (a dev overlay) is stamped into a scratch copy first so it lives one frame and never touches persistent_screen, matching the softbuffer path.
         #[cfg(target_os = "windows")]
         {
             let (sw, sh) = self.screen_size;
@@ -755,9 +751,7 @@ impl<A: FluorApp> DesktopShell<A> {
             crate::paint::shift_screen_wrap(&mut buffer, scr_w, scr_h, dx, dy);
             let _ = buffer.present();
         }
-        // Windows: no softbuffer surface — shift our owned persistent_screen and re-present it through
-        // the layered window. (The layered window already moves with window_rect via the α channel, so
-        // there's no OS input-region call to push like X11 does below.)
+        // Windows: no softbuffer surface — shift our owned persistent_screen and re-present it through the layered window. (The layered window already moves with window_rect via the α channel, so there's no OS input-region call to push like X11 does below.)
         #[cfg(target_os = "windows")]
         {
             crate::paint::shift_screen_wrap(&mut self.persistent_screen, scr_w, scr_h, dx, dy);
@@ -1085,9 +1079,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 super::macos_hittest::HittestMonitor::install(mon_h);
         }
 
-        // Windows: make the OS window LAYERED so UpdateLayeredWindow can present per-pixel alpha (and
-        // route clicks thru the α=0 region). winit's `with_transparent(true)` alone gives an opaque
-        // softbuffer surface on Windows — the layered style is what the fullscreen compositor needs.
+        // Windows: make the OS window LAYERED so UpdateLayeredWindow can present per-pixel alpha (and route clicks thru the α=0 region). winit's `with_transparent(true)` alone gives an opaque softbuffer surface on Windows — the layered style is what the fullscreen compositor needs.
         #[cfg(target_os = "windows")]
         super::windows_layered::make_layered(&window);
 
@@ -1113,9 +1105,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 self.screen_size.1,
             ));
         }
-        // Windows presents via UpdateLayeredWindow from `persistent_screen` directly (softbuffer's
-        // BitBlt present is opaque), so it needs no softbuffer surface. Every other non-macOS target
-        // (Linux/X11, Redox/Orbital) uses softbuffer.
+        // Windows presents via UpdateLayeredWindow from `persistent_screen` directly (softbuffer's BitBlt present is opaque), so it needs no softbuffer surface. Every other non-macOS target (Linux/X11, Redox/Orbital) uses softbuffer.
         #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
         {
             use std::num::NonZeroU32;
@@ -1250,17 +1240,9 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                     }
                 }
 
-                // Re-centre + clamp window_rect to the current screen on every screen-size change
-                // (initial fullscreen, monitor switch, etc.). Skip during an active drag — the user is
-                // steering the rect themselves.
+                // Re-centre + clamp window_rect to the current screen on every screen-size change (initial fullscreen, monitor switch, etc.). Skip during an active drag — the user is steering the rect themselves.
                 //
-                // SIZE comes from the app: on the FIRST real surface (before surface_ready) we (re)apply
-                // `FluorApp::initial_size` now that the true screen size is known — `resumed` set it
-                // against the monitor we *expected*, and Windows in particular reports a different size
-                // here (DPI virtualization), so deriving it again keeps the app's aspect (e.g. Photon's
-                // tall portrait window) instead of the old hardcoded screen/2 that made the window
-                // "supa fat". On LATER resizes we PRESERVE the current window size (the user may have
-                // resized it) and only re-centre + clamp.
+                // SIZE comes from the app: on the FIRST real surface (before surface_ready) we (re)apply `FluorApp::initial_size` now that the true screen size is known — `resumed` set it against the monitor we *expected*, and Windows in particular reports a different size here (DPI virtualization), so deriving it again keeps the app's aspect (e.g. Photon's tall portrait window) instead of the old hardcoded screen/2 that made the window "supa fat". On LATER resizes we PRESERVE the current window size (the user may have resized it) and only re-centre + clamp.
                 if !self.is_dragging_resize && !self.is_dragging_move {
                     let (new_w, new_h) = if !self.surface_ready {
                         let (rw, rh) = self.app.initial_size((size.width, size.height));
@@ -1493,9 +1475,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 self.dispatch_event(event);
             }
             WindowEvent::RedrawRequested => {
-                // macOS click-thru: if the global monitor detected the cursor re-entering
-                // an opaque region while hittest was off, flip it back on. While hittest is
-                // off we keep requesting redraws to poll the monitor flag at vsync rate.
+                // macOS click-thru: if the global monitor detected the cursor re-entering an opaque region while hittest was off, flip it back on. While hittest is off we keep requesting redraws to poll the monitor flag at vsync rate.
                 #[cfg(target_os = "macos")]
                 if self.hittest_off {
                     if let Some(ref monitor) = self.hittest_monitor {
