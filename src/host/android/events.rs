@@ -1,13 +1,10 @@
 //! Android input → fluor::event translation.
 //!
 //! Touch events arrive from `nativeOnTouch` as `(action: i32, x: f32, y: f32)`. Action codes are Android's `MotionEvent.ACTION_*`:
-//! - 0 DOWN — primary touch began. Translate to `CursorMoved` (so widgets get the focus-tracking
-//!   coordinate update) followed by `MouseInput { Pressed, Left }`.
-//! - 1 UP — primary touch ended. `MouseInput { Released, Left }` only — the cursor stays where
-//!   it last moved, matching desktop convention (mouse buttons release; cursor doesn't teleport).
+//! - 0 DOWN — primary touch began. Translate to `CursorMoved` (so widgets get the focus-tracking coordinate update) followed by `MouseInput { Pressed, Left }`.
+//! - 1 UP — primary touch ended. `MouseInput { Released, Left }` only — the cursor stays where it last moved, matching desktop convention (mouse buttons release; cursor doesn't teleport).
 //! - 2 MOVE — drag. `CursorMoved`.
-//! - 3 CANCEL — gesture cancelled by the system. `CursorLeft` + `MouseInput { Released, Left }`
-//!   so any in-flight drag-select / button-press cleans up.
+//! - 3 CANCEL — gesture cancelled by the system. `CursorLeft` + `MouseInput { Released, Left }` so any in-flight drag-select / button-press cleans up.
 //!
 //! Key events arrive from `nativeOnKeyEvent` as Android `KeyEvent` keycodes. Only the codes photon currently routes are translated; everything else maps to `Key::Unidentified` so the JNI layer can short-circuit and return `false` (unhandled).
 //!
