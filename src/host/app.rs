@@ -215,6 +215,11 @@ pub trait FluorApp {
     fn wants_keyboard(&mut self) -> Option<bool> {
         None
     }
+
+    /// One-shot: the app cleared its text field programmatically (e.g. sent a message), so the Android host should `InputMethodManager.restartInput` to reset the IME's stale composing buffer — otherwise a predictive keyboard re-materialises the just-sent text on the next keystroke. Default `false` (no-op); drained per poll like [`FluorApp::wants_keyboard`].
+    fn wants_input_reset(&mut self) -> bool {
+        false
+    }
 }
 
 /// Run the desktop host until the window closes. Builds an `EventLoop` typed on `A::UserEvent` so background-thread wake-ups via the WakeSender route thru [`FluorApp::on_user_event`]. The proxy is created up-front, wrapped in a [`winit_compat::WinitWakeSender`], and handed to the app via [`FluorApp::set_event_proxy`] BEFORE the event loop starts, so apps can clone-and-ship the Arc to background tasks during their own constructor or [`FluorApp::init`].
