@@ -95,6 +95,42 @@ mod x11_atomic {
         let _ = conn.flush();
         true
     }
+
+    /// The desktop work area `(x, y, w, h)` — the monitor minus space reserved by panels /
+    /// taskbars — read from the root window's EWMH `_NET_WORKAREA` property. Used to place
+    /// the visible window so its bottom edge (the chrome status band) doesn't slide under a
+    /// taskbar. `_NET_WORKAREA` holds `[x, y, w, h]` per virtual desktop; we take the first
+    /// (current/default desktop). Returns `None` if not X11, the atom is unset (no EWMH WM),
+    /// or the read fails — caller falls back to the full monitor.
+    pub fn work_area() -> Option<(i32, i32, u32, u32)> {
+        use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+        let conn = conn()?;
+        let root = conn.setup().roots.first()?.root;
+        let atom = conn
+            .intern_atom(false, b"_NET_WORKAREA")
+            .ok()?
+            .reply()
+            .ok()?
+            .atom;
+        if atom == 0 {
+            return None;
+        }
+        let reply = conn
+            .get_property(false, root, atom, AtomEnum::CARDINAL, 0, 4)
+            .ok()?
+            .reply()
+            .ok()?;
+        let mut vals = reply.value32()?;
+        let x = vals.next()? as i32;
+        let y = vals.next()? as i32;
+        let w = vals.next()?;
+        let h = vals.next()?;
+        if w == 0 || h == 0 {
+            None
+        } else {
+            Some((x, y, w, h))
+        }
+    }
 }
 
 /// Per-callback access to host-owned shared resources. Re-borrowed for each call into the trait — the consumer can keep references for the duration of the call but not across calls.
@@ -277,6 +313,10 @@ struct DesktopShell<A: FluorApp> {
     viewport: Viewport,
     /// Display size in pixels (= OS window size in fullscreen mode). The OS surface buffer matches this.
     screen_size: (u32, u32),
+    /// Desktop work area `(x, y, w, h)` — monitor minus panels/taskbars (X11 `_NET_WORKAREA`,
+    /// else the full monitor). Initial placement and the "maximized" rect target this instead
+    /// of the raw screen so the window never lands under a taskbar. Set in `resumed`.
+    work_area: (i32, i32, u32, u32),
     /// Where the visible window lives inside the screen buffer. Driven by drag-to-move + resize-drag (later steps); initialized centered with a 3/4-of-monitor-short initial size.
     window_rect: WindowRect,
     /// Window-sized scratch buffer. The consumer renders into this (at viewport dimensions); the host runs `finalize_for_os` on it with the window-space clip mask, then blits row-by-row into the screen buffer at `window_rect.x, window_rect.y`. Resized on `window_rect` size change.
@@ -356,6 +396,7 @@ impl<A: FluorApp> DesktopShell<A> {
             window: None,
             viewport: Viewport::new(1, 1),
             screen_size: (1, 1),
+            work_area: (0, 0, 1, 1),
             window_rect: WindowRect {
                 x: 0,
                 y: 0,
@@ -842,11 +883,14 @@ impl<A: FluorApp> DesktopShell<A> {
             Some(prev) => prev,
             None => {
                 self.saved_rect_for_maximize = Some(self.window_rect);
-                WindowRect {
-                    x: 0,
-                    y: 0,
-                    w: scr_w,
-                    h: scr_h,
+                // Maximize to the work area (monitor minus panels), not the raw screen, so
+                // the maximized window's bottom chrome stays clear of the taskbar. Falls
+                // back to full screen if the work area was never resolved.
+                let (wx, wy, ww, wh) = self.work_area;
+                if ww > 1 && wh > 1 {
+                    WindowRect { x: wx, y: wy, w: ww, h: wh }
+                } else {
+                    WindowRect { x: 0, y: 0, w: scr_w, h: scr_h }
                 }
             }
         };
@@ -1110,12 +1154,28 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
         #[cfg(target_os = "windows")]
         super::windows_layered::make_layered(&window);
 
-        // Initial visible-window size: app-supplied (defaults to half the screen in each axis) and centred. Apps with aspect-ratio opinions override [`FluorApp::initial_size`].
-        let (req_w, req_h) = self.app.initial_size((mon_w, mon_h));
-        let initial_w = req_w.max(1).min(mon_w);
-        let initial_h = req_h.max(1).min(mon_h);
-        let win_x = ((mon_w as i32) - (initial_w as i32)) / 2;
-        let win_y = ((mon_h as i32) - (initial_h as i32)) / 2;
+        // Desktop work area (monitor minus panels/taskbars) so the visible window — and
+        // especially its bottom chrome status band — doesn't end up under a taskbar. X11
+        // reads `_NET_WORKAREA`; other platforms fall back to the full monitor until their
+        // native query (Windows SPI_GETWORKAREA, macOS NSScreen.visibleFrame) is wired.
+        let (wa_x, wa_y, wa_w, wa_h) = {
+            #[cfg(target_os = "linux")]
+            {
+                x11_atomic::work_area().unwrap_or((0, 0, mon_w, mon_h))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                (0i32, 0i32, mon_w, mon_h)
+            }
+        };
+        self.work_area = (wa_x, wa_y, wa_w, wa_h);
+
+        // Initial visible-window size: app-supplied (defaults to half the screen in each axis), clamped to the work area and centred within it. Apps with aspect-ratio opinions override [`FluorApp::initial_size`].
+        let (req_w, req_h) = self.app.initial_size((wa_w, wa_h));
+        let initial_w = req_w.max(1).min(wa_w);
+        let initial_h = req_h.max(1).min(wa_h);
+        let win_x = wa_x + ((wa_w as i32) - (initial_w as i32)) / 2;
+        let win_y = wa_y + ((wa_h as i32) - (initial_h as i32)) / 2;
         self.window_rect = WindowRect {
             x: win_x,
             y: win_y,
