@@ -133,6 +133,90 @@ mod x11_atomic {
     }
 }
 
+/// Windows work-area query — `SystemParametersInfo(SPI_GETWORKAREA)` gives the primary
+/// monitor's work rect (full screen minus the taskbar), in virtual-screen pixels.
+#[cfg(all(feature = "host-winit", target_os = "windows"))]
+fn work_area_windows() -> Option<(i32, i32, u32, u32)> {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    };
+    let mut r = RECT::default();
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut r as *mut RECT as *mut core::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    if ok.is_err() {
+        return None;
+    }
+    let w = (r.right - r.left).max(0) as u32;
+    let h = (r.bottom - r.top).max(0) as u32;
+    if w == 0 || h == 0 {
+        None
+    } else {
+        Some((r.left, r.top, w, h))
+    }
+}
+
+/// macOS work-area query — `NSScreen.mainScreen.visibleFrame` (full frame minus the menu
+/// bar + Dock). macOS frames are in points with a bottom-left origin; we derive the insets
+/// as fractions of the full frame and apply them to the physical monitor pixels (`mon_w` ×
+/// `mon_h`), which is scale-factor-independent and yields a top-left-origin pixel rect.
+#[cfg(all(feature = "host-winit", target_os = "macos"))]
+fn work_area_macos(mon_w: u32, mon_h: u32) -> Option<(i32, i32, u32, u32)> {
+    use objc2_app_kit::NSScreen;
+    let mtm = objc2::MainThreadMarker::new()?;
+    let screen = NSScreen::mainScreen(mtm)?;
+    let full = screen.frame();
+    let vf = screen.visibleFrame();
+    let (fw, fh) = (full.size.width, full.size.height);
+    if fw <= 0.0 || fh <= 0.0 {
+        return None;
+    }
+    let left_f = ((vf.origin.x - full.origin.x) / fw).max(0.0);
+    let bottom_f = ((vf.origin.y - full.origin.y) / fh).max(0.0);
+    let right_f = (((full.origin.x + fw) - (vf.origin.x + vf.size.width)) / fw).max(0.0);
+    let top_f = (((full.origin.y + fh) - (vf.origin.y + vf.size.height)) / fh).max(0.0);
+    let (mw, mh) = (mon_w as f64, mon_h as f64);
+    let wa_w = (mw * (1.0 - left_f - right_f)).max(0.0) as u32;
+    let wa_h = (mh * (1.0 - top_f - bottom_f)).max(0.0) as u32;
+    if wa_w == 0 || wa_h == 0 {
+        None
+    } else {
+        Some(((left_f * mw) as i32, (top_f * mh) as i32, wa_w, wa_h))
+    }
+}
+
+/// Desktop work area `(x, y, w, h)` in physical pixels (top-left origin) — the monitor
+/// minus space reserved by panels / taskbars / the menu bar + Dock. Dispatches to the
+/// platform query (X11 `_NET_WORKAREA`, Windows `SPI_GETWORKAREA`, macOS `visibleFrame`);
+/// falls back to the full monitor on Wayland (no client-side work-area query) and anywhere
+/// the query is unavailable.
+#[cfg(feature = "host-winit")]
+fn monitor_work_area(mon_w: u32, mon_h: u32) -> (i32, i32, u32, u32) {
+    #[cfg(target_os = "linux")]
+    {
+        // Wayland has no EWMH root window; `work_area()` returns None there and we fall back.
+        return x11_atomic::work_area().unwrap_or((0, 0, mon_w, mon_h));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return work_area_windows().unwrap_or((0, 0, mon_w, mon_h));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return work_area_macos(mon_w, mon_h).unwrap_or((0, 0, mon_w, mon_h));
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    {
+        (0, 0, mon_w, mon_h)
+    }
+}
+
 /// Per-callback access to host-owned shared resources. Re-borrowed for each call into the trait — the consumer can keep references for the duration of the call but not across calls.
 pub struct Context<'a> {
     /// Current viewport in physical pixels.
@@ -1154,20 +1238,11 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
         #[cfg(target_os = "windows")]
         super::windows_layered::make_layered(&window);
 
-        // Desktop work area (monitor minus panels/taskbars) so the visible window — and
-        // especially its bottom chrome status band — doesn't end up under a taskbar. X11
-        // reads `_NET_WORKAREA`; other platforms fall back to the full monitor until their
-        // native query (Windows SPI_GETWORKAREA, macOS NSScreen.visibleFrame) is wired.
-        let (wa_x, wa_y, wa_w, wa_h) = {
-            #[cfg(target_os = "linux")]
-            {
-                x11_atomic::work_area().unwrap_or((0, 0, mon_w, mon_h))
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                (0i32, 0i32, mon_w, mon_h)
-            }
-        };
+        // Desktop work area (monitor minus panels/taskbars/menu-bar+Dock) so the visible
+        // window — and especially its bottom chrome status band — doesn't end up under a
+        // taskbar. Per-OS query (X11 `_NET_WORKAREA`, Windows `SPI_GETWORKAREA`, macOS
+        // `visibleFrame`); falls back to the full monitor on Wayland and where unavailable.
+        let (wa_x, wa_y, wa_w, wa_h) = monitor_work_area(mon_w, mon_h);
         self.work_area = (wa_x, wa_y, wa_w, wa_h);
 
         // Initial visible-window size: app-supplied (defaults to half the screen in each axis), clamped to the work area and centred within it. Apps with aspect-ratio opinions override [`FluorApp::initial_size`].
