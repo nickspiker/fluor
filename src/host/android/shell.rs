@@ -156,6 +156,11 @@ impl<A: FluorApp> AndroidShell<A> {
         }
     }
 
+    /// Poll `FluorApp::wants_input_reset` → `1` (the Activity should `InputMethodManager.restartInput` to clear a stale IME composing buffer after a programmatic text clear) or `0`. One-shot, drained here.
+    pub fn poll_input_reset(&mut self) -> i32 {
+        self.app.wants_input_reset() as i32
+    }
+
     /// Key event from `nativeOnKeyEvent`. Returns true if the host handled it (app's response was `Handled`). Untranslated keys (Key::Unidentified) return false so Android's default behavior runs.
     pub fn on_key_event(&mut self, key_code: i32) -> bool {
         let Some(ev) = events::key_press_from_keycode(key_code) else {
