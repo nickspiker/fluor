@@ -1098,8 +1098,18 @@ pub fn draw_blinkey(canvas: &mut Canvas, bx: usize, by: usize, height: usize, to
         };
         let w = wave as u32;
         for dx in -7i32..=7 {
-            let pixel = 0x00010101u32 * (w >> dx.unsigned_abs());
-            pixels[(idx as isize + dx as isize) as usize] += pixel;
+            // The cursor is a BRIGHT wave. In the α + darkness convention (RGB bytes are
+            // darkness, `0 = white`), brightening means REDUCING darkness — a per-channel
+            // saturating subtract, NOT the add the visible-RGB original used. (Photon's
+            // buffer was visible-space, so it added; the port kept the `+=` which silently
+            // darkened the cursor into invisibility against a dark field.) α is preserved.
+            let k = w >> dx.unsigned_abs();
+            let p = &mut pixels[(idx as isize + dx as isize) as usize];
+            let a = *p & 0xFF00_0000;
+            let r = ((*p >> 16) & 0xFF).saturating_sub(k);
+            let g = ((*p >> 8) & 0xFF).saturating_sub(k);
+            let b = (*p & 0xFF).saturating_sub(k);
+            *p = a | (r << 16) | (g << 8) | b;
         }
     }
 }
