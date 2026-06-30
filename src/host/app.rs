@@ -132,6 +132,19 @@ pub trait FluorApp {
         ""
     }
 
+    /// The app-identity icon for the OS window (taskbar / alt-tab / title bar). The host
+    /// applies it at window creation so the OS-level icon matches the in-chrome orb — apps
+    /// that hold a [`DefaultChrome`] typically return `self.chrome.app_icon.as_ref()`.
+    ///
+    /// **Platform reach.** This drives winit's `set_window_icon`, which only takes effect on
+    /// **Windows and X11**. On **Wayland** the icon is sourced from a `.desktop` file matched
+    /// by `app_id`, and on **macOS** from the `.app` bundle's `.icns` — both are build-time
+    /// packaging, not a runtime call, so this hook is a no-op there. Returns `None` by
+    /// default (no OS icon set).
+    fn window_icon(&self) -> Option<&crate::host::icon::Icon> {
+        None
+    }
+
     /// Hand off the host's wake-sender ONCE, before [`Self::init`], so the app can clone it for background threads. host-winit wraps `winit::event_loop::EventLoopProxy`; host-android wraps a JNI callback (or a [`super::NoopWakeSender`] when the app doesn't use cross-thread wake-ups). A typical implementer stashes the `Arc` in its own field and clone-and-ships it to spawned tasks. Default no-op for apps that don't need cross-thread wake-up.
     fn set_event_proxy(&mut self, proxy: alloc::sync::Arc<dyn super::WakeSender<Self::UserEvent>>) {
         let _ = proxy;
@@ -1070,6 +1083,15 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
             .with_transparent(true)
             .with_resizable(false);
         let window = Arc::new(event_loop.create_window(attrs).expect("create_window"));
+
+        // Match the OS window icon (taskbar / alt-tab / title bar) to the app's orb. winit
+        // honours this on Windows + X11; it's a no-op on Wayland (icon from .desktop app_id)
+        // and macOS (icon from the .app bundle), which source the icon at packaging time.
+        if let Some(icon) = self.app.window_icon() {
+            if let Some(winit_icon) = icon.to_winit_icon() {
+                window.set_window_icon(Some(winit_icon));
+            }
+        }
 
         #[cfg(target_os = "macos")]
         {
