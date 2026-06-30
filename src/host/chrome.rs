@@ -361,6 +361,35 @@ pub fn draw_status_bar(
     let y_top = height - band_h;
     // Damage = full-width band [y_top, height).
     canvas.damage.add_bounds(0, y_top, width, height);
+
+    // Status text FIRST. Chrome composites front-to-back ("topmost paints first wins"), so
+    // the text must be drawn before the band bg — otherwise it under-blends BEHIND the
+    // opaque fill and vanishes. Horizontally centered, vertically centered in the band;
+    // `band_h / 2` side padding clips long strings off the BL/BR curves.
+    if !text.is_empty() {
+        let side_margin = band_h / 2;
+        let clip_x_end = width.saturating_sub(side_margin);
+        if side_margin < clip_x_end {
+            let font_size = band_h as Coord * 0.55;
+            let x_center = width as Coord * 0.5;
+            let y_center = y_top as Coord + band_h as Coord * 0.5;
+            let clip = Clip::new(side_margin, y_top, clip_x_end, height);
+            text_renderer.draw_text_center_u32(
+                canvas,
+                text,
+                x_center,
+                y_center,
+                font_size,
+                400,
+                text_colour,
+                "Open Sans",
+                Some(clip),
+                None,
+                None,
+            );
+        }
+    }
+
     let pixels: &mut [u32] = canvas.pixels;
 
     // Top hairline (1 px) — claims y_top across the full width. The squircle perimeter's clip_mask handles rounding at BL/BR.
@@ -371,7 +400,9 @@ pub fn draw_status_bar(
         pixels[idx] = pixels[idx].under(hairline, BlendMode::Normal);
     }
 
-    // BG fill — opaque pixels in (y_top, height). Front-to-back under-blend means earlier writers (perimeter hairline + corner curve pixels) keep their values; bg fills only the empty interior.
+    // BG fill — under-blends beneath the already-drawn text + hairline, filling the rest of
+    // the band interior. (Earlier writers — perimeter hairline, corner curve, status text —
+    // keep their pixels; bg only lands where the band is still empty.)
     let bg_opaque = 0xFF000000 | (bg & 0x00FFFFFF);
     for y in (y_top + 1)..height {
         let row_base = y * width;
@@ -380,33 +411,6 @@ pub fn draw_status_bar(
             pixels[idx] = pixels[idx].under(bg_opaque, BlendMode::Normal);
         }
     }
-
-    // Status text (optional). Horizontally centered in the band; vertically centered in the band's height. `band_h / 2` of side padding on both edges defines the clip so very long status strings don't bleed past the curves. Font size proportional to band height.
-    if text.is_empty() {
-        return;
-    }
-    let side_margin = band_h / 2;
-    let clip_x_end = width.saturating_sub(side_margin);
-    if side_margin >= clip_x_end {
-        return;
-    }
-    let font_size = band_h as Coord * 0.55;
-    let x_center = width as Coord * 0.5;
-    let y_center = y_top as Coord + band_h as Coord * 0.5;
-    let clip = Clip::new(side_margin, y_top, clip_x_end, height);
-    text_renderer.draw_text_center_u32(
-        canvas,
-        text,
-        x_center,
-        y_center,
-        font_size,
-        400,
-        text_colour,
-        "Open Sans",
-        Some(clip),
-        None,
-        None,
-    );
 }
 
 /// Rasterize the top-left app-icon orb: a circular sample of `icon` clipped to `radius`, wrapped in an optional ring stroked in `ring_colour`. The ring is a thin hairline — the icon fills crisply to `r−1`, then a `stroke_width + 1`-px solid band (1px when `stroke_width` is 0), then a 1px outer AA against the chrome. The icon/ring seam is opaque→opaque so it needs no AA; only the outer silhouette is anti-aliased. `cx`/`cy` give the orb centre in pixel coords; `radius` is the icon sampling radius (ring extends outward from it). Without an `icon`, the interior fills with `ring_colour` (treated as a solid dark disk). Without a `ring_colour`, the orb is just the icon clipped to a circle (1-pixel outer-AA against the chrome).
