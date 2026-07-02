@@ -1324,6 +1324,19 @@ mod widget_impls {
                     self.cursor_end();
                     changed = true;
                 }
+                // Single-line field: Up/Down have no vertical target, so act as Home/End
+                // (jump to the far left / far right). Shift extends a selection, mirroring
+                // Home/End above.
+                FKey::Named(NamedKey::ArrowUp) => {
+                    start_selection_if_needed(self);
+                    self.cursor_home();
+                    changed = true;
+                }
+                FKey::Named(NamedKey::ArrowDown) => {
+                    start_selection_if_needed(self);
+                    self.cursor_end();
+                    changed = true;
+                }
                 FKey::Character(c) if ctrl && (c == "a" || c == "A") => {
                     self.select_all();
                     changed = true;
