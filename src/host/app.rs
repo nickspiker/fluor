@@ -541,7 +541,8 @@ impl<A: FluorApp> DesktopShell<A> {
         let r = &self.window_rect;
         let inside = cx >= r.x && cx < r.x + r.w as i32
                   && cy >= r.y && cy < r.y + r.h as i32;
-        let should_ignore = !inside;
+        // NEVER re-engage click-through mid-drag. A resize-grow (or a move) pushes the cursor to or past the CURRENT rect edge before `apply_resize_drag` catches the rect up; if we flipped hittest off there, macOS would stop delivering the drag and the window could shrink but never grow. Hold hittest ON for the whole drag; the next cursor-move after release recomputes normally.
+        let should_ignore = !inside && !self.is_dragging_resize && !self.is_dragging_move;
         if should_ignore != self.hittest_off {
             if let Some(window) = self.window.as_ref() {
                 if should_ignore {
