@@ -108,6 +108,26 @@ pub fn draw_window_edges_and_mask(
     let cap_big = start_big + crossings_big.len();
     let cap_small = start_small + crossings_small.len();
 
+    // Degenerate-window guard: below two corner caps per axis the per-corner walks underflow usize (`w - cap` panics) and index out of bounds.
+    // Fall back to a plain 1-px rectangular hairline with the mask left fully visible, so extreme shrinks stay panic-free instead of crashing the app.
+    if w < cap_big + cap_small + 2 || h < cap_big + cap_small + 2 {
+        if w == 0 || h == 0 {
+            return;
+        }
+        for x in 0..w {
+            pixels[x] = pixels[x].under(light, BlendMode::Normal);
+            let idx = (h - 1) * w + x;
+            pixels[idx] = pixels[idx].under(shadow, BlendMode::Normal);
+        }
+        for y in 0..h {
+            let l = y * w;
+            pixels[l] = pixels[l].under(light, BlendMode::Normal);
+            let r = y * w + (w - 1);
+            pixels[r] = pixels[r].under(shadow, BlendMode::Normal);
+        }
+        return;
+    }
+
     // Straight edges — opaque chrome composed via Under. Each edge spans between the caps of its two end corners, which now differ: e.g. the top edge runs from the TL big cap to the TR small cap. Clip mask along these edges stays at the host's 255 default (fully visible).
     let top_lo = cap_big; // TL
     let top_hi = w - cap_small; // TR
