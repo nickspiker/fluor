@@ -4,7 +4,9 @@
 
 pub mod blink;
 pub mod button;
+pub mod slider;
 pub mod textbox;
 pub use blink::BlinkTimer;
 pub use button::Button;
+pub use slider::Slider;
 pub use textbox::Textbox;

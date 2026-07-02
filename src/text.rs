@@ -117,6 +117,18 @@ impl TextRenderer {
         &mut self.font_system
     }
 
+    /// Load a font from raw bytes and return its primary family name, for use as the `font: &str`
+    /// argument to the `draw_text_*` methods. Consumers that ship their own font (e.g. a capsule
+    /// carrying a monospace face) call this once and cache the returned family name. Returns `None`
+    /// if the bytes register no face.
+    pub fn load_font_data_named(&mut self, data: Vec<u8>) -> Option<String> {
+        let db = self.font_system.db_mut();
+        db.load_font_data(data);
+        db.faces()
+            .last()
+            .and_then(|f| f.families.first().map(|(name, _)| name.clone()))
+    }
+
     pub fn draw_text_center_u32(
         &mut self,
         canvas: &mut Canvas,
