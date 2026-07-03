@@ -302,6 +302,27 @@ pub fn wrap_add_rgb_where(pixels: &mut [u32], hit_map: &[HitId], target_id: HitI
 
 /// Generic per-hit-id overlay pass: walk `hit_test_map`, for each pixel whose hit id is currently tinted OR was tinted last frame, COPY the corresponding scratch pixel into persistent_screen — XOR'd to visible RGB, forced opaque, with an optional per-channel wrap-sub of `deltas[id]` if the id is currently tinted. The hit_test_map IS the silhouette trace of each interactive element (same flood-fill identification Photon uses), and we use it strictly to bound which pixels we touch — there's no diff math, no `last_applied_delta` accumulation, just "read scratch, maybe-adjust, write screen." Every frame's overlay is independently correct against scratch's content, so nothing the persistent_screen does between frames (fade, debug toggles, anything) can corrupt the tint.
 ///
+/// Overlay-delta flag (bit 24, above the three channel bytes): apply the per-pixel sqrt gamma lift instead of a constant wrap-sub. The low 24 bits are zero, so a consumer that predates the flag degrades to a visible no-op write rather than a wrong colour.
+pub const OVERLAY_SQRT_BRIGHTEN: u32 = 0x0100_0000;
+
+/// `SQRT_BRIGHTEN_LUT[v] = round(sqrt(v/255)·255)` — the visible-RGB gamma-lift curve for [`OVERLAY_SQRT_BRIGHTEN`]. Endpoints are fixed points (0→0, 255→255); midtones lift hard (64→128).
+static SQRT_BRIGHTEN_LUT: [u8; 256] = build_sqrt_brighten_lut();
+const fn build_sqrt_brighten_lut() -> [u8; 256] {
+    let mut t = [0u8; 256];
+    let mut v = 0usize;
+    while v < 256 {
+        let n = v * 255;
+        let mut r = 0usize;
+        while (r + 1) * (r + 1) <= n {
+            r += 1;
+        }
+        // Round to nearest: bump when the remainder passes the (r + 0.5)² midpoint.
+        t[v] = if n - r * r > r { r + 1 } else { r } as u8;
+        v += 1;
+    }
+    t
+}
+
 /// `deltas[id] == 0` means "this id is not currently tinted." `last_active[id] == true` means "we wrote this id last frame, so this frame we still need to restore its pixels to clean scratch baseline even if the tint is now zero." After the walk, `last_active` is updated to reflect which ids had non-zero delta this frame.
 ///
 /// Why wrap-sub when applying: chrome's hover-colour constants and `wrap_sub_rgb(THEME_HOVER, THEME_FILL)` are darkness-space deltas. The persistent screen is post-finalize visible-RGB. Since `visible = 255 − darkness` per channel, adding `delta` in darkness = subtracting `delta` in visible. So the same delta constants the bake path used apply here with a flipped operator.
@@ -311,6 +332,8 @@ pub fn wrap_add_rgb_where(pixels: &mut [u32], hit_map: &[HitId], target_id: HitI
 /// Force-α=0xFF on every write is safe because pixels with non-`HIT_NONE` id are always interior to the window shape (corners and the squircle AA rim are stamped `HIT_NONE`), so no clip_mask carve gets stomped.
 ///
 /// `deltas` and `last_active` are caller-owned slices the same length, sized to `registry.next_id` (= 1 + number of registered hit zones). With the u16 hit-id widening a fixed `[T; 256]` would either truncate the ID space or balloon to 256 KB per frame; slices keep the per-frame cost proportional to live widget count. IDs past `deltas.len()` are treated as `HIT_NONE` for safety — defensive against a stale paint stamping with an unregistered ID.
+///
+/// Besides the constant wrap-sub deltas, a delta with [`OVERLAY_SQRT_BRIGHTEN`] set applies a per-pixel gamma lift instead: each visible channel becomes `sqrt(v/255)·255` (LUT'd). Nonlinear, so it can't be a constant delta — it brightens midtones hard while leaving black and white alone, which reads as the whole image glowing rather than a flat tint wash. Used by the chrome app-icon orb's hover.
 pub fn apply_overlay(
     scratch: &[u32],
     persistent_screen: &mut [u32],
@@ -380,12 +403,23 @@ pub fn apply_overlay(
             }
             let raw = scratch[map_idx];
             let visible = raw ^ 0x00FF_FFFF;
-            let dr = ((delta >> 16) & 0xFF) as u8;
-            let dg = ((delta >> 8) & 0xFF) as u8;
-            let db = (delta & 0xFF) as u8;
-            let r = (((visible >> 16) & 0xFF) as u8).wrapping_sub(dr) as u32;
-            let g = (((visible >> 8) & 0xFF) as u8).wrapping_sub(dg) as u32;
-            let b = ((visible & 0xFF) as u8).wrapping_sub(db) as u32;
+            let (r, g, b) = if delta & OVERLAY_SQRT_BRIGHTEN != 0 {
+                // Per-pixel gamma lift: v' = sqrt(v/255)·255 per channel. See the doc note above.
+                (
+                    SQRT_BRIGHTEN_LUT[((visible >> 16) & 0xFF) as usize] as u32,
+                    SQRT_BRIGHTEN_LUT[((visible >> 8) & 0xFF) as usize] as u32,
+                    SQRT_BRIGHTEN_LUT[(visible & 0xFF) as usize] as u32,
+                )
+            } else {
+                let dr = ((delta >> 16) & 0xFF) as u8;
+                let dg = ((delta >> 8) & 0xFF) as u8;
+                let db = (delta & 0xFF) as u8;
+                (
+                    (((visible >> 16) & 0xFF) as u8).wrapping_sub(dr) as u32,
+                    (((visible >> 8) & 0xFF) as u8).wrapping_sub(dg) as u32,
+                    ((visible & 0xFF) as u8).wrapping_sub(db) as u32,
+                )
+            };
             let scr_x = (x as i32 + win_ox) as usize;
             persistent_screen[scr_row + scr_x] = 0xFF00_0000 | (r << 16) | (g << 8) | b;
         }

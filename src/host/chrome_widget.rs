@@ -104,12 +104,12 @@ impl Hover for ChromeButton {
         if !self.focused && !self.hovered {
             return 0;
         }
-        // Theme constants are already pre-baked visible-RGB deltas (wrap-add values), not target colours — keeps chrome's overlay path identical to what [`super::widget::build_overlay_deltas`] expects from any other widget. App-icon orb has no hover tint by convention; tab-focused orb still doesn't show a tint (until / unless we wire an action for it).
+        // Theme constants are already pre-baked visible-RGB deltas (wrap-add values), not target colours — keeps chrome's overlay path identical to what [`super::widget::build_overlay_deltas`] expects from any other widget. The app-icon orb takes the per-pixel sqrt gamma lift instead of a flat tint — a flat delta over a multi-colour starburst washes it toward one hue, while the sqrt lift makes the whole icon glow in place.
         match self.action {
             ChromeAction::Close => theme::CLOSE_HOVER,
             ChromeAction::ToggleMaximized => theme::MAXIMIZE_HOVER,
             ChromeAction::Minimize => theme::MINIMIZE_HOVER,
-            ChromeAction::AppIcon => 0,
+            ChromeAction::AppIcon => crate::paint::OVERLAY_SQRT_BRIGHTEN,
         }
     }
 }
