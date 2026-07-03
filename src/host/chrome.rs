@@ -559,13 +559,15 @@ fn modulate_icon_pixel(pixel: u32, darken: u8, brighten: bool) -> u32 {
     }
 
     if darken > 0 {
+        // Floor `>> 8` lerp instead of `/ 255`: bump the 255-max weight to 256-max (`f + (f >> 7)` maps 255 → 256, 0 → 0) so both endpoints stay exact — darken=0 returns the icon untouched, darken=255 lands exactly on grey — and the interior is within 1 LSB of the exact 255-division. Shift beats division on every orb pixel.
         let f = darken as u32;
-        let inv = 255 - f;
+        let f = f + (f >> 7);
+        let inv = 256 - f;
         // Mid-grey in darkness space (= mid-grey in visible space, since 0x80 ≈ 255 − 0x7F). Linear lerp on each darkness channel toward this neutral.
         let grey = 0x80u32;
-        dr = (dr * inv + grey * f) / 255;
-        dg = (dg * inv + grey * f) / 255;
-        db = (db * inv + grey * f) / 255;
+        dr = (dr * inv + grey * f) >> 8;
+        dg = (dg * inv + grey * f) >> 8;
+        db = (db * inv + grey * f) >> 8;
     }
 
     (pixel & 0xFF000000) | (dr << 16) | (dg << 8) | db

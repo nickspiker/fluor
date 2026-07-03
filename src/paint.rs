@@ -674,7 +674,8 @@ pub fn fill_rect(
                 for col in x_min..x_max {
                     let idx = base + col;
                     let mask_a = m.pixels[idx] as u32;
-                    let effective_alpha = (colour_alpha * mask_a) / 255;
+                    // Floor `>> 8` with the +1 weight bump instead of `/ 255` (house convention, paint.rs module doc): mask 255 → +1 → ×256 passes colour_α thru EXACTLY, mask 0 → ×1 floors to 0, everything between lands within 1 LSB of the exact 255-division — and the shift is far cheaper than the division in this per-pixel loop.
+                    let effective_alpha = (colour_alpha * (mask_a + 1)) >> 8;
                     if effective_alpha == 0 {
                         continue;
                     }
