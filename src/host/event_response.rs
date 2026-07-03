@@ -2,7 +2,21 @@
 //!
 //! Lives outside `host::app` because widget capability traits (which return `EventResponse`) compile without `host-winit`. Same enum, just relocated so the dependency graph works on every host.
 
-use super::chrome::ResizeEdge;
+/// Resize-edge classification (see `chrome::get_resize_edge` for the classifier). Lives here
+/// rather than in `chrome` so `EventResponse::StartResize` compiles without the `icon` feature
+/// (chrome is icon-gated; this enum is pure geometry). Re-exported from `chrome` for old paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResizeEdge {
+    None,
+    Top,
+    Bottom,
+    Left,
+    Right,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
 
 /// What the consumer wants the host to do after a widget click / key / `FluorApp::on_event`. Pass-thru behaviour lets the consumer ignore events they don't care about; the explicit variants override the host's default for that event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

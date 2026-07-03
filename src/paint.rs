@@ -751,21 +751,23 @@ fn background_row(
     const CHUNK: usize = 64;
     let mut noise_buf = [0u32; CHUNK];
     let ones = 0x0001_0101u32;
-    let seed: usize = 0xDEAD_BEEF_0123_4567usize
-        ^ (logical_row as usize)
-            .wrapping_sub(height / 2)
+    // RNG chain is explicitly u64 (not usize) so the noise pattern is bit-identical on 32-bit
+    // targets (wasm32 browser renderer) and 64-bit desktops — same seed, same wrap points.
+    let seed: u64 = 0xDEAD_BEEF_0123_4567u64
+        ^ (logical_row as i64 as u64)
+            .wrapping_sub(height as u64 / 2)
             .wrapping_mul(0x9E37_79B9_4517_B397);
 
     // Right half — left to right. Noise composes UNDER existing content (topmost-first): an empty pixel gets the noise; a non-empty pixel (e.g. a topmost rect already painted) has the noise blended behind it.
     let mut rng = seed;
-    let mut colour = rng.wrapping_add(shimmer) as u32 & BG_MASK;
+    let mut colour = rng.wrapping_add(shimmer as u64) as u32 & BG_MASK;
     let mut x = width / 2;
     while x < x_end {
         let chunk_len = (x_end - x).min(CHUNK);
         for i in 0..chunk_len {
             rng ^= rng.rotate_left(13).wrapping_add(12_345_678_942);
             let adder = rng as u32 & ones;
-            if rng < usize::MAX / 256 {
+            if rng < u64::MAX / 256 {
                 colour = (rng as u32 >> 8) & BG_SPECKLE;
             } else {
                 colour = colour.wrapping_add(adder) & BG_MASK;
@@ -781,7 +783,7 @@ fn background_row(
 
     // Left half — right to left, same RNG seed (mirror), SUB instead of ADD on the rng step. Within each chunk the RNG iterates rightmost-pixel-first; we store into `noise_buf` in left-to-right order (`i = chunk_len-1` down to 0) so the chunk dispatch can scan the buffer sequentially.
     rng = seed;
-    let mut colour = rng.wrapping_add(shimmer) as u32 & BG_MASK;
+    let mut colour = rng.wrapping_add(shimmer as u64) as u32 & BG_MASK;
     let mut x_hi = width / 2;
     while x_hi > x_start {
         let chunk_lo = x_hi.saturating_sub(CHUNK).max(x_start);
@@ -789,7 +791,7 @@ fn background_row(
         for i in (0..chunk_len).rev() {
             rng ^= rng.rotate_left(13).wrapping_sub(12_345_678_942);
             let adder = rng as u32 & ones;
-            if rng < usize::MAX / 256 {
+            if rng < u64::MAX / 256 {
                 colour = (rng as u32 >> 8) & BG_SPECKLE;
             } else {
                 colour = colour.wrapping_add(adder) & BG_MASK;
