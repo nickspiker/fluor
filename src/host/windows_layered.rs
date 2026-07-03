@@ -93,9 +93,11 @@ pub fn present(window: &Arc<Window>, persistent_screen: &[u32], screen_w: u32, s
             let g = (src >> 8) & 0xFF;
             let b = src & 0xFF;
             // Premultiply each channel by alpha (UpdateLayeredWindow with ULW_ALPHA expects it), and pack BGRA (DIB byte order is B,G,R,A in memory = 0xAARRGGBB little-endian — same as src once premultiplied, so we repack with the premultiplied channels).
-            let pr = (r * a / 255) & 0xFF;
-            let pg = (g * a / 255) & 0xFF;
-            let pb = (b * a / 255) & 0xFF;
+            // Floor `>> 8` with the `a + (a >> 7)` weight bump instead of `/ 255`: α=255 passes the channel thru exactly, α=0 floors to 0, interior within 1 LSB — and premul ≤ α holds for every (channel, α) pair (verified exhaustively), which ULW_ALPHA requires. Three divisions per pixel per present was the most expensive `/ 255` in the tree.
+            let ae = a + (a >> 7);
+            let pr = ((r * ae) >> 8) & 0xFF;
+            let pg = ((g * ae) >> 8) & 0xFF;
+            let pb = ((b * ae) >> 8) & 0xFF;
             *d = (a << 24) | (pr << 16) | (pg << 8) | pb;
         }
 
