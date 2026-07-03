@@ -33,19 +33,9 @@ impl Default for OrbTint {
     }
 }
 
-/// Resize-edge classification returned by [`get_resize_edge`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResizeEdge {
-    None,
-    Top,
-    Bottom,
-    Left,
-    Right,
-    TopLeft,
-    TopRight,
-    BottomLeft,
-    BottomRight,
-}
+/// Resize-edge classification returned by [`get_resize_edge`]. Defined in `event_response`
+/// (which compiles without the `icon` feature); re-exported here for existing `chrome::` paths.
+pub use super::event_response::ResizeEdge;
 
 /// Classify a cursor position as one of nine resize zones (or None for the window interior). Geometry only — no rasterization. Edge band thickness derived from harmonic-mean span so the hit zone scales with viewport size.
 pub fn get_resize_edge(window_width: u32, window_height: u32, x: Coord, y: Coord) -> ResizeEdge {

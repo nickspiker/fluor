@@ -28,13 +28,17 @@ std = []
 # macOS uses wgpu/Metal for PostMultiplied alpha (transparent squircle corners);
 # Linux/Windows/Redox use softbuffer (CPU blit, no GPU dependency).
 # wgpu + pollster (macOS-only) and arboard (clipboard; every desktop EXCEPT Redox, which has no arboard backend) are NOT in this set — they're pulled by the per-target dependency blocks below so a host-winit build for Redox (winit's Orbital backend + softbuffer, both of which support Redox) doesn't drag in deps that won't compile there. The non-macOS softbuffer present path in host/app.rs is `cfg(not(target_os = "macos"))`, so it already covers Redox with zero source changes.
-host-winit = ["std", "text", "dep:winit", "dep:softbuffer"]
-host-softbuffer = ["std", "dep:softbuffer"]
+host-winit = ["std", "text", "icon", "dep:winit", "dep:softbuffer"]
+host-softbuffer = ["std", "icon", "dep:softbuffer"]
 host-bare = []
+# App-icon decode (host::icon + the chrome that draws the orb). Pulls vsf + rav1d — rav1d cannot
+# build for wasm32, so headless consumers (toka's browser renderer) leave this off. Implied by
+# every real host feature; only paint/text/canvas consumers skip it.
+icon = ["dep:rav1d", "dep:vsf"]
 # Android backend — ANativeWindow surface + JNI entry points + Choreographer-driven render scheduling. Enabled by the consumer's Android target block (e.g. photon's `[target.'cfg(target_os = "android")'.dependencies]`). text stays required because the chrome paints title glyphs; ndk + ndk-sys + jni + log are the NDK bindings the surface and JNI shims wrap.
 #
 # winit is intentionally NOT in this feature set — `FluorApp::set_event_proxy` takes a fluor-native `Arc<dyn WakeSender<Self::UserEvent>>` so the trait shape is platform-uniform without dragging winit's data types onto Android. Eliminates the `android-activity` compile-glue dep + the `android_main` linker shim that came along when winit was present on Android.
-host-android = ["std", "text", "dep:ndk", "dep:ndk-sys", "dep:jni", "dep:log", "dep:libc"]
+host-android = ["std", "text", "icon", "dep:ndk", "dep:ndk-sys", "dep:jni", "dep:log", "dep:libc"]
 text = ["std", "dep:cosmic-text", "dep:swash"]
 # Portable SIMD via the `wide` crate. Widens inner loops in rasterizers / boundary passes /
 # the under() kernel to 4–8 pixels per iter. Scalar fallback path is preserved for builds
@@ -52,11 +56,11 @@ rayon = ["std", "dep:rayon"]
 # is required for crates.io publish.
 spirix = { version = "0.0.12", path = "../spirix", default-features = false, features = ["alloc"] }
 
-# vsf decodes the canonical image format used by `host::icon` (orb / app-icon decode). Default features (std + registry) match fluor's host environment.
-vsf = "0.8"
+# vsf decodes the canonical image format used by `host::icon` (orb / app-icon decode). Default features (std + registry) match fluor's host environment. Optional behind `icon` — headless consumers (toka's wasm renderer) don't decode app icons, and rav1d can't build for wasm32.
+vsf = { version = "0.8", optional = true }
 
-# rav1d decodes AV1 OBU bitstreams for icons over `vsfimg`'s UNCOMPRESSED_MAX_DIM. `bitdepth_8` keeps the build slim — fluor's icon path is u8 RGB only.
-rav1d = { version = "1.1", default-features = false, features = ["bitdepth_8"] }
+# rav1d decodes AV1 OBU bitstreams for icons over `vsfimg`'s UNCOMPRESSED_MAX_DIM. `bitdepth_8` keeps the build slim — fluor's icon path is u8 RGB only. Optional behind `icon` (see vsf note).
+rav1d = { version = "1.1", default-features = false, features = ["bitdepth_8"], optional = true }
 
 libm = "0.2"
 # Portable SIMD types (f32x4/x8, u32x4/x8, etc) with x86 SSE/AVX, ARM NEON, and WASM SIMD
