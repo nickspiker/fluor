@@ -54,10 +54,10 @@ rayon = ["std", "dep:rayon"]
 # `spirix-coord` feature; layout types default to f32 so f32-native consumers (photon,
 # rhe, basecalc) match their pre-fluor speed. `path` is for local development; `version`
 # is required for crates.io publish.
-spirix = { version = "0.0.12", path = "../spirix", default-features = false, features = ["alloc"] }
+spirix = { version = "0.1.1", path = "../spirix", default-features = false, features = ["alloc"] }
 
 # vsf decodes the canonical image format used by `host::icon` (orb / app-icon decode). Default features (std + registry) match fluor's host environment. Optional behind `icon` — headless consumers (toka's wasm renderer) don't decode app icons, and rav1d can't build for wasm32.
-vsf = { version = "0.8", optional = true }
+vsf = { path = "../vsf", optional = true }
 
 # rav1d decodes AV1 OBU bitstreams for icons over `vsfimg`'s UNCOMPRESSED_MAX_DIM. `bitdepth_8` keeps the build slim — fluor's icon path is u8 RGB only. Optional behind `icon` (see vsf note).
 rav1d = { version = "1.1", default-features = false, features = ["bitdepth_8"], optional = true }
