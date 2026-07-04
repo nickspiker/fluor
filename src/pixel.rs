@@ -17,6 +17,25 @@
 //! Every compositing op in fluor — Normal source-under, Multiply, Screen, Add, Subtract, Overlay, Darken, Lighten — flows thru one trait method: `top.under(bottom, mode)`. `top` is the partial composite already accumulated above (its α-byte = opacity so far; its RGB = darkness accumulated so far, with the canonical empty value `0x00000000` representing "nothing here yet"). `bottom` is the new layer going behind. The mode shapes only how `bottom`'s darkness is interpreted before contributing.
 //!
 //! Convention: each new layer ADDS darkness to the buffer at `mod_dark × consumed >> 8` per channel, where `consumed = ((256 − top_α) × bot_α) >> 8` (how much of the remaining opacity budget the new layer fills). The opacity accumulates as `new_α = top_α + consumed`. Mode kernels operate in *darkness space* but preserve the *visible-space* semantic the mode name promises (e.g., `BlendMode::Multiply` still darkens the visible result like Photoshop multiply).
+//!
+//! # When `under()` is worth it (vs read-modify-write)
+//!
+//! Two rasterizer patterns exist in fluor. Both compose a new layer over a partial buffer; they differ in where per-pixel computation happens.
+//!
+//! * **`under()` topmost-first**: caller computes `src = f(x, y)` (some pure function of position + constants), then `dst[i] = dst[i].under(src, mode)`. Buffer holds the running composite; `src` is independent of what's already there.
+//! * **Direct read-modify-write**: caller reads `dst[i]`, computes `new = g(dst[i], x, y)`, writes back. `g` reads the bg pixel as an INPUT — the wave's per-pixel sqrt-blend `(c_wave · scale + c_bg²).sqrt()` is a canonical example; the noise's shimmer-mixed-into-seed is another.
+//!
+//! Choice depends on the cost of the src computation, the availability of an early-out, and whether the pattern SIMDs.
+//!
+//! **Scalar `Blend::under` early-out** — `if self >= 0xFF000000 { return self; }` fires whenever the top is fully opaque; bottom is invisible so the mode math is skipped. Release-mode LLVM inlines the trait method into the caller's loop, sees the src computation is pure, and successfully hoists the opaque check ABOVE the src work — DCE elides the whole `f(x, y)` pipeline on opaque pixels. Verified against a wave-mimicking loop (sqrt + trig + matmul-shaped src) built at `opt-level = 3`: LLVM emits `cmp dst, 0xFEFFFFFF; ja end_of_pixel_body` right after the dst load, jumping past every `sqrtss` / `mulss` / `call sinf` on the opaque branch. Debug (`opt-level = 0`) does NOT reorder — src is computed unconditionally, then `under()` early-outs and discards. Any perf-relevant DEBUG use of `under()` with expensive src pays the full compute cost on every pixel.
+//!
+//! **SIMD `under_x8_normal`** has no per-lane early-out. Every lane runs the full RGB math; the opacity mask is applied at the end via `(opaque_mask & dst) | (not_mask & result)`. Zero DCE possible — the src computation always executes for all eight lanes regardless of opt level. Vectorized rasterizers layered under a mostly-opaque top pay full compute on every lane.
+//!
+//! **Guidelines**:
+//!
+//! * `under()` is right for **cheap or constant src** (uniform tint, gradients, single-glyph blits, chrome buttons) — waste is negligible in both dirs, doctrine cleanliness dominates. All chrome / widget / textbox rasterizers use this path.
+//! * Direct read-modify-write is right when the src computation is **expensive AND depends on the bg pixel value AND / OR you want a predictable SIMD-vectorization ceiling**. The chromatic wave (photon) and background noise (fluor) both fall here: the bg is a mathematical input (wave's per-channel sqrt-blend of bg squared; noise's row-seeded RNG chain), not something an under-blend could recover cleanly. Rewriting them as `under()` would either lose the visual (the sqrt-blend isn't expressible as `mode_kernel(top, bot)`) or waste per-pixel work on any SIMD-ification.
+//! * If you're unsure, prefer `under()` — the doctrine cleanliness is real and release performance is usually fine. Reach for direct read-modify-write only when profiling shows it, or when the effect literally needs the bg value as an argument.
 
 /// Packed pixel in α + darkness convention: `0xααRRGGBB`. Type alias for `u32` — `&[Argb8]` and `&[u32]` are the same slice. The name carries the convention contract, not a new type.
 pub type Argb8 = u32;
