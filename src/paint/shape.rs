@@ -83,6 +83,74 @@ pub fn draw_rect(
     });
 }
 
+/// Blit a decoded image (`src`, α + darkness packed, row-major `src_w × src_h`) scaled into a dest
+/// rect centred at `(cx, cy)` with px size `(dst_w, dst_h)`. Nearest-neighbour sampling. Each
+/// sampled pixel composes UNDER existing content via [`Blend::under`] exactly like the other
+/// primitives, so draw order controls z. Source pixels are treated as opaque — the VSF image
+/// decoder packs α = `0xFF`; a source pixel's own α still rides through `under`, so a decoder that
+/// emits transparency (future masked avatars) composites correctly with no change here.
+///
+/// Bounds are clamped/clipped like [`draw_rect`] (the dest rect may be partly off-buffer). Edges
+/// are hard (no boundary AA) — fine behind a rounded mask or at icon scale; add coverage later if
+/// bare-edged blits need softening.
+pub fn draw_image(
+    canvas: &mut Canvas,
+    src: &[u32],
+    src_w: usize,
+    src_h: usize,
+    cx: Coord,
+    cy: Coord,
+    dst_w: Coord,
+    dst_h: Coord,
+    clip: Option<Clip>,
+) {
+    let width = canvas.width;
+    let height = canvas.height;
+    if src_w == 0 || src_h == 0 || dst_w <= 0.0 || dst_h <= 0.0 || width == 0 || height == 0 {
+        return;
+    }
+    if src.len() < src_w * src_h {
+        return;
+    }
+    let hw = dst_w * 0.5;
+    let hh = dst_h * 0.5;
+    let left = cx - hw;
+    let top = cy - hh;
+    let x_min = left.floor() as i32;
+    let x_max = (cx + hw).ceil() as i32;
+    let y_min = top.floor() as i32;
+    let y_max = (cy + hh).ceil() as i32;
+    let Some((x_start, y_start, x_end, y_end)) =
+        Clip::intersect_bbox(clip, width, height, x_min, x_max, y_min, y_max)
+    else {
+        return;
+    };
+    canvas.damage.add_bounds(x_start, y_start, x_end, y_end);
+    let pixels: &mut [u32] = canvas.pixels;
+    // Source pixels per dest pixel along each axis (nearest-neighbour scale factor).
+    let step_x = src_w as Coord / dst_w;
+    let step_y = src_h as Coord / dst_h;
+    let src_w_i = src_w as i32;
+    let src_h_i = src_h as i32;
+    crate::par::par_rows(pixels, width, y_start, y_end, |py, row| {
+        let sy_f = ((py as Coord + 0.5) - top) * step_y;
+        if sy_f < 0.0 {
+            return;
+        }
+        let sy = (sy_f as i32).clamp(0, src_h_i - 1) as usize;
+        let src_row_base = sy * src_w;
+        for px in x_start..x_end {
+            let sx_f = ((px as Coord + 0.5) - left) * step_x;
+            if sx_f < 0.0 {
+                continue;
+            }
+            let sx = (sx_f as i32).clamp(0, src_w_i - 1) as usize;
+            let sp = src[src_row_base + sx];
+            row[px] = row[px].under(sp, BlendMode::Normal);
+        }
+    });
+}
+
 /// Filled rectangle, anti-aliased, rotated by `angle` radians around `(cx, cy)`. Positive angle rotates counter-clockwise (standard math convention). Other semantics match [`draw_rect`] — α + darkness colour, AA edges, UNDER-blend onto existing pixel content.
 ///
 /// Scanline + per-pixel edge AA. Per row we analytically solve the px range where each pixel's centre lies in the rect's local-coord interior (full coverage) vs the wider "any coverage" band (AA needed). The interior loop is a tight UNDER-blend with a precomputed `(α<<24)|RGB` value — no per-pixel rotation, no coverage math, no abs/clamp. Only the two AA strips at the row endpoints (and full-AA rows near top/bottom corners) pay for the 4-edge product coverage. Bounding box is the tight rotated extent `(hw|cos| + hh|sin|, hw|sin| + hh|cos|)`.

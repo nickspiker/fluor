@@ -2297,7 +2297,7 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
 name = "spirix"
-version = "0.0.12"
+version = "0.1.1"
 dependencies = [
  "i256",
  "num-complex",
@@ -2626,9 +2626,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vsf"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2c7481e6809ad0226db749bfb75818588fe205852f582fb8b84868aebd89170"
+version = "0.9.1"
 dependencies = [
  "bitvec",
  "blake3",
