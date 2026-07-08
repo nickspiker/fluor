@@ -1122,12 +1122,13 @@ impl TextRenderer {
         buffer.set_size(&mut self.font_system, Some(10000.0), Some(size * 2.0));
         buffer.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced);
 
-        // Calculate width using glyph advances (includes spacing for spaces!)
+        // Sum each glyph's ADVANCE (glyph.w), don't take max(glyph.x + glyph.w). A trailing space has
+        // zero visual extent, so cosmic-text gives it glyph.x = glyph.w = 0 when it's the last (or only)
+        // glyph in the run — max(x+w) then returns 0, so a lone " " measures 0 and words that end in a
+        // space collapse into the next (text looks truncated / spaces vanish). Summing advances counts
+        // the space's advance regardless of position, matching `measure_text_widths_per_char` below.
         buffer.layout_runs().fold(0.0, |max_width, run| {
-            let run_width = run
-                .glyphs
-                .iter()
-                .fold(0.0, |w, glyph| (glyph.x + glyph.w).max(w));
+            let run_width = run.glyphs.iter().fold(0.0, |w, glyph| w + glyph.w);
             max_width.max(run_width)
         })
     }
