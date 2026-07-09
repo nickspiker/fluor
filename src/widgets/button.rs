@@ -434,6 +434,36 @@ impl Button {
         self.last_painted_focused = self.focused;
         self.last_painted_hovered = self.hovered;
     }
+
+    /// Stamp this button's `hit_id` into `hit_map` at every pixel its pill (fill + two-tone stroke) touches — the true squircle silhouette, not a bbox rectangle.
+    /// Call AFTER any widget that overlaps this button (e.g. a textbox this button is overlaid inside): those widgets stamp their own id over the button's during their colour blit, so this re-wins the button's hit region as the last writer. `render_content_into` must have run first this frame to populate `pill_cache`.
+    /// Anything the pill covers → this id (α > 0 catches the AA edge too), so the whole visible button — including a glyph painted over it by the host — dispatches to this button.
+    pub fn stamp_hit_into(&self, hit_map: &mut [HitId], buf_w: usize, buf_h: usize, hit_id: HitId) {
+        let pill_x = (self.center_x - self.width * 0.5) as isize;
+        let pill_y = (self.center_y - self.height * 0.5) as isize;
+        let cw = self.pill_cache_w;
+        let ch = self.pill_cache_h;
+        if cw == 0 || ch == 0 || self.pill_cache.len() < cw * ch {
+            return;
+        }
+        for cy in 0..ch {
+            let ty = pill_y + cy as isize;
+            if ty < 0 || ty as usize >= buf_h {
+                continue;
+            }
+            for cx in 0..cw {
+                // Any alpha at all = the pill touches this pixel → BOINK.
+                if (self.pill_cache[cy * cw + cx] >> 24) == 0 {
+                    continue;
+                }
+                let tx = pill_x + cx as isize;
+                if tx < 0 || tx as usize >= buf_w {
+                    continue;
+                }
+                hit_map[ty as usize * buf_w + tx as usize] = hit_id;
+            }
+        }
+    }
 }
 
 /// Same RU-invariant glow factor as Textbox's [`Textbox::glow_factor_256`]; duplicated here so Button doesn't pull a `pub(crate)` from Textbox just for one tiny formula. Returns a factor in `[96, 254]` where smaller = steeper decay = shorter visual reach; matches the chrome shadow's `factor_256` math so glows around buttons and textboxes share the same look.
