@@ -34,6 +34,9 @@ pub struct Button {
     /// `true` (default) while the button accepts input. When `false` the [`crate::host::widget::Widget`] capability accessors return `None`, so dispatch + tab-cycle skip it — the "frozen sibling" of a disabled textbox (an Attest / plus button that goes inert while its query is in flight). Visual unchanged; inert, not greyed. Toggle via [`Self::set_enabled`].
     enabled: bool,
 
+    /// Optional per-instance hovered fill colour (α+darkness), replacing the shared [`theme::BUTTON_HOVER`] for this button only. `None` = use the default. Lets a host give specific controls their own hover colour (the pre-fluor model, where the send/query button had a distinct subtle tint from a generic action button). Set via [`Self::set_hover_fill`].
+    hover_fill: Option<u32>,
+
     /// Number of times [`Click::on_click`] has fired since construction. Monotonic. Consumers compare against [`Self::last_seen_click_counter`] via [`Self::take_click`] to know "has this button fired since I last looked."
     click_counter: u32,
     last_seen_click_counter: u32,
@@ -79,6 +82,7 @@ impl Button {
             focused: false,
             hovered: false,
             enabled: true,
+            hover_fill: None,
             click_counter: 0,
             last_seen_click_counter: 0,
             pill_cache: Vec::new(),
@@ -104,6 +108,12 @@ impl Button {
     }
     pub fn is_hovered(&self) -> bool {
         self.hovered
+    }
+    /// Give this button a specific hovered fill colour (α+darkness), instead of the shared
+    /// [`theme::BUTTON_HOVER`]. `None` restores the default. Used to reproduce the pre-fluor
+    /// per-control hover colours (e.g. a subtle neutral tint on the send/query button).
+    pub fn set_hover_fill(&mut self, colour: Option<u32>) {
+        self.hover_fill = colour;
     }
     pub fn label(&self) -> &str {
         &self.label
@@ -563,10 +573,9 @@ mod widget_impls {
                     crate::theme::BUTTON_FILL,
                 )
             } else if self.is_hovered() {
-                crate::paint::wrap_sub_rgb(
-                    crate::theme::BUTTON_HOVER,
-                    crate::theme::BUTTON_FILL,
-                )
+                // Per-instance hover colour if set (pre-fluor per-control model), else the shared default.
+                let hover = self.hover_fill.unwrap_or(crate::theme::BUTTON_HOVER);
+                crate::paint::wrap_sub_rgb(hover, crate::theme::BUTTON_FILL)
             } else {
                 0
             }
