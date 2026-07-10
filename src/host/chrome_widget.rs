@@ -104,11 +104,26 @@ impl Hover for ChromeButton {
         if !self.focused && !self.hovered {
             return 0;
         }
-        // Theme constants are already pre-baked visible-RGB deltas (wrap-add values), not target colours — keeps chrome's overlay path identical to what [`super::widget::build_overlay_deltas`] expects from any other widget. The app-icon orb takes the per-pixel sqrt gamma lift instead of a flat tint — a flat delta over a multi-colour starburst washes it toward one hue, while the sqrt lift makes the whole icon glow in place.
+        // The CLOSE/MAX/MIN theme constants are TARGET colours, so return the darkness-space DELTA from the control's base fill to the target — `wrap_sub_rgb(target, WINDOW_CONTROLS_BG)`, exactly the form the overlay's visible-space wrap-sub expects (lands a base-fill pixel at the target hue), and the same shape `Button::tint_delta` produces.
+        // Returning the raw target here made the overlay subtract the full colour off the fill instead → a muddy/grey shift, not the cyan/magenta/yellow.
+        // The app-icon orb takes the per-pixel sqrt gamma lift instead of a flat tint — a flat delta over a multi-colour starburst washes it toward one hue, while the sqrt lift makes the whole icon glow.
+        // Quarter-strength (num/den = 1/4) so the vivid red/green/blue targets read as a gentle wash over the control fill, not a full-saturation flood.
         match self.action {
-            ChromeAction::Close => theme::CLOSE_HOVER,
-            ChromeAction::ToggleMaximized => theme::MAXIMIZE_HOVER,
-            ChromeAction::Minimize => theme::MINIMIZE_HOVER,
+            ChromeAction::Close => {
+                crate::paint::wrap_sub_rgb_scaled(theme::CLOSE_HOVER, theme::WINDOW_CONTROLS_BG, 1, 4)
+            }
+            ChromeAction::ToggleMaximized => crate::paint::wrap_sub_rgb_scaled(
+                theme::MAXIMIZE_HOVER,
+                theme::WINDOW_CONTROLS_BG,
+                1,
+                4,
+            ),
+            ChromeAction::Minimize => crate::paint::wrap_sub_rgb_scaled(
+                theme::MINIMIZE_HOVER,
+                theme::WINDOW_CONTROLS_BG,
+                1,
+                4,
+            ),
             ChromeAction::AppIcon => crate::paint::OVERLAY_SQRT_BRIGHTEN,
         }
     }

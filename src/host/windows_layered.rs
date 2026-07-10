@@ -1,10 +1,10 @@
 //! Windows present path for the fullscreen-transparent compositor.
 //!
-//! fluor owns a fullscreen borderless OS window and paints the visible "window" as a sub-rect, with every pixel outside it left at α=0 so the desktop shows through, and clicks outside it pass thru to whatever's underneath. On X11 that's an XShape input region + a transparent visual; on macOS it's a transparent NSWindow + a global hit-test monitor. On Windows neither of those exists, and softbuffer's present is an opaque `BitBlt` — so a plain softbuffer window is OPAQUE and screen-sized, which is the "screen/2 opaque box, no click-thru" bug.
+//! fluor owns a fullscreen borderless OS window and paints the visible "window" as a sub-rect, with every pixel outside it left at α=0 so the desktop shows thru, and clicks outside it pass thru to whatever's underneath. On X11 that's an XShape input region + a transparent visual; on macOS it's a transparent NSWindow + a global hit-test monitor. On Windows neither of those exists, and softbuffer's present is an opaque `BitBlt` — so a plain softbuffer window is OPAQUE and screen-sized, which is the "screen/2 opaque box, no click-thru" bug.
 //!
 //! The Windows-native answer is a **layered window**: `WS_EX_LAYERED` + `UpdateLayeredWindow` blends a 32-bit premultiplied-BGRA bitmap onto the desktop per-pixel. Two things fall out of that for free:
 //!   1. Per-pixel alpha — the α=0 pixels outside the visible window are fully transparent (desktop shows).
-//!   2. Click-through — Windows routes mouse input through fully-transparent (α=0) pixels of a layered window automatically, so no separate input-region call is needed (the analog of XShape here).
+//!   2. Click-thru — Windows routes mouse input thru fully-transparent (α=0) pixels of a layered window automatically, so no separate input-region call is needed (the analog of XShape here).
 //!
 //! So this single present mechanism fixes BOTH Windows symptoms. The window is created `WS_EX_LAYERED` in `resumed`; this module does the per-frame present from fluor's owned `persistent_screen` buffer.
 

@@ -73,10 +73,12 @@ pub const WINDOW_SHADOW_EDGE_UNFOCUSED: u32 = dark(fmt(0x00_2A_2D_32));
 // Controls strip background. The strip stays functional/clickable even when the window is unfocused, so the bg is focus-invariant. Strip hairlines + BL curve are NOT constants here — they now follow the focus-driven edge palette (vertical dividers + bottom hairline = `WINDOW_LIGHT_EDGE[_UNFOCUSED]`; BL squircle = `WINDOW_SHADOW_EDGE[_UNFOCUSED]`) so the strip's framing dims with the rest of the window.
 pub const WINDOW_CONTROLS_BG: u32 = dark(fmt(0x00_1E_1E_1E));
 
-// Button hover deltas (RGB channels wrap intentionally; α is 0xFF opaque from `dark()`).
-pub const CLOSE_HOVER: u32 = dark(fmt(0x00_21_FD_F9));
-pub const MAXIMIZE_HOVER: u32 = dark(fmt(0x00_FA_10_FA));
-pub const MINIMIZE_HOVER: u32 = dark(fmt(0x00_F7_FA_25));
+// Window-control hover TARGET colours: close = red, maximize = green, minimize = blue.
+// `dark(fmt(rgb))` stores visible RGB → darkness; the migration previously carried the legacy DARKNESS-encoded values (0x21FDF9 etc.) and wrapped them in dark() again, double-inverting to cyan/magenta/yellow.
+// These are the plain visible primaries so ChromeButton::tint_delta's `wrap_sub_rgb(target, WINDOW_CONTROLS_BG)` lands the control at the right hue.
+pub const CLOSE_HOVER: u32 = dark(fmt(0x00_DE_02_06));
+pub const MAXIMIZE_HOVER: u32 = dark(fmt(0x00_05_EF_05));
+pub const MINIMIZE_HOVER: u32 = dark(fmt(0x00_08_05_DA));
 
 // Generic UI text. `TEXT_COLOUR` is the focused title + primary body text (brighter than the previous 0xD0 for a stronger active-window contrast). `TEXT_COLOUR_UNFOCUSED` dims for inactive-window titles (between `LABEL_COLOUR` and the focused value — readable but obviously quiet). `LABEL_COLOUR` stays as the secondary/labels grey used everywhere else.
 pub const TEXT_COLOUR: u32 = dark(fmt(0x00_E8_E8_E8));

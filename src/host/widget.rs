@@ -96,6 +96,13 @@ pub trait Hover {
     fn tint_delta(&self) -> u32 {
         0
     }
+    /// Pixel bbox of this widget's hit footprint, for BOUNDING the host's overlay tint scan to just this widget instead of the whole window.
+    /// `None` (default) → the host falls back to a full-window scan for this id (correct, just slower).
+    /// Return the widget's bbox so hover tinting is O(widget), not O(screen).
+    /// See [`build_overlay_bboxes`] + [`crate::paint::apply_overlay`].
+    fn hover_bbox(&self, _viewport_w: usize, _viewport_h: usize) -> Option<PixelRect> {
+        None
+    }
 }
 
 /// Tree node. The app root is a [`Container`], chrome is a [`Container`], future panes / dialogs are [`Container`]s. The single `visit` method does depth-first traversal handing each leaf widget to the callback. Recursion handles arbitrary nesting depth; the dispatch loop in the app stays one walk regardless of N.
@@ -150,6 +157,26 @@ pub fn build_overlay_deltas(root: &mut dyn Container, count: usize) -> alloc::ve
         if id < t.len() {
             if let Some(h) = w.hover() {
                 t[id] = h.tint_delta();
+            }
+        }
+    });
+    t
+}
+
+/// Build the per-hit-id overlay BBOX table (parallel to [`build_overlay_deltas`]): each Hover-capable widget's [`Hover::hover_bbox`] by id, so the host can bound the overlay tint scan to each widget instead of the whole window.
+/// Entry is `None` for ids with no widget / no bbox → the host full-window scans those (safe fallback).
+pub fn build_overlay_bboxes(
+    root: &mut dyn Container,
+    count: usize,
+    viewport_w: usize,
+    viewport_h: usize,
+) -> alloc::vec::Vec<Option<PixelRect>> {
+    let mut t = alloc::vec![None; count];
+    root.visit(&mut |w| {
+        let id = w.id() as usize;
+        if id < t.len() {
+            if let Some(h) = w.hover() {
+                t[id] = h.hover_bbox(viewport_w, viewport_h);
             }
         }
     });
