@@ -300,6 +300,18 @@ pub trait FluorApp {
         Vec::new()
     }
 
+    /// Per-hit-id bbox table for THIS frame, PARALLEL to [`Self::overlay_deltas`] — entry `[id]` is the pixel bbox of that widget, or `None`.
+    /// Lets the host bound the overlay tint scan to each hovered widget's rect instead of scanning the whole window every frame (the tint only touches pixels where `hit_map == id` inside the rect).
+    /// `None` entries (and the default empty slice) fall back to a full-window scan for those ids — correct, just slower.
+    /// Build via [`crate::host::widget::build_overlay_bboxes`].
+    fn overlay_bboxes(
+        &mut self,
+        _viewport_w: usize,
+        _viewport_h: usize,
+    ) -> Vec<Option<crate::canvas::PixelRect>> {
+        Vec::new()
+    }
+
     /// Read-only handle to the consumer's hit-test map so the host's overlay diff pass can walk it. Returns `Some((&map, win_w, win_h))` where `map.len() >= win_w * win_h` (one [`crate::paint::HitId`] per pixel — `u16` since the v0.0 widening). Default `None` = no overlay walk, no hover support.
     fn hit_test_map(&self) -> Option<(&[crate::paint::HitId], usize, usize)> {
         None
@@ -541,7 +553,7 @@ impl<A: FluorApp> DesktopShell<A> {
         let r = &self.window_rect;
         let inside = cx >= r.x && cx < r.x + r.w as i32
                   && cy >= r.y && cy < r.y + r.h as i32;
-        // NEVER re-engage click-through mid-drag. A resize-grow (or a move) pushes the cursor to or past the CURRENT rect edge before `apply_resize_drag` catches the rect up; if we flipped hittest off there, macOS would stop delivering the drag and the window could shrink but never grow. Hold hittest ON for the whole drag; the next cursor-move after release recomputes normally.
+        // NEVER re-engage click-thru mid-drag. A resize-grow (or a move) pushes the cursor to or past the CURRENT rect edge before `apply_resize_drag` catches the rect up; if we flipped hittest off there, macOS would stop delivering the drag and the window could shrink but never grow. Hold hittest ON for the whole drag; the next cursor-move after release recomputes normally.
         let should_ignore = !inside && !self.is_dragging_resize && !self.is_dragging_move;
         if should_ignore != self.hittest_off {
             if let Some(window) = self.window.as_ref() {
@@ -721,6 +733,9 @@ impl<A: FluorApp> DesktopShell<A> {
         //
         // Order matters: [`FluorApp::overlay_deltas`] takes `&mut self` (so the app can walk its widget tree), so we build the table first and release the borrow before grabbing the shared `hit_test_map` borrow used by `apply_overlay`.
         let current = self.app.overlay_deltas();
+        // Parallel bbox table so the overlay scan is bounded to each hovered widget's rect, not the whole window.
+        // Built before the hit_test_map borrow (both take &mut / &self respectively).
+        let bboxes = self.app.overlay_bboxes(win_w, win_h);
         if let Some((map, hw, hh)) = self.app.hit_test_map() {
             // Match last_overlay_active length to deltas length. Grow with `false` if the app registered new IDs since last frame; shrink if it (rare) collapsed. apply_overlay debug-asserts equal lengths.
             if self.last_overlay_active.len() != current.len() {
@@ -736,6 +751,7 @@ impl<A: FluorApp> DesktopShell<A> {
                 hw,
                 hh,
                 &current,
+                &bboxes,
                 &mut self.last_overlay_active,
             );
         }
@@ -815,7 +831,7 @@ impl<A: FluorApp> DesktopShell<A> {
                 monitor.update_rect(r.x, r.y, r.w, r.h);
             }
         }
-        // Windows: present the owned screen buffer through the layered window (per-pixel alpha + click-thru on α=0). The damage outline (a dev overlay) is stamped into a scratch copy first so it lives one frame and never touches persistent_screen, matching the softbuffer path.
+        // Windows: present the owned screen buffer thru the layered window (per-pixel alpha + click-thru on α=0). The damage outline (a dev overlay) is stamped into a scratch copy first so it lives one frame and never touches persistent_screen, matching the softbuffer path.
         #[cfg(target_os = "windows")]
         {
             let (sw, sh) = self.screen_size;
@@ -895,7 +911,7 @@ impl<A: FluorApp> DesktopShell<A> {
             crate::paint::shift_screen_wrap(&mut buffer, scr_w, scr_h, dx, dy);
             let _ = buffer.present();
         }
-        // Windows: no softbuffer surface — shift our owned persistent_screen and re-present it through the layered window. (The layered window already moves with window_rect via the α channel, so there's no OS input-region call to push like X11 does below.)
+        // Windows: no softbuffer surface — shift our owned persistent_screen and re-present it thru the layered window. (The layered window already moves with window_rect via the α channel, so there's no OS input-region call to push like X11 does below.)
         #[cfg(target_os = "windows")]
         {
             crate::paint::shift_screen_wrap(&mut self.persistent_screen, scr_w, scr_h, dx, dy);

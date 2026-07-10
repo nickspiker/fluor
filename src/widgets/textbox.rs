@@ -1242,6 +1242,14 @@ mod widget_impls {
                 0
             }
         }
+        fn hover_bbox(
+            &self,
+            viewport_w: usize,
+            viewport_h: usize,
+        ) -> Option<crate::canvas::PixelRect> {
+            // The pill bbox — bounds the host's overlay tint scan to this textbox, not the whole window.
+            Some(super::region_to_pixelrect(self.bbox(), viewport_w, viewport_h))
+        }
     }
 
     impl Key for Textbox {

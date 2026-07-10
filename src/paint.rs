@@ -344,6 +344,7 @@ pub fn apply_overlay(
     win_w: usize,
     win_h: usize,
     deltas: &[u32],
+    bboxes: &[Option<crate::canvas::PixelRect>],
     last_active: &mut [bool],
 ) {
     debug_assert_eq!(
@@ -367,12 +368,12 @@ pub fn apply_overlay(
     }
     let table_len = deltas.len();
     let scr_h = persistent_screen.len() / scr_w;
-    // Compute the window-space y/x range whose screen coords land inside [0, scr_h) / [0, scr_w).
-    let y_lo = ((-win_oy).max(0) as usize).min(win_h);
-    let y_hi = win_h.min(((scr_h as i32) - win_oy).max(0) as usize);
-    let x_lo = ((-win_ox).max(0) as usize).min(win_w);
-    let x_hi = win_w.min(((scr_w as i32) - win_ox).max(0) as usize);
-    if y_lo >= y_hi || x_lo >= x_hi {
+    // The full on-screen window range — the fallback scan for an id with no bbox.
+    let full_y_lo = ((-win_oy).max(0) as usize).min(win_h);
+    let full_y_hi = win_h.min(((scr_h as i32) - win_oy).max(0) as usize);
+    let full_x_lo = ((-win_ox).max(0) as usize).min(win_w);
+    let full_x_hi = win_w.min(((scr_w as i32) - win_ox).max(0) as usize);
+    if full_y_lo >= full_y_hi || full_x_lo >= full_x_hi {
         for a in last_active.iter_mut() {
             *a = false;
         }
@@ -382,46 +383,61 @@ pub fn apply_overlay(
     // Snapshot prev → new. With u16 IDs the previous fixed `[bool; 256]` swap can't survive, but the table is bounded by registered widget count (~tens, not 65 k) so a per-frame Vec pair is cheap.
     let prev_active: alloc::vec::Vec<bool> = last_active.to_vec();
     let mut new_active = alloc::vec![false; table_len];
-    for y in y_lo..y_hi {
-        let scr_y = (y as i32 + win_oy) as usize;
-        let map_row = y * win_w;
-        let scr_row = scr_y * scr_w;
-        for x in x_lo..x_hi {
-            let map_idx = map_row + x;
-            let id = hit_test_map[map_idx] as usize;
-            if id >= table_len {
-                continue;
+
+    // Per-id BOUNDED scan: for each id that's tinted now OR was last frame, walk ONLY its bbox (clamped to the on-screen range; falling back to the full window if it has none), tinting the pixels where `hit_map == id`.
+    // This makes hover cost O(hovered widget), not O(screen) — the whole point of the bbox table.
+    // A just-left id (delta == 0, was_active) restores its pixels to clean scratch.
+    for id in 0..table_len {
+        let delta = deltas[id];
+        let was_active = prev_active[id];
+        if delta == 0 && !was_active {
+            continue;
+        }
+        if delta != 0 {
+            new_active[id] = true;
+        }
+        let (y0, y1, x0, x1) = match bboxes.get(id).copied().flatten() {
+            Some(r) => (
+                r.y0.clamp(full_y_lo, full_y_hi),
+                r.y1.clamp(full_y_lo, full_y_hi),
+                r.x0.clamp(full_x_lo, full_x_hi),
+                r.x1.clamp(full_x_lo, full_x_hi),
+            ),
+            None => (full_y_lo, full_y_hi, full_x_lo, full_x_hi),
+        };
+        let sqrt = delta & OVERLAY_SQRT_BRIGHTEN != 0;
+        let dr = ((delta >> 16) & 0xFF) as u8;
+        let dg = ((delta >> 8) & 0xFF) as u8;
+        let db = (delta & 0xFF) as u8;
+        let id_hit = id as HitId;
+        for y in y0..y1 {
+            let scr_y = (y as i32 + win_oy) as usize;
+            let map_row = y * win_w;
+            let scr_row = scr_y * scr_w;
+            for x in x0..x1 {
+                let map_idx = map_row + x;
+                if hit_test_map[map_idx] != id_hit {
+                    continue;
+                }
+                let raw = scratch[map_idx];
+                let visible = raw ^ 0x00FF_FFFF;
+                let (r, g, b) = if sqrt {
+                    // Per-pixel gamma lift: v' = sqrt(v/255)·255 per channel. See the doc note above.
+                    (
+                        SQRT_BRIGHTEN_LUT[((visible >> 16) & 0xFF) as usize] as u32,
+                        SQRT_BRIGHTEN_LUT[((visible >> 8) & 0xFF) as usize] as u32,
+                        SQRT_BRIGHTEN_LUT[(visible & 0xFF) as usize] as u32,
+                    )
+                } else {
+                    (
+                        (((visible >> 16) & 0xFF) as u8).wrapping_sub(dr) as u32,
+                        (((visible >> 8) & 0xFF) as u8).wrapping_sub(dg) as u32,
+                        ((visible & 0xFF) as u8).wrapping_sub(db) as u32,
+                    )
+                };
+                let scr_x = (x as i32 + win_ox) as usize;
+                persistent_screen[scr_row + scr_x] = 0xFF00_0000 | (r << 16) | (g << 8) | b;
             }
-            let delta = deltas[id];
-            let was_active = prev_active[id];
-            // Skip pixels for ids that aren't tinted now AND weren't tinted last frame — nothing to do.
-            if delta == 0 && !was_active {
-                continue;
-            }
-            if delta != 0 {
-                new_active[id] = true;
-            }
-            let raw = scratch[map_idx];
-            let visible = raw ^ 0x00FF_FFFF;
-            let (r, g, b) = if delta & OVERLAY_SQRT_BRIGHTEN != 0 {
-                // Per-pixel gamma lift: v' = sqrt(v/255)·255 per channel. See the doc note above.
-                (
-                    SQRT_BRIGHTEN_LUT[((visible >> 16) & 0xFF) as usize] as u32,
-                    SQRT_BRIGHTEN_LUT[((visible >> 8) & 0xFF) as usize] as u32,
-                    SQRT_BRIGHTEN_LUT[(visible & 0xFF) as usize] as u32,
-                )
-            } else {
-                let dr = ((delta >> 16) & 0xFF) as u8;
-                let dg = ((delta >> 8) & 0xFF) as u8;
-                let db = (delta & 0xFF) as u8;
-                (
-                    (((visible >> 16) & 0xFF) as u8).wrapping_sub(dr) as u32,
-                    (((visible >> 8) & 0xFF) as u8).wrapping_sub(dg) as u32,
-                    ((visible & 0xFF) as u8).wrapping_sub(db) as u32,
-                )
-            };
-            let scr_x = (x as i32 + win_ox) as usize;
-            persistent_screen[scr_row + scr_x] = 0xFF00_0000 | (r << 16) | (g << 8) | b;
         }
     }
     last_active.copy_from_slice(&new_active);
@@ -467,6 +483,20 @@ pub fn wrap_sub_rgb(a: u32, b: u32) -> u32 {
     ((ar.wrapping_sub(br) & 0xFF) << 16)
         | ((ag.wrapping_sub(bg) & 0xFF) << 8)
         | (ab.wrapping_sub(bb) & 0xFF)
+}
+
+/// Like [`wrap_sub_rgb`] but scales the SIGNED per-channel delta `(target − base)` by `num/den` before wrapping — a fractional-strength tint.
+/// The overlay's visible-space wrap-sub of the result lands a base-coloured pixel `num/den` of the way toward `target` (e.g. `(1, 4)` = quarter-opacity hover), so a vivid target hue reads as a gentle wash instead of a full-saturation flood.
+/// α byte is dropped (0).
+pub fn wrap_sub_rgb_scaled(target: u32, base: u32, num: i32, den: i32) -> u32 {
+    let mut out = 0u32;
+    for shift in [16u32, 8, 0] {
+        let t = ((target >> shift) & 0xFF) as i32;
+        let b = ((base >> shift) & 0xFF) as i32;
+        let d = (t - b) * num / den;
+        out |= ((d.rem_euclid(256)) as u32) << shift;
+    }
+    out
 }
 
 /// Unpack a fluor internal pixel into `(r, g, b, a)` with visible RGB and opacity α — the inverse of [`pack_argb`]. Flips darkness back to visible RGB; α passes thru.

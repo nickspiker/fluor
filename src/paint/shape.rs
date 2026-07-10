@@ -87,7 +87,7 @@ pub fn draw_rect(
 /// rect centred at `(cx, cy)` with px size `(dst_w, dst_h)`. Nearest-neighbour sampling. Each
 /// sampled pixel composes UNDER existing content via [`Blend::under`] exactly like the other
 /// primitives, so draw order controls z. Source pixels are treated as opaque — the VSF image
-/// decoder packs α = `0xFF`; a source pixel's own α still rides through `under`, so a decoder that
+/// decoder packs α = `0xFF`; a source pixel's own α still rides thru `under`, so a decoder that
 /// emits transparency (future masked avatars) composites correctly with no change here.
 ///
 /// Bounds are clamped/clipped like [`draw_rect`] (the dest rect may be partly off-buffer). Edges
