@@ -11,6 +11,15 @@
 
 use crate::coord::{Coord, RuVec2};
 
+/// The photon zoom step curve — asymmetric BY DESIGN (confirmed by Nick, 2026-07-12; the trio 31/32/33 is the spec, born in photon commit 529fbeb): each in-step multiplies by `32/31` (≈ +3.23%), each out-step by `32/33` (≈ −3.03%). The in/out ratios are deliberately incommensurate, so combinations of notches form a DENSE set — any zoom value is reachable by mixing ins and outs instead of being locked to a single ratio's lattice; the ≈0.1% in/out round-trip drift is the price and it's imperceptible. The ONE curve for every zoomable in the ecosystem: the host's RU zoom consumes it via [`Viewport::adjust_zoom`], and apps consume it directly for their own zoom targets (opsin's image wheel) so all wheels speak the same steps. Do NOT "fix" this into reciprocal steps — that trades reachability for a lattice.
+pub fn zoom_step_factor(steps: f32) -> f32 {
+    if steps.is_sign_negative() {
+        (33f32 / 32.).powf(steps)
+    } else {
+        (31f32 / 32.).powf(-steps)
+    }
+}
+
 /// Viewport state. Recomputed every time the host window resizes.
 #[derive(Clone, Copy, Debug)]
 pub struct Viewport {
@@ -94,14 +103,9 @@ impl Viewport {
         self.span * self.ru
     }
 
-    /// Adjust zoom by `steps` (positive = zoom in, negative = zoom out). Asymmetric photon-style log curve: each in-step multiplies `ru` by `32/31` (≈ +3.23%), each out-step by `32/33` (≈ −3.03%). The slight asymmetry means in/out aren't exact inverses — `in_then_out` drifts by `1024/1023 ≈ 1.001` per pair, which is visually imperceptible but matches photon's behaviour exactly so cross-codebase muscle memory transfers. **Unbounded by design** — clamp at the consumer layer if a particular widget needs guardrails; the host applies no min/max.
+    /// Adjust zoom by `steps` (positive = zoom in, negative = zoom out) along [`zoom_step_factor`] — see there for why the curve is asymmetric on purpose. Matches photon's behaviour exactly so cross-codebase muscle memory transfers.
     pub fn adjust_zoom(&mut self, steps: f32) {
-        let factor = if steps < 0.0 {
-            (33.0_f32 / 32.0).powf(steps)
-        } else {
-            (31.0_f32 / 32.0).powf(-steps)
-        };
-        self.ru *= factor;
+        self.ru *= zoom_step_factor(steps);
         // Production zoom clamp (requested + justified by Nick): below 1/8 (12.5%) or above 3× (300%) the layout/scratch math starts to break, so the shipping build pins ru to that range. WHY this clamp is allowed despite AGENT.md Rule 0: it's a user-requested, user-justified bound on EXTERNAL input (scroll/zoom gestures), not defensive masking of internal math — and it's release-gated so it never hides a bug in dev (debug builds stay unclamped so the breakage threshold can still be probed).
         #[cfg(not(debug_assertions))]
         {

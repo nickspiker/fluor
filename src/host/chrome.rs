@@ -37,11 +37,16 @@ impl Default for OrbTint {
 /// (which compiles without the `icon` feature); re-exported here for existing `chrome::` paths.
 pub use super::event_response::ResizeEdge;
 
-/// Classify a cursor position as one of nine resize zones (or None for the window interior). Geometry only — no rasterization. Edge band thickness derived from harmonic-mean span so the hit zone scales with viewport size.
-pub fn get_resize_edge(window_width: u32, window_height: u32, x: Coord, y: Coord) -> ResizeEdge {
-    let span = 2. * window_width as Coord * window_height as Coord
-        / (window_width as Coord + window_height as Coord);
-    let resize_border = math::ceil(span / 32.);
+/// Height in pixels of the `DefaultChrome` top bar / controls strip: `2 · ceil(effective_span/32)` — twice the base button unit, so the strip fits the 2× close/min/max buttons while the orb + title (base-sized) sit vertically centred. Single source of truth: `get_resize_edge` derives its band from it, and consumers that draw their own full-width bar (opsin) should match it so their bottom hairline lines up with the strip's. Zoom-scaled via `effective_span`.
+pub fn strip_height(viewport: crate::geom::Viewport) -> Coord {
+    2.0 * math::ceil(viewport.effective_span() / 32.0)
+}
+
+/// Classify a cursor position as one of nine resize zones (or None for the window interior). Geometry only — no rasterization. Band thickness = a quarter of the chrome strip height (`strip_height()/4`), so it scales with the user's RU zoom like every other chrome dimension — a full-width title bar's top quarter resizes while the rest is the move handle, and all four edges honor the same thickness. (Was raw-span `ceil(span/32)` before the RU-coherence fix — that band ignored zoom, and at ru=1 swallowed a bar-height strip on every edge.)
+pub fn get_resize_edge(viewport: crate::geom::Viewport, x: Coord, y: Coord) -> ResizeEdge {
+    let window_width = viewport.width_px;
+    let window_height = viewport.height_px;
+    let resize_border = strip_height(viewport) / 4.;
 
     let at_left = x < resize_border;
     let at_right = x > (window_width as Coord - resize_border);
@@ -330,9 +335,9 @@ pub fn draw_title_text(
     if left_margin >= clip_x_end {
         return;
     }
-    let font_size = button_size as Coord * 0.55;
-    // Clip band is centred on the title's row (a full button_size tall, centred on y_center) so the glyphs aren't clipped after the title drops to follow the orb.
-    let half_band = button_size as Coord * 0.5;
+    let font_size = button_size as Coord * 0.825; // 1.5× the former 0.55·button_size.
+    // Clip band centred on the title's row. Widened to 0.6·button_size (from 0.5) so the 1.5×-larger glyphs clear the band — the controls strip is 2·button_size tall now, so there's ample room.
+    let half_band = button_size as Coord * 0.6;
     let clip_y0 = (y_center - half_band).max(0.0) as usize;
     let clip_y1 = (y_center + half_band) as usize;
     let clip = Clip::new(left_margin, clip_y0, clip_x_end, clip_y1);
@@ -752,9 +757,11 @@ pub fn draw_strip_hairlines(
     let cap = start + crossings.len();
     let curve_active = start < button_size;
 
-    // Vertical dividers — full height of the strip.
+    // Vertical dividers — full height of the strip. `strip_x` is the strip's left edge (left of the minimize button), separating the controls block from whatever fills the bar to its left; div1/div2 sit between the three buttons.
     for py in 0..button_size {
         let row_base = py * w;
+        let idx = row_base + strip_x;
+        pixels[idx] = pixels[idx].under(edge, BlendMode::Normal);
         let idx = row_base + strip_x + div1;
         pixels[idx] = pixels[idx].under(edge, BlendMode::Normal);
         let idx = row_base + strip_x + div2;

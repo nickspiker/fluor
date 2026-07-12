@@ -223,6 +223,7 @@ impl<A: FluorApp> AndroidShell<A> {
             cursor_x: self.cursor_x,
             cursor_y: self.cursor_y,
             is_maximized: false,
+            window_origin: (0, 0),
             damage_clip: PixelRect::new(
                 0,
                 0,
@@ -252,6 +253,7 @@ impl<A: FluorApp> AndroidShell<A> {
             cursor_x: self.cursor_x,
             cursor_y: self.cursor_y,
             is_maximized: false,
+            window_origin: (0, 0),
             damage_clip,
         };
         f(&mut self.app, &mut self.scratch, &mut ctx);

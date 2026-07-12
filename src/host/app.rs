@@ -238,6 +238,8 @@ pub struct Context<'a> {
     pub cursor_y: Coord,
     /// `true` if the host's `window_rect` is currently in the screen-sized "maximized" state set by [`EventResponse::ToggleMaximized`]. Consumers consult this so chrome can switch to full-edge mode (no corner cutouts, no perimeter hairline, no drop shadow) — the shadow/hairline are screen edges anyway, the WM can't show them, and AA on a corner that's flush with the screen is wasted work.
     pub is_maximized: bool,
+    /// The visible window's top-left corner in screen coordinates (the fullscreen-compositor `window_rect` origin). Lets consumers screen-anchor content across origin-moving operations — a left/top edge resize shifts the origin, and content that should stay put on screen (an image canvas, a document) compensates by the origin delta. Bottom/right resizes and pure renders leave it unchanged. Android: always (0, 0) — the surface IS the window.
+    pub window_origin: (i32, i32),
 }
 
 pub use super::event_response::EventResponse;
@@ -441,7 +443,7 @@ struct DesktopShell<A: FluorApp> {
 
     // --- Drag-to-move tracking. In the fullscreen-compositor architecture the OS window is fullscreen and `window.drag_window()` doesn't move anything — we move our internal `window_rect` inside the screen buffer instead. On press we capture the cursor's screen position + window_rect origin; on cursor-move we update window_rect.x/y by the delta. The actual screen-buffer shift happens at vsync (RedrawRequested) via paint::shift_screen_wrap — skipping consumer render + finalize + shadow entirely during the drag. On drag release, a request_redraw kicks off a clean full re-render that overwrites the wrap artefacts.
     is_dragging_move: bool,
-    /// Click hit a drag-eligible area and we're waiting to see if the cursor crosses the drag threshold (`DRAG_DEADZONE_PX`) before committing to an actual move-drag. Set on `EventResponse::StartWindowDrag`; cleared on mouse release. While armed but not yet committed, the cursor handler treats movements below the threshold as a no-op (so a click that defocuses a widget but doesn't drag doesn't promote to full_repaint via the wrap-shift fast path). On crossing the threshold, `is_dragging_move` flips true and the shift logic engages.
+    /// Click hit a drag-eligible area; the NEXT CursorMoved commits the move-drag (no dead zone — 1:1 tracking from the first pixel of motion). Set on `EventResponse::StartWindowDrag`; cleared on mouse release. A click with zero motion never commits because the commit lives in the CursorMoved arm, so click-without-drag stays free of wrap-shift artefacts.
     move_drag_armed: bool,
     drag_move_anchor_screen: (i32, i32),
     drag_move_rect_start: (i32, i32),
@@ -647,6 +649,7 @@ impl<A: FluorApp> DesktopShell<A> {
             cursor_x: self.cursor_x - self.window_rect.x as Coord,
             cursor_y: self.cursor_y - self.window_rect.y as Coord,
             is_maximized: self.saved_rect_for_maximize.is_some(),
+                window_origin: (self.window_rect.x, self.window_rect.y),
             damage_clip,
         };
 
@@ -946,7 +949,7 @@ impl<A: FluorApp> DesktopShell<A> {
         match response {
             EventResponse::Handled | EventResponse::Pass => false,
             EventResponse::StartWindowDrag => {
-                // Fullscreen-compositor model: OS window.drag_window() would do nothing (OS window is fullscreen). Drag is internal — capture the anchor here and move window_rect on CursorMoved. We ARM the drag without committing; `is_dragging_move` doesn't flip true until the cursor crosses `DRAG_DEADZONE_PX` in `CursorMoved`. Click-without-drag (e.g. defocus click on the panel area) never commits, so no wrap-shift fast path runs, no persistent_screen wrap artefacts, and the textbox's small `glow_bbox` damage_rect drives the only repaint.
+                // Fullscreen-compositor model: OS window.drag_window() would do nothing (OS window is fullscreen). Drag is internal — capture the anchor here and move window_rect on CursorMoved. We ARM the drag without committing; the first CursorMoved commits it (no dead zone). Click-without-motion never commits, so no wrap-shift fast path runs, no persistent_screen wrap artefacts, and the textbox's small `glow_bbox` damage_rect drives the only repaint.
                 //
                 // Maximized state suppresses drag entirely. Most WMs handle this with "drag a maximized window → unmaximize and resume drag at cursor"; that's the right ergonomic but more involved (need to compute the unmaximized origin relative to cursor, then begin the drag). For v0 the simpler rule is "ignore the drag request" — title-bar clicks while maximized do nothing instead of producing nonsense (the drag would translate the fullscreen-sized rect into negative offsets and clip_through the input region). Revisit when we add the unmaximize-then-drag flow.
                 if self.saved_rect_for_maximize.is_none() {
@@ -1025,6 +1028,7 @@ impl<A: FluorApp> DesktopShell<A> {
                     cursor_x: self.cursor_x - self.window_rect.x as Coord,
                     cursor_y: self.cursor_y - self.window_rect.y as Coord,
                     is_maximized: self.saved_rect_for_maximize.is_some(),
+                window_origin: (self.window_rect.x, self.window_rect.y),
                     damage_clip: crate::canvas::PixelRect::new(
                         0,
                         0,
@@ -1193,6 +1197,7 @@ impl<A: FluorApp> DesktopShell<A> {
                     cursor_x: self.cursor_x - self.window_rect.x as Coord,
                     cursor_y: self.cursor_y - self.window_rect.y as Coord,
                     is_maximized: self.saved_rect_for_maximize.is_some(),
+                window_origin: (self.window_rect.x, self.window_rect.y),
                     damage_clip: crate::canvas::PixelRect::new(
                         0,
                         0,
@@ -1323,6 +1328,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
                 cursor_y: self.cursor_y - self.window_rect.y as Coord,
                 is_maximized: self.saved_rect_for_maximize.is_some(),
+                window_origin: (self.window_rect.x, self.window_rect.y),
                 damage_clip: crate::canvas::PixelRect::new(
                     0,
                     0,
@@ -1364,6 +1370,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
                 cursor_y: self.cursor_y - self.window_rect.y as Coord,
                 is_maximized: self.saved_rect_for_maximize.is_some(),
+                window_origin: (self.window_rect.x, self.window_rect.y),
                 damage_clip: crate::canvas::PixelRect::new(
                     0,
                     0,
@@ -1470,6 +1477,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                                     self.viewport.height_px as usize,
                                 ),
                                 is_maximized: self.saved_rect_for_maximize.is_some(),
+                window_origin: (self.window_rect.x, self.window_rect.y),
                             };
                             self.app.on_resize(new_w, new_h, &mut ctx);
                         }
@@ -1504,15 +1512,11 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                     return;
                 }
 
-                // In-buffer drag-to-move: update window_rect.x/y by the cursor delta from the drag anchor. The actual screen-buffer shift + input-region update + present happens at vsync in `apply_move_drag_shift` (called from RedrawRequested), naturally coalescing the 200+ Hz raw input rate down to the display refresh rate. Skip consumer dispatch — they don't need cursor moves during the drag. Drag commits only after the cursor crosses `DRAG_DEADZONE_PX` from the press anchor — sub-threshold jitter on click-without-drag stays a no-op so no wrap-shift fast path runs and no persistent_screen artefact accumulates.
+                // In-buffer drag-to-move: update window_rect.x/y by the cursor delta from the drag anchor. The actual screen-buffer shift + input-region update + present happens at vsync in `apply_move_drag_shift` (called from RedrawRequested), naturally coalescing the 200+ Hz raw input rate down to the display refresh rate. Skip consumer dispatch — they don't need cursor moves during the drag. No dead zone: the drag commits on the first cursor move after the press — 1:1 tracking from the first pixel (the old 4px threshold was a feel papercut; a click-without-motion still never commits because this arm only runs on CursorMoved).
                 if self.move_drag_armed {
-                    const DRAG_DEADZONE_PX: i32 = 4;
                     let dx = (self.cursor_x as i32) - self.drag_move_anchor_screen.0;
                     let dy = (self.cursor_y as i32) - self.drag_move_anchor_screen.1;
                     if !self.is_dragging_move {
-                        if dx.abs() < DRAG_DEADZONE_PX && dy.abs() < DRAG_DEADZONE_PX {
-                            return;
-                        }
                         self.is_dragging_move = true;
                         if let Some(window) = self.window.as_ref() {
                             window.set_cursor(winit::window::CursorIcon::Grabbing);
@@ -1539,6 +1543,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                         cursor_x: self.cursor_x - self.window_rect.x as Coord,
                         cursor_y: self.cursor_y - self.window_rect.y as Coord,
                         is_maximized: self.saved_rect_for_maximize.is_some(),
+                window_origin: (self.window_rect.x, self.window_rect.y),
                         damage_clip: crate::canvas::PixelRect::new(
                             0,
                             0,
@@ -1590,14 +1595,10 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
             WindowEvent::MouseWheel { delta, .. }
                 if self.modifiers.control_key() || self.modifiers.super_key() =>
             {
-                // Ctrl/Cmd + scroll → zoom. 1 step per scroll notch (LineDelta). Trackpad PixelDelta accumulates many small events; ~31 px per zoom-in step, ~32 px per zoom-out step matches typical trackpad density. The 31/32 split mirrors `adjust_zoom`'s 32/31 vs 32/33 asymmetry — in/out aren't exact inverses, so repeated in→out scrolling drifts by a small fraction per pair, giving subpixel positioning instead of clamping the user to a discrete lattice.
+                // Ctrl/Cmd + scroll → zoom. 1 step per scroll notch (LineDelta). Trackpad PixelDelta accumulates many small events; a step's worth of travel is span/(1<<6) — ≈21 px on a 1920×1080 window (the legacy photon "20 px" notch feel), derived from the display instead of hardcoded (no fixed pixels). Bare span, not effective_span: feed sensitivity must not compound with the ru being adjusted. Direction-independent — the dense-reachability design lives in `zoom_step_factor`'s in/out ratios, not the feed (the old 31/32-px split was fixed pixels AND redundant asymmetry).
                 let steps: f32 = match delta {
                     MouseScrollDelta::LineDelta(_, y) => *y,
-                    MouseScrollDelta::PixelDelta(p) => {
-                        let py = p.y as f32;
-                        let divisor = if py >= 0.0 { 31.0 } else { 32.0 };
-                        py / divisor
-                    }
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / (self.viewport.span / (1 << 6) as f32),
                 };
                 if steps != 0.0 {
                     self.apply_zoom_change(Some(steps));
@@ -1639,7 +1640,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                     self.is_dragging_resize = false;
                     self.resize_edge = ResizeEdge::None;
                 }
-                // End of in-buffer drag-to-move. Two release paths from the deadzone state machine: (a) armed but never committed (cursor never crossed `DRAG_DEADZONE_PX`) — no shifts happened, persistent_screen is intact, consumer's damage_rect drives the next paint. (b) Committed (`is_dragging_move = true`) — the wrap-shift fast path moved persistent_screen contents, leaving wrap artefacts at whichever edges the window slid across, so a full repaint is required to clean them up. Always request_redraw on either path so consumer-side invalidations queued during the press window (e.g. textbox defocus → glow_bbox damage) get a fresh render_frame to flush.
+                // End of in-buffer drag-to-move. Two release paths: (a) armed but never committed (zero cursor motion during the press) — no shifts happened, persistent_screen is intact, consumer's damage_rect drives the next paint. (b) Committed (`is_dragging_move = true`) — the wrap-shift fast path moved persistent_screen contents, leaving wrap artefacts at whichever edges the window slid across, so a full repaint is required to clean them up. Always request_redraw on either path so consumer-side invalidations queued during the press window (e.g. textbox defocus → glow_bbox damage) get a fresh render_frame to flush.
                 if self.move_drag_armed {
                     self.move_drag_armed = false;
                     if self.is_dragging_move {
@@ -1704,6 +1705,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
             cursor_x: self.cursor_x - self.window_rect.x as Coord,
             cursor_y: self.cursor_y - self.window_rect.y as Coord,
             is_maximized: self.saved_rect_for_maximize.is_some(),
+                window_origin: (self.window_rect.x, self.window_rect.y),
             damage_clip: crate::canvas::PixelRect::new(
                 0,
                 0,
@@ -1736,6 +1738,7 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
                 cursor_y: self.cursor_y - self.window_rect.y as Coord,
                 is_maximized: self.saved_rect_for_maximize.is_some(),
+                window_origin: (self.window_rect.x, self.window_rect.y),
                 damage_clip: crate::canvas::PixelRect::new(
                     0,
                     0,
@@ -1763,6 +1766,7 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
                 cursor_x: self.cursor_x - self.window_rect.x as Coord,
                 cursor_y: self.cursor_y - self.window_rect.y as Coord,
                 is_maximized: self.saved_rect_for_maximize.is_some(),
+                window_origin: (self.window_rect.x, self.window_rect.y),
                 damage_clip: crate::canvas::PixelRect::new(
                     0,
                     0,
