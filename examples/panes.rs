@@ -467,12 +467,7 @@ impl FluorApp for PanesDemo {
                 let hit_id = self.chrome.hit_at(ctx.cursor_x, ctx.cursor_y);
                 if hit_id == HIT_NONE {
                     // Resize-edge — only consulted when no widget claimed the pixel.
-                    let edge = chrome::get_resize_edge(
-                        ctx.viewport.width_px,
-                        ctx.viewport.height_px,
-                        ctx.cursor_x,
-                        ctx.cursor_y,
-                    );
+                    let edge = chrome::get_resize_edge(ctx.viewport, ctx.cursor_x, ctx.cursor_y);
                     if edge != ResizeEdge::None {
                         // Defensively clear any in-progress selection-drag so cursor moves during resize can't bleed into textbox selection extension. Host suppresses CursorMoved dispatch during resize, but a prior interaction that didn't release cleanly could leave stale state.
                         self.is_dragging_select = false;
@@ -1043,7 +1038,7 @@ impl FluorApp for PanesDemo {
             return CursorIcon::Pointer;
         }
         let is_textbox_hover = self.textbox_index_by_id(hit).is_some();
-        match chrome::get_resize_edge(ctx.viewport.width_px, ctx.viewport.height_px, x, y) {
+        match chrome::get_resize_edge(ctx.viewport, x, y) {
             ResizeEdge::Top | ResizeEdge::Bottom => CursorIcon::NsResize,
             ResizeEdge::Left | ResizeEdge::Right => CursorIcon::EwResize,
             ResizeEdge::TopLeft | ResizeEdge::BottomRight => CursorIcon::NwseResize,

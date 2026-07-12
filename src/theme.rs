@@ -58,17 +58,40 @@ const fn dark_rgb_only(trgb: u32) -> u32 {
 }
 
 // Background texture (organic noise, scrollable). These are NOISE-MATH constants — bit-patterns the noise function uses (base colour + low-bit variance mask + speckle mask), not display colours. They operate in visible-RGB space (matching photon's reference); the noise function does its math then flips the result to stored darkness at the store site (`result ^ 0x00FFFFFF`). NOT wrapped with `dark()` so the photon-original patterns survive.
+#[cfg(not(feature = "amber"))]
 pub const BG_BASE: u32 = fmt(0x00_0C_14_0E);
+#[cfg(not(feature = "amber"))]
 pub const BG_MASK: u32 = fmt(0x00_0F_07_1F);
+#[cfg(not(feature = "amber"))]
 pub const BG_SPECKLE: u32 = fmt(0x00_3F_1F_7F);
+// amber (dev builds): the same noise-math bit patterns re-biased from purple to debug orange — #FFA000's FF:A0:00 channel ratio at each constant's original magnitude (base warm-dark, variance orange-heavy, speckle an orange flash).
+#[cfg(feature = "amber")]
+pub const BG_BASE: u32 = fmt(0x00_14_0D_00);
+#[cfg(feature = "amber")]
+pub const BG_MASK: u32 = fmt(0x00_1F_0F_03);
+#[cfg(feature = "amber")]
+pub const BG_SPECKLE: u32 = fmt(0x00_7F_50_00);
 
 // Window edges (focused). Saturated warm top/left + saturated cool bottom/right give the chrome its 3D bevel cue. Brighter than the unfocused variants below — an active window earns the eye's attention.
+// amber (dev builds): the perimeter hairline IS the debug badge — full #FFA000 on the light edge; a darker orange shadow edge keeps the bevel cue.
+#[cfg(not(feature = "amber"))]
 pub const WINDOW_LIGHT_EDGE: u32 = dark(fmt(0x00_5C_4F_35));
+#[cfg(not(feature = "amber"))]
 pub const WINDOW_SHADOW_EDGE: u32 = dark(fmt(0x00_29_3A_4A));
+#[cfg(feature = "amber")]
+pub const WINDOW_LIGHT_EDGE: u32 = dark(fmt(0x00_FF_A0_00));
+#[cfg(feature = "amber")]
+pub const WINDOW_SHADOW_EDGE: u32 = dark(fmt(0x00_80_50_00));
 
 // Window edges (unfocused). Desaturated (channels pulled toward grey, keeping a slight warm vs cool hint so the bevel survives) and darker than the focused variants. Reads as "this window is quiet, but I can still see it's a window."
+#[cfg(not(feature = "amber"))]
 pub const WINDOW_LIGHT_EDGE_UNFOCUSED: u32 = dark(fmt(0x00_36_34_30));
+#[cfg(not(feature = "amber"))]
 pub const WINDOW_SHADOW_EDGE_UNFOCUSED: u32 = dark(fmt(0x00_2A_2D_32));
+#[cfg(feature = "amber")]
+pub const WINDOW_LIGHT_EDGE_UNFOCUSED: u32 = dark(fmt(0x00_8A_58_00));
+#[cfg(feature = "amber")]
+pub const WINDOW_SHADOW_EDGE_UNFOCUSED: u32 = dark(fmt(0x00_45_2C_00));
 
 // Controls strip background. The strip stays functional/clickable even when the window is unfocused, so the bg is focus-invariant. Strip hairlines + BL curve are NOT constants here — they now follow the focus-driven edge palette (vertical dividers + bottom hairline = `WINDOW_LIGHT_EDGE[_UNFOCUSED]`; BL squircle = `WINDOW_SHADOW_EDGE[_UNFOCUSED]`) so the strip's framing dims with the rest of the window.
 pub const WINDOW_CONTROLS_BG: u32 = dark(fmt(0x00_1E_1E_1E));
@@ -84,6 +107,16 @@ pub const MINIMIZE_HOVER: u32 = dark(fmt(0x00_08_05_DA));
 pub const TEXT_COLOUR: u32 = dark(fmt(0x00_E8_E8_E8));
 pub const TEXT_COLOUR_UNFOCUSED: u32 = dark(fmt(0x00_6A_6A_6A));
 pub const LABEL_COLOUR: u32 = dark(fmt(0x00_80_80_80));
+
+// Title-bar text — normally just TEXT_COLOUR[_UNFOCUSED]; a named constant so the amber dev theme can badge the TITLE orange without touching body text everywhere.
+#[cfg(not(feature = "amber"))]
+pub const TITLE_TEXT: u32 = TEXT_COLOUR;
+#[cfg(not(feature = "amber"))]
+pub const TITLE_TEXT_UNFOCUSED: u32 = TEXT_COLOUR_UNFOCUSED;
+#[cfg(feature = "amber")]
+pub const TITLE_TEXT: u32 = dark(fmt(0x00_FF_A0_00));
+#[cfg(feature = "amber")]
+pub const TITLE_TEXT_UNFOCUSED: u32 = dark(fmt(0x00_8A_58_00));
 
 // Hint / placeholder text — pure white at 1/4 opacity (α=64), stored directly in α+darkness format (the version watermark is the same treatment at 1/8). Glyph coverage multiplies into this α, so every hint reads as faint light over the dark background rather than flat ink — the eye reads real content first, the hint only on attention. One colour for every hint, by design.
 pub const HINT_COLOUR: u32 = 0x40_00_00_00;

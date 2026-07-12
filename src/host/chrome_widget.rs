@@ -371,17 +371,12 @@ impl DefaultChrome {
         // Span-relative: button height is span/32, where span is the harmonic mean of viewport dims times zoom. Strip layout bails downstream if the result is too small to render glyphs.
         let button_size = crate::math::ceil(span / 32.0) as usize;
 
-        // Base squircle (radius = span/4, squirdleyness 24) — the controls-strip BL curve still uses this symmetric shape. At typical viewport sizes the curve is too big to fit in the strip and degrades to a rectangular bottom; at high zoom it appears.
-        let (start, crossings) = compute_squircle_crossings(span / 4.0, 24);
-        // No curve to draw — bail. start=0 is fine (just means the corner-of-corner cutout is empty); curve walks handle it.
-        if crossings.is_empty() {
-            return;
-        }
+        // Controls unit. The close/min/max strip and its buttons are 2× the base button size — a taller strip with bigger glyphs — while the orb and title keep the base size. There's no BL swoop any more: the strip bottom is a straight hairline. The orb/title y-centre is `button_size`, which is exactly `ctl/2`, so they land vertically centred in the taller strip with no position change.
+        // ctl ≥ 2 always: button_size = ceil(span/32) ≥ 1 for any live viewport (the vp_w/vp_h < 2 bail above already excluded degenerate surfaces).
+        let ctl = button_size * 2;
 
-        // (Asymmetric window-perimeter corners — the TL+BR span/2 big table — moved with the perimeter into `rasterize_perimeter`. The strip's BL curve still reuses the base `start`/`crossings` computed above.)
-
-        // Controls-strip layout. Computed early so the title text pass can clip against `strip_x` (title shouldn't paint over the buttons even at long titles or narrow windows). The strip lives in the top-right `button_size`-tall band, `strip_w` wide.
-        let strip_w = button_size * 7 / 2;
+        // Controls-strip layout. Computed early so the title text pass can clip against `strip_x` (title shouldn't paint over the buttons even at long titles or narrow windows). The strip lives in the top-right `ctl`-tall band, `strip_w` wide.
+        let strip_w = ctl * 7 / 2;
         let strip_x = buf_w.saturating_sub(strip_w);
 
         // App-icon orb layout: centered in the top-left `button_size`-tall band, mirroring the right-side controls strip. Diameter is half the band height so the orb reads as a tasteful badge rather than a full button. Title text shifts right by the orb's footprint when an icon is present. `draw_app_icon` has an `r < 2` early-return so degenerate sizes pass thru without drawing — no min-size guard needed here.
@@ -423,18 +418,10 @@ impl DefaultChrome {
         //   6. Strip background fill (lowest — fills remaining empty pixels in the strip).
         //   7. Hover-state tint baked into chrome (wrap-add on hit_test_map matches).
         // `[]c`: skip the window edge/perimeter AND title text (both are "decoration"). Controls still render. clip_mask stays at host default (255 everywhere), so the window appears as a rectangle (no rounded corners). Focus-driven palette. Each element pulls from a named theme constant so a downstream consumer can override (e.g. an app that wants a totally different unfocused look) by swapping the theme module rather than re-implementing the rasterizer wiring.
-        let (edge_light, edge_shadow, title_colour) = if self.focused {
-            (
-                theme::WINDOW_LIGHT_EDGE,
-                theme::WINDOW_SHADOW_EDGE,
-                theme::TEXT_COLOUR,
-            )
+        let (edge_light, title_colour) = if self.focused {
+            (theme::WINDOW_LIGHT_EDGE, theme::TITLE_TEXT)
         } else {
-            (
-                theme::WINDOW_LIGHT_EDGE_UNFOCUSED,
-                theme::WINDOW_SHADOW_EDGE_UNFOCUSED,
-                theme::TEXT_COLOUR_UNFOCUSED,
-            )
+            (theme::WINDOW_LIGHT_EDGE_UNFOCUSED, theme::TITLE_TEXT_UNFOCUSED)
         };
 
         // Orb tint: FollowFocus → ring matches the active perimeter colour, icon gets `theme::ORB_DARKEN_UNFOCUSED` blend when the window is unfocused. Custom → app dictates ring + brighten; window-focus state doesn't dim a Custom orb (apps using it as a status indicator want it stable).
@@ -490,49 +477,38 @@ impl DefaultChrome {
             return;
         }
 
-        let button_area_x = strip_x + button_size / 4;
-        let glyph_y = button_size / 2;
-        let glyph_r = button_size / 4;
-        let min_cx = button_area_x + button_size / 2;
-        let max_cx = button_area_x + button_size + button_size / 2;
-        let close_cx = button_area_x + button_size * 2 + button_size / 2;
-        let strip_w = button_size * 7 / 2;
+        let button_area_x = strip_x + ctl / 4;
+        let glyph_y = ctl / 2;
+        let glyph_r = ctl / 4;
+        let min_cx = button_area_x + ctl / 2;
+        let max_cx = button_area_x + ctl + ctl / 2;
+        let close_cx = button_area_x + ctl * 2 + ctl / 2;
+        let strip_w = ctl * 7 / 2;
 
         // Hairlines (dividers + bottom) BEFORE curves: solid lines have to win at intersection pixels, otherwise the curve's inner-AA hairline (which is mostly transparent in the linear region) fragments them. With this order, dividers and bottom hairline claim their pixels first; the BL curve's hairlines fill in only the gaps the straight lines didn't reach.
         //
-        // Strip-frame colours follow the focus palette: vertical dividers + bottom hairline take `edge_light` (same as the top/left window perimeter), the BL squircle curve's vertical face takes `edge_light` (continues the left-of-strip vertical hairline) and its horizontal face takes `edge_shadow` (continues the bottom-of-strip hairline if no curve is present, and matches the bottom-of-window shadow) — so the strip reads as a continuation of the window edge, not a separate piece.
+        // Strip-frame colours follow the focus palette: vertical dividers + bottom hairline take `edge_light` (same as the top/left window perimeter), so the strip reads as a continuation of the window edge, not a separate piece.
+        // Straight strip frame — dividers + bottom hairline, no BL swoop. Passing the strip height as `start` with empty crossings puts both hairlines and the bg fill on their no-curve path (`curve_active = start < height` is false), so the bottom-left is a clean right-angle.
         chrome::draw_strip_hairlines(
             chrome_buf,
             vp_w,
             vp_h,
-            button_size,
-            start,
-            &crossings,
+            ctl,
+            ctl,
+            &[],
             edge_light,
         );
 
-        chrome::draw_strip_curves(
-            chrome_buf,
-            &mut self.hit_test_map,
-            vp_w,
-            vp_h,
-            button_size,
-            start,
-            &crossings,
-            edge_light,
-            edge_shadow,
-        );
-
-        // Per-row directional fills — runs AFTER hairlines + curves but BEFORE symbols + bg fill. Each button anchors at the slot's inner edge (one pixel past its adjacent divider on the side opposite the slot's content boundary) and scans outward across the row toward the curve / silhouette / strip edge. No inward scan needed: the divider itself is the inner boundary, and we start past it. MAX is the only button with dividers on BOTH sides — handled by splitting top half / bottom half between the two directions, so each half-row scan still only crosses one direction.
-        let div1_col = button_area_x + button_size;
-        let div2_col = button_area_x + 2 * button_size;
+        // Per-row directional fills — runs AFTER hairlines but BEFORE symbols + bg fill. Each button anchors at the slot's inner edge (one pixel past its adjacent divider on the side opposite the slot's content boundary) and scans outward across the row toward the silhouette / strip edge. No inward scan needed: the divider itself is the inner boundary, and we start past it. MAX is the only button with dividers on BOTH sides — handled by splitting top half / bottom half between the two directions, so each half-row scan still only crosses one direction.
+        let div1_col = button_area_x + ctl;
+        let div2_col = button_area_x + 2 * ctl;
         let bound_x_min = strip_x;
         let bound_x_max = strip_x + strip_w;
         let min_id = self.min_btn.id();
         let max_id = self.max_btn.id();
         let close_id = self.close_btn.id();
 
-        // MIN: anchor just left of div1, scan LEFT toward strip edge / BL curve.
+        // MIN: anchor just left of div1, scan LEFT toward strip edge.
         chrome::paint_button_hit_row_scan(
             chrome_buf,
             clip_mask,
@@ -542,7 +518,7 @@ impl DefaultChrome {
             false,
             min_id,
             0,
-            button_size,
+            ctl,
             bound_x_min,
             bound_x_max,
         );
@@ -557,7 +533,7 @@ impl DefaultChrome {
             true,
             close_id,
             0,
-            button_size,
+            ctl,
             bound_x_min,
             bound_x_max,
         );
@@ -572,7 +548,7 @@ impl DefaultChrome {
             true,
             max_id,
             0,
-            button_size / 2,
+            ctl / 2,
             bound_x_min,
             bound_x_max,
         );
@@ -586,8 +562,8 @@ impl DefaultChrome {
             div2_col - 1,
             false,
             max_id,
-            button_size / 2,
-            button_size,
+            ctl / 2,
+            ctl,
             bound_x_min,
             bound_x_max,
         );
@@ -630,9 +606,9 @@ impl DefaultChrome {
             &mut self.hit_test_map,
             vp_w,
             vp_h,
-            button_size,
-            start,
-            &crossings,
+            ctl,
+            ctl,
+            &[],
         );
 
         // Status bar — bottom band, half the height of the top strip. Painted last (after every top-side chrome element) but the regions never overlap, so order is just for readability. `band_h = 0` ⇒ no-op rasterizer when `status_text` is `None` or empty. Hairline uses `edge_light` (same colour as the top strip's dividers); bg matches the top strip's `WINDOW_CONTROLS_BG` so both bands read as the same material. Title-text colour reuses the same focus-driven `title_colour` so the status text dims when the window is unfocused.

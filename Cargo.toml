@@ -24,6 +24,8 @@ crate-type = ["rlib"]
 # `text` IS in default — anything visual needs `TextRenderer`. cosmic-text + swash do compile on Android; if APK size grows uncomfortably the text path can move to a feature gate later (see `host-android` plan).
 default = ["std", "text", "simd", "rayon"]
 std = []
+# amber — the development-build theme: photon's debug orange (#FFA000) swapped into the theme CONSTANTS (bg noise tint, window hairlines, title text). Zero extra drawing steps, pure colour changes; photon's `development` feature enables it so a dev build is never mistaken for release.
+amber = []
 # host-winit transitively requires text — desktop chrome wants real glyphs out of the box.
 # macOS uses wgpu/Metal for PostMultiplied alpha (transparent squircle corners);
 # Linux/Windows/Redox use softbuffer (CPU blit, no GPU dependency).
@@ -57,7 +59,7 @@ rayon = ["std", "dep:rayon"]
 spirix = { version = "0.1.1", path = "../spirix", default-features = false, features = ["alloc"] }
 
 # vsf decodes the canonical image format used by `host::icon` (orb / app-icon decode). Default features (std + registry) match fluor's host environment. Optional behind `icon` — headless consumers (toka's wasm renderer) don't decode app icons, and rav1d can't build for wasm32.
-vsf = { path = "../vsf", optional = true }
+vsf = { version = "0.9.2", path = "../vsf", optional = true }
 
 # rav1d decodes AV1 OBU bitstreams for icons over `vsfimg`'s UNCOMPRESSED_MAX_DIM. `bitdepth_8` keeps the build slim — fluor's icon path is u8 RGB only. Optional behind `icon` (see vsf note).
 rav1d = { version = "1.1", default-features = false, features = ["bitdepth_8"], optional = true }
