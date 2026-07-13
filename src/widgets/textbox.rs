@@ -694,9 +694,9 @@ impl Textbox {
         }
     }
 
-    /// Pixel X of the cursor bar.
+    /// Pixel X of the cursor bar. Clamped: `chars`/`widths`/`cursor` are pub, so a caller mutating text directly (instead of thru `clear()`/`set_text`) can leave `cursor` past `widths` — a paint must degrade to end-of-text, never slice out of range (with panic=abort that was a whole-app crash).
     fn cursor_pixel_x(&self) -> Coord {
-        self.text_start_x() + self.widths[..self.cursor].iter().sum::<Coord>()
+        self.text_start_x() + self.widths[..self.cursor.min(self.widths.len())].iter().sum::<Coord>()
     }
 
     /// Bounding rect (viewport coords) of the cursor's wave smear including the 7-pixel decay on each side. Used to size a sub-viewport `cursor_group` so blink ticks touch ~16 × font_size pixels instead of the entire viewport.
