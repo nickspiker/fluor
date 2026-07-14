@@ -181,7 +181,8 @@ impl<A: FluorApp> AndroidShell<A> {
             // Touch-drag → scroll: a MOVE while the finger is down emits a synthetic MouseWheel so the app's wheel handling scrolls (contacts / conversation / settings). Same sign convention as a trackpad flick — drag up (y decreases) yields a negative pixel delta, which the app's wheel arm turns into "reveal lower". Dispatched AFTER the CursorMoved so the arbiter's drag-off (tap cancel) is already processed. The DOWN's own CursorMoved arrives before `touch_down` is armed, so it never scrolls.
             if let FEvent::CursorMoved { y: cy, .. } = ev {
                 if self.touch_down {
-                    let dy = *cy - self.touch_last_y;
+                    // Natural touch: dragging the finger UP moves the content up (reveals what's below). The finger delta is NEGATED into the wheel delta so it matches the consumer's wheel-scroll sign convention — without the flip, a touch drag scrolled the opposite way from a mouse wheel (the "backwards" report).
+                    let dy = self.touch_last_y - *cy;
                     self.touch_last_y = *cy;
                     if dy != 0.0 {
                         let _ = self.dispatch(&FEvent::MouseWheel {
