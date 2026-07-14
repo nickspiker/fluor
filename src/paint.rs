@@ -758,11 +758,32 @@ pub fn background_noise(
     clip: Option<Clip>,
     base: Option<u32>,
 ) {
+    background_noise_split(canvas, shimmer, fullscreen, scroll_offset, None, None, clip, base)
+}
+
+/// [`background_noise`] with an explicit texture ORIGIN and independent per-half scroll.
+/// The noise mirrors left/right around `split_x` (the "texture origin"); `None` = the buffer centre `width/2` (what plain [`background_noise`] uses).
+/// `left_scroll = None` scrolls both halves together by `scroll_offset` (the chat / single-pane case); `Some(v)` scrolls the LEFT half by `v` while the right half keeps `scroll_offset` — so a split pane (e.g. the settings rail vs content) scrolls each half with its own pane, with the origin sitting on the divider between them.
+#[allow(clippy::too_many_arguments)]
+pub fn background_noise_split(
+    canvas: &mut Canvas,
+    shimmer: usize,
+    fullscreen: bool,
+    scroll_offset: isize,
+    split_x: Option<usize>,
+    left_scroll: Option<isize>,
+    clip: Option<Clip>,
+    base: Option<u32>,
+) {
     let buf_w = canvas.width;
     let buf_h = canvas.height;
     if buf_w < 2 || buf_h < 2 {
         return;
     }
+    // Texture origin: the left/right mirror axis + each half's inner edge. Clamped in-bounds. Default = buffer centre.
+    let split_x = split_x.unwrap_or(buf_w / 2).min(buf_w);
+    // Right half keeps `scroll_offset`; the left half tracks its own pane when given, else moves with the right (a single unified scroll → the two halves stay mirror-locked).
+    let left_scroll = left_scroll.unwrap_or(scroll_offset);
     let clip = Clip::resolve(clip, buf_w, buf_h);
     // Clip first, then `fullscreen` further insets by 1 px for the edge hairline.
     let (row_start, row_end, x_start, x_end) = if fullscreen {
@@ -782,14 +803,16 @@ pub fn background_noise(
     let pixels: &mut [u32] = canvas.pixels;
     let resolved_base = base.unwrap_or(crate::theme::BG_BASE);
     crate::par::par_rows(pixels, buf_w, row_start, row_end, |row_idx, row_pixels| {
-        let logical_row = row_idx as isize - scroll_offset;
         background_row(
             row_pixels,
             buf_w,
-            logical_row,
+            row_idx as isize,
             buf_h,
             x_start,
             x_end,
+            split_x,
+            left_scroll,
+            scroll_offset,
             shimmer,
             resolved_base,
         );
@@ -797,13 +820,17 @@ pub fn background_noise(
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn background_row(
     row_pixels: &mut [u32],
-    width: usize,
-    logical_row: isize,
+    _width: usize,
+    row: isize,
     height: usize,
     x_start: usize,
     x_end: usize,
+    split_x: usize,
+    left_scroll: isize,
+    right_scroll: isize,
     shimmer: usize,
     base: u32,
 ) {
@@ -818,15 +845,20 @@ fn background_row(
     let ones = 0x0001_0101u32;
     // RNG chain is explicitly u64 (not usize) so the noise pattern is bit-identical on 32-bit
     // targets (wasm32 browser renderer) and 64-bit desktops — same seed, same wrap points.
-    let seed: u64 = 0xDEAD_BEEF_0123_4567u64
-        ^ (logical_row as i64 as u64)
-            .wrapping_sub(height as u64 / 2)
-            .wrapping_mul(0x9E37_79B9_4517_B397);
+    // Each half's seed is keyed by its OWN scrolled row, so equal scroll → identical seed → the two halves stay mirror-locked (the chat case); different scroll → each half's texture tracks its pane (the split settings case).
+    let seed_for = |logical_row: isize| -> u64 {
+        0xDEAD_BEEF_0123_4567u64
+            ^ (logical_row as i64 as u64)
+                .wrapping_sub(height as u64 / 2)
+                .wrapping_mul(0x9E37_79B9_4517_B397)
+    };
+    // The mirror axis: both halves grow outward from here. Clamped into the paint range.
+    let origin = split_x.clamp(x_start, x_end);
 
-    // Right half — left to right. Noise composes UNDER existing content (topmost-first): an empty pixel gets the noise; a non-empty pixel (e.g. a topmost rect already painted) has the noise blended behind it.
-    let mut rng = seed;
+    // Right half — origin to right edge, ADD step, scrolled by `right_scroll`. Noise composes UNDER existing content (topmost-first): an empty pixel gets the noise; a non-empty pixel (e.g. a topmost rect already painted) has the noise blended behind it.
+    let mut rng = seed_for(row - right_scroll);
     let mut colour = rng.wrapping_add(shimmer as u64) as u32 & BG_MASK;
-    let mut x = width / 2;
+    let mut x = origin;
     while x < x_end {
         let chunk_len = (x_end - x).min(CHUNK);
         for i in 0..chunk_len {
@@ -846,10 +878,10 @@ fn background_row(
         x += chunk_len;
     }
 
-    // Left half — right to left, same RNG seed (mirror), SUB instead of ADD on the rng step. Within each chunk the RNG iterates rightmost-pixel-first; we store into `noise_buf` in left-to-right order (`i = chunk_len-1` down to 0) so the chunk dispatch can scan the buffer sequentially.
-    rng = seed;
+    // Left half — origin leftward, SUB instead of ADD on the rng step, scrolled by `left_scroll` (its own seed). Within each chunk the RNG iterates rightmost-pixel-first; we store into `noise_buf` in left-to-right order (`i = chunk_len-1` down to 0) so the chunk dispatch can scan the buffer sequentially.
+    rng = seed_for(row - left_scroll);
     let mut colour = rng.wrapping_add(shimmer as u64) as u32 & BG_MASK;
-    let mut x_hi = width / 2;
+    let mut x_hi = origin;
     while x_hi > x_start {
         let chunk_lo = x_hi.saturating_sub(CHUNK).max(x_start);
         let chunk_len = x_hi - chunk_lo;
