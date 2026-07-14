@@ -58,7 +58,11 @@ pub trait Widget {
     }
 }
 
-/// Click handler. Coordinates are in viewport-local pixels (top-left origin). `mods` is the live modifier state at press time; widgets that want shift-click / ctrl-click semantics read it here.
+/// Click handler. Coordinates are in viewport-local pixels (top-left origin). `mods` is the live modifier state at the moment the handler fires; widgets that want shift-click / ctrl-click semantics read it here.
+///
+/// `activate_on_release` selects the widget's pointer gesture under fluor's press-hold-release model (see [`crate::host::pointer`]):
+/// - `true` (default) — the widget ARMS on press and FIRES on release, and a drag off its footprint before release cancels. This is the touch/click convention for anything that performs an action (buttons, menu rows, chrome controls). The host calls [`Click::on_click`] on the validated release only.
+/// - `false` — the widget ENGAGES on press and *uses* the ensuing drag itself (a textbox placing then extending a selection, a slider tracking its thumb, a dropdown opening its popup). The host calls [`Click::on_click`] on press; there is no drag-off cancel because the drag is the widget's own gesture.
 pub trait Click {
     fn on_click(
         &mut self,
@@ -66,6 +70,14 @@ pub trait Click {
         y: Coord,
         mods: ModifiersState,
     ) -> crate::host::EventResponse;
+
+    /// See the trait docs. Default `true` = arm-on-press, fire-on-release, cancel-on-drag-off (buttons, rows, chrome). Override to `false` for widgets whose press-drag is their own gesture (textbox, slider, dropdown-open).
+    fn activate_on_release(&self) -> bool {
+        true
+    }
+
+    /// The pointer is currently DOWN on this widget and a release here will fire it (or it just dragged off / released). Widgets that show a "held" visual (a button lighting up while pressed) store this and fold it into their paint / `tint_delta`. Default no-op — most widgets don't need it. Driven by [`apply_pressed`] from the host's [`crate::host::pointer::PointerArbiter`] state.
+    fn set_pressed(&mut self, _pressed: bool) {}
 }
 
 /// Keyboard handler. Receives the fluor-native [`KeyEvent`] (with both the logical key and any text-mode text payload), the live modifier state, and a mutable [`TextRenderer`] for widgets that need to recompute glyph widths after an edit (textbox inserts a character → widths must be re-measured before the next paint can position the cursor). Widgets that don't care about text (chrome buttons) ignore the `text` parameter; widgets that don't care about a key return [`crate::host::EventResponse::Pass`] so the host knows the event went unconsumed.
@@ -202,6 +214,48 @@ pub fn dispatch_click(
     response
 }
 
+/// Press-phase dispatch under the press-hold-release model: deliver to `target_id` ONLY if it engages-on-press ([`Click::activate_on_release`] == `false` — textbox, slider, dropdown-open). Arm-on-release widgets (buttons, rows) are skipped here and handled by [`dispatch_release`] on the validated release instead. Returns [`crate::host::EventResponse::Pass`] when the target is absent, has no [`Click`], or is a release-activated widget.
+pub fn dispatch_press(
+    root: &mut dyn Container,
+    target_id: HitId,
+    x: Coord,
+    y: Coord,
+    mods: ModifiersState,
+) -> crate::host::EventResponse {
+    let mut response = crate::host::EventResponse::Pass;
+    root.visit(&mut |w| {
+        if w.id() == target_id {
+            if let Some(c) = w.click() {
+                if !c.activate_on_release() {
+                    response = c.on_click(x, y, mods);
+                }
+            }
+        }
+    });
+    response
+}
+
+/// Release-phase dispatch under the press-hold-release model: deliver to `target_id` ONLY if it activates-on-release ([`Click::activate_on_release`] == `true` — the default: buttons, rows, chrome). Engage-on-press widgets already fired via [`dispatch_press`] and are skipped. The host calls this from the arbiter's validated release (pointer up over the same widget it went down on), so a drag-off never reaches here. Returns [`crate::host::EventResponse::Pass`] when the target is absent, has no [`Click`], or is a press-engaged widget.
+pub fn dispatch_release(
+    root: &mut dyn Container,
+    target_id: HitId,
+    x: Coord,
+    y: Coord,
+    mods: ModifiersState,
+) -> crate::host::EventResponse {
+    let mut response = crate::host::EventResponse::Pass;
+    root.visit(&mut |w| {
+        if w.id() == target_id {
+            if let Some(c) = w.click() {
+                if c.activate_on_release() {
+                    response = c.on_click(x, y, mods);
+                }
+            }
+        }
+    });
+    response
+}
+
 /// Deliver a key event to the widget with `target_id`, if any. Mirror of [`dispatch_click`] for keyboard input — caller picks the target (typically the currently-focused widget tracked by the app) and this routes the fluor-native [`KeyEvent`] + [`ModifiersState`] + [`TextRenderer`] handle thru to the widget's [`Key::on_key`] impl. Returns [`crate::host::EventResponse::Pass`] if `target_id` doesn't match any widget or the matching widget doesn't impl [`Key`].
 pub fn dispatch_key(
     root: &mut dyn Container,
@@ -244,6 +298,16 @@ pub fn apply_focus_change(root: &mut dyn Container, old: Option<HitId>, new: Opt
             }
         });
     }
+}
+
+/// Sync every clickable widget's "held" visual to the currently-pressed hit id (from the host's [`crate::host::pointer::PointerArbiter`], surfaced as [`crate::host::app::Context`]`.pressed_hit`). One walk: each widget with a [`Click`] capability gets `set_pressed(w.id() == held)`. Widgets store-and-compare so a no-change call is free; the one whose id matches lights up, everyone else is cleared. Call once per frame from the app's `render`, mirroring how `set_hovered`/`set_focused` are app-driven. `held == HIT_NONE` (idle or dragged-off) clears all.
+pub fn apply_pressed(root: &mut dyn Container, held: HitId) {
+    root.visit(&mut |w| {
+        let id = w.id();
+        if let Some(c) = w.click() {
+            c.set_pressed(id == held && held != HIT_NONE);
+        }
+    });
 }
 
 #[cfg(test)]

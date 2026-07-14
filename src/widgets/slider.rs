@@ -300,6 +300,10 @@ mod widget_impls {
             self.set_value_from_x(x);
             crate::host::EventResponse::Handled
         }
+        // Engage on press: the press sets the value at the thumb and the ensuing drag tracks it — the slider owns its press-drag, so no drag-off-cancel.
+        fn activate_on_release(&self) -> bool {
+            false
+        }
     }
 
     impl Key for Slider {

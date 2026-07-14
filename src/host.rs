@@ -35,6 +35,10 @@ pub mod os_input;
 #[cfg(feature = "text")]
 pub mod widget;
 
+// Press-hold-release + drag-off-cancel arbiter. Shared by the winit and android hosts so activation semantics are identical on every OS. Pure logic (no rendering / platform deps), so it compiles anywhere the host code does.
+#[cfg(feature = "text")]
+pub mod pointer;
+
 /// macOS renderer — wgpu/Metal with PostMultiplied alpha for transparent corners.
 #[cfg(all(feature = "host-winit", target_os = "macos"))]
 pub mod renderer_wgpu;

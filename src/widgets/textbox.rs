@@ -1206,6 +1206,7 @@ mod widget_impls {
             self.selection_anchor = None;
             crate::host::EventResponse::Handled
         }
+        // Textbox activates on release like every other item (default `activate_on_release() == true`): the press arms + shows the held colour, a release over the field places the cursor + focuses it, and a drag-off cancels. (Press-drag text selection is therefore not a textbox gesture — a focused field selects via keyboard / handles, not click-drag.)
     }
 
     impl Focus for Textbox {

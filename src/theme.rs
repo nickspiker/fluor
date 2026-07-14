@@ -143,6 +143,8 @@ pub const TEXTBOX_SELECTION_BG: u32 = dark(fmt(0x00_3A_5A_8C));
 pub const BUTTON_FILL: u32 = dark(fmt(0x00_1A_22_4E));
 pub const BUTTON_HOVER: u32 = dark(fmt(0x00_28_34_71));
 pub const BUTTON_ACTIVE: u32 = dark(fmt(0x00_0C_10_32));
+// Held: a finger/button is DOWN on this control and a release here will fire it (press-hold-release — see host::pointer). A brighter, more-saturated azure than HOVER so touch-down visibly LIGHTS UP the control (distinct from ACTIVE's darker "pressed-in" focus reading); slides back to FILL if the pointer drags off before release. Also the fill used for photon's non-widget stamped elements (pills, contact/nav rows, orb) while held.
+pub const BUTTON_HELD: u32 = dark(fmt(0x00_3C_4C_A8));
 
 // Cursor (blinkey).
 pub const CURSOR_BRIGHTNESS: f32 = 100.0;
