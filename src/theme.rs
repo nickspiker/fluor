@@ -100,7 +100,7 @@ pub const WINDOW_CONTROLS_BG: u32 = dark(fmt(0x00_1E_1E_1E));
 // `dark(fmt(rgb))` stores visible RGB → darkness; the migration previously carried the legacy DARKNESS-encoded values (0x21FDF9 etc.) and wrapped them in dark() again, double-inverting to cyan/magenta/yellow.
 // These are the plain visible primaries so ChromeButton::tint_delta's `wrap_sub_rgb(target, WINDOW_CONTROLS_BG)` lands the control at the right hue.
 pub const CLOSE_HOVER: u32 = dark(fmt(0x00_DE_02_06));
-pub const MAXIMIZE_HOVER: u32 = dark(fmt(0x00_05_EF_05));
+pub const MAXIMIZE_HOVER: u32 = dark(fmt(0x00_03_78_03));
 pub const MINIMIZE_HOVER: u32 = dark(fmt(0x00_08_05_DA));
 
 // Generic UI text. `TEXT_COLOUR` is the focused title + primary body text (brighter than the previous 0xD0 for a stronger active-window contrast). `TEXT_COLOUR_UNFOCUSED` dims for inactive-window titles (between `LABEL_COLOUR` and the focused value — readable but obviously quiet). `LABEL_COLOUR` stays as the secondary/labels grey used everywhere else.
