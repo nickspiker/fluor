@@ -31,6 +31,8 @@ pub struct Button {
     focused: bool,
     /// `true` while the cursor is over the button. Drives the hover fill colour via the host's overlay-delta pipe (Button doesn't bake hover into its own cache — same pattern as Textbox).
     hovered: bool,
+    /// `true` while a pointer is DOWN on this button and a release here would fire it (press-hold-release — see [`crate::host::pointer`]). Set by [`crate::host::widget::apply_pressed`] from the host arbiter; drives the [`theme::BUTTON_HELD`] "held" fill via the overlay-delta pipe, ranked above hover and focus. Clears on release or drag-off.
+    pressed: bool,
     /// `true` (default) while the button accepts input. When `false` the [`crate::host::widget::Widget`] capability accessors return `None`, so dispatch + tab-cycle skip it — the "frozen sibling" of a disabled textbox (an Attest / plus button that goes inert while its query is in flight). Visual unchanged; inert, not greyed. Toggle via [`Self::set_enabled`].
     enabled: bool,
 
@@ -81,6 +83,7 @@ impl Button {
             font_size,
             focused: false,
             hovered: false,
+            pressed: false,
             enabled: true,
             hover_fill: None,
             click_counter: 0,
@@ -133,6 +136,16 @@ impl Button {
         }
         if hovered != self.hovered {
             self.hovered = hovered;
+        }
+    }
+
+    /// Set the "held" (pointer-down) state. No-op while disabled (a disabled button still stamps its hit silhouette, but must never light up). Idempotent; the painter's `tint_delta` reads `pressed` to pick [`theme::BUTTON_HELD`].
+    pub fn set_pressed(&mut self, pressed: bool) {
+        if !self.enabled {
+            return;
+        }
+        if pressed != self.pressed {
+            self.pressed = pressed;
         }
     }
 
@@ -525,6 +538,9 @@ mod widget_impls {
             self.fire();
             crate::host::EventResponse::Handled
         }
+        fn set_pressed(&mut self, pressed: bool) {
+            Button::set_pressed(self, pressed);
+        }
     }
 
     impl Key for Button {
@@ -566,7 +582,13 @@ mod widget_impls {
             Button::set_hovered(self, hovered);
         }
         fn tint_delta(&self) -> u32 {
-            // Three states from the BUTTON_* palette: idle (no tint, lands on BUTTON_FILL — slate-grey-blue), hovered → BUTTON_HOVER (slightly more saturated blue, signals "clickable"), focused → BUTTON_ACTIVE (darkens back toward TEXTBOX_FILL for the conventional "pressed in" inverse-bevel reading). Focus dominates hover so a focused-and-hovered button stays at ACTIVE rather than flickering to HOVER while the cursor passes over.
+            // Four states from the BUTTON_* palette, held ranked highest: HELD (pointer down on it, brighter azure — "release here to fire") dominates so a pressed button reads as armed regardless of focus/hover; then focused → BUTTON_ACTIVE (darker "pressed-in"); then hovered → BUTTON_HOVER; else idle (no tint, lands on BUTTON_FILL).
+            if self.pressed {
+                return crate::paint::wrap_sub_rgb(
+                    crate::theme::BUTTON_HELD,
+                    crate::theme::BUTTON_FILL,
+                );
+            }
             if self.is_focused() {
                 crate::paint::wrap_sub_rgb(
                     crate::theme::BUTTON_ACTIVE,

@@ -26,6 +26,7 @@ use crate::geom::Viewport;
 use crate::host::app::{Context, FluorApp};
 use crate::host::wake::NoopWakeSender;
 use crate::host::EventResponse;
+use crate::paint::{HitId, HIT_NONE};
 use crate::text::TextRenderer;
 use alloc::sync::Arc;
 
@@ -45,6 +46,12 @@ pub struct AndroidShell<A: FluorApp> {
     clip_mask: Vec<u8>,
     /// Damage accumulator for the current frame.
     pending_damage: Damage,
+    /// Press-hold-release + drag-off-cancel arbiter (shared with the desktop host). Fed the hit id under the finger at each touch DOWN / MOVE / UP; gates action dispatch to a validated release and surfaces the held id for the "held" colour. See [`crate::host::pointer`].
+    pointer: crate::host::pointer::PointerArbiter,
+    /// A finger is currently down (between ACTION_DOWN and ACTION_UP/CANCEL). Gates touch-drag → scroll: a MOVE while down emits a synthetic `MouseWheel` so the app's existing wheel handling scrolls (contacts, conversation, settings) — desktop has a wheel, touch didn't.
+    touch_down: bool,
+    /// The finger's y at the last touch event, for the per-move scroll delta.
+    touch_last_y: Coord,
     /// Last-known good last_tick used by `tick`-style apps.
     #[allow(dead_code)]
     last_tick: Option<Instant>,
@@ -71,6 +78,9 @@ impl<A: FluorApp> AndroidShell<A> {
             scratch: alloc::vec![0u32; (width as usize) * (height as usize)],
             clip_mask: alloc::vec![255u8; (width as usize) * (height as usize)],
             pending_damage: Damage::new(),
+            pointer: crate::host::pointer::PointerArbiter::new(),
+            touch_down: false,
+            touch_last_y: 0.0,
             last_tick: None,
         };
         shell.with_context(|app, ctx| app.init(ctx));
@@ -135,16 +145,77 @@ impl<A: FluorApp> AndroidShell<A> {
     ///
     /// Return value is the Android `nativeOnTouch` ABI: `1` = host should show the soft keyboard (focus moved into a text input), `-1` = hide, `0` = no change. Wraps `FluorApp::wants_keyboard`; the JNI shim passes it straight back to Java.
     pub fn on_touch(&mut self, action: i32, x: f32, y: f32) -> i32 {
+        use crate::event::{ElementState, MouseButton};
         let (count, evs) = events::translate_touch(action, x as Coord, y as Coord);
         for ev in &evs[..count] {
             if let FEvent::CursorMoved { x: cx, y: cy } = ev {
                 self.cursor_x = *cx;
                 self.cursor_y = *cy;
             }
+            // Feed the press-hold-release arbiter (identical semantics to the desktop host). Down arms the element under the finger; a drag off toggles the held colour; a release over the same element is the validated activation (`on_activate`); ACTION_CANCEL (→ CursorLeft) disarms. Arbiter runs BEFORE `dispatch(ev)` so a release's activation is delivered ahead of the raw Released, matching desktop ordering.
+            match ev {
+                FEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                    self.pointer.on_down(self.hit_under_cursor());
+                    // Arm touch-drag scroll from the press position (the DOWN's CursorMoved already updated cursor_y just above).
+                    self.touch_down = true;
+                    self.touch_last_y = self.cursor_y;
+                }
+                FEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                    if let Some(id) = self.pointer.on_up(self.hit_under_cursor()) {
+                        self.dispatch_activate(id);
+                    }
+                    self.touch_down = false;
+                }
+                FEvent::CursorMoved { .. } => {
+                    if self.pointer.on_move(self.hit_under_cursor()) {
+                        self.window.mark_dirty();
+                    }
+                }
+                FEvent::CursorLeft => {
+                    self.pointer.on_cancel();
+                    self.touch_down = false;
+                }
+                _ => {}
+            }
             let _ = self.dispatch(ev);
+            // Touch-drag → scroll: a MOVE while the finger is down emits a synthetic MouseWheel so the app's wheel handling scrolls (contacts / conversation / settings). Same sign convention as a trackpad flick — drag up (y decreases) yields a negative pixel delta, which the app's wheel arm turns into "reveal lower". Dispatched AFTER the CursorMoved so the arbiter's drag-off (tap cancel) is already processed. The DOWN's own CursorMoved arrives before `touch_down` is armed, so it never scrolls.
+            if let FEvent::CursorMoved { y: cy, .. } = ev {
+                if self.touch_down {
+                    let dy = *cy - self.touch_last_y;
+                    self.touch_last_y = *cy;
+                    if dy != 0.0 {
+                        let _ = self.dispatch(&FEvent::MouseWheel {
+                            delta: crate::event::MouseScrollDelta::Pixels(0.0, dy),
+                        });
+                    }
+                }
+            }
         }
         self.window.mark_dirty();
         self.poll_keyboard()
+    }
+
+    /// Hit id under the finger right now, from the app's [`FluorApp::hit_test_map`] at the surface-local cursor (Android's surface IS the window, so cursor coords need no origin offset). `HIT_NONE` when there is no map or the point is out of bounds. Feeds the [`crate::host::pointer::PointerArbiter`].
+    fn hit_under_cursor(&self) -> HitId {
+        let x = self.cursor_x as i32;
+        let y = self.cursor_y as i32;
+        if x < 0 || y < 0 {
+            return HIT_NONE;
+        }
+        match self.app.hit_test_map() {
+            Some((map, w, h)) if (x as usize) < w && (y as usize) < h => {
+                map[(y as usize) * w + (x as usize)]
+            }
+            _ => HIT_NONE,
+        }
+    }
+
+    /// Deliver a validated activation ([`FluorApp::on_activate`]) — finger up over the same element it went down on. Android mirror of the desktop `dispatch_activate`.
+    fn dispatch_activate(&mut self, hit_id: HitId) {
+        let (x, y, mods) = (self.cursor_x, self.cursor_y, self.modifiers);
+        self.with_context(|app, ctx| {
+            let _ = app.on_activate(hit_id, x, y, mods, ctx);
+        });
     }
 
     /// Poll `FluorApp::wants_keyboard` and map its one-shot Option to the Android IME-action ABI (`1` = show, `-1` = hide, `0` = no change). Called from both `on_touch` (focus changes driven by user taps) and the JNI shim's per-frame `nativePollKeyboard` hook so app-driven focus changes (e.g. `change_focus(None)` from `submit_handle` while the user is just watching the "Attesting…" spinner) propagate to the Activity without waiting for the next touch.
@@ -214,6 +285,7 @@ impl<A: FluorApp> AndroidShell<A> {
             .as_mut()
             .expect("TextRenderer must be initialized in AndroidShell::new");
         let mut ctx = Context {
+            pressed_hit: self.pointer.held_id(),
             viewport: self.viewport,
             text,
             clip_mask: &mut self.clip_mask,
@@ -244,6 +316,7 @@ impl<A: FluorApp> AndroidShell<A> {
             .as_mut()
             .expect("TextRenderer must be initialized in AndroidShell::new");
         let mut ctx = Context {
+            pressed_hit: self.pointer.held_id(),
             viewport: self.viewport,
             text,
             clip_mask: &mut self.clip_mask,

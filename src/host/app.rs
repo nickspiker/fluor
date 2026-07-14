@@ -240,6 +240,8 @@ pub struct Context<'a> {
     pub is_maximized: bool,
     /// The visible window's top-left corner in screen coordinates (the fullscreen-compositor `window_rect` origin). Lets consumers screen-anchor content across origin-moving operations — a left/top edge resize shifts the origin, and content that should stay put on screen (an image canvas, a document) compensates by the origin delta. Bottom/right resizes and pure renders leave it unchanged. Android: always (0, 0) — the surface IS the window.
     pub window_origin: (i32, i32),
+    /// The hit id currently held DOWN under the pointer and eligible to fire on release — the host's [`crate::host::pointer::PointerArbiter`] state, surfaced so the app can paint that element in its "held" colour (see [`crate::theme::BUTTON_HELD`]). `HIT_NONE` when nothing is pressed, or when a press has been dragged off its target. Consult it in `render` for custom hit-stamped elements; widget trees get it applied automatically via [`crate::host::widget::apply_pressed`].
+    pub pressed_hit: crate::paint::HitId,
 }
 
 pub use super::event_response::EventResponse;
@@ -280,6 +282,19 @@ pub trait FluorApp {
 
     /// Window event from the host. Consumer returns an [`EventResponse`] telling the host what to do next. Events are fluor-native [`crate::event::Event`] values — hosts translate platform input at the boundary.
     fn on_event(&mut self, event: &FEvent, ctx: &mut Context) -> EventResponse;
+
+    /// A clickable element was ACTIVATED — the pointer went down on `hit_id` and released over the same `hit_id`, with no drag-off in between (the press-hold-release model, arbitrated by [`crate::host::pointer::PointerArbiter`]). This is where apps fire the *action* for their custom hit-stamped elements, and dispatch release-activated widgets via [`crate::host::widget::dispatch_release`]. Raw press/release still arrive via [`Self::on_event`] for press-time concerns (focus, cursor placement, drag-select, window drag); actions belong here so a mis-touch dragged off before release fires nothing. `(x, y)` is the release position in viewport pixels. Default no-op ([`EventResponse::Pass`]) — apps opt in; those that don't keep whatever they do in `on_event` unchanged.
+    fn on_activate(
+        &mut self,
+        hit_id: crate::paint::HitId,
+        x: Coord,
+        y: Coord,
+        mods: FModifiersState,
+        ctx: &mut Context,
+    ) -> EventResponse {
+        let _ = (hit_id, x, y, mods, ctx);
+        EventResponse::Pass
+    }
 
     /// Damage region this app will repaint this frame. Returns `None` if no widget state changed since the last frame — host can persist scratch as-is and skip render entirely. Returns `Some(rect)` to declare the union of all dirty widget bboxes (each widget's `prev ∪ current` from `widget.damage_rect(...)`); host clears scratch in that rect and threads it thru `ctx.damage_clip` so the consumer's render call clips every flatten / blit to it.
     ///
@@ -443,6 +458,8 @@ struct DesktopShell<A: FluorApp> {
 
     // --- Drag-to-move tracking. In the fullscreen-compositor architecture the OS window is fullscreen and `window.drag_window()` doesn't move anything — we move our internal `window_rect` inside the screen buffer instead. On press we capture the cursor's screen position + window_rect origin; on cursor-move we update window_rect.x/y by the delta. The actual screen-buffer shift happens at vsync (RedrawRequested) via paint::shift_screen_wrap — skipping consumer render + finalize + shadow entirely during the drag. On drag release, a request_redraw kicks off a clean full re-render that overwrites the wrap artefacts.
     is_dragging_move: bool,
+    /// Press-hold-release + drag-off-cancel arbiter (shared with the Android host). Fed the hit id under the cursor at each mouse down / move / up; gates action dispatch to a validated release and surfaces the currently-held id for the "held" colour. See [`crate::host::pointer`].
+    pointer: crate::host::pointer::PointerArbiter,
     /// Click hit a drag-eligible area; the NEXT CursorMoved commits the move-drag (no dead zone — 1:1 tracking from the first pixel of motion). Set on `EventResponse::StartWindowDrag`; cleared on mouse release. A click with zero motion never commits because the commit lives in the CursorMoved arm, so click-without-drag stays free of wrap-shift artefacts.
     move_drag_armed: bool,
     drag_move_anchor_screen: (i32, i32),
@@ -517,6 +534,7 @@ impl<A: FluorApp> DesktopShell<A> {
             drag_start_window_pos: (0, 0),
             drag_start_cursor_screen_pos: (0, 0),
             is_dragging_move: false,
+            pointer: crate::host::pointer::PointerArbiter::new(),
             move_drag_armed: false,
             drag_move_anchor_screen: (0, 0),
             drag_move_rect_start: (0, 0),
@@ -640,6 +658,7 @@ impl<A: FluorApp> DesktopShell<A> {
         };
 
         let mut ctx = Context {
+            pressed_hit: self.pointer.held_id(),
             viewport: self.viewport,
             text,
             clip_mask: &mut self.clip_mask,
@@ -1019,6 +1038,7 @@ impl<A: FluorApp> DesktopShell<A> {
 
             if let Some(text) = self.text.as_mut() {
                 let mut ctx = Context {
+                    pressed_hit: self.pointer.held_id(),
                     viewport: self.viewport,
                     text,
                     clip_mask: &mut self.clip_mask,
@@ -1188,6 +1208,7 @@ impl<A: FluorApp> DesktopShell<A> {
             // Let the consumer reflow — they may relayout panes, recompute glyph metrics, etc.
             if let Some(text) = self.text.as_mut() {
                 let mut ctx = Context {
+                    pressed_hit: self.pointer.held_id(),
                     viewport: self.viewport,
                     text,
                     clip_mask: &mut self.clip_mask,
@@ -1319,6 +1340,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
         {
             let text = self.text.as_mut().expect("text renderer initialized");
             let mut ctx = Context {
+                pressed_hit: self.pointer.held_id(),
                 viewport: self.viewport,
                 text,
                 clip_mask: &mut self.clip_mask,
@@ -1361,6 +1383,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
             (self.window.as_ref().cloned(), self.text.as_mut())
         {
             let mut ctx = Context {
+                pressed_hit: self.pointer.held_id(),
                 viewport: self.viewport,
                 text,
                 clip_mask: &mut self.clip_mask,
@@ -1462,6 +1485,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                             (self.window.as_ref().cloned(), self.text.as_mut())
                         {
                             let mut ctx = Context {
+                                pressed_hit: self.pointer.held_id(),
                                 viewport: self.viewport,
                                 text,
                                 clip_mask: &mut self.clip_mask,
@@ -1530,10 +1554,18 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                     return;
                 }
 
+                // Press-hold-release: while a press is in flight, track whether the pointer is still over the armed target. A drag off (or back on) toggles the held colour — request a redraw so it appears/clears. Runs before the app dispatch so ctx.pressed_hit below reflects this move.
+                if self.pointer.on_move(self.hit_under_cursor()) {
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
+                }
+
                 if let (Some(window), Some(text)) =
                     (self.window.as_ref().cloned(), self.text.as_mut())
                 {
                     let mut ctx = Context {
+                        pressed_hit: self.pointer.held_id(),
                         viewport: self.viewport,
                         text,
                         clip_mask: &mut self.clip_mask,
@@ -1631,10 +1663,24 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 }
             }
             WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                // Press-hold-release: arm the element under the pointer. The action does NOT fire here — it waits for a release over the same element (drag-off cancels). The raw press is still forwarded so the app can do its press-time work (focus, textbox cursor, drag-select arm, window-drag / resize). Redraw so the "held" colour appears.
+                self.pointer.on_down(self.hit_under_cursor());
+                self.dispatch_event(event);
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::MouseInput {
                 state: ElementState::Released,
                 button: MouseButton::Left,
                 ..
             } => {
+                // Press-hold-release: a release over the SAME element the press armed is a validated activation; a release after a drag-off fires nothing. Emit the activation BEFORE forwarding the raw release so the app's release-time bookkeeping sees a consistent world.
+                let activate = self.pointer.on_up(self.hit_under_cursor());
                 // End of resize drag — release ownership of the loop. The buffer is already in the final state from the last drag tick; no extra repaint needed.
                 if self.is_dragging_resize {
                     self.is_dragging_resize = false;
@@ -1652,7 +1698,14 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                         window.request_redraw();
                     }
                 }
+                if let Some(id) = activate {
+                    self.dispatch_activate(id);
+                }
                 self.dispatch_event(event);
+                // Clear the "held" colour now that the press ended (whether it fired or cancelled).
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
             }
             WindowEvent::RedrawRequested => {
                 // macOS click-thru: if the global monitor detected the cursor re-entering an opaque region while hittest was off, flip it back on. While hittest is off we keep requesting redraws to poll the monitor flag at vsync rate.
@@ -1696,6 +1749,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
             return;
         };
         let mut ctx = Context {
+            pressed_hit: self.pointer.held_id(),
             viewport: self.viewport,
             text,
             clip_mask: &mut self.clip_mask,
@@ -1729,6 +1783,7 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
         self.pending_full_repaint = true;
         if let (Some(window), Some(text)) = (self.window.as_ref().cloned(), self.text.as_mut()) {
             let mut ctx = Context {
+                pressed_hit: self.pointer.held_id(),
                 viewport: self.viewport,
                 text,
                 clip_mask: &mut self.clip_mask,
@@ -1754,9 +1809,56 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
     }
 
     /// Helper: dispatch a generic event to `app.on_event`, applying any returned [`EventResponse`].
+    /// Hit id under the cursor right now, read from the app's [`FluorApp::hit_test_map`] at the window-local cursor position — the same map + indexing the overlay pass uses. `HIT_NONE` when the app exposes no map, or the cursor is out of bounds. Feeds the [`crate::host::pointer::PointerArbiter`] on every down / move / up.
+    fn hit_under_cursor(&self) -> crate::paint::HitId {
+        let x = (self.cursor_x - self.window_rect.x as Coord) as i32;
+        let y = (self.cursor_y - self.window_rect.y as Coord) as i32;
+        if x < 0 || y < 0 {
+            return crate::paint::HIT_NONE;
+        }
+        match self.app.hit_test_map() {
+            Some((map, w, h)) if (x as usize) < w && (y as usize) < h => {
+                map[(y as usize) * w + (x as usize)]
+            }
+            _ => crate::paint::HIT_NONE,
+        }
+    }
+
+    /// Deliver a validated activation ([`FluorApp::on_activate`]) — pointer up over the same element it went down on, no drag-off. Mirrors [`Self::dispatch_event`]'s Context build; called from the mouse-release arm before the raw Released is forwarded.
+    fn dispatch_activate(&mut self, hit_id: crate::paint::HitId) {
+        if let (Some(window), Some(text)) = (self.window.as_ref().cloned(), self.text.as_mut()) {
+            let x = self.cursor_x - self.window_rect.x as Coord;
+            let y = self.cursor_y - self.window_rect.y as Coord;
+            let mods = winit_compat::from_winit_mods(self.modifiers);
+            let mut ctx = Context {
+                pressed_hit: crate::paint::HIT_NONE,
+                viewport: self.viewport,
+                text,
+                clip_mask: &mut self.clip_mask,
+                damage: &mut self.pending_damage,
+                window: &*window,
+                modifiers: mods,
+                cursor_x: x,
+                cursor_y: y,
+                is_maximized: self.saved_rect_for_maximize.is_some(),
+                window_origin: (self.window_rect.x, self.window_rect.y),
+                damage_clip: crate::canvas::PixelRect::new(
+                    0,
+                    0,
+                    self.viewport.width_px as usize,
+                    self.viewport.height_px as usize,
+                ),
+            };
+            let response = self.app.on_activate(hit_id, x, y, mods, &mut ctx);
+            drop(ctx);
+            self.apply_response(response);
+        }
+    }
+
     fn dispatch_event(&mut self, event: WindowEvent) {
         if let (Some(window), Some(text)) = (self.window.as_ref().cloned(), self.text.as_mut()) {
             let mut ctx = Context {
+                pressed_hit: self.pointer.held_id(),
                 viewport: self.viewport,
                 text,
                 clip_mask: &mut self.clip_mask,

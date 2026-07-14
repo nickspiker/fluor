@@ -772,6 +772,10 @@ mod widget_impls {
             self.toggle_open();
             crate::host::EventResponse::Handled
         }
+        // Engage on press: the header opens its popup on press-down so the user can press-drag into the list and release on a row (native combobox gesture). The rows ([`DropdownRow`]) keep the default arm-on-release so the selection itself fires on release / cancels on drag-off.
+        fn activate_on_release(&self) -> bool {
+            false
+        }
     }
 
     impl Key for Dropdown {
