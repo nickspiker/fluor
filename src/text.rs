@@ -675,7 +675,7 @@ impl TextRenderer {
         buffer: &mut Buffer,
         pixels: &mut [u8],
         width: u32,
-        _height: u32,
+        height: u32,
         anchor_x: f32,
         anchor_y: f32,
         text_width: f32,
@@ -733,6 +733,14 @@ impl TextRenderer {
                                 // Convert back to absolute coordinates
                                 let final_x = (anchor_x + rot_x) as i32;
                                 let final_y = (anchor_y + rot_y) as i32;
+                                // Clip to the buffer: a glyph can land partly (or wholly) off-canvas — e.g. a mid-rotation sliver resize (observed 1440×202 on Android) put final_y negative, and the `as usize` cast wrapped it to ~2^64, indexing OOB (samsung panic, 2026-07-15). Skip the off-canvas pixels instead.
+                                if final_x < 0
+                                    || final_y < 0
+                                    || final_x >= width as i32
+                                    || final_y >= height as i32
+                                {
+                                    continue;
+                                }
                                 let offset = (final_y as usize * width as usize + final_x as usize)
                                     * channels;
 
