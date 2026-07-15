@@ -269,7 +269,11 @@ impl Textbox {
         let blinkey_was = self.last_painted_blinkey_on;
         let blinkey_active = blinkey_want || blinkey_was;
 
-        if !pill_dirty && !blinkey_active && self.last_painted_bbox.is_some() {
+        // Never painted: nothing on screen to clear — the frame that first shows this widget is a scene/full repaint (scroll, page change), not incremental widget damage. Without this, a widget that's in the app's walk but not currently rendered (a culled off-screen row, a not-yet-revealed button) keeps its dirty-from-birth caches forever and leaks phantom damage every frame.
+        if self.last_painted_bbox.is_none() {
+            return None;
+        }
+        if !pill_dirty && !blinkey_active {
             return None;
         }
 
@@ -311,6 +315,16 @@ impl Textbox {
         }
 
         combined.filter(|r| !r.is_empty())
+    }
+
+    /// Reset the paint-tracking state to "never painted": no prior bbox to clear, caches dirty so the next actual render re-rasterizes from scratch. An app calls this when it CULLS the widget from a frame (scrolled outside the visible band) — the culling frame is a full scene repaint that already cleared the old pixels, and while culled the widget must report NO damage (see the never-painted early-return in [`Self::damage_rect`]).
+    pub fn reset_paint_tracking(&mut self) {
+        self.last_painted_bbox = None;
+        self.last_painted_blinkey_on = false;
+        self.last_painted_blinkey_bbox = None;
+        self.last_painted_selection = None;
+        self.pill_cache_dirty = true;
+        self.text_cache_dirty = true;
     }
 
     /// Record the bbox we just painted into and the focus/hover/blinkey state that drove it — called at the tail of [`render_content_into`] so the next frame's [`damage_rect`] knows what to union with. Always records the bare `bbox` (no glow padding) so the next frame's prev-union doesn't inflate steady-state damage back to `glow_bbox`. The glow envelope only enters damage on focus transitions or pill geometry changes, both of which `damage_rect` handles via `need_glow_damage` independently of `last_painted_bbox`.

@@ -252,7 +252,11 @@ impl Button {
         let focus_changed = self.focused != self.last_painted_focused;
         let hover_changed = self.hovered != self.last_painted_hovered;
         let pill_dirty = self.pill_cache_dirty || self.text_cache_dirty;
-        if !pill_dirty && !focus_changed && !hover_changed && self.last_painted_bbox.is_some() {
+        // Never painted: nothing on screen to clear (see Textbox::damage_rect) — a button in the app's walk but not yet revealed (attest before a handle is typed, the contacts + before a search) must not leak its dirty-from-birth caches as phantom damage.
+        if self.last_painted_bbox.is_none() {
+            return None;
+        }
+        if !pill_dirty && !focus_changed && !hover_changed {
             return None;
         }
         let mut combined: Option<PixelRect> = None;
