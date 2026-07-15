@@ -8,13 +8,26 @@
 //! * **Windows** — TODO: `GetDoubleClickTime()` from user32. Needs a windows-sys dep; same status as macOS.
 //! * **Default** — 400 ms. The middle of the typical OS-default range (250–500 ms) and what GTK ships when no user override is set.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
 const DEFAULT_DOUBLE_CLICK_MS: u32 = 400;
 
-/// Maximum time between two presses that still counts as a "double" (or third, etc.) for the same multi-click sequence. Honors the OS / DE setting where available — on X11 via XSettings, on Wayland (GNOME family) via `gsettings`, with a 400 ms fallback for unsupported platforms or environments without a configured manager. Result is cached for the life of the process.
+/// Host-injected override, milliseconds (0 = unset). Platforms whose timing query lives OUTSIDE fluor push the OS value here — Android's `ViewConfiguration.getDoubleTapTimeout()` comes thru the app's JNI layer at init (fluor has no JNI plumbing of its own). Read before the query ladder, so a set value wins everywhere.
+static OVERRIDE_MS: AtomicU32 = AtomicU32::new(0);
+
+/// Inject the platform's double-click/tap interval from outside fluor (e.g. Android `ViewConfiguration.getDoubleTapTimeout()` via the app's JNI init). Call before the first [`double_click_interval`] read; later calls still win because the override is checked on every read.
+pub fn set_double_click_interval(ms: u32) {
+    OVERRIDE_MS.store(ms, Ordering::Relaxed);
+}
+
+/// Maximum time between two presses that still counts as a "double" (or third, etc.) for the same multi-click sequence. Honors the OS / DE setting where available — a host-injected override first (Android), then X11 XSettings / gsettings on Linux, with a 400 ms fallback for unsupported platforms or environments without a configured manager. The query ladder is cached for the life of the process; the override is live.
 pub fn double_click_interval() -> Duration {
+    let over = OVERRIDE_MS.load(Ordering::Relaxed);
+    if over != 0 {
+        return Duration::from_millis(over as u64);
+    }
     static CACHE: OnceLock<Duration> = OnceLock::new();
     *CACHE.get_or_init(|| {
         let ms = query_double_click_ms().unwrap_or(DEFAULT_DOUBLE_CLICK_MS);
