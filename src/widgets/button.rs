@@ -526,6 +526,9 @@ mod widget_impls {
         fn hover(&mut self) -> Option<&mut dyn Hover> {
             self.enabled.then_some(self as &mut dyn Hover)
         }
+        fn damage_rect(&self, viewport_w: usize, viewport_h: usize) -> Option<crate::canvas::PixelRect> {
+            Button::damage_rect(self, viewport_w, viewport_h)
+        }
     }
 
     impl Click for Button {

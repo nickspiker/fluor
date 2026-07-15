@@ -666,6 +666,38 @@ impl Textbox {
         }
     }
 
+    // --- Pointer-driven caret + selection (the app's press/drag/release path drives these) ---
+
+    /// Pointer press: place the caret at the clicked column and drop a selection anchor there, so a subsequent [`Self::pointer_drag_to`] extends a selection. Keeps the caret in view.
+    pub fn pointer_press(&mut self, x: Coord) {
+        self.cursor = self.cursor_index_from_x(x);
+        self.selection_anchor = Some(self.cursor);
+        self.blinkey_visible = true;
+        self.blinkey_wave_top = true;
+        self.update_scroll();
+    }
+
+    /// Pointer drag: extend the selection to the column under the cursor (anchor stays at the press point). Auto-scrolls to keep the moving caret visible. Returns true if the caret moved (caller redraws).
+    pub fn pointer_drag_to(&mut self, x: Coord) -> bool {
+        let idx = self.cursor_index_from_x(x);
+        if idx == self.cursor {
+            return false;
+        }
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = Some(self.cursor);
+        }
+        self.cursor = idx;
+        self.update_scroll();
+        true
+    }
+
+    /// Pointer release: if no drag happened (anchor coincides with the caret), drop the zero-width anchor so it reads as a plain caret rather than an empty selection. Leaves a real selection intact.
+    pub fn pointer_release(&mut self) {
+        if self.selection_anchor == Some(self.cursor) {
+            self.selection_anchor = None;
+        }
+    }
+
     // --- Blinkey ---
 
     /// Flip the blinkey wave between top-bright and bottom-bright. Returns true if the blinkey is visible (caller should redraw).
@@ -1191,6 +1223,12 @@ mod widget_impls {
         }
         fn hover(&mut self) -> Option<&mut dyn Hover> {
             self.enabled.then_some(self as &mut dyn Hover)
+        }
+        fn damage_rect(&self, viewport_w: usize, viewport_h: usize) -> Option<crate::canvas::PixelRect> {
+            Textbox::damage_rect(self, viewport_w, viewport_h)
+        }
+        fn is_text_input(&self) -> bool {
+            true
         }
     }
 
