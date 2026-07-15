@@ -39,6 +39,9 @@ pub struct Button {
     /// Optional per-instance hovered fill colour (α+darkness), replacing the shared [`theme::BUTTON_HOVER`] for this button only. `None` = use the default. Lets a host give specific controls their own hover colour (the pre-fluor model, where the send/query button had a distinct subtle tint from a generic action button). Set via [`Self::set_hover_fill`].
     hover_fill: Option<u32>,
 
+    /// Optional per-instance resting fill colour (α+darkness) for the pill interior, replacing the shared [`theme::BUTTON_FILL`] for this button only. `None` = use the default theme fill. Lets a host tint a specific control (e.g. an orange "nuke" button) without changing the shared theme. Baked into `pill_cache`, so [`Self::set_fill`] dirties the cache. Set via [`Self::set_fill`].
+    fill: Option<u32>,
+
     /// Number of times [`Click::on_click`] has fired since construction. Monotonic. Consumers compare against [`Self::last_seen_click_counter`] via [`Self::take_click`] to know "has this button fired since I last looked."
     click_counter: u32,
     last_seen_click_counter: u32,
@@ -86,6 +89,7 @@ impl Button {
             pressed: false,
             enabled: true,
             hover_fill: None,
+            fill: None,
             click_counter: 0,
             last_seen_click_counter: 0,
             pill_cache: Vec::new(),
@@ -117,6 +121,16 @@ impl Button {
     /// per-control hover colours (e.g. a subtle neutral tint on the send/query button).
     pub fn set_hover_fill(&mut self, colour: Option<u32>) {
         self.hover_fill = colour;
+    }
+
+    /// Give this button a specific resting pill fill colour (α+darkness), instead of the shared
+    /// [`theme::BUTTON_FILL`]. `None` restores the default. Dirties the pill cache so the new
+    /// colour rasterizes on the next paint.
+    pub fn set_fill(&mut self, colour: Option<u32>) {
+        if colour != self.fill {
+            self.fill = colour;
+            self.pill_cache_dirty = true;
+        }
     }
     pub fn label(&self) -> &str {
         &self.label
@@ -318,7 +332,7 @@ impl Button {
                         inner_y,
                         inner_w,
                         inner_h,
-                        theme::BUTTON_FILL,
+                        self.fill.unwrap_or(theme::BUTTON_FILL),
                         squirdleyness,
                     );
                 }
