@@ -301,7 +301,9 @@ pub trait FluorApp {
     /// Default impl returns `Some(full viewport)` — safe fallback that preserves today's full-redraw behavior. Apps opt into differential rendering by overriding this to union their widget damage rects.
     ///
     /// Takes `Viewport` directly (not `Context`) so the host can call it without holding the text-renderer borrow that `Context` carries.
-    fn damage_rect(&self, viewport: Viewport) -> Option<crate::canvas::PixelRect> {
+    ///
+    /// `&mut self` so an app can union widget damage by walking its own widget tree (which yields `&mut dyn Widget`) — the walk only reads each widget's `damage_rect`, but the tree-walk currency is `&mut`. Nothing is mutated.
+    fn damage_rect(&mut self, viewport: Viewport) -> Option<crate::canvas::PixelRect> {
         let w = viewport.width_px as usize;
         let h = viewport.height_px as usize;
         Some(crate::canvas::PixelRect::new(0, 0, w, h))

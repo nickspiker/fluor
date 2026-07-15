@@ -56,6 +56,14 @@ pub trait Widget {
     fn hover(&mut self) -> Option<&mut dyn Hover> {
         None
     }
+    /// Self-reported dirty rectangle for this frame in viewport pixel coords, or `None` if the widget didn't change (host skips it). Default `None` ⇒ the widget has no differential-render story and relies on the app's full-frame path. Widgets with persistent scratch (textbox blinkey/selection, button held-tint) override this so an app can union every active widget's damage by walking the widget tree instead of hand-listing — the union then AUTOMATICALLY mirrors the render gate.
+    fn damage_rect(&self, _viewport_w: usize, _viewport_h: usize) -> Option<PixelRect> {
+        None
+    }
+    /// `true` for text-entry widgets (a textbox) — lets an app show the I-beam cursor over them without downcasting. Default `false`.
+    fn is_text_input(&self) -> bool {
+        false
+    }
 }
 
 /// Click handler. Coordinates are in viewport-local pixels (top-left origin). `mods` is the live modifier state at the moment the handler fires; widgets that want shift-click / ctrl-click semantics read it here.
