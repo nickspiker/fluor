@@ -28,7 +28,8 @@ pub mod app;
 #[cfg(all(feature = "host-android", target_os = "android"))]
 pub mod android;
 
-#[cfg(feature = "host-winit")]
+// OS input-timing settings (double-click interval, …). Available on ANY host — the pointer gestures that consume it (multi-click word/all select) are host-agnostic; only the query backends are per-OS (Linux XSettings/gsettings; everywhere else the 400 ms default until a native query lands).
+#[cfg(any(feature = "host-winit", feature = "host-android"))]
 pub mod os_input;
 
 // Widget abstraction (Container, Widget, Click, Key, Focus, Hover capability traits). Available on any host with `text` because the capability traits speak fluor-native events now — apps build their widget tree against this regardless of which host (winit/android/future) is driving the event loop.
