@@ -680,36 +680,40 @@ impl Textbox {
         }
     }
 
-    // --- Pointer-driven caret + selection (the app's press/drag/release path drives these) ---
+    // --- Pointer-driven caret + text-pan (the app's press/drag/release path drives these). The uniform pointer model, every platform: press = caret under the pointer, drag = the TEXT pans with the pointer (the caret rides its character, staying under the finger), release = spring back into bounds. Selection is dbl-click (word) / triple (paragraph) / keyboard — never drag. ---
 
-    /// Pointer press: place the caret at the clicked column and drop a selection anchor there, so a subsequent [`Self::pointer_drag_to`] extends a selection. Keeps the caret in view.
+    /// Pointer press: place the caret at the pressed column and clear any selection. No anchor — a drag PANS the text (see [`Self::pan_scroll_to`]), it does not select.
     pub fn pointer_press(&mut self, x: Coord) {
         self.cursor = self.cursor_index_from_x(x);
-        self.selection_anchor = Some(self.cursor);
+        self.selection_anchor = None;
         self.blinkey_visible = true;
         self.blinkey_wave_top = true;
-        self.update_scroll();
     }
 
-    /// Pointer drag: extend the selection to the column under the cursor (anchor stays at the press point). Auto-scrolls to keep the moving caret visible. Returns true if the caret moved (caller redraws).
-    pub fn pointer_drag_to(&mut self, x: Coord) -> bool {
-        let idx = self.cursor_index_from_x(x);
-        if idx == self.cursor {
+    /// Pan the text to `offset` UNCLAMPED — the drag gesture owns the position while the pointer is down, so the text can be carried infinitely past its bounds (the stretch is bounded by the finger, not by us). [`Self::spring_scroll`] eases it back after release. Returns true if the offset changed (caller redraws).
+    pub fn pan_scroll_to(&mut self, offset: Coord) -> bool {
+        if self.scroll_offset == offset {
             return false;
         }
-        if self.selection_anchor.is_none() {
-            self.selection_anchor = Some(self.cursor);
-        }
-        self.cursor = idx;
-        self.update_scroll();
+        self.scroll_offset = offset;
+        self.text_cache_dirty = true;
         true
     }
 
-    /// Pointer release: if no drag happened (anchor coincides with the caret), drop the zero-width anchor so it reads as a plain caret rather than an empty selection. Leaves a real selection intact.
-    pub fn pointer_release(&mut self) {
-        if self.selection_anchor == Some(self.cursor) {
-            self.selection_anchor = None;
+    /// Spring the scroll back toward its clamp bounds by one tick: `over × decay` (the app passes `e^(−kΔt)`), snapping the final sub-third-pixel so the animation terminates. Returns true while animating (caller redraws + calls again next tick). No-op inside bounds — safe to call on every textbox every tick.
+    pub fn spring_scroll(&mut self, decay: Coord) -> bool {
+        let tw = self.text_width();
+        let uw = self.usable_width();
+        let bound = if tw <= uw { 0.0 } else { (tw - uw) * 0.5 };
+        let target = self.scroll_offset.clamp(-bound, bound);
+        let over = self.scroll_offset - target;
+        if over == 0.0 {
+            return false;
         }
+        let next = over * decay;
+        self.scroll_offset = if next.abs() < 0.3 { target } else { target + next };
+        self.text_cache_dirty = true;
+        true
     }
 
     // --- Blinkey ---
