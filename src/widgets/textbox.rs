@@ -3,6 +3,7 @@
 //! Patterns lifted from photon's text_editing.rs + compositing.rs — `chars + widths + cursor` model, pill shape via squircle crossings, wave blinkey with alternating top/bottom brightness, symmetric scroll margins, 4-directional glow blur, XOR selection inversion.
 
 use crate::canvas::PixelRect;
+use crate::text::TextStyle;
 use crate::coord::Coord;
 use crate::paint::{self, Clip, HitId};
 use crate::region::Region;
@@ -966,19 +967,7 @@ impl Textbox {
 
             // Front-to-back: TOPMOST paints FIRST in fluor's model. Glyphs are visually topmost (the things you read), so they claim their cells before the selection bg paints into the surrounding empties. Anchor x is the LEFT edge of the visible substring (derived from cumulative widths up to first_padded), not the substring's centre — keeps the substring's first char locked to the same local x regardless of where the substring boundary falls during scroll.
             if let Some((ref text_str, anchor_x)) = s {
-                text.draw_text_left_u32(
-                    &mut text_canvas,
-                    text_str,
-                    anchor_x,
-                    local_y_center,
-                    self.font_size,
-                    400,
-                    theme::TEXTBOX_TEXT,
-                    self.font,
-                    None,
-                    Some(&mask_buffer),
-                    None,
-                );
+                text.draw_text_left(&mut text_canvas, text_str, anchor_x, local_y_center, &TextStyle::new(self.font_size, theme::TEXTBOX_TEXT).font(self.font), None, Some(&mask_buffer));
             }
 
             // Selection background (painted AFTER text so it goes UNDER glyphs via under()'s opaque-top early-out — glyph cells stay glyph colour, non-glyph cells inside the selection range get the selection bg). Same mask as text → selection ends fade along the same squircle curve.

@@ -9,6 +9,7 @@
 //! All RGB values stored in the chrome layer are straight-α (the canonical buffer convention). The OS conversion layer at the present boundary handles platform-specific premultiplication.
 
 use crate::coord::Coord;
+use crate::text::TextStyle;
 use crate::host::icon::Icon;
 use crate::math;
 use crate::paint::Clip;
@@ -341,19 +342,7 @@ pub fn draw_title_text(
     let clip_y0 = (y_center - half_band).max(0.0) as usize;
     let clip_y1 = (y_center + half_band) as usize;
     let clip = Clip::new(left_margin, clip_y0, clip_x_end, clip_y1);
-    text_renderer.draw_text_left_u32(
-        canvas,
-        title,
-        left_margin as f32,
-        y_center,
-        font_size,
-        400,
-        colour,
-        "Open Sans",
-        Some(clip),
-        None,
-        None,
-    );
+    text_renderer.draw_text_left(canvas, title, left_margin as f32, y_center, &TextStyle::new(font_size, colour), Some(clip), None);
 }
 
 /// Rasterize the bottom status band: a thin strip at `height − band_h .. height` filled with `bg`, topped by a 1-px `hairline_colour` divider where the band meets the pane content. Optional left-aligned `text` paints in `text_colour` (Open Sans, font size = `band_h × 0.55`). The band is short — `band_h` is typically `button_size / 2` — so it reads as a secondary surface, distinct from the top controls strip.
@@ -389,19 +378,7 @@ pub fn draw_status_bar(
             let x_center = width as Coord * 0.5;
             let y_center = y_top as Coord + band_h as Coord * 0.5;
             let clip = Clip::new(side_margin, y_top, clip_x_end, height);
-            text_renderer.draw_text_center_u32(
-                canvas,
-                text,
-                x_center,
-                y_center,
-                font_size,
-                400,
-                text_colour,
-                "Open Sans",
-                Some(clip),
-                None,
-                None,
-            );
+            text_renderer.draw_text_center(canvas, text, x_center, y_center, &TextStyle::new(font_size, text_colour), Some(clip), None);
         }
     }
 

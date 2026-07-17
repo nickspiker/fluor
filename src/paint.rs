@@ -7,6 +7,7 @@
 //! Every blending primitive accepts an optional [`Clip`] (defaults to full buffer when `None`) and an optional [`AlphaMask`] (full-frame, multiplies into per-pixel alpha for soft clipping — rounded textboxes, squircle pane corners, scroll fades). The clip is resolved once at entry into `(x_min, y_min, x_max, y_max)` loop bounds, so the inner loops carry **zero per-pixel bounds checks** — the math at the entry is the proof. AlphaMask dimensions must equal the buffer's `(buf_w, buf_h)`; mismatches panic per AGENT.md "fail loud."
 
 use crate::canvas::Canvas;
+use crate::text::TextStyle;
 use crate::coord::Coord;
 
 // Submodules — extracted from this file as part of the paint-organisation pass. Each is re-exported flat so existing call sites (`crate::paint::draw_squircle_pill`, etc.) continue to resolve without any caller changes.
@@ -1038,36 +1039,12 @@ pub fn draw_chord_hint(
     let title_colour = pack_argb(255, 255, 255, 0xFF);
     let body_colour = pack_argb(220, 220, 220, 0xFF);
 
-    text.draw_text_center_u32(
-        canvas,
-        "Debug chord — [ + ] then …",
-        cx,
-        panel_y + pad + header_size * 0.5,
-        header_size,
-        500,
-        title_colour,
-        "Open Sans",
-        None,
-        None,
-        None,
-    );
+    text.draw_text_center(canvas, "Debug chord — [ + ] then …", cx, panel_y + pad + header_size * 0.5, &TextStyle::new(header_size, title_colour).weight(500), None, None);
 
     for (i, (chord, desc)) in hints.iter().enumerate() {
         let line_y = panel_y + pad + header_size + line_h * (i as f32 + 0.5) + font_size * 0.5;
         let line = alloc::format!("{}  —  {}", chord, desc);
-        text.draw_text_center_u32(
-            canvas,
-            &line,
-            cx,
-            line_y,
-            font_size,
-            400,
-            body_colour,
-            "Open Sans",
-            None,
-            None,
-            None,
-        );
+        text.draw_text_center(canvas, &line, cx, line_y, &TextStyle::new(font_size, body_colour), None, None);
     }
 
     // Panel background fills behind the glyphs (text rows already occupied; bar's under() only lands on the gaps).
@@ -1160,19 +1137,7 @@ pub fn draw_debug_strip(
     // Topmost-first ordering: text glyphs paint FIRST so the bar's under() writes are rejected by the glyph pixels, leaving the green characters visible against the black. If the bar were painted first it would fill all strip pixels opaque and every glyph would be eaten.
     let fg = pack_argb(80, 255, 120, 0xFF);
     let text_cy = strip_y as f32 + DEBUG_STRIP_H as f32 * 0.5;
-    text.draw_text_center_u32(
-        canvas,
-        &stats_line,
-        width as f32 * 0.5,
-        text_cy,
-        FONT_SIZE,
-        400,
-        fg,
-        "monospace",
-        None,
-        None,
-        None,
-    );
+    text.draw_text_center(canvas, &stats_line, width as f32 * 0.5, text_cy, &TextStyle::new(FONT_SIZE, fg).font("monospace"), None, None);
 
     // Bar fills behind the glyphs (topmost-first: text rows already occupied, bar's under() only lands on the gaps).
     let bg = pack_argb(0, 0, 0, 0xE0);

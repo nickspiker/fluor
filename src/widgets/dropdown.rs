@@ -7,6 +7,7 @@
 //! **Action model.** Poll-based like Button/Slider: row clicks and keyboard commits accumulate into a change counter; the app calls [`Dropdown::take_change`] after dispatch (and/or in `tick`) — `Some(index)` means the selection changed since last poll. `take_change` is also where row-click commits are folded into `selected` (the row widgets can't reach back into the parent during the visit walk).
 
 use crate::canvas::PixelRect;
+use crate::text::TextStyle;
 use crate::coord::Coord;
 use crate::paint::{self, Clip, HitId};
 use crate::region::Region;
@@ -479,19 +480,7 @@ impl Dropdown {
                     clip,
                 );
             }
-            text.draw_text_left_u32(
-                canvas,
-                label,
-                text_left,
-                row_cy,
-                self.font_size,
-                400,
-                theme::TEXTBOX_TEXT,
-                self.font,
-                clip,
-                None,
-                None,
-            );
+            text.draw_text_left(canvas, label, text_left, row_cy, &TextStyle::new(self.font_size, theme::TEXTBOX_TEXT).font(self.font), clip, None);
             // Stamp the row's hit band (interior of the popup only, clear of the AA edge).
             if let Some(map) = hit_map.as_deref_mut() {
                 let x0 = (x + stroke_px).max(0) as usize;
@@ -624,19 +613,7 @@ impl Dropdown {
             let pad = self.font_size * 0.4;
             if self.font_size > 0.0 {
                 let mask_buffer = paint::AlphaMask::new(&self.inner_pill_mask, cw, ch);
-                text.draw_text_left_u32(
-                    &mut text_canvas,
-                    &self.options[self.selected],
-                    pad * 1.5,
-                    local_y_center,
-                    self.font_size,
-                    400,
-                    colour,
-                    self.font,
-                    None,
-                    Some(&mask_buffer),
-                    None,
-                );
+                text.draw_text_left(&mut text_canvas, &self.options[self.selected], pad * 1.5, local_y_center, &TextStyle::new(self.font_size, colour).font(self.font), None, Some(&mask_buffer));
             }
             // Chevron: two 45° strokes forming a "v", right-aligned. Drawn geometrically (rotated rects) rather than as a glyph so it renders identically regardless of font coverage.
             let chev_w = self.font_size * 0.55;

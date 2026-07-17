@@ -91,6 +91,61 @@ pub struct TextRenderer {
     transform_cache: TransformGlyphCache,
 }
 
+/// How text draws — everything beyond "which glyphs, where". REQUIRED values (size, colour) live in [`TextStyle::new`]; every OPTION defaults to none and is added by a chainable builder. Fields are PRIVATE on purpose: no struct literals means adding the next option (kerning, vertical shear, …) can never break a call site — the forward-compat contract this API was rebuilt for (2026-07-17).
+///
+/// The transform options compose in font space as `rotate(rotation) ∘ [stretch, skew; 0, 1]` and feed the SAME contour+position machinery rotated titles already use — so skewed text is a true synthetic oblique (contours skew before rasterization, proper AA), stretch scales advances automatically, and the transformed-glyph cache keys on the resulting matrix with no extra plumbing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextStyle<'a> {
+    size: f32,
+    colour: u32,
+    weight: u16,
+    font: &'a str,
+    skew: f32,
+    stretch: f32,
+    rotation: f32,
+}
+
+impl<'a> TextStyle<'a> {
+    /// The required pair: `size` (px, span-scaled by the caller like everything in fluor) and `colour` (α+darkness u32). There is deliberately NO `Default` — a defaulted size or colour is an invisible-text bug, so required-ness is structural.
+    pub const fn new(size: f32, colour: u32) -> Self {
+        Self { size, colour, weight: 400, font: "Open Sans", skew: 0., stretch: 1., rotation: 0. }
+    }
+    /// Font weight (cosmic-text face selection). Default 400.
+    pub const fn weight(mut self, w: u16) -> Self {
+        self.weight = w;
+        self
+    }
+    /// Font family name. Default "Open Sans".
+    pub const fn font(mut self, f: &'a str) -> Self {
+        self.font = f;
+        self
+    }
+    /// Forward slant: the x-shear coefficient applied to glyph CONTOURS in font space (`x' = x + skew·y`). 0 = upright; `tan 12° ≈ 0.2126` is the classic oblique amount. Named skew, not italic — a true italic is a different FACE; this is an honest geometric slant (and it works on faces that ship no italic at all).
+    pub const fn skew(mut self, s: f32) -> Self {
+        self.skew = s;
+        self
+    }
+    /// Horizontal stretch of contours AND advances: 1 = natural, <1 condensed, >1 extended.
+    pub const fn stretch(mut self, s: f32) -> Self {
+        self.stretch = s;
+        self
+    }
+    /// Rotation in radians. Snapping to the 1-pixel-arc cache grid stays internal.
+    pub const fn rotation(mut self, r: f32) -> Self {
+        self.rotation = r;
+        self
+    }
+    /// The composed font-space linear transform, or `None` when every option is at its default (the identity fast path).
+    fn transform(&self) -> Option<Transform> {
+        if self.rotation == 0. && self.skew == 0. && self.stretch == 1. {
+            return None;
+        }
+        // M = [stretch, skew; 0, 1] (skew + stretch act on the glyph), then rotate the styled glyph as a rigid body.
+        let m = Transform::new(self.stretch, 0., self.skew, 1., 0., 0.);
+        Some(if self.rotation == 0. { m } else { m.then(Transform::rotate(self.rotation)) })
+    }
+}
+
 impl TextRenderer {
     pub fn new() -> Self {
         let mut font_system = FontSystem::new();
@@ -129,7 +184,25 @@ impl TextRenderer {
             .and_then(|f| f.families.first().map(|(name, _)| name.clone()))
     }
 
-    pub fn draw_text_center_u32(
+
+    /// Draw left-aligned styled text. `x, y` = left edge, vertical center. Returns the drawn width. The whole "how" lives in [`TextStyle`]; clip and mask stay positional because they're render-target concerns, not style.
+    pub fn draw_text_left(&mut self, canvas: &mut Canvas, text: &str, x: f32, y: f32, style: &TextStyle, clip: Option<Clip>, mask: Option<&AlphaMask>) -> f32 {
+        self.draw_text_left_u32(canvas, text, x, y, style.size, style.weight, style.colour, style.font, clip, mask, style.transform())
+    }
+    /// Draw center-aligned styled text (`x` = center).
+    pub fn draw_text_center(&mut self, canvas: &mut Canvas, text: &str, x: f32, y: f32, style: &TextStyle, clip: Option<Clip>, mask: Option<&AlphaMask>) -> f32 {
+        self.draw_text_center_u32(canvas, text, x, y, style.size, style.weight, style.colour, style.font, clip, mask, style.transform())
+    }
+    /// Draw right-aligned styled text (`x` = right edge).
+    pub fn draw_text_right(&mut self, canvas: &mut Canvas, text: &str, x: f32, y: f32, style: &TextStyle, clip: Option<Clip>, mask: Option<&AlphaMask>) -> f32 {
+        self.draw_text_right_u32(canvas, text, x, y, style.size, style.weight, style.colour, style.font, clip, mask, style.transform())
+    }
+    /// Measure styled text width: summed advances × stretch (skew and rotation don't change advances). Build ONE style and share it between measure and draw — that's the intended pattern.
+    pub fn measure_text(&mut self, text: &str, style: &TextStyle) -> f32 {
+        self.measure_text_width_impl(text, style.size, style.weight, style.font) * style.stretch
+    }
+
+    fn draw_text_center_u32(
         &mut self,
         canvas: &mut Canvas,
         text: &str,
@@ -194,7 +267,7 @@ impl TextRenderer {
         }
     }
 
-    pub fn draw_text_left_u32(
+    fn draw_text_left_u32(
         &mut self,
         canvas: &mut Canvas,
         text: &str,
@@ -256,7 +329,7 @@ impl TextRenderer {
         }
     }
 
-    pub fn draw_text_right_u32(
+    fn draw_text_right_u32(
         &mut self,
         canvas: &mut Canvas,
         text: &str,
@@ -318,7 +391,7 @@ impl TextRenderer {
         }
     }
 
-    pub fn draw_text_center(
+    pub fn draw_text_center_legacy(
         &mut self,
         pixels: &mut [u8],
         width: u32,
@@ -376,7 +449,7 @@ impl TextRenderer {
         }
     }
 
-    pub fn draw_text_left(
+    pub fn draw_text_left_legacy(
         &mut self,
         pixels: &mut [u8],
         width: u32,
@@ -428,7 +501,7 @@ impl TextRenderer {
         }
     }
 
-    pub fn draw_text_right(
+    pub fn draw_text_right_legacy(
         &mut self,
         pixels: &mut [u8],
         width: u32,
@@ -1117,7 +1190,7 @@ impl TextRenderer {
     }
 
     /// Measure the width of text without rendering it
-    pub fn measure_text_width(&mut self, text: &str, size: f32, weight: u16, font: &str) -> f32 {
+    fn measure_text_width_impl(&mut self, text: &str, size: f32, weight: u16, font: &str) -> f32 {
         if text.is_empty() {
             return 0.0;
         }
