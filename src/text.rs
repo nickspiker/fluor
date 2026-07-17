@@ -100,7 +100,7 @@ pub struct TextStyle<'a> {
     colour: u32,
     weight: u16,
     font: &'a str,
-    skew: f32,
+    shear: f32,
     stretch: f32,
     rotation: f32,
 }
@@ -108,7 +108,7 @@ pub struct TextStyle<'a> {
 impl<'a> TextStyle<'a> {
     /// The required pair: `size` (px, span-scaled by the caller like everything in fluor) and `colour` (α+darkness u32). There is deliberately NO `Default` — a defaulted size or colour is an invisible-text bug, so required-ness is structural.
     pub const fn new(size: f32, colour: u32) -> Self {
-        Self { size, colour, weight: 400, font: "Open Sans", skew: 0., stretch: 1., rotation: 0. }
+        Self { size, colour, weight: 400, font: "Open Sans", shear: 0., stretch: 1., rotation: 0. }
     }
     /// Font weight (cosmic-text face selection). Default 400.
     pub const fn weight(mut self, w: u16) -> Self {
@@ -120,9 +120,9 @@ impl<'a> TextStyle<'a> {
         self.font = f;
         self
     }
-    /// Forward slant: the x-shear coefficient applied to glyph CONTOURS in font space (`x' = x + skew·y`). 0 = upright; `tan 12° ≈ 0.2126` is the classic oblique amount. Named skew, not italic — a true italic is a different FACE; this is an honest geometric slant (and it works on faces that ship no italic at all).
-    pub const fn skew(mut self, s: f32) -> Self {
-        self.skew = s;
+    /// Forward slant: the x-SHEAR coefficient applied to glyph CONTOURS (`x' = x + shear·y`). 0 = upright; `tan 12° ≈ 0.2126` is the classic oblique amount. Named for the mathematics — CSS says "skew" and parameterizes by angle; this is the shear COEFFICIENT (tan of that angle). Not "italic": a true italic is a different FACE; this is honest geometry, and it works on faces that ship no italic at all. Advances and baselines are untouched — only the contours lean (the shear rides the contour path alone, never the position transform).
+    pub const fn shear(mut self, s: f32) -> Self {
+        self.shear = s;
         self
     }
     /// Horizontal stretch of contours AND advances: 1 = natural, <1 condensed, >1 extended.
@@ -135,13 +135,12 @@ impl<'a> TextStyle<'a> {
         self.rotation = r;
         self
     }
-    /// The composed font-space linear transform, or `None` when every option is at its default (the identity fast path).
+    /// The composed POSITION/rotation-component matrix (rotation ∘ stretch), or `None` at defaults. The shear is deliberately NOT here: it must never touch glyph positions (baseline drift) nor `base_theta` (the rotation snapper would read shear as rotation) — it composes separately at the contour handoff.
     fn transform(&self) -> Option<Transform> {
-        if self.rotation == 0. && self.skew == 0. && self.stretch == 1. {
+        if self.rotation == 0. && self.stretch == 1. {
             return None;
         }
-        // M = [stretch, skew; 0, 1] (skew + stretch act on the glyph), then rotate the styled glyph as a rigid body.
-        let m = Transform::new(self.stretch, 0., self.skew, 1., 0., 0.);
+        let m = Transform::new(self.stretch, 0., 0., 1., 0., 0.);
         Some(if self.rotation == 0. { m } else { m.then(Transform::rotate(self.rotation)) })
     }
 }
@@ -187,15 +186,15 @@ impl TextRenderer {
 
     /// Draw left-aligned styled text. `x, y` = left edge, vertical center. Returns the drawn width. The whole "how" lives in [`TextStyle`]; clip and mask stay positional because they're render-target concerns, not style.
     pub fn draw_text_left(&mut self, canvas: &mut Canvas, text: &str, x: f32, y: f32, style: &TextStyle, clip: Option<Clip>, mask: Option<&AlphaMask>) -> f32 {
-        self.draw_text_left_u32(canvas, text, x, y, style.size, style.weight, style.colour, style.font, clip, mask, style.transform())
+        self.draw_text_left_u32(canvas, text, x, y, style.size, style.weight, style.colour, style.font, clip, mask, style.transform(), style.shear)
     }
     /// Draw center-aligned styled text (`x` = center).
     pub fn draw_text_center(&mut self, canvas: &mut Canvas, text: &str, x: f32, y: f32, style: &TextStyle, clip: Option<Clip>, mask: Option<&AlphaMask>) -> f32 {
-        self.draw_text_center_u32(canvas, text, x, y, style.size, style.weight, style.colour, style.font, clip, mask, style.transform())
+        self.draw_text_center_u32(canvas, text, x, y, style.size, style.weight, style.colour, style.font, clip, mask, style.transform(), style.shear)
     }
     /// Draw right-aligned styled text (`x` = right edge).
     pub fn draw_text_right(&mut self, canvas: &mut Canvas, text: &str, x: f32, y: f32, style: &TextStyle, clip: Option<Clip>, mask: Option<&AlphaMask>) -> f32 {
-        self.draw_text_right_u32(canvas, text, x, y, style.size, style.weight, style.colour, style.font, clip, mask, style.transform())
+        self.draw_text_right_u32(canvas, text, x, y, style.size, style.weight, style.colour, style.font, clip, mask, style.transform(), style.shear)
     }
     /// Measure styled text width: summed advances × stretch (skew and rotation don't change advances). Build ONE style and share it between measure and draw — that's the intended pattern.
     pub fn measure_text(&mut self, text: &str, style: &TextStyle) -> f32 {
@@ -215,6 +214,7 @@ impl TextRenderer {
         clip: Option<Clip>,
         mask: Option<&AlphaMask>,
         transform: Option<Transform>,
+        shear: f32,
     ) -> f32 {
         let buf_w = canvas.width;
         let buf_h = canvas.height;
@@ -260,6 +260,7 @@ impl TextRenderer {
                 clip,
                 mask,
                 transform,
+                shear,
             );
             text_width
         } else {
@@ -280,6 +281,7 @@ impl TextRenderer {
         clip: Option<Clip>,
         mask: Option<&AlphaMask>,
         transform: Option<Transform>,
+        shear: f32,
     ) -> f32 {
         let buf_w = canvas.width;
         let buf_h = canvas.height;
@@ -322,6 +324,7 @@ impl TextRenderer {
                 clip,
                 mask,
                 transform,
+                shear,
             );
             text_width
         } else {
@@ -342,6 +345,7 @@ impl TextRenderer {
         clip: Option<Clip>,
         mask: Option<&AlphaMask>,
         transform: Option<Transform>,
+        shear: f32,
     ) -> f32 {
         let buf_w = canvas.width;
         let buf_h = canvas.height;
@@ -384,6 +388,7 @@ impl TextRenderer {
                 clip,
                 mask,
                 transform,
+                shear,
             );
             text_width
         } else {
@@ -573,6 +578,7 @@ impl TextRenderer {
         clip: Option<Clip>,
         mask: Option<&AlphaMask>,
         transform: Option<Transform>,
+        shear: f32,
     ) {
         let clip = Clip::resolve(clip, buf_w, buf_h);
         if let Some(m) = mask {
@@ -594,7 +600,12 @@ impl TextRenderer {
         //   1. **Contour transform** (linear part only — `a, b, c, d`, *no translation*) → fed to swash::scale to rotate/skew/scale the glyph outline in font space. Translation is intentionally stripped here because swash applies its transform to the contour in glyph-local coords (origin at 0,0 baseline-left); leaving translation in would translate the contour itself, blowing the placement bbox out into absolute pixel space. The linear part is *snapped* per-glyph to the 1-pixel-arc rotation grid via [`crate::paint::snap_rotation`], so consecutive frames within the same rotation bin reuse the same rasterized glyph (cache hit). Snapping the contour but **not** the position lets the run slide smoothly along its arc while each glyph's orientation steps in cache-friendly bins.
         //   2. **Position transform** (full transform — linear *plus* translation, *unsnapped*) → applied to each glyph's run-local position, so the run translates + rotates as a rigid body around the chosen anchor with sub-bin precision.
         // zeno's Transform constructor takes (xx, xy, yx, yy, x, y) where the matrix is `[xx xy x; yx yy y]`. Our `Transform` stores `[a c tx; b d ty]` — same layout, just renamed: xx=a, xy=c, yx=b, yy=d, x=tx, y=ty.
-        let active_transform = transform.filter(|t| !t.is_identity());
+        let active_transform = if shear != 0. {
+            // Shear-only text must still route thru the contour machinery (the identity fast path would drop it).
+            Some(transform.unwrap_or(Transform::IDENTITY))
+        } else {
+            transform.filter(|t| !t.is_identity())
+        };
         // Continuous rotation angle of the linear part (radians). atan2 of the rotated +X axis. For pure rotation `R(θ)` this returns θ exactly; for rotation+uniform-scale the magnitude factors out; for skew/non-uniform scale this picks the angle of the first column as the "rotation component" — fine for our text use case (titles rotate, scale stays uniform).
         let base_theta = active_transform.map(|t| crate::math::atan2(t.b, t.a));
 
@@ -631,6 +642,14 @@ impl TextRenderer {
                     }
                     _ => None,
                 };
+                // The shear folds in HERE — contour-only, post-snap, BEFORE the cache key is taken (sheared and upright glyphs must never share an entry). It deliberately never enters `active_transform`: positions would drift (∝ shear·x) and base_theta's snapper would read shear as rotation. Slot empirics (2026-07-17): the c-slot renders as VERTICAL shear thru zeno — the layout comment above notwithstanding; rotations can't distinguish a transposition, shears can — so the horizontal-oblique coefficient rides the b-slot.
+                let contour_transform = contour_transform.map(|t| {
+                    if shear != 0. {
+                        Transform::new(1., shear, 0., 1., 0., 0.).then(t)
+                    } else {
+                        t
+                    }
+                });
                 let zeno_transform =
                     contour_transform.map(|t| ZenoTransform::new(t.a, t.c, t.b, t.d, 0.0, 0.0));
 
