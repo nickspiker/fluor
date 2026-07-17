@@ -164,6 +164,8 @@ pub struct DefaultChrome {
     pub app_icon: Option<crate::host::icon::Icon>,
     /// Window-focus state. `true` = active (full edge bevel, bright title, ring follows perimeter, icon at full saturation). `false` = inactive (edges + title + orb ring collapse to `LABEL_COLOUR`; orb image desaturates 50 % toward grey when `orb_tint` is `FollowFocus`). Host wires this from `WindowEvent::Focused`. Mutate via [`set_focused`](Self::set_focused) to mark the chrome layer dirty automatically.
     pub focused: bool,
+    /// Orb press state: while `true` the chrome raster blooms the wordmark-style glow beneath the orb (disk → soft blurs → white-under, painted AFTER the orb so under()'s earliest-wins keeps the icon art untouched). Mutate via [`set_orb_pressed`](Self::set_orb_pressed) — press/release edges each cost one chrome re-raster, which is exactly two per click.
+    pub orb_pressed: bool,
     /// Orb visual state. Default `OrbTint::FollowFocus` makes the orb a window-state indicator; `OrbTint::Custom` lets the app turn it into a network/recording/presence badge. Mutate via [`set_orb_tint`](Self::set_orb_tint) to mark the chrome layer dirty automatically.
     pub orb_tint: chrome::OrbTint,
     /// Currently-hovered button id (HIT_NONE if none). Consumed by the host's overlay pass to derive the visible-RGB tint delta to apply at matching `hit_test_map` pixels in persistent_screen.
@@ -223,6 +225,7 @@ impl DefaultChrome {
             app_icon,
             focused: true,
             orb_tint: chrome::OrbTint::FollowFocus,
+            orb_pressed: false,
             hover_state: HIT_NONE,
             full_edge: false,
             viewport,
@@ -468,6 +471,10 @@ impl DefaultChrome {
                     orb_darken,
                     orb_brighten,
                 );
+                if self.orb_pressed {
+                    // Press glow — painted AFTER the orb+ring, so under()'s earliest-wins layering puts the halo BENEATH them: the opaque disk pixels early-out untouched and the bloom lands only in the transparent surround. Same pipeline as photon's text halos (disk coverage at the glow grey → soft h+v blurs → white-under), here with real under() because the chrome layer is still building.
+                    chrome::draw_orb_press_glow(chrome_buf, buf_w, buf_h, orb_cx, orb_cy, orb_radius);
+                }
             }
             {
                 // Title-text rasterization thru the frame-level damage accumulator. Other chrome rasterizers (perimeter, app icon, button glyphs) still write into `chrome_buf` directly without damage tracking — they'll migrate when the rest of the chrome surface gets the Canvas treatment.
@@ -755,6 +762,16 @@ impl DefaultChrome {
     }
 
     /// Update the orb tint. Returns `true` iff the value changed. App calls this when the orb's semantic state shifts (network came online, recording started, presence flipped). Marks the chrome layer dirty.
+    /// Set the orb's pressed state (the host feeds `pressed_hit == app_icon_btn.id()` each frame; no-op when unchanged). Returns `true` iff it changed — the chrome layer re-rasters with (or without) the press glow.
+    pub fn set_orb_pressed(&mut self, pressed: bool) -> bool {
+        if pressed == self.orb_pressed {
+            return false;
+        }
+        self.orb_pressed = pressed;
+        self.group.rpn.layers[self.layer_chrome].dirty = true;
+        true
+    }
+
     pub fn set_orb_tint(&mut self, tint: chrome::OrbTint) -> bool {
         if tint == self.orb_tint {
             return false;
