@@ -119,4 +119,15 @@ impl Viewport {
     pub fn reset_zoom(&mut self) {
         self.ru = 1.0;
     }
+
+    /// Set zoom to an ABSOLUTE `ru` (a restored per-device zoom setting riding `FluorApp::take_zoom_request`). Same release clamp as [`Self::adjust_zoom`], same debug-unclamped rationale.
+    pub fn set_zoom(&mut self, ru: Coord) {
+        self.ru = ru;
+        #[cfg(not(debug_assertions))]
+        {
+            const ZOOM_MIN: f32 = 1.0 / (1 << 3) as f32; // 12.5%
+            const ZOOM_MAX: f32 = 3.0; // 300%
+            self.ru = self.ru.clamp(ZOOM_MIN, ZOOM_MAX);
+        }
+    }
 }
