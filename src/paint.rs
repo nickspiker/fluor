@@ -509,6 +509,18 @@ pub fn unpack_argb(packed: u32) -> (u8, u8, u8, u8) {
     (r, g, b, a)
 }
 
+/// Scale a fluor internal pixel's VISIBLE brightness by `num/den`, clamping each channel to
+/// `[0, 255]` and preserving α. Derives a lighter/darker variant of a fill in the same hue — e.g. a
+/// custom-coloured button's hover/held fills off its resting fill, so any tint gets the same
+/// luminance ramp the `BUTTON_FILL/HOVER/HELD` constants encode (dark idle → ~1.5× hover → ~2.2×
+/// held) instead of a hand-picked pair per colour. `(num, den) = (1, 1)` is identity.
+#[inline]
+pub fn scale_brightness(packed: u32, num: u16, den: u16) -> u32 {
+    let (r, g, b, a) = unpack_argb(packed);
+    let s = |c: u8| ((c as u32 * num as u32 / den.max(1) as u32).min(255)) as u8;
+    pack_argb(s(r), s(g), s(b), a)
+}
+
 use crate::pixel::Blend;
 pub use crate::pixel::BlendMode;
 

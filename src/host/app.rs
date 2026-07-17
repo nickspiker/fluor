@@ -345,6 +345,11 @@ pub trait FluorApp {
     }
 
     /// Called once per `about_to_wait` cycle (after the host's own platform polling). Drive time-based state here — blink timers, animation tweens, drag-scroll. Return `true` if state changed and a redraw is needed; the host will call `request_redraw` for you.
+    /// One-shot ABSOLUTE zoom request — e.g. a restored per-device zoom setting. Polled by the host each idle pass BEFORE tick; `Some(ru)` applies exactly like a user zoom (clamped, full repaint, `on_resize` propagation) and the app must return it at most once (take semantics). Default: never.
+    fn take_zoom_request(&mut self) -> Option<f32> {
+        None
+    }
+
     fn tick(&mut self, ctx: &mut Context) -> bool {
         let _ = ctx;
         false
@@ -1381,6 +1386,11 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // App-requested absolute zoom (restored setting): set the ru, then run the standard zoom propagation with a zero-step change (factor 1.0 — the set already happened) so chrome/widgets re-rasterize exactly like a user zoom.
+        if let Some(ru) = self.app.take_zoom_request() {
+            self.viewport.set_zoom(ru);
+            self.apply_zoom_change(Some(0.0));
+        }
         let needs_redraw = if let (Some(window), Some(text)) =
             (self.window.as_ref().cloned(), self.text.as_mut())
         {

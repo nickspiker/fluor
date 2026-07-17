@@ -42,6 +42,15 @@ pub struct Button {
     /// Optional per-instance resting fill colour (α+darkness) for the pill interior, replacing the shared [`theme::BUTTON_FILL`] for this button only. `None` = use the default theme fill. Lets a host tint a specific control (e.g. an orange "nuke" button) without changing the shared theme. Baked into `pill_cache`, so [`Self::set_fill`] dirties the cache. Set via [`Self::set_fill`].
     fill: Option<u32>,
 
+    /// Optional per-instance PRESSED ("held") fill (α+darkness), replacing [`theme::BUTTON_HELD`] / the derived ramp. `None` = default. Set via [`Self::set_held_fill`]. Read by [`Self::effective_fill`] and, in overlay mode, by `tint_delta`.
+    held_fill: Option<u32>,
+
+    /// When `true`, `render_content_into` bakes the current STATE fill ([`Self::effective_fill`]) directly into the pill instead of only the idle fill — for headless hosts (e.g. toka in the browser) that don't run the host's overlay-delta hover pass. When `false` (default, desktop/Android), the pill bakes the idle fill and hover/pressed come from the overlay via `tint_delta`. Set via [`Self::set_bake_states`].
+    bake_states: bool,
+
+    /// Last effective fill actually rasterized into `pill_cache` — lets baked-state mode re-dirty the cache only when the state fill genuinely changes (hover/press transition), not every frame.
+    last_baked_fill: Option<u32>,
+
     /// Number of times [`Click::on_click`] has fired since construction. Monotonic. Consumers compare against [`Self::last_seen_click_counter`] via [`Self::take_click`] to know "has this button fired since I last looked."
     click_counter: u32,
     last_seen_click_counter: u32,
@@ -90,6 +99,9 @@ impl Button {
             enabled: true,
             hover_fill: None,
             fill: None,
+            held_fill: None,
+            bake_states: false,
+            last_baked_fill: None,
             click_counter: 0,
             last_seen_click_counter: 0,
             pill_cache: Vec::new(),
@@ -130,6 +142,47 @@ impl Button {
         if colour != self.fill {
             self.fill = colour;
             self.pill_cache_dirty = true;
+        }
+    }
+
+    /// Give this button a specific PRESSED ("held") fill (α+darkness), instead of [`theme::BUTTON_HELD`]
+    /// / the derived ramp. `None` restores the default.
+    pub fn set_held_fill(&mut self, colour: Option<u32>) {
+        self.held_fill = colour;
+    }
+
+    /// Select baked-state rendering (`true`) vs. host-overlay hover/pressed (`false`, default). See the
+    /// `bake_states` field. Headless hosts (toka) set `true`; the desktop/Android host leaves it `false`.
+    pub fn set_bake_states(&mut self, bake: bool) {
+        self.bake_states = bake;
+    }
+
+    /// Ratios that turn a resting fill into its hover / held variant — chosen so a default
+    /// [`theme::BUTTON_FILL`] scales to ≈[`theme::BUTTON_HOVER`] / ≈[`theme::BUTTON_HELD`], and any
+    /// custom idle fill inherits the same luminance ramp.
+    const HOVER_FACTOR: (u16, u16) = (3, 2); // ×1.5
+    const HELD_FACTOR: (u16, u16) = (11, 5); // ×2.2
+
+    /// The pill fill for the button's CURRENT state, precedence pressed → focused → hovered → idle.
+    /// Each state prefers its explicit override; an unset override on a *custom-idle* button derives
+    /// from the idle fill (so a coloured button gets a matching ramp), while a default button (no idle
+    /// override) falls back to the exact `theme::BUTTON_*` constants — pixel-identical to today.
+    fn effective_fill(&self) -> u32 {
+        let idle = self.fill.unwrap_or(theme::BUTTON_FILL);
+        if self.pressed {
+            self.held_fill.unwrap_or_else(|| match self.fill {
+                Some(_) => crate::paint::scale_brightness(idle, Self::HELD_FACTOR.0, Self::HELD_FACTOR.1),
+                None => theme::BUTTON_HELD,
+            })
+        } else if self.focused {
+            theme::BUTTON_ACTIVE
+        } else if self.hovered {
+            self.hover_fill.unwrap_or_else(|| match self.fill {
+                Some(_) => crate::paint::scale_brightness(idle, Self::HOVER_FACTOR.0, Self::HOVER_FACTOR.1),
+                None => theme::BUTTON_HOVER,
+            })
+        } else {
+            idle
         }
     }
     pub fn label(&self) -> &str {
@@ -310,6 +363,18 @@ impl Button {
         let squirdleyness = 1.75;
         let stroke_px = (self.stroke_ru * self.font_size) as isize + 1;
 
+        // Fill for THIS paint: baked-state mode folds hover/pressed/focus into the pill fill (headless
+        // hosts have no overlay pass); otherwise just the idle fill and the overlay tints on top. A
+        // state transition re-dirties the cache so only the fill re-rasterizes — stroke is unchanged.
+        let pill_fill = if self.bake_states {
+            self.effective_fill()
+        } else {
+            self.fill.unwrap_or(theme::BUTTON_FILL)
+        };
+        if self.bake_states && self.last_baked_fill != Some(pill_fill) {
+            self.pill_cache_dirty = true;
+        }
+
         // --- Pill cache rasterize: squircle fill + AA edges, gated by pill_cache_dirty. Identical to Textbox's pill rasterize so the two widgets share the visual family. ---
         if self.pill_cache_dirty {
             paint::RASTERIZE_OPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -332,7 +397,7 @@ impl Button {
                         inner_y,
                         inner_w,
                         inner_h,
-                        self.fill.unwrap_or(theme::BUTTON_FILL),
+                        pill_fill,
                         squirdleyness,
                     );
                 }
@@ -360,6 +425,7 @@ impl Button {
                 );
             }
             self.pill_cache_dirty = false;
+            self.last_baked_fill = Some(pill_fill);
         }
 
         // --- Text cache: centred label clipped by inner-pill mask. No scroll, no selection — anchor at pill centre, draw_text_left_u32 with x = centre − text_width / 2. ---
@@ -603,25 +669,17 @@ mod widget_impls {
             Button::set_hovered(self, hovered);
         }
         fn tint_delta(&self) -> u32 {
-            // Four states from the BUTTON_* palette, held ranked highest: HELD (pointer down on it, brighter azure — "release here to fire") dominates so a pressed button reads as armed regardless of focus/hover; then focused → BUTTON_ACTIVE (darker "pressed-in"); then hovered → BUTTON_HOVER; else idle (no tint, lands on BUTTON_FILL).
-            if self.pressed {
-                return crate::paint::wrap_sub_rgb(
-                    crate::theme::BUTTON_HELD,
-                    crate::theme::BUTTON_FILL,
-                );
+            // Baked-state mode folds the state colour into the pill fill itself, so there is no overlay
+            // tint to add — the delta is zero (a host that runs the overlay must not double-apply).
+            if self.bake_states {
+                return 0;
             }
-            if self.is_focused() {
-                crate::paint::wrap_sub_rgb(
-                    crate::theme::BUTTON_ACTIVE,
-                    crate::theme::BUTTON_FILL,
-                )
-            } else if self.is_hovered() {
-                // Per-instance hover colour if set (pre-fluor per-control model), else the shared default.
-                let hover = self.hover_fill.unwrap_or(crate::theme::BUTTON_HOVER);
-                crate::paint::wrap_sub_rgb(hover, crate::theme::BUTTON_FILL)
-            } else {
-                0
-            }
+            // Otherwise the pill baked its RESTING fill and the host overlay wrap-adds this delta on the
+            // hovered/pressed pixels. `effective_fill()` picks the state colour (held > focused > hover >
+            // idle) honouring per-instance overrides + the derived ramp; the delta carries it there off
+            // the resting fill, so `idle` yields a zero delta (no tint).
+            let idle = self.fill.unwrap_or(crate::theme::BUTTON_FILL);
+            crate::paint::wrap_sub_rgb(self.effective_fill(), idle)
         }
         fn hover_bbox(
             &self,
