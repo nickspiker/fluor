@@ -3,6 +3,7 @@
 //! **Action model.** Button doesn't carry a callback or an action enum — it owns a click counter. App polls [`Button::take_click`] each frame; `true` means the button fired since last poll. That's the smallest stateful API that decouples "the widget knows it was clicked" from "the app knows what to do about it" without dragging closures + lifetime juggling into the widget. For richer action dispatch (per-button intent codes, multi-target routing), the app builds a `HashMap<HitId, Action>` keyed by `button.hit_id()` and matches at the dispatch layer.
 
 use crate::canvas::PixelRect;
+use crate::text::TextStyle;
 use crate::coord::Coord;
 use crate::paint::{self, Clip, HitId};
 use crate::region::Region;
@@ -436,26 +437,14 @@ impl Button {
             self.text_cache_w = cw;
             self.text_cache_h = ch;
             if !self.label.is_empty() && self.font_size > 0.0 {
-                let tw = text.measure_text_width(&self.label, self.font_size, 400, self.font);
+                let tw = text.measure_text(&self.label, &TextStyle::new(self.font_size, 0).font(self.font));
                 let local_text_left = pill_w as Coord * 0.5 - tw * 0.5;
                 let local_y_center = pill_h as Coord * 0.5;
                 let mut text_damage = crate::canvas::Damage::new();
                 let mut text_canvas =
                     crate::canvas::Canvas::new(&mut self.text_cache, cw, ch, &mut text_damage);
                 let mask_buffer = paint::AlphaMask::new(&self.inner_pill_mask, cw, ch);
-                text.draw_text_left_u32(
-                    &mut text_canvas,
-                    &self.label,
-                    local_text_left,
-                    local_y_center,
-                    self.font_size,
-                    400,
-                    theme::TEXTBOX_TEXT,
-                    self.font,
-                    None,
-                    Some(&mask_buffer),
-                    None,
-                );
+                text.draw_text_left(&mut text_canvas, &self.label, local_text_left, local_y_center, &TextStyle::new(self.font_size, theme::TEXTBOX_TEXT).font(self.font), None, Some(&mask_buffer));
             }
             self.text_cache_dirty = false;
         }
