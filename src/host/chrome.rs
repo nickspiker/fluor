@@ -415,6 +415,79 @@ pub fn draw_status_bar(
 /// `stroke_width = (r >> 5) + 1`: the `+1` is the textbox "minimum 1-px stroke" idiom (an additive floor, not a clamp), and `r >> 5` adds a proportional pixel only on large / zoomed orbs.
 ///
 /// Precondition: the orb is the fixed top-left chrome badge, always fully on-screen (`cx, cy ≥ r_aa` and `cx+r_aa, cy+r_aa < dims` for the chrome's `button_size/2`-centred, `button_size/4`-radius orb), so the bbox is in-bounds by construction — no clamping. A violated precondition wraps a `usize` and panics on the index (fail loud). Without an `icon`, the interior fills with `ring_colour` as a solid disk; `hit_test_map` (when present) tags every pixel inside the solid ring with `hit_id`.
+/// The orb's press glow: the wordmark-family light, disk form. Rasterize the disk's coverage at the glow grey into a full-width band scratch, run the soft IIR blurs (horizontal factor 3/4, vertical 1/2 — the same character as photon's wordmark + text halos), then composite as a WHITE light layer via real `under()` — called AFTER the orb paints, so earliest-wins layering keeps every opaque disk pixel untouched and the bloom lands only in the transparent surround.
+pub fn draw_orb_press_glow(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    cx: isize,
+    cy: isize,
+    radius: isize,
+) {
+    const GLOW_GREY: u8 = 0xB0;
+    let r_out = radius * 2;
+    let band_top = (cy - r_out).max(0) as usize;
+    let band_bot = (((cy + r_out + 1).max(0)) as usize).min(height);
+    let band_h = band_bot.saturating_sub(band_top);
+    if band_h < 2 || width == 0 {
+        return;
+    }
+    let mut scratch = vec![0u8; width * band_h];
+    let rim2 = radius * radius;
+    for y in band_top..band_bot {
+        let dy = y as isize - cy;
+        let row = (y - band_top) * width;
+        let x0 = (cx - radius).max(0) as usize;
+        let x1 = (((cx + radius + 1).max(0)) as usize).min(width);
+        for x in x0..x1 {
+            let dx = x as isize - cx;
+            if dx * dx + dy * dy <= rim2 {
+                scratch[row + x] = GLOW_GREY;
+            }
+        }
+    }
+    // Soft IIR blurs, forward + backward per axis (verbatim character-match with photon_logo's halo blurs).
+    {
+        let buf = &mut scratch;
+        let len = buf.len();
+        let mut prev = buf[0];
+        for i in 1..len {
+            prev = (((buf[i] as u16 + prev as u16 * 3) >> 2) as u8).max(buf[i]);
+            buf[i] = prev;
+        }
+        let mut prev = buf[len - 1];
+        for i in (0..len).rev() {
+            prev = (((buf[i] as u16 + prev as u16 * 3) >> 2) as u8).max(buf[i]);
+            buf[i] = prev;
+        }
+        for x in 0..width {
+            let mut prev = buf[x];
+            for y in 1..band_h {
+                let idx = y * width + x;
+                prev = (((buf[idx] as u16 + prev as u16) >> 1) as u8).max(buf[idx]);
+                buf[idx] = prev;
+            }
+        }
+        for x in 0..width {
+            let last_idx = (band_h - 1) * width + x;
+            let mut prev = buf[last_idx];
+            for y in (0..band_h - 1).rev() {
+                let idx = y * width + x;
+                prev = (((buf[idx] as u16 + prev as u16) >> 1) as u8).max(buf[idx]);
+                buf[idx] = prev;
+            }
+        }
+    }
+    for (i, &grey) in scratch.iter().enumerate() {
+        if grey == 0 {
+            continue;
+        }
+        let idx = i + band_top * width;
+        // White light: darkness = 0, α = blurred coverage. under() on the already-opaque disk pixels no-ops — the orb art protects itself.
+        pixels[idx] = pixels[idx].under((grey as u32) << 24, BlendMode::Normal);
+    }
+}
+
 pub fn draw_app_icon(
     pixels: &mut [u32],
     hit_test_map: Option<&mut [HitId]>,
