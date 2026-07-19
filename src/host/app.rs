@@ -355,9 +355,20 @@ pub trait FluorApp {
         false
     }
 
-    /// User-event payload arrived from a background thread via [`EventLoopProxy::send_event`]. Typical use: a network task completed, an avatar download finished, a key-ceremony hit a milestone — the task sends the appropriate variant; this method routes it to the right state-machine handler and (usually) calls `ctx.window.request_redraw()` to repaint with the new state. Default no-op for apps that declared `type UserEvent = ()`.
-    fn on_user_event(&mut self, event: Self::UserEvent, ctx: &mut Context) {
+    /// User-event payload arrived from a background thread via [`EventLoopProxy::send_event`]. Typical use: a network task completed, an avatar download finished, a key-ceremony hit a milestone — the task sends the appropriate variant; this method routes it to the right state-machine handler and (usually) calls `ctx.window.request_redraw()` to repaint with the new state. The returned [`EventResponse`] goes thru the same host dispatch as `on_event`'s — so a background trigger can drive window-state changes (chiefly `ShowWindow` for a second-launch handoff). Default `Pass` for apps that declared `type UserEvent = ()`.
+    fn on_user_event(&mut self, event: Self::UserEvent, ctx: &mut Context) -> EventResponse {
         let _ = (event, ctx);
+        EventResponse::Pass
+    }
+
+    /// Whether the window should be created INVISIBLE — the resident/background launch (`--background`-style flags): the app boots, network comes up, but no surface shows until an explicit [`EventResponse::ShowWindow`]. Consulted once at window creation. Default `false` (normal visible launch).
+    fn start_hidden(&self) -> bool {
+        false
+    }
+
+    /// The window is being closed — by the OS (`WindowEvent::CloseRequested`: Alt-F4, taskbar close) or by the app's own chrome close button ([`EventResponse::Close`]). Return `true` to stay RESIDENT: the host hides the window (`set_visible(false)`) and the process keeps running — network, timers, everything — until an [`EventResponse::ShowWindow`] surfaces it again. Return `false` (the default) for the normal exit. The app is the policy owner: track your own hidden state here (the host won't call anything else).
+    fn on_close_requested(&mut self) -> bool {
+        false
     }
 
     /// Initial visible-window size when the app first opens, given the monitor dimensions in pixels. Default returns half the monitor in each axis (the conventional "open at a reasonable fraction of the display, centred" desktop convention) — apps with strong aspect-ratio opinions (Photon's portrait launch window, fixed-aspect editors) override. Return `(width, height)`; the host clamps each to ≥ 1 and centres the window on the monitor.
@@ -990,7 +1001,21 @@ impl<A: FluorApp> DesktopShell<A> {
                 false
             }
             EventResponse::Close => {
-                std::process::exit(0);
+                // Same policy gate as the OS CloseRequested path: a resident app hides instead of dying.
+                if self.app.on_close_requested() {
+                    window.set_visible(false);
+                    false
+                } else {
+                    std::process::exit(0);
+                }
+            }
+            EventResponse::ShowWindow => {
+                // Surface a hidden resident window: un-hide, take focus, and repaint everything — the surface content is stale (or never-painted, on a start_hidden boot).
+                window.set_visible(true);
+                window.focus_window();
+                self.pending_full_repaint = true;
+                window.request_redraw();
+                false
             }
             EventResponse::ToggleMaximized => {
                 self.toggle_maximized(&window);
@@ -1264,6 +1289,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
             .with_position(winit::dpi::PhysicalPosition::new(0i32, 0i32))
             .with_decorations(false)
             .with_transparent(true)
+            .with_visible(!self.app.start_hidden())
             .with_resizable(false);
         let window = Arc::new(event_loop.create_window(attrs).expect("create_window"));
 
@@ -1431,7 +1457,14 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match &event {
             WindowEvent::CloseRequested => {
-                std::process::exit(0);
+                // Resident apps hide on close and keep running (see FluorApp::on_close_requested); everyone else exits, as ever.
+                if self.app.on_close_requested() {
+                    if let Some(window) = self.window.as_ref() {
+                        window.set_visible(false);
+                    }
+                } else {
+                    std::process::exit(0);
+                }
             }
             WindowEvent::Resized(size) => {
                 // In the fullscreen-compositor architecture, the OS surface is the whole screen — `size` is the SCREEN size, not the consumer-visible viewport. WMs commonly fire Resized multiple times during fullscreen activation (default-window-size → animating → final fullscreen); each tick we resize the surface to match, re-centre the visible window inside the new bounds, and re-issue the input region. Suppresses the "chrome appears in the top-left of a growing window" artefact during WM fullscreen animations.
@@ -1779,7 +1812,8 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 self.viewport.height_px as usize,
             ),
         };
-        self.app.on_user_event(event, &mut ctx);
+        let response = self.app.on_user_event(event, &mut ctx);
+        self.apply_response(response);
     }
 }
 
