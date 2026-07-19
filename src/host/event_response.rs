@@ -35,4 +35,6 @@ pub enum EventResponse {
     ToggleMaximized,
     /// Minimize the window. On desktop calls `winit::Window::set_minimized(true)`; on Android a no-op (the OS owns lifecycle). Exists as a distinct variant (rather than the consumer calling `ctx.window.set_minimized` directly) so chrome's `Minimize`-button widget can return a window-handle-free response.
     Minimize,
+    /// Surface a hidden resident window: `set_visible(true)` + focus + full repaint. The counterpart of a `Close` that `FluorApp::on_close_requested` turned into a hide — typically returned from `on_user_event` when a second launch hands off "show yourself" to the resident instance.
+    ShowWindow,
 }
