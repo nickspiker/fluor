@@ -32,21 +32,32 @@ impl Icon {
     ///
     /// **Why this lives on Icon**: the orb file IS the canonical app-identity asset; baking the OS-icon path into the same struct keeps the chrome's `app_icon` and the OS taskbar icon perfectly synced — set one, set the other.
     pub fn to_winit_icon(&self) -> Option<winit::window::Icon> {
-        let n = self.pixels.len();
-        let mut rgba: Vec<u8> = Vec::with_capacity(n * 4);
-        for &p in &self.pixels {
+        let (rgba, w, h) = self.to_rgba_circular();
+        winit::window::Icon::from_rgba(rgba, w, h).ok()
+    }
+
+    /// Row-major visible-RGBA bytes with a CIRCULAR alpha mask — the shape every OS icon surface (taskbar, alt-tab, tray) wants: the orb disk, transparent corners, ~1.5px anti-aliased rim. The stored pixels are square and opaque (the in-app chrome shapes them with the rasterizer's mask instead); this is the one place squareness is clipped for the OS, so window icon and tray can't drift apart.
+    pub fn to_rgba_circular(&self) -> (Vec<u8>, u32, u32) {
+        let (w, h) = (self.width, self.height);
+        let cx = (w as f32 - 1.0) / 2.0;
+        let cy = (h as f32 - 1.0) / 2.0;
+        let radius = (w.min(h) as f32) / 2.0;
+        let mut rgba: Vec<u8> = Vec::with_capacity(self.pixels.len() * 4);
+        for (i, &p) in self.pixels.iter().enumerate() {
             // fluor pixel is 0xααDDDDDD where DDDDDD is darkness; flip via XOR with 0x00FF_FFFF to get visible RGB.
             let visible = p ^ 0x00FF_FFFF;
-            let a = ((visible >> 24) & 0xFF) as u8;
-            let r = ((visible >> 16) & 0xFF) as u8;
-            let g = ((visible >> 8) & 0xFF) as u8;
-            let b = (visible & 0xFF) as u8;
-            rgba.push(r);
-            rgba.push(g);
-            rgba.push(b);
+            let x = (i as u32 % w) as f32;
+            let y = (i as u32 / w) as f32;
+            let d = ((x - cx) * (x - cx) + (y - cy) * (y - cy)).sqrt();
+            // Full inside, zero outside, linear ramp across the ~1.5px rim.
+            let cover = ((radius - d) / 1.5).clamp(0.0, 1.0);
+            let a = (((visible >> 24) & 0xFF) as f32 * cover) as u8;
+            rgba.push(((visible >> 16) & 0xFF) as u8);
+            rgba.push(((visible >> 8) & 0xFF) as u8);
+            rgba.push((visible & 0xFF) as u8);
             rgba.push(a);
         }
-        winit::window::Icon::from_rgba(rgba, self.width, self.height).ok()
+        (rgba, w, h)
     }
 }
 
