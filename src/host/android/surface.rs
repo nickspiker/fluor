@@ -7,7 +7,7 @@
 //! Idle frames (`dirty = false` and magic-pixel matches) cost one lock + one read + one unlock+post — no per-pixel work. Stale-but-idle frames re-finalize from `scratch` (which retains the last full α + darkness frame), so we converge to the cached state across the buffer rotation without keeping an intermediate `Vec<u32>` cache.
 
 use ndk::native_window::NativeWindow;
-use ndk_sys::{ADataSpace, ANativeWindow_Buffer, ANativeWindow_lock, ANativeWindow_unlockAndPost};
+use ndk_sys::{ANativeWindow_Buffer, ANativeWindow_lock, ANativeWindow_unlockAndPost};
 
 use crate::canvas::PixelRect;
 

@@ -11,7 +11,6 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::time::Duration;
 use std::time::Instant;
 
 use ndk::native_window::NativeWindow;
