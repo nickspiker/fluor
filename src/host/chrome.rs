@@ -493,7 +493,7 @@ pub fn draw_app_icon(
     hit_test_map: Option<&mut [HitId]>,
     hit_id: HitId,
     width: usize,
-    height: usize,
+    _height: usize,
     cx: isize,
     cy: isize,
     radius: isize,

@@ -57,16 +57,18 @@ const fn dark_rgb_only(trgb: u32) -> u32 {
     trgb ^ 0x00FFFFFF
 }
 
-// Background texture (organic noise, scrollable). These are NOISE-MATH constants — bit-patterns the noise function uses (base colour + low-bit variance mask + speckle mask), not display colours. They operate in visible-RGB space (matching photon's reference); the noise function does its math then flips the result to stored darkness at the store site (`result ^ 0x00FFFFFF`). NOT wrapped with `dark()` so the photon-original patterns survive.
+// Background texture (organic noise, scrollable). Three NOISE-MATH constants: an additive BASE colour, and two bit-MASKS the noise function ANDs random bits into (`rng & BG_MASK`, `>>8 & BG_SPECKLE`) — the masks carve variance into the channels, they are NOT colours, so a colour-space matrix on them is meaningless and they stay as-authored. Only BG_BASE is a real colour.
+// COLOUR DOCTRINE (see photon theme.rs): the display surface is assumed BT.2020 γ2, so BG_BASE is HAND-CONVERTED VSF-RGB→Rec.2020 ONCE at authoring time and the Rec.2020 literal is baked here — the noise runs per-pixel on every frame, so it must never take a runtime matrix (that is the whole reason this is a const bake, not a to_display call). The VSF-authored originals are kept in the comment so the value is re-derivable. macOS ships the raw VSF value via its ICC-tagged surface — the shift is small enough for a dark near-neutral base (the matrix is near-identity on low-saturation darks) that one baked literal serves both paths acceptably; revisit only if a wide BG tint is ever introduced.
+// The noise function does its math then flips the result to stored darkness at the store site (`result ^ 0x00FFFFFF`) — so these are NOT wrapped with `dark()`.
 #[cfg(not(feature = "amber"))]
-pub const BG_BASE: u32 = fmt(0x00_0C_14_0E);
+pub const BG_BASE: u32 = fmt(0x00_0C_14_0D); // VSF 0x0C140E → Rec.2020
 #[cfg(not(feature = "amber"))]
 pub const BG_MASK: u32 = fmt(0x00_0F_07_1F);
 #[cfg(not(feature = "amber"))]
 pub const BG_SPECKLE: u32 = fmt(0x00_3F_1F_7F);
 // amber (dev builds): the same noise-math bit patterns re-biased from purple to debug orange — #FFA000's FF:A0:00 channel ratio at each constant's original magnitude (base warm-dark, variance orange-heavy, speckle an orange flash).
 #[cfg(feature = "amber")]
-pub const BG_BASE: u32 = fmt(0x00_14_0D_00);
+pub const BG_BASE: u32 = fmt(0x00_16_0B_02); // VSF 0x140D00 → Rec.2020
 #[cfg(feature = "amber")]
 pub const BG_MASK: u32 = fmt(0x00_1F_0F_03);
 #[cfg(feature = "amber")]
