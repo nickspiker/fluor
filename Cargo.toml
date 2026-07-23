@@ -41,7 +41,7 @@ icon = ["dep:rav1d", "dep:vsf"]
 #
 # winit is intentionally NOT in this feature set — `FluorApp::set_event_proxy` takes a fluor-native `Arc<dyn WakeSender<Self::UserEvent>>` so the trait shape is platform-uniform without dragging winit's data types onto Android. Eliminates the `android-activity` compile-glue dep + the `android_main` linker shim that came along when winit was present on Android.
 host-android = ["std", "text", "icon", "dep:ndk", "dep:ndk-sys", "dep:jni", "dep:log", "dep:libc"]
-text = ["std", "dep:cosmic-text", "dep:swash"]
+text = ["std", "dep:cosmic-text", "dep:swash", "dep:unicode-script"]
 # Portable SIMD via the `wide` crate. Widens inner loops in rasterizers / boundary passes /
 # the under() kernel to 4–8 pixels per iter. Scalar fallback path is preserved for builds
 # with `--no-default-features`.
@@ -79,6 +79,8 @@ cosmic-text = { version = "0.14", optional = true }
 # glyph rasterization (rotated/skewed text). Pinning the same version cosmic-text uses keeps
 # FontRef + ScaleContext interop trivial.
 swash = { version = "0.2", optional = true }
+# The concrete `Script` type in cosmic-text's `Fallback::script_fallback` signature — needed to impl our own deterministic BundledFallback (cosmic-text doesn't re-export it). Already in the tree transitively via cosmic-text; pin the same version.
+unicode-script = { version = "0.5", optional = true }
 
 # Android NDK bindings — surface (ANativeWindow), JNI entry points, native logging. Optional at the workspace level (gated on `host-android`) but listed unconditionally here because Cargo doesn't allow `[target.'cfg(target_os = "android")'.dependencies]` entries to mark themselves optional. The feature gate inside `host-android` brings them into the dep graph; consumers without that feature don't compile the host::android module so the deps stay unused.
 ndk = { version = "0.9", features = ["api-level-26"], optional = true }

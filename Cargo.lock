@@ -633,6 +633,7 @@ dependencies = [
  "softbuffer",
  "spirix",
  "swash",
+ "unicode-script",
  "vsf",
  "wgpu",
  "wide",

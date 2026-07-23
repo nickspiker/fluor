@@ -5,7 +5,9 @@
 use crate::canvas::{Canvas, Damage};
 use crate::paint::{AlphaMask, Clip, Transform};
 use crate::pixel::{Blend, BlendMode};
-use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
+use cosmic_text::fontdb::Database;
+use cosmic_text::{Attrs, Buffer, Fallback, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
+use unicode_script::Script;
 use swash::scale::{Render, ScaleContext, Source, image::Image as SwashImage};
 use swash::zeno::Transform as ZenoTransform;
 
@@ -145,17 +147,48 @@ impl<'a> TextStyle<'a> {
     }
 }
 
+/// The ONE fallback chain, hardcoded and identical on every platform.
+/// cosmic-text's default `PlatformFallback` returns real system family names on Linux/macOS/Windows but an EMPTY list on Android (its `other.rs` impl), so a codepoint absent from the primary font resolved through a system font on desktop and rendered as tofu on Android — the "heart shows a square on her phone, fine on mine" divergence.
+/// This impl names ONLY our bundled families, so glyph selection is deterministic: the same bytes render the same glyph everywhere, with no dependency on what fonts happen to be installed.
+/// A codepoint we don't bundle a glyph for is tofu on ALL platforms (consistently) rather than silently working on one — bundle another font to cover it, never rely on the host.
+struct BundledFallback;
+
+impl Fallback for BundledFallback {
+    fn common_fallback(&self) -> &[&'static str] {
+        // After the primary font misses, try our symbol font (hearts ♥♡, stars, checks, weather, geometric shapes). Extend this list as more bundled fonts are added — never with a host family name.
+        &["Noto Sans Symbols 2"]
+    }
+    fn forbidden_fallback(&self) -> &[&'static str] {
+        &[]
+    }
+    fn script_fallback(&self, _script: Script, _locale: &str) -> &[&'static str] {
+        // No per-script host fonts; the common chain above is the whole story. A future CJK/RTL bundle would be named here, still hardcoded.
+        &[]
+    }
+}
+
 impl TextRenderer {
     pub fn new() -> Self {
-        let mut font_system = FontSystem::new();
+        // Build the FontSystem from an EXPLICIT db + our BundledFallback — NOT `FontSystem::new()`, whose `PlatformFallback` diverges per-OS (see BundledFallback). Locale is fixed too: cosmic-text only uses it to pick han-unification CJK order, which our bundled set doesn't cover, so a constant keeps rendering identical regardless of the host's `LANG`.
+        let mut db = Database::new();
 
-        let db = font_system.db_mut();
-
-        // Open Sans Regular + Bold. Photon bundles a much larger family set; v0 fluor keeps the crate tiny.
+        // Open Sans Regular + Bold — the primary Latin family. Photon bundles a much larger family set; v0 fluor keeps the crate tiny.
         db.load_font_data(
             include_bytes!("../assets/Open_Sans/static/OpenSans-Regular.ttf").to_vec(),
         );
         db.load_font_data(include_bytes!("../assets/Open_Sans/static/OpenSans-Bold.ttf").to_vec());
+        // Noto Sans Symbols 2 — the deterministic symbol fallback (monochrome, so swash rasterizes it; color-emoji COLR/CBDT fonts don't rasterize cleanly here). Covers the hearts + common symbols Open Sans lacks.
+        db.load_font_data(
+            include_bytes!("../assets/Noto_Sans_Symbols2/NotoSansSymbols2-Regular.ttf").to_vec(),
+        );
+
+        db.set_sans_serif_family("Open Sans");
+
+        let font_system = FontSystem::new_with_locale_and_db_and_fallback(
+            "en-US".to_string(),
+            db,
+            BundledFallback,
+        );
 
         Self {
             font_system,
