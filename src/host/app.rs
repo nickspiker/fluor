@@ -50,7 +50,7 @@ mod x11_atomic {
 
     /// Restrict the window's INPUT region to the given screen-space rectangle. Clicks outside this rect pass thru to whatever window is behind us. Used by the fullscreen-compositor architecture: our OS surface covers the whole screen but the visible window is just a sub-rect, so we tell X11 "I'm only hittable inside that sub-rect" — the rest is mouse-transparent. Call once per `window_rect` change (initial creation, drag-to-move, resize-drag, monitor change).
     ///
-    /// The rect is in window-relative coordinates (= screen coords when the OS window is fullscreen at the screen origin). Negative offsets get clamped to 0 since XShape rectangles must be unsigned. Returns `true` if the call was sent successfully, `false` if the window isn't X11 or the connection failed.
+    /// The rect is in window-relative coordinates (= surface-local coords when the OS window is fullscreen at its monitor's origin). Negative offsets get clamped to 0 since XShape rectangles must be unsigned. A zero `w` or `h` sends an EMPTY rectangle list, which makes the window fully click-thru — X11's SET with no rectangles yields an empty input region. Returns `true` if the call was sent successfully, `false` if the window isn't X11 or the connection failed.
     pub fn set_input_region(
         window: &winit::window::Window,
         x: i32,
@@ -72,22 +72,20 @@ mod x11_atomic {
         let Some(conn) = conn() else {
             return false;
         };
+        // Empty rect → empty rectangle list → the whole window is mouse-transparent (used when the visible window doesn't intersect this surface at all).
         let rect = Rectangle {
             x: x.max(0).min(i16::MAX as i32) as i16,
             y: y.max(0).min(i16::MAX as i32) as i16,
             width: w.min(u16::MAX as u32) as u16,
             height: h.min(u16::MAX as u32) as u16,
         };
+        let rects: &[Rectangle] = if w == 0 || h == 0 {
+            &[]
+        } else {
+            std::slice::from_ref(&rect)
+        };
         if conn
-            .shape_rectangles(
-                SO::SET,
-                SK::INPUT,
-                ClipOrdering::UNSORTED,
-                xid,
-                0,
-                0,
-                &[rect],
-            )
+            .shape_rectangles(SO::SET, SK::INPUT, ClipOrdering::UNSORTED, xid, 0, 0, rects)
             .is_err()
         {
             return false;
@@ -191,29 +189,50 @@ fn work_area_macos(mon_w: u32, mon_h: u32) -> Option<(i32, i32, u32, u32)> {
     }
 }
 
-/// Desktop work area `(x, y, w, h)` in physical pixels (top-left origin) — the monitor
-/// minus space reserved by panels / taskbars / the menu bar + Dock. Dispatches to the
-/// platform query (X11 `_NET_WORKAREA`, Windows `SPI_GETWORKAREA`, macOS `visibleFrame`);
-/// falls back to the full monitor on Wayland (no client-side work-area query) and anywhere
-/// the query is unavailable.
+/// Intersect two `(x, y, w, h)` rects in global desktop units; `None` when they don't overlap.
 #[cfg(feature = "host-winit")]
-fn monitor_work_area(mon_w: u32, mon_h: u32) -> (i32, i32, u32, u32) {
+fn intersect_rect(
+    a: (i32, i32, u32, u32),
+    b: (i32, i32, u32, u32),
+) -> Option<(i32, i32, u32, u32)> {
+    let x0 = a.0.max(b.0);
+    let y0 = a.1.max(b.1);
+    let x1 = (a.0 + a.2 as i32).min(b.0 + b.2 as i32);
+    let y1 = (a.1 + a.3 as i32).min(b.1 + b.3 as i32);
+    if x0 < x1 && y0 < y1 {
+        Some((x0, y0, (x1 - x0) as u32, (y1 - y0) as u32))
+    } else {
+        None
+    }
+}
+
+/// Per-monitor work area `(x, y, w, h)` in GLOBAL desktop units — the monitor rect at `origin`/`size` minus space reserved by panels / taskbars / the menu bar + Dock. The platform queries are GLOBAL (X11 `_NET_WORKAREA` is per-virtual-desktop, Windows `SPI_GETWORKAREA` is the primary monitor in virtual-screen coords), so we intersect the global work area with this monitor's rect; per-strut per-monitor refinement is a phase-D note. Falls back to the full monitor rect on Wayland (no client-side work-area query), when the rects don't overlap, and anywhere the query is unavailable.
+#[cfg(feature = "host-winit")]
+fn monitor_work_area(origin: (i32, i32), size: (u32, u32)) -> (i32, i32, u32, u32) {
+    let mon_rect = (origin.0, origin.1, size.0, size.1);
     #[cfg(target_os = "linux")]
     {
         // Wayland has no EWMH root window; `work_area()` returns None there and we fall back.
-        return x11_atomic::work_area().unwrap_or((0, 0, mon_w, mon_h));
+        return x11_atomic::work_area()
+            .and_then(|wa| intersect_rect(wa, mon_rect))
+            .unwrap_or(mon_rect);
     }
     #[cfg(target_os = "windows")]
     {
-        return work_area_windows().unwrap_or((0, 0, mon_w, mon_h));
+        return work_area_windows()
+            .and_then(|wa| intersect_rect(wa, mon_rect))
+            .unwrap_or(mon_rect);
     }
     #[cfg(target_os = "macos")]
     {
-        return work_area_macos(mon_w, mon_h).unwrap_or((0, 0, mon_w, mon_h));
+        // The macOS query already returns monitor-relative insets; translate to global by the monitor origin.
+        return work_area_macos(size.0, size.1)
+            .map(|(x, y, w, h)| (x + origin.0, y + origin.1, w, h))
+            .unwrap_or(mon_rect);
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
-        (0, 0, mon_w, mon_h)
+        mon_rect
     }
 }
 
@@ -403,7 +422,7 @@ pub fn run_app<A: FluorApp + 'static>(mut app: A) -> Result<(), EventLoopError> 
 
 // ============================================================================ Everything below this point is `host-winit`-only — DesktopShell + winit event loop. AndroidShell lives at [`crate::host::android::shell`]. ============================================================================
 
-/// Visible-window placement inside the fullscreen screen buffer. fluor now runs as a fullscreen transparent OS window owning the whole display — the "window" the consumer paints into is a sub-rect of that screen buffer at `(x, y)` with `(w, h)` pixels. `(x, y, w, h)` are screen-space pixel coordinates. `(0, 0)` is the top-left of the display. WindowRect is mutated by drag-to-move (changes `x, y`) and resize-drag (changes `w, h`); both are in-buffer operations that don't touch the OS window geometry.
+/// Visible-window placement inside the fullscreen compositor surfaces. fluor runs fullscreen transparent OS windows owning each display — the "window" the consumer paints into is a sub-rect at `(x, y)` with `(w, h)` pixels. `(x, y, w, h)` are GLOBAL virtual-desktop units (winit's monitor-position space); each surface blits the window at `(x, y) − surface.origin`, so on a single monitor at origin (0, 0) these are numerically the old screen-space coords. WindowRect is mutated by drag-to-move (changes `x, y`) and resize-drag (changes `w, h`); both are in-buffer operations that don't touch the OS window geometry.
 #[derive(Clone, Copy, Debug)]
 #[cfg(feature = "host-winit")]
 struct WindowRect {
@@ -433,36 +452,75 @@ fn clear_scratch_rect(scratch: &mut [u32], win_w: usize, rect: crate::canvas::Pi
     }
 }
 
+/// One per-monitor OS surface in the fullscreen-compositor model — a fullscreen borderless transparent window pinned to its monitor, plus the per-surface presentation state.
+/// Phase A holds exactly ONE of these (the primary monitor); the multi-monitor phases spawn one per output and route events by `WindowId`.
+#[cfg(feature = "host-winit")]
+struct MonitorSurface {
+    /// The fullscreen borderless transparent OS window covering this monitor.
+    window: Arc<Window>,
+    /// The winit monitor this surface is pinned to; geometry refreshes (rotation, hotplug) re-read from here.
+    #[allow(dead_code)]
+    monitor: winit::monitor::MonitorHandle,
+    /// This monitor's top-left corner in virtual-desktop units.
+    origin: (i32, i32),
+    /// This monitor's size in desktop units (= the OS surface buffer size on X11/Windows).
+    size: (u32, u32),
+    /// The monitor scale factor as reported by winit.
+    scale: f64,
+    /// Surface backing pixels per desktop unit — 1.0 on X11/Windows (physical-pixel desktop), the monitor scale on macOS (point desktop).
+    #[allow(dead_code)]
+    pixel_ratio: f64,
+    /// This monitor's work area `(x, y, w, h)` in GLOBAL desktop units — the monitor minus panels/taskbars, via [`monitor_work_area`].
+    work_area: (i32, i32, u32, u32),
+    /// wgpu renderer for this surface (macOS present path).
+    #[cfg(target_os = "macos")]
+    renderer: Option<super::renderer_wgpu::Renderer>,
+    /// softbuffer surface for this window (Linux/X11, Redox); `None` on Windows which presents via UpdateLayeredWindow directly.
+    #[cfg(not(target_os = "macos"))]
+    surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    /// Persistent surface-sized pixel buffer, owned by us. Survives across frames so post-finalize overlays (hover/focus tint diffs, blinkey) can mutate just a few pixels each frame without re-running finalize for the whole window. The platform's softbuffer / wgpu back buffer may rotate or arrive stale; we always memcpy this over it just before `present()` so the platform buffer's prior state doesn't matter. Resized when the surface size changes.
+    persistent_screen: Vec<u32>,
+    /// `false` until the first `WindowEvent::Resized` (or creation-at-known-size) confirms the OS surface is allocated at real geometry — painting before that positions chrome against a stale rect.
+    surface_ready: bool,
+    /// The window doesn't currently intersect this surface — present nothing, accept no input (phase B; always `false` in phase A).
+    #[allow(dead_code)]
+    dormant: bool,
+    /// This surface's OS window has keyboard focus; the shell's `is_focused` is the any() fold over all surfaces.
+    focused: bool,
+    /// One-shot per-surface full-repaint request — set when the window enters this surface (phase B) so its first composite refills the buffer; cleared by `composite_and_present`.
+    needs_full_blit: bool,
+    /// Last input region pushed to the OS for this surface, in surface-local desktop units, `(0, 0, 0, 0)` meaning fully click-thru. Used by [`DesktopShell::push_input_region`] to dedupe the XShape call.
+    last_input_region: (i32, i32, u32, u32),
+}
+
 /// The host's adapter — owns platform handles + the consumer's `App`, dispatches events thru the trait. Not user-facing; constructed by [`run_app`].
 ///
 /// **Compositor architecture.** The OS window is fullscreen borderless transparent — fluor owns the entire screen buffer. The consumer paints into a window-sized scratch buffer (sized to `viewport` = `window_rect.w × window_rect.h`); the host then blits that scratch into the screen buffer at the `window_rect` offset. Pixels outside the window stay α=0 so the OS compositor shows whatever's behind us. Click-thru is via a per-resize input-region call (set later, see step 2 of the fullscreen-compositor pivot) so clicks outside `window_rect` route to whatever's underneath.
 #[cfg(feature = "host-winit")]
 struct DesktopShell<A: FluorApp> {
     app: A,
-    window: Option<Arc<Window>>,
+    /// Per-monitor OS surfaces. Phase A: exactly one entry (the primary monitor), created in `resumed`; empty until then.
+    surfaces: Vec<MonitorSurface>,
+    /// Index of the surface that owns tick/render/maximize — the surface the window (mostly) lives on. Phase A: always 0.
+    home: usize,
+    /// Index of the taskbar-visible surface (the one that keeps title + icon + alt-tab presence in phase B). Phase A: always 0.
+    #[allow(dead_code)]
+    anchor: usize,
+    /// The monitor scale the window geometry was last rebased to (phase-C DPI model; inert until then). Set to the home surface's scale at creation.
+    #[allow(dead_code)]
+    window_scale: f64,
     /// Consumer-visible viewport — sized to `window_rect.w × window_rect.h`, NOT the screen. Consumers paint and lay out as if their window is `viewport.width_px × viewport.height_px`; the host handles placing that paint inside the larger screen buffer.
     viewport: Viewport,
-    /// Display size in pixels (= OS window size in fullscreen mode). The OS surface buffer matches this.
-    screen_size: (u32, u32),
-    /// Desktop work area `(x, y, w, h)` — monitor minus panels/taskbars (X11 `_NET_WORKAREA`,
-    /// else the full monitor). Initial placement and the "maximized" rect target this instead
-    /// of the raw screen so the window never lands under a taskbar. Set in `resumed`.
-    work_area: (i32, i32, u32, u32),
-    /// Where the visible window lives inside the screen buffer. Driven by drag-to-move + resize-drag (later steps); initialized centered with a 3/4-of-monitor-short initial size.
+    /// Where the visible window lives, in GLOBAL virtual-desktop units (winit's monitor-position space). Driven by drag-to-move + resize-drag; on a single monitor at origin (0, 0) these are numerically the old screen-buffer coords.
     window_rect: WindowRect,
-    /// Window-sized scratch buffer. The consumer renders into this (at viewport dimensions); the host runs `finalize_for_os` on it with the window-space clip mask, then blits row-by-row into the screen buffer at `window_rect.x, window_rect.y`. Resized on `window_rect` size change.
+    /// Window-sized scratch buffer. The consumer renders into this (at viewport dimensions); the host runs `finalize_for_os` on it with the window-space clip mask, then blits row-by-row into each involved surface's buffer at `window_rect.xy − surface.origin`. Resized on `window_rect` size change.
     scratch: Vec<u32>,
-
-    // --- Renderer ---
-    #[cfg(target_os = "macos")]
-    renderer: Option<super::renderer_wgpu::Renderer>,
-    #[cfg(not(target_os = "macos"))]
-    surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
 
     // --- Shared resources ---
     text: Option<TextRenderer>,
     /// Window-shape clip mask, one byte α per pixel. Sized to `viewport` (= window-space, NOT screen-space). The consumer carves shape into it (rounded corner cutouts etc.); `finalize_for_os` multiplies it into each pixel's α at the scratch-buffer boundary before the host blits to screen. Default `255` (fully visible) means a consumer that doesn't touch it gets a rectangular window.
     clip_mask: Vec<u8>,
+    /// Last known cursor position in GLOBAL virtual-desktop units — surface-local position + that surface's origin, updated on every `CursorMoved`. On a single monitor at origin (0, 0) these equal the old screen-space values.
     cursor_x: Coord,
     cursor_y: Coord,
     modifiers: ModifiersState,
@@ -482,15 +540,12 @@ struct DesktopShell<A: FluorApp> {
     move_drag_armed: bool,
     drag_move_anchor_screen: (i32, i32),
     drag_move_rect_start: (i32, i32),
-    /// Last window_rect (x, y, w, h) that was actually painted into the screen buffer. Set after every render_frame; consulted at drag-move vsync ticks to compute the (dx, dy) delta to feed into `shift_screen_wrap`. Without this we'd have no way to know "how much did the window move since the last frame" because the cursor anchor describes total drag distance, not per-frame increment.
+    /// Last window_rect (x, y, w, h) that was actually painted, in GLOBAL virtual-desktop units like `window_rect` itself. Set after every render_frame; consulted at drag-move vsync ticks to compute the (dx, dy) delta to feed into `shift_screen_wrap`. Without this we'd have no way to know "how much did the window move since the last frame" because the cursor anchor describes total drag distance, not per-frame increment.
     last_painted_rect: WindowRect,
-    /// Saved `window_rect` from BEFORE the last `EventResponse::ToggleMaximized` set us screen-sized. `Some` ⇒ we're currently in the maximized state and the next toggle restores from here; `None` ⇒ we're at user-sized and the next toggle saves+grows. Drag-to-move while maximized currently drags the screen-sized rect (weird but harmless); a future iteration could auto-unmaximize on drag like most WMs.
+    /// Saved `window_rect` (GLOBAL virtual-desktop units) from BEFORE the last `EventResponse::ToggleMaximized` set us work-area-sized. `Some` ⇒ we're currently in the maximized state and the next toggle restores from here; `None` ⇒ we're at user-sized and the next toggle saves+grows. Drag-to-move while maximized currently drags the screen-sized rect (weird but harmless); a future iteration could auto-unmaximize on drag like most WMs.
     saved_rect_for_maximize: Option<WindowRect>,
 
-    /// `false` until the first `WindowEvent::Resized` arrives confirming the OS surface size. Most WMs open a default-sized window (800×600 or similar) and then animate / configure it to fullscreen — Resized fires when the actual surface is ready. Until then, painting positions chrome against a stale `window_rect` (sized for the monitor we expected) inside a buffer that's smaller than expected, producing a brief "chrome in the top-left of a tiny window" flash as the WM grows the surface. Defer all rendering until this flips true.
-    surface_ready: bool,
-
-    /// Tracks `WindowEvent::Focused` so the drop shadow can dim when the window is inactive — focused windows cast a stronger shadow (`SHADOW_SEED_FOCUSED`), unfocused ones use a quarter-strength shadow (`SHADOW_SEED_UNFOCUSED`).
+    /// Tracks `WindowEvent::Focused` folded over every surface (any() of `MonitorSurface::focused`) so the drop shadow can dim when the window is inactive — focused windows cast a stronger shadow (`SHADOW_SEED_FOCUSED`), unfocused ones use a quarter-strength shadow (`SHADOW_SEED_UNFOCUSED`).
     is_focused: bool,
 
     /// Live render-pipeline counters. Updated every `render_frame` call (composite-time EMA + frame counter); rendered to a bottom-of-window debug strip when [`paint::DEBUG_SHOW_FPS`] is set via the `[]f` chord.
@@ -500,9 +555,7 @@ struct DesktopShell<A: FluorApp> {
     pending_damage: crate::canvas::Damage,
     /// FPS strip active state from the previous frame. When it toggles `true → false`, this frame's damage_clip must include the strip bbox so the just-vanished strip pixels get cleared from scratch (and propagated into persistent_screen via finalize). Tracked instead of a generic `prev_damage_clip` union to avoid sticky viewport-sized damage on hover frames after any prior full repaint.
     last_strip_active: bool,
-    /// Persistent screen-sized pixel buffer, owned by us. Survives across frames so post-finalize overlays (hover/focus tint diffs, blinkey) can mutate just a few pixels each frame without re-running finalize for the whole window. The platform's softbuffer / wgpu back buffer may rotate or arrive stale; we always memcpy `persistent_screen` over it just before `present()` so the platform buffer's prior state doesn't matter. Resized when `screen_size` changes.
-    persistent_screen: Vec<u32>,
-    /// Set by any event that destroys the chrome perimeter + shadow band content in [`Self::persistent_screen`]: drag release, resize, zoom, focus change. Consumed once per `render_frame` to switch from incremental mode to full-repaint mode (wipe `persistent_screen`, finalize copies every pixel, paint_shadow runs once into the fresh band). Replaces every prior geometric-equality check on `damage_clip`.
+    /// Set by any event that destroys the chrome perimeter + shadow band content in the surfaces' `persistent_screen` buffers: drag release, resize, zoom, focus change. Consumed once per `render_frame` to switch from incremental mode to full-repaint mode (wipe the involved surfaces' buffers, finalize copies every pixel, paint_shadow runs once into the fresh band). Replaces every prior geometric-equality check on `damage_clip`.
     pending_full_repaint: bool,
     /// Which hit-ids the overlay wrote to persistent_screen LAST frame. Used so a transition (an id that was tinted, no longer is) still gets its pixels rewritten from scratch this frame to clear the prior tint. No tint magnitude is kept — the overlay just reads scratch and conditionally subtracts the current frame's delta. Re-sized to match the consumer's `overlay_deltas().len()` each frame (extended with `false` if the app registered new IDs since last frame; shrunk only on a full repaint). Cleared whenever `persistent_screen` is wiped.
     last_overlay_active: Vec<bool>,
@@ -526,10 +579,11 @@ impl<A: FluorApp> DesktopShell<A> {
     fn new(app: A) -> Self {
         Self {
             app,
-            window: None,
+            surfaces: Vec::new(),
+            home: 0,
+            anchor: 0,
+            window_scale: 1.0,
             viewport: Viewport::new(1, 1),
-            screen_size: (1, 1),
-            work_area: (0, 0, 1, 1),
             window_rect: WindowRect {
                 x: 0,
                 y: 0,
@@ -537,10 +591,6 @@ impl<A: FluorApp> DesktopShell<A> {
                 h: 1,
             },
             scratch: Vec::new(),
-            #[cfg(target_os = "macos")]
-            renderer: None,
-            #[cfg(not(target_os = "macos"))]
-            surface: None,
             text: None,
             clip_mask: Vec::new(),
             cursor_x: 0.0,
@@ -562,12 +612,10 @@ impl<A: FluorApp> DesktopShell<A> {
                 w: 1,
                 h: 1,
             },
-            surface_ready: false,
             is_focused: true,
             debug_stats: crate::paint::DebugStats::default(),
             pending_damage: crate::canvas::Damage::new(),
             last_strip_active: false,
-            persistent_screen: Vec::new(),
             pending_full_repaint: true,
             last_hitmask: false,
             last_alpha_mode: 0,
@@ -582,6 +630,241 @@ impl<A: FluorApp> DesktopShell<A> {
         }
     }
 
+    /// The home surface's window handle, cloned — the drop-in replacement for the old single `self.window` Option (empty surfaces vec pre-`resumed` maps to `None`).
+    fn home_window(&self) -> Option<Arc<Window>> {
+        self.surfaces.get(self.home).map(|s| s.window.clone())
+    }
+
+    /// Which surface owns this `WindowId` — linear scan, the vec is at most one-per-monitor small.
+    fn surface_for_window(&self, id: WindowId) -> Option<usize> {
+        self.surfaces.iter().position(|s| s.window.id() == id)
+    }
+
+    /// Push the click-thru input region for surface `si`: the window ∩ surface intersection in surface-local desktop units, `(0, 0, 0, 0)` (fully click-thru) when they don't overlap. Deduped against `last_input_region` so repeated pushes with unchanged geometry cost nothing. Replaces every direct `x11_atomic::set_input_region` call site; no-op on non-X11 platforms.
+    fn push_input_region(&mut self, si: usize) {
+        let Some(s) = self.surfaces.get_mut(si) else {
+            return;
+        };
+        let r = &self.window_rect;
+        let ix0 = r.x.max(s.origin.0);
+        let iy0 = r.y.max(s.origin.1);
+        let ix1 = (r.x + r.w as i32).min(s.origin.0 + s.size.0 as i32);
+        let iy1 = (r.y + r.h as i32).min(s.origin.1 + s.size.1 as i32);
+        let region = if ix0 < ix1 && iy0 < iy1 {
+            (
+                ix0 - s.origin.0,
+                iy0 - s.origin.1,
+                (ix1 - ix0) as u32,
+                (iy1 - iy0) as u32,
+            )
+        } else {
+            (0, 0, 0, 0)
+        };
+        if region == s.last_input_region {
+            return;
+        }
+        s.last_input_region = region;
+        #[cfg(target_os = "linux")]
+        x11_atomic::set_input_region(&s.window, region.0, region.1, region.2, region.3);
+        #[cfg(not(target_os = "linux"))]
+        let _ = region;
+    }
+
+    /// Create one fullscreen transparent OS surface pinned to `monitor` — window attributes as the old single-window `resumed` PLUS the monitor-origin position, softbuffer/wgpu at monitor size, work area from the (origin, size) signature. We deliberately avoid `with_fullscreen` — it triggers the WM's animated transition (default-window-size → grow → fullscreen) which makes the chrome appear to scale up from the top-left. Instead, ask for a plain borderless transparent window covering the monitor: the WM creates it at the requested geometry directly, no animation.
+    fn create_monitor_surface(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        monitor: winit::monitor::MonitorHandle,
+    ) -> MonitorSurface {
+        let origin = (monitor.position().x, monitor.position().y);
+        let size = (monitor.size().width.max(1), monitor.size().height.max(1));
+        let scale = monitor.scale_factor();
+
+        let attrs = WindowAttributes::default()
+            .with_title(self.app.title())
+            .with_inner_size(winit::dpi::PhysicalSize::new(size.0, size.1))
+            .with_position(winit::dpi::PhysicalPosition::new(origin.0, origin.1))
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_visible(!self.app.start_hidden())
+            .with_resizable(false);
+        let window = Arc::new(event_loop.create_window(attrs).expect("create_window"));
+        // Pin the surface to its monitor's origin post-create — some WMs apply their own placement to the pre-map with_position request, and the compositor model requires the surface to sit exactly on its monitor.
+        window.set_outer_position(winit::dpi::PhysicalPosition::new(origin.0, origin.1));
+
+        #[cfg(target_os = "macos")]
+        {
+            use winit::platform::macos::WindowExtMacOS;
+            window.set_has_shadow(false);
+        }
+
+        // Windows: make the OS window LAYERED so UpdateLayeredWindow can present per-pixel alpha (and route clicks thru the α=0 region). winit's `with_transparent(true)` alone gives an opaque softbuffer surface on Windows — the layered style is what the fullscreen compositor needs.
+        #[cfg(target_os = "windows")]
+        super::windows_layered::make_layered(&window);
+
+        // Per-monitor work area (monitor minus panels/taskbars/menu-bar+Dock), in GLOBAL desktop units, so the visible window — and especially its bottom chrome status band — doesn't end up under a taskbar.
+        let work_area = monitor_work_area(origin, size);
+
+        #[cfg(target_os = "macos")]
+        let renderer = Some(super::renderer_wgpu::Renderer::new(&window, size.0, size.1));
+        // Windows presents via UpdateLayeredWindow from `persistent_screen` directly (softbuffer's BitBlt present is opaque), so it needs no softbuffer surface. Every other non-macOS target (Linux/X11, Redox/Orbital) uses softbuffer.
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+        let surface = {
+            use std::num::NonZeroU32;
+            let context =
+                softbuffer::Context::new(window.clone()).expect("softbuffer Context::new");
+            let mut surface = softbuffer::Surface::new(&context, window.clone())
+                .expect("softbuffer Surface::new");
+            surface
+                .resize(
+                    NonZeroU32::new(size.0).expect("nonzero screen width"),
+                    NonZeroU32::new(size.1).expect("nonzero screen height"),
+                )
+                .expect("softbuffer Surface::resize");
+            Some(surface)
+        };
+        #[cfg(target_os = "windows")]
+        let surface = None;
+
+        MonitorSurface {
+            window,
+            monitor,
+            origin,
+            size,
+            scale,
+            #[cfg(target_os = "macos")]
+            pixel_ratio: scale,
+            #[cfg(not(target_os = "macos"))]
+            pixel_ratio: 1.0,
+            work_area,
+            #[cfg(target_os = "macos")]
+            renderer,
+            #[cfg(not(target_os = "macos"))]
+            surface,
+            persistent_screen: vec![0u32; (size.0 as usize) * (size.1 as usize)],
+            surface_ready: false,
+            dormant: false,
+            focused: false,
+            needs_full_blit: false,
+            // Sentinel that can never equal a computed region (x is never negative there), so the first push always reaches the OS.
+            last_input_region: (i32::MIN, i32::MIN, 0, 0),
+        }
+    }
+
+    /// Surface `si`'s OS window resized. In the fullscreen-compositor architecture the OS surface is the whole monitor — `size` is that surface's size, not the consumer-visible viewport. WMs commonly fire Resized multiple times during fullscreen activation (default-window-size → animating → final fullscreen); each tick we resize the surface buffers to match, re-centre the visible window inside the new bounds (when it lives on this surface), and re-issue the input region. Suppresses the "chrome appears in the top-left of a growing window" artefact during WM fullscreen animations.
+    fn handle_surface_resized(&mut self, si: usize, size: winit::dpi::PhysicalSize<u32>) {
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+        // Windows reports minimize as a Resized with the caption-stub geometry (~160×24), NOT 0×0 — adopting it clamps window_rect down to the stub, and the restore's Resized then "preserves the user's current size" at that clamped stub: the restore-from-minimize super-tiny-window bug. A minimized window has no visible surface to size against; ignore the event wholesale (is_minimized is None where the platform can't say, which safely falls thru).
+        if self.surfaces[si].window.is_minimized() == Some(true) {
+            return;
+        }
+        if size.width == self.surfaces[si].size.0
+            && size.height == self.surfaces[si].size.1
+            && self.surfaces[si].surface_ready
+        {
+            return;
+        }
+        // Sample readiness BEFORE mutating — the pre-ready branch below re-derives the initial size against the first real geometry.
+        let was_ready = self.surfaces[si].surface_ready;
+
+        self.surfaces[si].size = (size.width, size.height);
+
+        #[cfg(target_os = "macos")]
+        if let Some(renderer) = self.surfaces[si].renderer.as_mut() {
+            renderer.resize(size.width, size.height);
+        }
+        #[cfg(not(target_os = "macos"))]
+        if let Some(surface) = self.surfaces[si].surface.as_mut() {
+            use std::num::NonZeroU32;
+            if let (Some(w), Some(h)) =
+                (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+            {
+                surface.resize(w, h).expect("softbuffer Surface::resize");
+            }
+        }
+        // Match the persistent buffer to the new surface geometry; new pixels start at 0 which is fine — the next finalize populates them (composite's lazy length check backstops this).
+        let scr_px = (size.width as usize) * (size.height as usize);
+        if self.surfaces[si].persistent_screen.len() != scr_px {
+            self.surfaces[si].persistent_screen.resize(scr_px, 0);
+        }
+        // Re-query the work area against the refreshed monitor rect — panels/struts may have moved with the mode change.
+        self.surfaces[si].work_area =
+            monitor_work_area(self.surfaces[si].origin, self.surfaces[si].size);
+
+        // Re-centre + clamp window_rect within this surface's GLOBAL rect on every surface-size change (initial fullscreen, monitor switch, etc.) — but only when the window actually lives on this surface (phase A: it always does, there's one surface). Skip during an active drag — the user is steering the rect themselves.
+        //
+        // SIZE comes from the app: on the FIRST real surface (before surface_ready) we (re)apply `FluorApp::initial_size` now that the true screen size is known — `resumed` set it against the monitor we *expected*, and Windows in particular reports a different size here (DPI virtualization), so deriving it again keeps the app's aspect (e.g. Photon's tall portrait window) instead of the old hardcoded screen/2 that made the window "supa fat". On LATER resizes we PRESERVE the current window size (the user may have resized it) and only re-centre + clamp.
+        let origin = self.surfaces[si].origin;
+        let intersects = {
+            let r = &self.window_rect;
+            r.x < origin.0 + size.width as i32
+                && r.x + r.w as i32 > origin.0
+                && r.y < origin.1 + size.height as i32
+                && r.y + r.h as i32 > origin.1
+        };
+        // A never-ready surface hasn't confirmed geometry yet, so the intersect test against the stale rect doesn't gate the initial placement.
+        if !self.is_dragging_resize && !self.is_dragging_move && (intersects || !was_ready) {
+            let (new_w, new_h) = if !was_ready {
+                let (rw, rh) = self.app.initial_size((size.width, size.height));
+                (rw.max(1).min(size.width), rh.max(1).min(size.height))
+            } else {
+                (
+                    self.window_rect.w.max(1).min(size.width),
+                    self.window_rect.h.max(1).min(size.height),
+                )
+            };
+            let new_x = origin.0 + ((size.width as i32) - (new_w as i32)) / 2;
+            let new_y = origin.1 + ((size.height as i32) - (new_h as i32)) / 2;
+            let rect_changed = new_w != self.window_rect.w
+                || new_h != self.window_rect.h
+                || new_x != self.window_rect.x
+                || new_y != self.window_rect.y;
+            self.window_rect = WindowRect {
+                x: new_x,
+                y: new_y,
+                w: new_w,
+                h: new_h,
+            };
+            if rect_changed {
+                self.viewport = Viewport::new(new_w, new_h).with_ru(self.viewport.ru);
+                let win_px = (new_w as usize) * (new_h as usize);
+                self.scratch = vec![0u32; win_px];
+                self.clip_mask = vec![255u8; win_px];
+                // Surface-driven resize → window geometry changed → full repaint required.
+                self.pending_full_repaint = true;
+                if let (Some(window), Some(text)) = (self.home_window(), self.text.as_mut()) {
+                    let mut ctx = Context {
+                        pressed_hit: self.pointer.held_id(),
+                        viewport: self.viewport,
+                        text,
+                        clip_mask: &mut self.clip_mask,
+                        damage: &mut self.pending_damage,
+                        window: &*window,
+                        modifiers: winit_compat::from_winit_mods(self.modifiers),
+                        cursor_x: self.cursor_x - new_x as Coord,
+                        cursor_y: self.cursor_y - new_y as Coord,
+                        damage_clip: crate::canvas::PixelRect::new(
+                            0,
+                            0,
+                            self.viewport.width_px as usize,
+                            self.viewport.height_px as usize,
+                        ),
+                        is_maximized: self.saved_rect_for_maximize.is_some(),
+                        window_origin: (self.window_rect.x, self.window_rect.y),
+                    };
+                    self.app.on_resize(new_w, new_h, &mut ctx);
+                }
+                self.push_input_region(si);
+            }
+        }
+
+        // First Resized confirms the OS surface is actually allocated — safe to start painting.
+        self.surfaces[si].surface_ready = true;
+        self.render_frame();
+    }
+
     /// macOS click-thru: only disable hittest when the cursor is outside the window rect.
     /// Inside the window rect we always accept events — checking alpha per-pixel there is too fragile (transparent UI elements, frame transitions, etc. cause false negatives that drop clicks to the app behind us).
     #[cfg(target_os = "macos")]
@@ -594,7 +877,7 @@ impl<A: FluorApp> DesktopShell<A> {
         // NEVER re-engage click-thru mid-drag. A resize-grow (or a move) pushes the cursor to or past the CURRENT rect edge before `apply_resize_drag` catches the rect up; if we flipped hittest off there, macOS would stop delivering the drag and the window could shrink but never grow. Hold hittest ON for the whole drag; the next cursor-move after release recomputes normally.
         let should_ignore = !inside && !self.is_dragging_resize && !self.is_dragging_move;
         if should_ignore != self.hittest_off {
-            if let Some(window) = self.window.as_ref() {
+            if let Some(window) = self.home_window() {
                 if should_ignore {
                     window.set_cursor(winit::window::CursorIcon::Default);
                 }
@@ -605,10 +888,10 @@ impl<A: FluorApp> DesktopShell<A> {
     }
 
     fn render_frame(&mut self) {
-        if !self.surface_ready {
+        if !self.surfaces.get(self.home).is_some_and(|s| s.surface_ready) {
             return;
         }
-        let Some(window) = self.window.as_ref().cloned() else {
+        let Some(window) = self.home_window() else {
             return;
         };
         let win_w = self.viewport.width_px as usize;
@@ -651,7 +934,7 @@ impl<A: FluorApp> DesktopShell<A> {
         let full_repaint = self.pending_full_repaint;
         if full_repaint {
             self.pending_full_repaint = false;
-            self.persistent_screen.fill(0);
+            // The per-surface buffer wipe happens in `composite_and_present` (each surface owns its persistent_screen now); the overlay bookkeeping is shell-level and resets here.
             for a in self.last_overlay_active.iter_mut() {
                 *a = false;
             }
@@ -690,35 +973,76 @@ impl<A: FluorApp> DesktopShell<A> {
             damage_clip,
         };
 
-        // Per-stage stopwatches. Each Instant brackets one pipeline stage; the strip displays each as FPS so toggling SIMD/Rayon shows which stage actually moves. `buffer.present()` is excluded everywhere because it blocks for vsync, which would pin every reading to the display refresh rate. Each `let` is uninitialized and assigned exactly once below — drops the dead `= 0.0f32` placeholder the compiler used to flag.
-        let app_dt;
-        let fill_dt;
-        let finalize_dt;
-        let shadow_dt;
-
+        // Per-stage stopwatches. Each Instant brackets one pipeline stage; the strip displays each as FPS so toggling SIMD/Rayon shows which stage actually moves. `buffer.present()` is excluded everywhere because it blocks for vsync, which would pin every reading to the display refresh rate. The composite stages time themselves inside `composite_and_present` and return their readings.
         let app_start = Instant::now();
         self.app.render(&mut self.scratch, &mut ctx);
         drop(ctx);
-        app_dt = app_start.elapsed().as_secs_f32();
+        let app_dt = app_start.elapsed().as_secs_f32();
 
-        let scr_w = self.screen_size.0 as usize;
-        let scr_h = self.screen_size.1 as usize;
-        let rect_x = self.window_rect.x;
-        let rect_y = self.window_rect.y;
+        // Composite + present the finished scratch onto each involved surface — phase A: exactly the home surface.
+        let (fill_dt, finalize_dt, shadow_dt) =
+            self.composite_and_present(self.home, damage_clip, full_repaint, outline_active);
 
-        // Persistent screen lives across frames so the post-finalize overlay (blinkey) can mutate just a few pixels each frame without re-running finalize. Resize on screen-size change; new pixels start at 0 which is fine — finalize on the next render will populate them.
+        // Record what we just painted so the next drag-tick can compute its delta.
+        self.last_painted_rect = self.window_rect;
+
+        // Differential stats: F (frame) bumps every present; R (rasterize) only when a primitive actually did geometric paint work this frame (via the RASTERIZE_OPS atomic). On hover-only updates the atomic stays at 0 and R sticks. `damage_pct` reflects how much of the viewport this frame actually touched — drops to a small fraction on bbox-only updates.
+        let ras_ops = crate::paint::RASTERIZE_OPS.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let viewport_area = (win_w * win_h) as f32;
+        let damage_area = (damage_clip.width() * damage_clip.height()) as f32;
+        let damage_pct = if viewport_area > 0.0 {
+            damage_area / viewport_area
+        } else {
+            0.0
+        };
+        if ras_ops > 0 {
+            self.debug_stats
+                .record_rasterize(app_dt, fill_dt, finalize_dt, shadow_dt, damage_pct);
+        }
+        self.debug_stats.record_present(damage_pct);
+    }
+
+    /// Composite the finished window scratch onto surface `si` and present it: finalize into the surface's persistent buffer at the per-surface blit origin (`window_rect.xy − origin`), cast the drop shadow, run the overlay + FPS-strip passes with the same translated coords, then push the buffer thru the platform present path. Returns the (fill, finalize, shadow) stage timings for the debug stats. Phase A calls this once with the home surface; phase B calls it per involved surface.
+    fn composite_and_present(
+        &mut self,
+        si: usize,
+        damage_clip: crate::canvas::PixelRect,
+        full_repaint: bool,
+        outline_active: bool,
+    ) -> (f32, f32, f32) {
+        let win_w = self.viewport.width_px as usize;
+        let win_h = self.viewport.height_px as usize;
+        let hitmask_now =
+            crate::paint::DEBUG_SHOW_HITMASK.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "text")]
+        let strip_active = crate::paint::DEBUG_SHOW_FPS.load(std::sync::atomic::Ordering::Relaxed);
+        // Per-surface full repaint: the frame-level flag OR this surface's one-shot needs_full_blit (set when the window enters a surface in phase B); the one-shot is consumed here.
+        let full_repaint = full_repaint || self.surfaces[si].needs_full_blit;
+        self.surfaces[si].needs_full_blit = false;
+
+        let scr_w = self.surfaces[si].size.0 as usize;
+        let scr_h = self.surfaces[si].size.1 as usize;
+        // Per-surface blit origin: the window's GLOBAL desktop-unit rect translated into this surface's local space.
+        let rect_x = self.window_rect.x - self.surfaces[si].origin.0;
+        let rect_y = self.window_rect.y - self.surfaces[si].origin.1;
+
+        // Persistent screen lives across frames so the post-finalize overlay (blinkey) can mutate just a few pixels each frame without re-running finalize. Resize on surface-size change; new pixels start at 0 which is fine — finalize on the next render will populate them.
         let scr_px = scr_w * scr_h;
         let t = Instant::now();
-        if self.persistent_screen.len() != scr_px {
-            self.persistent_screen.resize(scr_px, 0);
+        if self.surfaces[si].persistent_screen.len() != scr_px {
+            self.surfaces[si].persistent_screen.resize(scr_px, 0);
         }
-        fill_dt = t.elapsed().as_secs_f32();
+        // A full repaint wipes this surface's buffer so finalize copies every pixel and paint_shadow casts into a known-zero band (the wipe lived at the top of render_frame when the buffer was shell-owned).
+        if full_repaint {
+            self.surfaces[si].persistent_screen.fill(0);
+        }
+        let fill_dt = t.elapsed().as_secs_f32();
 
         // Debug fade: saturating-subtract `FADE_STEP` from every persistent_screen RGB byte. Runs BEFORE finalize so pixels that finalize / overlay / strip overwrite this frame land at full brightness while pixels that nobody touches visibly decay toward black — diagnoses whether the incremental opaque-scan finalize is actually copying the regions it should. Skipped on full_repaint since persistent_screen is being wiped anyway.
         let fade_active = crate::paint::DEBUG_SHOW_FADE.load(std::sync::atomic::Ordering::Relaxed);
         if fade_active && !full_repaint {
             const FADE_STEP: u8 = 4;
-            for px in self.persistent_screen.iter_mut() {
+            for px in self.surfaces[si].persistent_screen.iter_mut() {
                 let a = *px & 0xFF00_0000;
                 let r = (((*px >> 16) & 0xFF) as u8).saturating_sub(FADE_STEP) as u32;
                 let g = (((*px >> 8) & 0xFF) as u8).saturating_sub(FADE_STEP) as u32;
@@ -735,7 +1059,7 @@ impl<A: FluorApp> DesktopShell<A> {
                 &self.clip_mask,
                 win_w,
                 win_h,
-                &mut self.persistent_screen,
+                &mut self.surfaces[si].persistent_screen,
                 scr_w,
                 rect_x,
                 rect_y,
@@ -743,7 +1067,7 @@ impl<A: FluorApp> DesktopShell<A> {
                 full_repaint,
             );
         }
-        finalize_dt = t.elapsed().as_secs_f32();
+        let finalize_dt = t.elapsed().as_secs_f32();
 
         // Drop shadow runs ONCE per full repaint, into a known-cleared band (persistent_screen.fill(0) above). Never runs on incremental frames — the perimeter AA pixels with their shadow contribution were preserved by the opaque-only finalize, and the shadow band cells outside the window were not touched either, so the shadow visible from the last full repaint is still correct. Skipped when hitmask debug is on so the band doesn't disturb the raw hit-id view at the chrome edge, and skipped when maximized because there's nothing outside the window to cast onto — the OS surface already covers the screen.
         let t = Instant::now();
@@ -753,21 +1077,22 @@ impl<A: FluorApp> DesktopShell<A> {
             let drop = (1240.0 / target_radius) as u32;
             let factor_256 = (256u32.saturating_sub(drop)).clamp(96, 254);
             let shadow_seed: u32 = if self.is_focused { 0x80 } else { 0x40 };
+            // Shadow casts in surface-local coords — the same translated blit origin finalize used.
             let rect_for_shadow = (
-                self.window_rect.x,
-                self.window_rect.y,
+                rect_x,
+                rect_y,
                 self.window_rect.w as i32,
                 self.window_rect.h as i32,
             );
             crate::paint::paint_shadow(
-                &mut self.persistent_screen,
+                &mut self.surfaces[si].persistent_screen,
                 scr_w,
                 factor_256,
                 shadow_seed,
                 rect_for_shadow,
             );
         }
-        shadow_dt = t.elapsed().as_secs_f32();
+        let shadow_dt = t.elapsed().as_secs_f32();
 
         // Post-finalize, post-shadow overlay pass. For each pixel whose hit id is currently tinted OR was tinted last frame, copy the scratch pixel → XOR to visible → optionally wrap-sub the per-id delta → write to persistent_screen. Restores the scratch baseline on unhover and applies the tint on hover — no diff math, no accumulation, just "copy and conditionally adjust." Runs every frame regardless of damage_clip so hover tints follow the cursor even when nothing else dirtied scratch.
         //
@@ -783,10 +1108,10 @@ impl<A: FluorApp> DesktopShell<A> {
             }
             crate::paint::apply_overlay(
                 &self.scratch,
-                &mut self.persistent_screen,
+                &mut self.surfaces[si].persistent_screen,
                 scr_w,
-                self.window_rect.x,
-                self.window_rect.y,
+                rect_x,
+                rect_y,
                 map,
                 hw,
                 hh,
@@ -823,9 +1148,9 @@ impl<A: FluorApp> DesktopShell<A> {
             }
             crate::paint::RASTERIZE_OPS.store(saved_ops, std::sync::atomic::Ordering::Relaxed);
 
-            // Clobber `strip_buf` rows into persistent_screen at `(window.x, window.y + strip_y_in_window)`. Per-pixel: XOR α + darkness → visible RGB, force α=0xFF.
-            let rect_x = self.window_rect.x;
-            let rect_y_top = self.window_rect.y + strip_y_in_window as i32;
+            // Clobber `strip_buf` rows into this surface's persistent_screen at the surface-local `(rect_x, rect_y + strip_y_in_window)`. Per-pixel: XOR α + darkness → visible RGB, force α=0xFF.
+            let rect_y_top = rect_y + strip_y_in_window as i32;
+            let ps = &mut self.surfaces[si].persistent_screen;
             for y in 0..strip_h {
                 let scr_y = rect_y_top + y as i32;
                 if scr_y < 0 || (scr_y as usize) >= scr_h {
@@ -841,7 +1166,7 @@ impl<A: FluorApp> DesktopShell<A> {
                     }
                     let scr_x = scr_x as usize;
                     let v = self.strip_buf[sb_row + x] ^ 0x00FF_FFFF;
-                    self.persistent_screen[ps_row + scr_x] = 0xFF00_0000 | (v & 0x00FF_FFFF);
+                    ps[ps_row + scr_x] = 0xFF00_0000 | (v & 0x00FF_FFFF);
                 }
             }
         }
@@ -849,11 +1174,12 @@ impl<A: FluorApp> DesktopShell<A> {
         // Copy persistent_screen → platform back buffer (whichever softbuffer/wgpu hands us this frame; it may be stale or rotated, but we always overwrite the whole thing from our owned persistent_screen). The damage outline overlay is stamped AFTER this copy and BEFORE present so it lives for exactly one frame and never touches persistent_screen.
         #[cfg(target_os = "macos")]
         {
-            let Some(renderer) = self.renderer.as_mut() else {
-                return;
+            let s = &mut self.surfaces[si];
+            let Some(renderer) = s.renderer.as_mut() else {
+                return (fill_dt, finalize_dt, shadow_dt);
             };
             let mut buffer = renderer.lock_buffer();
-            buffer.copy_from_slice(&self.persistent_screen);
+            buffer.copy_from_slice(&s.persistent_screen);
             if outline_active && !damage_clip.is_empty() {
                 crate::paint::stamp_damage_outline_visible(
                     &mut buffer,
@@ -865,40 +1191,41 @@ impl<A: FluorApp> DesktopShell<A> {
                 );
             }
             let _ = buffer.present();
-            // Update the global mouse monitor's window rect for re-entry detection.
+            // Update the global mouse monitor's window rect for re-entry detection — in the home surface's local coords, since the monitor was installed against that screen.
             if let Some(ref monitor) = self.hittest_monitor {
                 let r = &self.window_rect;
-                monitor.update_rect(r.x, r.y, r.w, r.h);
+                let home_origin = self.surfaces[self.home].origin;
+                monitor.update_rect(r.x - home_origin.0, r.y - home_origin.1, r.w, r.h);
             }
         }
         // Windows: present the owned screen buffer thru the layered window (per-pixel alpha + click-thru on α=0). The damage outline (a dev overlay) is stamped into a scratch copy first so it lives one frame and never touches persistent_screen, matching the softbuffer path.
         #[cfg(target_os = "windows")]
         {
-            let (sw, sh) = self.screen_size;
-            if let Some(window) = self.window.as_ref() {
-                if outline_active && !damage_clip.is_empty() {
-                    let mut scratch_screen = self.persistent_screen.clone();
-                    crate::paint::stamp_damage_outline_visible(
-                        &mut scratch_screen,
-                        scr_w,
-                        scr_h,
-                        damage_clip,
-                        rect_x,
-                        rect_y,
-                    );
-                    super::windows_layered::present(window, &scratch_screen, sw, sh);
-                } else {
-                    super::windows_layered::present(window, &self.persistent_screen, sw, sh);
-                }
+            let s = &self.surfaces[si];
+            let (sw, sh) = s.size;
+            if outline_active && !damage_clip.is_empty() {
+                let mut scratch_screen = s.persistent_screen.clone();
+                crate::paint::stamp_damage_outline_visible(
+                    &mut scratch_screen,
+                    scr_w,
+                    scr_h,
+                    damage_clip,
+                    rect_x,
+                    rect_y,
+                );
+                super::windows_layered::present(&s.window, &scratch_screen, sw, sh);
+            } else {
+                super::windows_layered::present(&s.window, &s.persistent_screen, sw, sh);
             }
         }
         #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
         {
-            let Some(surface) = self.surface.as_mut() else {
-                return;
+            let s = &mut self.surfaces[si];
+            let Some(surface) = s.surface.as_mut() else {
+                return (fill_dt, finalize_dt, shadow_dt);
             };
             let mut buffer = surface.buffer_mut().expect("softbuffer buffer_mut");
-            buffer.copy_from_slice(&self.persistent_screen);
+            buffer.copy_from_slice(&s.persistent_screen);
             if outline_active && !damage_clip.is_empty() {
                 crate::paint::stamp_damage_outline_visible(
                     &mut buffer,
@@ -911,23 +1238,8 @@ impl<A: FluorApp> DesktopShell<A> {
             }
             buffer.present().expect("softbuffer buffer.present");
         }
-        // Record what we just painted so the next drag-tick can compute its delta.
-        self.last_painted_rect = self.window_rect;
 
-        // Differential stats: F (frame) bumps every present; R (rasterize) only when a primitive actually did geometric paint work this frame (via the RASTERIZE_OPS atomic). On hover-only updates the atomic stays at 0 and R sticks. `damage_pct` reflects how much of the viewport this frame actually touched — drops to a small fraction on bbox-only updates.
-        let ras_ops = crate::paint::RASTERIZE_OPS.swap(0, std::sync::atomic::Ordering::Relaxed);
-        let viewport_area = (win_w * win_h) as f32;
-        let damage_area = (damage_clip.width() * damage_clip.height()) as f32;
-        let damage_pct = if viewport_area > 0.0 {
-            damage_area / viewport_area
-        } else {
-            0.0
-        };
-        if ras_ops > 0 {
-            self.debug_stats
-                .record_rasterize(app_dt, fill_dt, finalize_dt, shadow_dt, damage_pct);
-        }
-        self.debug_stats.record_present(damage_pct);
+        (fill_dt, finalize_dt, shadow_dt)
     }
 
     /// Drag-tick fast path: shift the screen buffer in place by the delta since the last paint, push the input region update, and present. Skips consumer render, scratch fill, finalize, and shadow rasterization entirely — the existing chrome pixels just slide thru the screen buffer, with anything that falls off any edge wrapping to the opposite side. On drag release, a normal `render_frame` overwrites the wrap artefacts in one clean frame.
@@ -937,50 +1249,44 @@ impl<A: FluorApp> DesktopShell<A> {
         if dx == 0 && dy == 0 {
             return;
         }
-        let scr_w = self.screen_size.0 as usize;
-        let scr_h = self.screen_size.1 as usize;
-        let Some(window) = self.window.as_ref().cloned() else {
+        let si = self.home;
+        let Some(s) = self.surfaces.get_mut(si) else {
             return;
         };
+        let scr_w = s.size.0 as usize;
+        let scr_h = s.size.1 as usize;
         #[cfg(target_os = "macos")]
         {
-            let Some(renderer) = self.renderer.as_mut() else {
+            let Some(renderer) = s.renderer.as_mut() else {
                 return;
             };
             let mut buffer = renderer.lock_buffer();
             crate::paint::shift_screen_wrap(&mut buffer, scr_w, scr_h, dx, dy);
             let _ = buffer.present();
         }
-        // Windows: no softbuffer surface — shift our owned persistent_screen and re-present it thru the layered window. (The layered window already moves with window_rect via the α channel, so there's no OS input-region call to push like X11 does below.)
+        // Windows: no softbuffer surface — shift the surface's owned persistent_screen and re-present it thru the layered window. (The layered window already moves with window_rect via the α channel, so there's no OS input-region call to push like X11 does below.)
         #[cfg(target_os = "windows")]
         {
-            crate::paint::shift_screen_wrap(&mut self.persistent_screen, scr_w, scr_h, dx, dy);
-            let (sw, sh) = self.screen_size;
-            super::windows_layered::present(&window, &self.persistent_screen, sw, sh);
+            crate::paint::shift_screen_wrap(&mut s.persistent_screen, scr_w, scr_h, dx, dy);
+            let (sw, sh) = s.size;
+            super::windows_layered::present(&s.window, &s.persistent_screen, sw, sh);
         }
         #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
         {
-            let Some(surface) = self.surface.as_mut() else {
+            let Some(surface) = s.surface.as_mut() else {
                 return;
             };
             let mut buffer = surface.buffer_mut().expect("softbuffer buffer_mut");
             crate::paint::shift_screen_wrap(&mut buffer, scr_w, scr_h, dx, dy);
             buffer.present().expect("softbuffer buffer.present");
         }
-        #[cfg(target_os = "linux")]
-        x11_atomic::set_input_region(
-            &window,
-            self.window_rect.x,
-            self.window_rect.y,
-            self.window_rect.w,
-            self.window_rect.h,
-        );
+        self.push_input_region(si);
         self.last_painted_rect = self.window_rect;
     }
 
     /// Apply an [`EventResponse`] returned from `app.on_event`. Returns `true` if the response was `Close` (caller should terminate).
     fn apply_response(&mut self, response: EventResponse) -> bool {
-        let Some(window) = self.window.as_ref().cloned() else {
+        let Some(window) = self.home_window() else {
             return false;
         };
         match response {
@@ -997,7 +1303,7 @@ impl<A: FluorApp> DesktopShell<A> {
                 false
             }
             EventResponse::StartResize(edge) => {
-                self.start_resize(edge, &window);
+                self.start_resize(edge);
                 false
             }
             EventResponse::Close => {
@@ -1018,7 +1324,7 @@ impl<A: FluorApp> DesktopShell<A> {
                 false
             }
             EventResponse::ToggleMaximized => {
-                self.toggle_maximized(&window);
+                self.toggle_maximized();
                 false
             }
             EventResponse::Minimize => {
@@ -1028,9 +1334,12 @@ impl<A: FluorApp> DesktopShell<A> {
         }
     }
 
-    /// Flip `window_rect` between the user-sized rect (saved in `saved_rect_for_maximize`) and the full screen. Mirrors the geometry-change tail of `resize_drag_update`: resize scratch + clip_mask, reflow viewport, notify the consumer via `on_resize`, mark full-repaint, and update the X11 input region. No-op if `screen_size` is still the (1,1) placeholder — first `Resized` event hasn't landed yet, no real geometry to swap to.
-    fn toggle_maximized(&mut self, window: &Window) {
-        let (scr_w, scr_h) = self.screen_size;
+    /// Flip `window_rect` between the user-sized rect (saved in `saved_rect_for_maximize`) and the home surface's work area. Mirrors the geometry-change tail of `resize_drag_update`: resize scratch + clip_mask, reflow viewport, notify the consumer via `on_resize`, mark full-repaint, and update the X11 input region. No-op if the home surface's size is still a placeholder — first `Resized` event hasn't landed yet, no real geometry to swap to.
+    fn toggle_maximized(&mut self) {
+        let Some(window) = self.home_window() else {
+            return;
+        };
+        let (scr_w, scr_h) = self.surfaces[self.home].size;
         if scr_w <= 1 || scr_h <= 1 {
             return;
         }
@@ -1038,14 +1347,15 @@ impl<A: FluorApp> DesktopShell<A> {
             Some(prev) => prev,
             None => {
                 self.saved_rect_for_maximize = Some(self.window_rect);
-                // Maximize to the work area (monitor minus panels), not the raw screen, so
+                // Maximize to the home surface's work area (monitor minus panels), not the raw screen, so
                 // the maximized window's bottom chrome stays clear of the taskbar. Falls
-                // back to full screen if the work area was never resolved.
-                let (wx, wy, ww, wh) = self.work_area;
+                // back to the full surface if the work area was never resolved. Both are GLOBAL desktop-unit rects.
+                let (wx, wy, ww, wh) = self.surfaces[self.home].work_area;
                 if ww > 1 && wh > 1 {
                     WindowRect { x: wx, y: wy, w: ww, h: wh }
                 } else {
-                    WindowRect { x: 0, y: 0, w: scr_w, h: scr_h }
+                    let o = self.surfaces[self.home].origin;
+                    WindowRect { x: o.0, y: o.1, w: scr_w, h: scr_h }
                 }
             }
         };
@@ -1075,7 +1385,7 @@ impl<A: FluorApp> DesktopShell<A> {
                     text,
                     clip_mask: &mut self.clip_mask,
                     damage: &mut self.pending_damage,
-                    window,
+                    window: &*window,
                     modifiers: winit_compat::from_winit_mods(self.modifiers),
                     cursor_x: self.cursor_x - self.window_rect.x as Coord,
                     cursor_y: self.cursor_y - self.window_rect.y as Coord,
@@ -1095,25 +1405,24 @@ impl<A: FluorApp> DesktopShell<A> {
             self.pending_full_repaint = true;
         }
 
-        #[cfg(target_os = "linux")]
-        x11_atomic::set_input_region(window, new_rect.x, new_rect.y, new_rect.w, new_rect.h);
+        self.push_input_region(self.home);
 
         window.request_redraw();
     }
 
-    /// Begin a self-driven resize drag. In the fullscreen-compositor model we resize `window_rect` inside our own screen buffer instead of asking the OS to resize the OS window (which is fullscreen). Captures the start geometry (window_rect size + position) and the screen-space cursor anchor; subsequent cursor moves compute the new (w, h, x, y) by delta from these starting values.
-    fn start_resize(&mut self, edge: ResizeEdge, _window: &Window) {
+    /// Begin a self-driven resize drag. In the fullscreen-compositor model we resize `window_rect` inside our own screen buffer instead of asking the OS to resize the OS window (which is fullscreen). Captures the start geometry (window_rect size + position) and the desktop-unit cursor anchor; subsequent cursor moves compute the new (w, h, x, y) by delta from these starting values.
+    fn start_resize(&mut self, edge: ResizeEdge) {
         self.is_dragging_resize = true;
         self.resize_edge = edge;
         self.drag_start_size = (self.window_rect.w, self.window_rect.h);
         self.drag_start_window_pos = (self.window_rect.x, self.window_rect.y);
-        // cursor_x/y are screen-space (raw from winit, OS window = screen in fullscreen) so no translation needed for the anchor.
+        // cursor_x/y are global desktop units (surface-local + surface origin) so no translation needed for the anchor.
         self.drag_start_cursor_screen_pos = (self.cursor_x as i32, self.cursor_y as i32);
     }
 
     /// Apply one tick of the self-driven resize drag — in-buffer. Called from `RedrawRequested` when `is_dragging_resize` (throttled to vsync). Updates `window_rect` directly (no OS round-trip — the OS window is fullscreen and request_inner_size / set_outer_position are no-ops). When the size changed, resizes `scratch` + `clip_mask` to the new dimensions and calls the consumer's `on_resize` so they can reflow. Always pushes a new XShape input region so click-thru follows the visible window. The subsequent `render_frame` paints at the new geometry into the screen buffer.
     fn apply_resize_drag(&mut self) {
-        let Some(window) = self.window.as_ref().cloned() else {
+        let Some(window) = self.home_window() else {
             return;
         };
 
@@ -1263,35 +1572,31 @@ impl<A: FluorApp> DesktopShell<A> {
         }
 
         // Update click-thru region so the OS routes clicks based on the new rect.
-        #[cfg(target_os = "linux")]
-        x11_atomic::set_input_region(&window, new_x, new_y, new_w, new_h);
+        self.push_input_region(self.home);
     }
 }
 
 #[cfg(feature = "host-winit")]
 impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
+        if !self.surfaces.is_empty() {
             return;
         }
 
-        // Probe the monitor BEFORE creating the window so we can request an OS surface of exactly the right size + position. We deliberately avoid `with_fullscreen` — it triggers the WM's animated transition (default-window-size → grow → fullscreen) which makes the chrome appear to scale up from the top-left. Instead, ask for a plain borderless transparent window covering the monitor: the WM creates it at the requested geometry directly, no animation.
-        let (mon_w, mon_h) = event_loop
+        // Probe the monitor BEFORE creating the window so we can request an OS surface of exactly the right size + position — see `create_monitor_surface` for the no-`with_fullscreen` rationale. Phase A creates ONE surface on the primary monitor (or the first available); the multi-monitor phases spawn one per output here.
+        let Some(monitor) = event_loop
             .primary_monitor()
             .or_else(|| event_loop.available_monitors().next())
-            .map(|m| (m.size().width.max(1), m.size().height.max(1)))
-            .unwrap_or((1920, 1080));
-        self.screen_size = (mon_w, mon_h);
-
-        let attrs = WindowAttributes::default()
-            .with_title(self.app.title())
-            .with_inner_size(winit::dpi::PhysicalSize::new(mon_w, mon_h))
-            .with_position(winit::dpi::PhysicalPosition::new(0i32, 0i32))
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_visible(!self.app.start_hidden())
-            .with_resizable(false);
-        let window = Arc::new(event_loop.create_window(attrs).expect("create_window"));
+        else {
+            // No monitor to pin a surface to (headless X server mid-teardown); nothing to create.
+            return;
+        };
+        let surface = self.create_monitor_surface(event_loop, monitor);
+        let window = surface.window.clone();
+        self.surfaces.push(surface);
+        self.home = 0;
+        self.anchor = 0;
+        self.window_scale = self.surfaces[0].scale;
 
         // Match the OS window icon (taskbar / alt-tab / title bar) to the app's orb. winit
         // honours this on Windows + X11; it's a no-op on Wayland (icon from .desktop app_id)
@@ -1304,24 +1609,12 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
 
         #[cfg(target_os = "macos")]
         {
-            use winit::platform::macos::WindowExtMacOS;
-            window.set_has_shadow(false);
             self.hittest_monitor =
-                super::macos_hittest::HittestMonitor::install(mon_h);
+                super::macos_hittest::HittestMonitor::install(self.surfaces[0].size.1);
         }
 
-        // Windows: make the OS window LAYERED so UpdateLayeredWindow can present per-pixel alpha (and route clicks thru the α=0 region). winit's `with_transparent(true)` alone gives an opaque softbuffer surface on Windows — the layered style is what the fullscreen compositor needs.
-        #[cfg(target_os = "windows")]
-        super::windows_layered::make_layered(&window);
-
-        // Desktop work area (monitor minus panels/taskbars/menu-bar+Dock) so the visible
-        // window — and especially its bottom chrome status band — doesn't end up under a
-        // taskbar. Per-OS query (X11 `_NET_WORKAREA`, Windows `SPI_GETWORKAREA`, macOS
-        // `visibleFrame`); falls back to the full monitor on Wayland and where unavailable.
-        let (wa_x, wa_y, wa_w, wa_h) = monitor_work_area(mon_w, mon_h);
-        self.work_area = (wa_x, wa_y, wa_w, wa_h);
-
-        // Initial visible-window size: app-supplied (defaults to half the screen in each axis), clamped to the work area and centred within it. Apps with aspect-ratio opinions override [`FluorApp::initial_size`].
+        // Initial visible-window size: app-supplied (defaults to half the screen in each axis), clamped to the surface's work area and centred within it — the work area is already in GLOBAL desktop units, so the centering math places the window correctly even when the primary monitor isn't at (0, 0). Apps with aspect-ratio opinions override [`FluorApp::initial_size`].
+        let (wa_x, wa_y, wa_w, wa_h) = self.surfaces[0].work_area;
         let (req_w, req_h) = self.app.initial_size((wa_w, wa_h));
         let initial_w = req_w.max(1).min(wa_w);
         let initial_h = req_h.max(1).min(wa_h);
@@ -1334,31 +1627,6 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
             h: initial_h,
         };
         self.viewport = Viewport::new(initial_w, initial_h);
-
-        #[cfg(target_os = "macos")]
-        {
-            self.renderer = Some(super::renderer_wgpu::Renderer::new(
-                &window,
-                self.screen_size.0,
-                self.screen_size.1,
-            ));
-        }
-        // Windows presents via UpdateLayeredWindow from `persistent_screen` directly (softbuffer's BitBlt present is opaque), so it needs no softbuffer surface. Every other non-macOS target (Linux/X11, Redox/Orbital) uses softbuffer.
-        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-        {
-            use std::num::NonZeroU32;
-            let context =
-                softbuffer::Context::new(window.clone()).expect("softbuffer Context::new");
-            let mut surface = softbuffer::Surface::new(&context, window.clone())
-                .expect("softbuffer Surface::new");
-            surface
-                .resize(
-                    NonZeroU32::new(self.screen_size.0).expect("nonzero screen width"),
-                    NonZeroU32::new(self.screen_size.1).expect("nonzero screen height"),
-                )
-                .expect("softbuffer Surface::resize");
-            self.surface = Some(surface);
-        }
 
         if self.text.is_none() {
             self.text = Some(TextRenderer::new());
@@ -1394,19 +1662,11 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
             self.app.init(&mut ctx);
         }
 
-        self.window = Some(window.clone());
         // Surface is created at the requested monitor size — we can paint immediately. The Resized handler still flips this flag if it sees a different first size, but with the non-fullscreen approach we expect the surface to come up at the right size on the first frame.
-        self.surface_ready = true;
+        self.surfaces[0].surface_ready = true;
 
-        // Click-thru: tell X11 our hittable area is just `window_rect`. Clicks outside the rect pass thru to whatever app is beneath us. Drag-to-move + resize-drag steps will re-call this on every rect change. No-op on non-X11 platforms; macOS/Windows passthrough handling lands in their own backend modules later.
-        #[cfg(target_os = "linux")]
-        x11_atomic::set_input_region(
-            &window,
-            self.window_rect.x,
-            self.window_rect.y,
-            self.window_rect.w,
-            self.window_rect.h,
-        );
+        // Click-thru: tell X11 our hittable area is just `window_rect`. Clicks outside the rect pass thru to whatever app is beneath us. Drag-to-move + resize-drag re-push this on every rect change. No-op on non-X11 platforms; macOS/Windows passthrough handling lands in their own backend modules later.
+        self.push_input_region(0);
 
         window.request_redraw();
     }
@@ -1418,7 +1678,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
             self.apply_zoom_change(Some(0.0));
         }
         let needs_redraw = if let (Some(window), Some(text)) =
-            (self.window.as_ref().cloned(), self.text.as_mut())
+            (self.home_window(), self.text.as_mut())
         {
             let mut ctx = Context {
                 pressed_hit: self.pointer.held_id(),
@@ -1444,7 +1704,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
             false
         };
         if needs_redraw {
-            if let Some(window) = self.window.as_ref() {
+            if let Some(window) = self.home_window() {
                 window.request_redraw();
             }
         }
@@ -1454,124 +1714,29 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
         }
     }
 
-    fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, _event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // Route by WindowId first — every event names the surface it arrived on; events for windows we don't own (or surfaces already dropped) are ignored wholesale.
+        let Some(si) = self.surface_for_window(id) else {
+            return;
+        };
         match &event {
             WindowEvent::CloseRequested => {
-                // Resident apps hide on close and keep running (see FluorApp::on_close_requested); everyone else exits, as ever.
+                // Resident apps hide on close and keep running (see FluorApp::on_close_requested); everyone else exits, as ever. Hiding hides every surface — the app is one entity across monitors.
                 if self.app.on_close_requested() {
-                    if let Some(window) = self.window.as_ref() {
-                        window.set_visible(false);
+                    for s in self.surfaces.iter() {
+                        s.window.set_visible(false);
                     }
                 } else {
                     std::process::exit(0);
                 }
             }
             WindowEvent::Resized(size) => {
-                // In the fullscreen-compositor architecture, the OS surface is the whole screen — `size` is the SCREEN size, not the consumer-visible viewport. WMs commonly fire Resized multiple times during fullscreen activation (default-window-size → animating → final fullscreen); each tick we resize the surface to match, re-centre the visible window inside the new bounds, and re-issue the input region. Suppresses the "chrome appears in the top-left of a growing window" artefact during WM fullscreen animations.
-                if size.width == 0 || size.height == 0 {
-                    return;
-                }
-                // Windows reports minimize as a Resized with the caption-stub geometry (~160×24), NOT 0×0 — adopting it clamps window_rect down to the stub, and the restore's Resized then "preserves the user's current size" at that clamped stub: the restore-from-minimize super-tiny-window bug. A minimized window has no visible surface to size against; ignore the event wholesale (is_minimized is None where the platform can't say, which safely falls thru).
-                if self
-                    .window
-                    .as_ref()
-                    .is_some_and(|w| w.is_minimized() == Some(true))
-                {
-                    return;
-                }
-                if size.width == self.screen_size.0
-                    && size.height == self.screen_size.1
-                    && self.surface_ready
-                {
-                    return;
-                }
-
-                self.screen_size = (size.width, size.height);
-
-                #[cfg(target_os = "macos")]
-                if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.resize(size.width, size.height);
-                }
-                #[cfg(not(target_os = "macos"))]
-                if let Some(surface) = self.surface.as_mut() {
-                    use std::num::NonZeroU32;
-                    if let (Some(w), Some(h)) =
-                        (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
-                    {
-                        surface.resize(w, h).expect("softbuffer Surface::resize");
-                    }
-                }
-
-                // Re-centre + clamp window_rect to the current screen on every screen-size change (initial fullscreen, monitor switch, etc.). Skip during an active drag — the user is steering the rect themselves.
-                //
-                // SIZE comes from the app: on the FIRST real surface (before surface_ready) we (re)apply `FluorApp::initial_size` now that the true screen size is known — `resumed` set it against the monitor we *expected*, and Windows in particular reports a different size here (DPI virtualization), so deriving it again keeps the app's aspect (e.g. Photon's tall portrait window) instead of the old hardcoded screen/2 that made the window "supa fat". On LATER resizes we PRESERVE the current window size (the user may have resized it) and only re-centre + clamp.
-                if !self.is_dragging_resize && !self.is_dragging_move {
-                    let (new_w, new_h) = if !self.surface_ready {
-                        let (rw, rh) = self.app.initial_size((size.width, size.height));
-                        (rw.max(1).min(size.width), rh.max(1).min(size.height))
-                    } else {
-                        (
-                            self.window_rect.w.max(1).min(size.width),
-                            self.window_rect.h.max(1).min(size.height),
-                        )
-                    };
-                    let new_x = ((size.width as i32) - (new_w as i32)) / 2;
-                    let new_y = ((size.height as i32) - (new_h as i32)) / 2;
-                    let rect_changed = new_w != self.window_rect.w
-                        || new_h != self.window_rect.h
-                        || new_x != self.window_rect.x
-                        || new_y != self.window_rect.y;
-                    self.window_rect = WindowRect {
-                        x: new_x,
-                        y: new_y,
-                        w: new_w,
-                        h: new_h,
-                    };
-                    if rect_changed {
-                        self.viewport = Viewport::new(new_w, new_h).with_ru(self.viewport.ru);
-                        let win_px = (new_w as usize) * (new_h as usize);
-                        self.scratch = vec![0u32; win_px];
-                        self.clip_mask = vec![255u8; win_px];
-                        // Surface-driven resize → window geometry changed → full repaint required.
-                        self.pending_full_repaint = true;
-                        if let (Some(window), Some(text)) =
-                            (self.window.as_ref().cloned(), self.text.as_mut())
-                        {
-                            let mut ctx = Context {
-                                pressed_hit: self.pointer.held_id(),
-                                viewport: self.viewport,
-                                text,
-                                clip_mask: &mut self.clip_mask,
-                                damage: &mut self.pending_damage,
-                                window: &*window,
-                                modifiers: winit_compat::from_winit_mods(self.modifiers),
-                                cursor_x: self.cursor_x - new_x as Coord,
-                                cursor_y: self.cursor_y - new_y as Coord,
-                                damage_clip: crate::canvas::PixelRect::new(
-                                    0,
-                                    0,
-                                    self.viewport.width_px as usize,
-                                    self.viewport.height_px as usize,
-                                ),
-                                is_maximized: self.saved_rect_for_maximize.is_some(),
-                window_origin: (self.window_rect.x, self.window_rect.y),
-                            };
-                            self.app.on_resize(new_w, new_h, &mut ctx);
-                        }
-                        #[cfg(target_os = "linux")]
-                        if let Some(window) = self.window.as_ref() {
-                            x11_atomic::set_input_region(window, new_x, new_y, new_w, new_h);
-                        }
-                    }
-                }
-
-                // First Resized confirms the OS surface is actually allocated — safe to start painting.
-                self.surface_ready = true;
-                self.render_frame();
+                self.handle_surface_resized(si, *size);
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor_x = position.x as Coord;
-                self.cursor_y = position.y as Coord;
+                // Promote surface-local cursor coords to GLOBAL desktop units by the reporting surface's origin — everything downstream (window-relative subtraction, drag anchors) already speaks the global space.
+                self.cursor_x = position.x as Coord + self.surfaces[si].origin.0 as Coord;
+                self.cursor_y = position.y as Coord + self.surfaces[si].origin.1 as Coord;
 
                 #[cfg(target_os = "macos")]
                 {
@@ -1583,7 +1748,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
 
                 // During a self-driven resize drag, CursorMoved fires at hundreds of Hz (raw input rate) AND we synthesize more via set_outer_position (window-relative cursor pos changes when the window moves). Doing a full resize+paint+OS-update per event floods X11 (`XIO: fatal IO error 11`) and creates a multi-second backlog of stale requests that play back after release. Coalesce: just stash the new cursor pos and request a redraw — winit caps RedrawRequested to vsync (~60-144 Hz), and the actual drag tick runs there. Skips consumer event dispatch too (consumer doesn't need to see resize-drag cursor moves).
                 if self.is_dragging_resize {
-                    if let Some(window) = self.window.as_ref() {
+                    if let Some(window) = self.home_window() {
                         window.request_redraw();
                     }
                     return;
@@ -1595,13 +1760,13 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                     let dy = (self.cursor_y as i32) - self.drag_move_anchor_screen.1;
                     if !self.is_dragging_move {
                         self.is_dragging_move = true;
-                        if let Some(window) = self.window.as_ref() {
+                        if let Some(window) = self.home_window() {
                             window.set_cursor(winit::window::CursorIcon::Grabbing);
                         }
                     }
                     self.window_rect.x = self.drag_move_rect_start.0 + dx;
                     self.window_rect.y = self.drag_move_rect_start.1 + dy;
-                    if let Some(window) = self.window.as_ref() {
+                    if let Some(window) = self.home_window() {
                         window.request_redraw();
                     }
                     return;
@@ -1609,13 +1774,13 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
 
                 // Press-hold-release: while a press is in flight, track whether the pointer is still over the armed target. A drag off (or back on) toggles the held colour — request a redraw so it appears/clears. Runs before the app dispatch so ctx.pressed_hit below reflects this move.
                 if self.pointer.on_move(self.hit_under_cursor()) {
-                    if let Some(window) = self.window.as_ref() {
+                    if let Some(window) = self.home_window() {
                         window.request_redraw();
                     }
                 }
 
                 if let (Some(window), Some(text)) =
-                    (self.window.as_ref().cloned(), self.text.as_mut())
+                    (self.home_window(), self.text.as_mut())
                 {
                     let mut ctx = Context {
                         pressed_hit: self.pointer.held_id(),
@@ -1695,13 +1860,15 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
             WindowEvent::MouseWheel { .. } => {
                 self.dispatch_event(event);
                 self.pending_full_repaint = true;
-                if let Some(window) = self.window.as_ref() {
+                if let Some(window) = self.home_window() {
                     window.request_redraw();
                 }
             }
             WindowEvent::Focused(focused) => {
                 let focused = *focused;
-                self.is_focused = focused;
+                // Per-surface focus, folded into the shell-level flag — the app is focused when ANY of its surfaces is.
+                self.surfaces[si].focused = focused;
+                self.is_focused = self.surfaces.iter().any(|s| s.focused);
                 // Cancel any in-progress resize drag if we lose focus mid-drag (the user alt-tabbed or the WM stole focus). Keeps state consistent.
                 if !focused && self.is_dragging_resize {
                     self.is_dragging_resize = false;
@@ -1711,7 +1878,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 self.pending_full_repaint = true;
                 self.dispatch_event(event);
                 // Repaint so the drop shadow dims/brightens immediately.
-                if let Some(window) = self.window.as_ref() {
+                if let Some(window) = self.home_window() {
                     window.request_redraw();
                 }
             }
@@ -1723,7 +1890,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 // Press-hold-release: arm the element under the pointer. The action does NOT fire here — it waits for a release over the same element (drag-off cancels). The raw press is still forwarded so the app can do its press-time work (focus, textbox cursor, drag-select arm, window-drag / resize). Redraw so the "held" colour appears.
                 self.pointer.on_down(self.hit_under_cursor());
                 self.dispatch_event(event);
-                if let Some(window) = self.window.as_ref() {
+                if let Some(window) = self.home_window() {
                     window.request_redraw();
                 }
             }
@@ -1746,7 +1913,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                         self.is_dragging_move = false;
                         self.pending_full_repaint = true;
                     }
-                    if let Some(window) = self.window.as_ref() {
+                    if let Some(window) = self.home_window() {
                         window.set_cursor(winit::window::CursorIcon::Default);
                         window.request_redraw();
                     }
@@ -1756,7 +1923,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 }
                 self.dispatch_event(event);
                 // Clear the "held" colour now that the press ended (whether it fired or cancelled).
-                if let Some(window) = self.window.as_ref() {
+                if let Some(window) = self.home_window() {
                     window.request_redraw();
                 }
             }
@@ -1766,11 +1933,11 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 if self.hittest_off {
                     if let Some(ref monitor) = self.hittest_monitor {
                         if monitor.check_reenter() {
-                            if let Some(window) = self.window.as_ref() {
+                            if let Some(window) = self.home_window() {
                                 let _ = window.set_cursor_hittest(true);
                                 self.hittest_off = false;
                             }
-                        } else if let Some(window) = self.window.as_ref() {
+                        } else if let Some(window) = self.home_window() {
                             // Keep polling — next vsync will check again.
                             window.request_redraw();
                         }
@@ -1795,7 +1962,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
 
     /// Cross-thread user-event payload from [`EventLoopProxy::send_event`]. Builds a [`Context`] over the host's shared resources and hands the typed event to [`FluorApp::on_user_event`]. The consumer typically reads/mutates app state and calls `ctx.window.request_redraw()` if the state change should repaint; if it doesn't request_redraw the next tick still runs normally.
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: A::UserEvent) {
-        let Some(window) = self.window.as_ref().cloned() else {
+        let Some(window) = self.home_window() else {
             return;
         };
         let Some(text) = self.text.as_mut() else {
@@ -1835,7 +2002,7 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
         }
         // Zoom changes effective_span → chrome perimeter, AA edges, glyphs, shadow ray length all scale. Full repaint required.
         self.pending_full_repaint = true;
-        if let (Some(window), Some(text)) = (self.window.as_ref().cloned(), self.text.as_mut()) {
+        if let (Some(window), Some(text)) = (self.home_window(), self.text.as_mut()) {
             let mut ctx = Context {
                 pressed_hit: self.pointer.held_id(),
                 viewport: self.viewport,
@@ -1880,7 +2047,7 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
 
     /// Deliver a validated activation ([`FluorApp::on_activate`]) — pointer up over the same element it went down on, no drag-off. Mirrors [`Self::dispatch_event`]'s Context build; called from the mouse-release arm before the raw Released is forwarded.
     fn dispatch_activate(&mut self, hit_id: crate::paint::HitId) {
-        if let (Some(window), Some(text)) = (self.window.as_ref().cloned(), self.text.as_mut()) {
+        if let (Some(window), Some(text)) = (self.home_window(), self.text.as_mut()) {
             let x = self.cursor_x - self.window_rect.x as Coord;
             let y = self.cursor_y - self.window_rect.y as Coord;
             let mods = winit_compat::from_winit_mods(self.modifiers);
@@ -1910,7 +2077,7 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
     }
 
     fn dispatch_event(&mut self, event: WindowEvent) {
-        if let (Some(window), Some(text)) = (self.window.as_ref().cloned(), self.text.as_mut()) {
+        if let (Some(window), Some(text)) = (self.home_window(), self.text.as_mut()) {
             let mut ctx = Context {
                 pressed_hit: self.pointer.held_id(),
                 viewport: self.viewport,
