@@ -1471,6 +1471,14 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 if size.width == 0 || size.height == 0 {
                     return;
                 }
+                // Windows reports minimize as a Resized with the caption-stub geometry (~160×24), NOT 0×0 — adopting it clamps window_rect down to the stub, and the restore's Resized then "preserves the user's current size" at that clamped stub: the restore-from-minimize super-tiny-window bug. A minimized window has no visible surface to size against; ignore the event wholesale (is_minimized is None where the platform can't say, which safely falls thru).
+                if self
+                    .window
+                    .as_ref()
+                    .is_some_and(|w| w.is_minimized() == Some(true))
+                {
+                    return;
+                }
                 if size.width == self.screen_size.0
                     && size.height == self.screen_size.1
                     && self.surface_ready
