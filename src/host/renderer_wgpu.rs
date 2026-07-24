@@ -33,6 +33,8 @@ impl<'a> WgpuBuffer<'a> {
 }
 
 pub struct Renderer {
+    /// The winit window this renderer presents to. Held so the renderer's ownership story is self-contained: the wgpu surface below was created FROM a clone of this Arc (wgpu's `SurfaceTarget` takes ownership, which is what makes `Surface<'static>` sound — no transmuted lifetime), and the raw `ns_view_ptr` derived from it stays valid for the renderer's whole life.
+    _window: std::sync::Arc<Window>,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -47,19 +49,19 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(window: &Window, width: u32, height: u32) -> Self {
-        let static_window: &'static Window = unsafe { std::mem::transmute(window) };
-        pollster::block_on(Self::init(static_window, width, height))
+    pub fn new(window: std::sync::Arc<Window>, width: u32, height: u32) -> Self {
+        pollster::block_on(Self::init(window, width, height))
     }
 
-    async fn init(window: &'static Window, width: u32, height: u32) -> Self {
+    async fn init(window: std::sync::Arc<Window>, width: u32, height: u32) -> Self {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::METAL,
             ..Default::default()
         });
 
+        // Created from an Arc CLONE: wgpu's SurfaceTarget takes ownership of the Arc, so the surface keeps the window alive and `Surface<'static>` is sound without any lifetime transmute.
         let surface = instance
-            .create_surface(window)
+            .create_surface(window.clone())
             .expect("wgpu: create_surface failed");
 
         let adapter = instance
@@ -118,6 +120,7 @@ impl Renderer {
         let cpu_buffer = vec![0u32; (width * height) as usize];
 
         Self {
+            _window: window,
             surface,
             device,
             queue,
