@@ -94,6 +94,38 @@ mod x11_atomic {
         true
     }
 
+    /// Tell the compositor to NEVER unredirect this window (`_NET_WM_BYPASS_COMPOSITOR = 2`). Mutter/KWin fast-path a window that exactly covers a monitor by bypassing compositing — and an unredirected window loses its alpha channel, so every transparent pixel of our monitor-sized surface renders OPAQUE BLACK (observed: the taskbar strip going black "on occasion"). The hint is advisory but honoured by both major compositors; set once per surface at creation.
+    pub fn set_never_bypass_compositor(window: &winit::window::Window) -> bool {
+        use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode};
+        use x11rb::wrapper::ConnectionExt as _;
+
+        let Ok(handle) = window.window_handle() else {
+            return false;
+        };
+        let xid = match handle.as_raw() {
+            RawWindowHandle::Xcb(h) => h.window.get(),
+            RawWindowHandle::Xlib(h) => h.window as u32,
+            _ => return false,
+        };
+        let Some(conn) = conn() else {
+            return false;
+        };
+        let Some(atom) = conn
+            .intern_atom(false, b"_NET_WM_BYPASS_COMPOSITOR")
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|r| r.atom)
+        else {
+            return false;
+        };
+        // EWMH values: 0 = no preference, 1 = request bypass, 2 = request NO bypass — we need 2.
+        let ok = conn
+            .change_property32(PropMode::REPLACE, xid, atom, AtomEnum::CARDINAL, &[2u32])
+            .is_ok();
+        let _ = conn.flush();
+        ok
+    }
+
     /// Ask the WM to keep this window OUT of the taskbar and pager via an EWMH `_NET_WM_STATE` client message carrying `_NET_WM_STATE_SKIP_TASKBAR` + `_NET_WM_STATE_SKIP_PAGER` (action add when `skip`, remove otherwise). Sent on every non-anchor monitor surface so alt-tab and the taskbar show ONE entry for the app instead of one per monitor. Returns `true` if the message was sent; `false` if the window isn't X11 or the connection failed (a WM that ignores the hint just shows extra entries — cosmetic, not fatal).
     pub fn set_skip_taskbar(window: &winit::window::Window, skip: bool) -> bool {
         use x11rb::protocol::xproto::{ClientMessageEvent, ConnectionExt as _, EventMask};
@@ -1249,6 +1281,10 @@ impl<A: FluorApp> DesktopShell<A> {
         ));
         #[cfg(not(target_os = "macos"))]
         window.set_outer_position(winit::dpi::PhysicalPosition::new(origin.0, origin.1));
+
+        // A monitor-sized window is exactly what compositors unredirect for performance — and unredirected means no alpha, so our transparent pixels (including the strip over the taskbar) render opaque black. Opt out permanently.
+        #[cfg(target_os = "linux")]
+        x11_atomic::set_never_bypass_compositor(&window);
 
         #[cfg(target_os = "macos")]
         {
