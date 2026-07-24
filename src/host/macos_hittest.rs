@@ -10,12 +10,12 @@ use std::sync::Arc;
 pub(super) struct HittestMonitor {
     /// Set by the monitor callback when the cursor is inside the window rect.
     pub reenter_flag: Arc<AtomicBool>,
-    /// Window rect in screen coords (top-left origin, matching winit convention).
+    /// Window rect in GLOBAL desktop POINTS (top-left origin, primary screen's top edge at y = 0 — the same space the shell's `window_rect` lives in). `NSEvent::mouseLocation` is already global points, so multi-monitor needs no per-surface translation here: the ONE window rect covers the cursor test on every screen.
     pub win_x: Arc<AtomicI32>,
     pub win_y: Arc<AtomicI32>,
     pub win_w: Arc<AtomicU32>,
     pub win_h: Arc<AtomicU32>,
-    /// Screen height for Y-flip (NSEvent uses bottom-left origin).
+    /// PRIMARY screen height in POINTS for the Y-flip (NSEvent uses a bottom-left origin whose reference is the primary screen frame).
     pub screen_h: Arc<AtomicU32>,
     _monitor: *mut objc2::runtime::AnyObject,
 }
@@ -23,7 +23,7 @@ pub(super) struct HittestMonitor {
 unsafe impl Send for HittestMonitor {}
 
 impl HittestMonitor {
-    /// Install a global mouse-moved monitor.
+    /// Install a global mouse-moved monitor. `screen_h` = the PRIMARY screen's height in POINTS (the mouseLocation flip reference).
     pub fn install(screen_h: u32) -> Option<Self> {
         use objc2::rc::Retained;
         use objc2::runtime::AnyObject;
@@ -83,7 +83,7 @@ impl HittestMonitor {
         })
     }
 
-    /// Update the window rect (call after move/resize).
+    /// Update the window rect (call after move/resize) — GLOBAL desktop points, same space as the shell's `window_rect`.
     pub fn update_rect(&self, x: i32, y: i32, w: u32, h: u32) {
         self.win_x.store(x, Ordering::Relaxed);
         self.win_y.store(y, Ordering::Relaxed);
