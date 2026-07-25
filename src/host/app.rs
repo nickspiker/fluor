@@ -1239,10 +1239,15 @@ impl<A: FluorApp> DesktopShell<A> {
             ),
         );
         #[cfg(not(target_os = "macos"))]
-        let (origin, size) = (
+        let (origin, mut size) = (
             (monitor.position().x, monitor.position().y),
             (monitor.size().width.max(1), monitor.size().height.max(1)),
         );
+        // Linux/X11: undersize the surface by ONE pixel row. An undecorated window EXACTLY monitor-sized gets auto-promoted to legacy FULLSCREEN by Mutter-family WMs (Muffin 6.4 verified live 2026-07-25: _NET_WM_STATE grew FULLSCREEN unrequested) — fullscreen-layer stacking sits ABOVE the panel, burying the taskbar (the "black taskbar" lockup; _NET_WM_BYPASS_COMPOSITOR=2 and the unredirect gsetting were both red herrings). h−1 defeats the exact-size match; the missing row is imperceptible — maximize targets the work area, and the bottom row usually sits over the panel anyway.
+        #[cfg(target_os = "linux")]
+        {
+            size.1 = size.1.saturating_sub(1).max(1);
+        }
         #[cfg(target_os = "macos")]
         let pixel_ratio = scale;
         #[cfg(not(target_os = "macos"))]
