@@ -1192,10 +1192,12 @@ impl<A: FluorApp> DesktopShell<A> {
             return;
         };
         let r = &self.window_rect;
-        let ix0 = r.x.max(s.origin.0);
-        let iy0 = r.y.max(s.origin.1);
-        let ix1 = (r.x + r.w as i32).min(s.origin.0 + s.size.0 as i32);
-        let iy1 = (r.y + r.h as i32).min(s.origin.1 + s.size.1 as i32);
+        // Inflate the hittable region by the resize band so the border extends INVISIBLY past the window edge — the CSD convention. With the region exactly the window rect, a cursor approaching an edge from OUTSIDE parked on pixels that received no events at all (they pass thru to the window below), so resize could only ever be grabbed from inside ("moving mouse in from outside never lets you resize"). get_resize_edge already classifies just-outside (negative window-relative) coords as the matching edge, and hit_at bounds-checks, so the only missing piece was the region. Same band as the classifier: strip_height/4.
+        let band = (super::chrome::strip_height(self.viewport) / 4.0).ceil() as i32;
+        let ix0 = (r.x - band).max(s.origin.0);
+        let iy0 = (r.y - band).max(s.origin.1);
+        let ix1 = (r.x + r.w as i32 + band).min(s.origin.0 + s.size.0 as i32);
+        let iy1 = (r.y + r.h as i32 + band).min(s.origin.1 + s.size.1 as i32);
         let region = if ix0 < ix1 && iy0 < iy1 {
             (
                 ix0 - s.origin.0,
