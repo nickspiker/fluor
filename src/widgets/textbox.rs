@@ -41,6 +41,8 @@ pub struct Textbox {
     // --- Scroll ---
     /// Horizontal scroll offset in pixels. Positive = text shifted right (cursor near left edge). Private — access via [`Self::scroll_offset`] / [`Self::set_scroll_offset`] / [`Self::nudge_scroll_offset`] so the text cache invalidates correctly on every change.
     scroll_offset: Coord,
+    /// Extra text-area exclusion from the pill's RIGHT edge, in pixels — for an app button OVERLAID inside the pill (photon's contacts `+`, the compose send arrow). The usable text area ends here instead of at the pill edge: layout centres in the reduced area, the scroll clamp bounds against it, and the text mask hard-cuts at the boundary so overflowing text never paints under the button. 0 = the classic full-pill behaviour. Set via [`Self::set_right_inset`]; the app re-asserts it alongside `set_rect` in its layout pass.
+    right_inset: Coord,
 
     // --- Blinkey ---
     /// Whether the blinkey is currently drawn (visible half of blink cycle).
@@ -227,6 +229,7 @@ impl Textbox {
             widths: Vec::new(),
             font: "Open Sans",
             scroll_offset: 0.0,
+            right_inset: 0.0,
             blinkey_visible: false,
             blinkey_wave_top: true,
             selection_anchor: None,
@@ -441,14 +444,30 @@ impl Textbox {
         self.center_x - self.width * 0.5 + self.padding()
     }
 
-    /// Viewport-space pixel x of the right edge of the usable text area (= pill right − padding). Counterpart to [`Self::text_left`].
+    /// Viewport-space pixel x of the right edge of the usable text area (= pill right − padding − [`right_inset`](Self::set_right_inset)). Counterpart to [`Self::text_left`].
     pub fn text_right(&self) -> Coord {
-        self.center_x + self.width * 0.5 - self.padding()
+        self.center_x + self.width * 0.5 - self.padding() - self.right_inset
     }
 
-    /// Usable text area width (pill interior minus [`Self::padding`] on both sides). What the scroll clamp uses as the "fit boundary": `text_width ≤ usable_width` ⇒ text fits and centres at `scroll_offset = 0`; otherwise it overflows and `scroll_offset` is bounded to `±(text_width − usable_width) / 2`.
+    /// Usable text area width (pill interior minus [`Self::padding`] on both sides, minus the [`right_inset`](Self::set_right_inset) button exclusion). What the scroll clamp uses as the "fit boundary": `text_width ≤ usable_width` ⇒ text fits and centres at `scroll_offset = 0`; otherwise it overflows and `scroll_offset` is bounded to `±(text_width − usable_width) / 2`.
     pub fn usable_width(&self) -> Coord {
-        self.width - self.padding() * 2.0
+        (self.width - self.padding() * 2.0 - self.right_inset).max(0.0)
+    }
+
+    /// Centre x of the USABLE text area — the pill centre shifted left by half the right-inset. Every layout/centring/scroll computation anchors here so text centres in the area the user can actually see (excluding an overlaid button), not the raw pill.
+    fn usable_center_x(&self) -> Coord {
+        self.center_x - self.right_inset * 0.5
+    }
+
+    /// Exclude `inset` pixels at the pill's right edge from the text area (an overlaid button's footprint: its width + its inset from the pill edge). Text layout, scroll bounds, and the clip mask all respect it — typed text stops at the button instead of sliding under it. Invalidates the caches on change (the mask + text anchor both move).
+    pub fn set_right_inset(&mut self, inset: Coord) {
+        let inset = inset.max(0.0);
+        if self.right_inset != inset {
+            self.right_inset = inset;
+            self.pill_cache_dirty = true;
+            self.text_cache_dirty = true;
+            self.clamp_scroll_to_bounds();
+        }
     }
 
     // --- Editing ---
@@ -735,7 +754,7 @@ impl Textbox {
     fn text_start_x(&self) -> Coord {
         let tw = self.text_width();
         let uw = self.usable_width();
-        let usable_center = self.center_x;
+        let usable_center = self.usable_center_x();
         if tw <= uw {
             // Text fits — center it in the usable area.
             usable_center - tw * 0.5
@@ -865,6 +884,15 @@ impl Textbox {
             for i in 0..(cw * ch) {
                 self.inner_pill_mask[i] = ((self.pill_cache[i] >> 24) & 0xFF) as u8;
             }
+            // Button-exclusion hard cut: zero the mask columns under an overlaid button (right_inset from the pill's right edge) so overflowing text/selection can never paint beneath it. A vertical cut, no AA fade — the button's own opaque fill sits over the boundary, so the cut is never naked.
+            if self.right_inset > 0.0 {
+                let cut = (pill_w as Coord - self.right_inset).max(0.0) as usize;
+                for y in 0..ch {
+                    for x in cut..cw {
+                        self.inner_pill_mask[y * cw + x] = 0;
+                    }
+                }
+            }
             // Outer two-tone stroke painted after the snapshot so it doesn't influence the mask.
             {
                 let mut cache_canvas =
@@ -900,7 +928,8 @@ impl Textbox {
 
             // Anchor at the LOCAL pill centre (in cache coords), shifted by scroll_offset. `draw_text_center_u32` keeps text and cursor on the SAME anchor point — the textbox centre — instead of going thru a derived text_start_x that depends on the running sum of glyph widths. When the window scales, all the per-glyph widths change and a left-anchored layout would have positions drifting because text_start_x = center_x − tw/2 sees both terms shift. Centre-anchored stays stable. Selection x range uses the same local_text_left math so selection bg lines up with glyph positions exactly.
             let tw = self.text_width();
-            let local_text_left = pill_w as Coord * 0.5 - tw * 0.5 + self.scroll_offset;
+            // The anchor centre is the USABLE-area centre (pill centre shifted left by right_inset/2), mirroring text_start_x — so an overlaid button's exclusion moves the whole text block, not just the clamp bounds.
+            let local_text_left = pill_w as Coord * 0.5 - self.right_inset * 0.5 - tw * 0.5 + self.scroll_offset;
             let local_y_center = pill_h as Coord * 0.5;
             // Pre-compute the selection rect in local coords BEFORE the mutable borrow of self.text_cache starts (selection_range / widths read self).
             let sel_rect: Option<(isize, isize, isize, isize)> =
