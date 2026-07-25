@@ -54,6 +54,10 @@ pub struct AndroidShell<A: FluorApp> {
     /// Last-known good last_tick used by `tick`-style apps.
     #[allow(dead_code)]
     last_tick: Option<Instant>,
+    /// Pinned size-driving span (see resize): the last full-height span, re-derived only on width change.
+    span_basis: Coord,
+    /// The surface width the pinned span was derived at — the rotation detector.
+    basis_width: u32,
 }
 
 impl<A: FluorApp> AndroidShell<A> {
@@ -62,6 +66,9 @@ impl<A: FluorApp> AndroidShell<A> {
         // Android writes finalize output directly into an ANativeWindow_lock'd buffer that the SurfaceFlinger compositor consumes after unlockAndPost. Worker-thread writes to that buffer need to be visible to the compositor by the time unlockAndPost runs; rayon's join is a CPU memory barrier but not a guaranteed device-coherent flush across all worker cores. Forcing par_rows / par_chunks sequential keeps writes on the calling thread so unlockAndPost's cache flush covers everything in one shot — eliminates the "horizontal white band at a random row" tear we hit with parallel finalize.
         crate::par::FORCE_SEQUENTIAL.store(true, core::sync::atomic::Ordering::Relaxed);
         let viewport = Viewport::new(width, height);
+        // Scale basis: the creation-time (full-height) span, re-derived only when the WIDTH changes (rotation). The IME shrinks only the height, and a live harmonic-mean span shrank the whole UI on every keyboard open — width is the Android scale invariant (the surface is always full-screen wide).
+        let span_basis = viewport.span;
+        let basis_width = width;
         // Host contract: set_event_proxy fires BEFORE init. On desktop run_app wraps winit's EventLoopProxy; here we hand the app a no-op sender. Apps that override `on_user_event` to react to background-task pings won't see any (background tasks should use JNI callbacks to wake the Activity on Android instead).
         let wake: Arc<dyn crate::host::wake::WakeSender<A::UserEvent>> = Arc::new(NoopWakeSender);
         app.set_event_proxy(wake);
@@ -81,6 +88,8 @@ impl<A: FluorApp> AndroidShell<A> {
             touch_down: false,
             touch_last_y: 0.0,
             last_tick: None,
+            span_basis,
+            basis_width,
         };
         shell.with_context(|app, ctx| app.init(ctx));
         shell
@@ -92,7 +101,12 @@ impl<A: FluorApp> AndroidShell<A> {
             return;
         }
         self.surface.resize(width, height);
-        self.viewport = Viewport::new(width, height).with_ru(self.viewport.ru);
+        // Width changed = a REAL display change (rotation/fold): re-derive the scale basis from the new full surface. Width unchanged = the IME resizing the height: keep the pinned basis so the UI crops instead of shrinking.
+        if width != self.basis_width {
+            self.span_basis = Viewport::new(width, height).span;
+            self.basis_width = width;
+        }
+        self.viewport = Viewport::new(width, height).with_span(self.span_basis).with_ru(self.viewport.ru);
         let px = (width as usize) * (height as usize);
         self.scratch.resize(px, 0);
         self.clip_mask.resize(px, 255);
