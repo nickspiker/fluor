@@ -836,6 +836,7 @@ impl<A: FluorApp> DesktopShell<A> {
             }
         }
         if best != self.home {
+            log::info!("FLUOR-MON: home {} → {} (window=({},{}) {}x{})", self.home, best, r.0, r.1, r.2, r.3);
             self.home = best;
             self.pending_full_repaint = true;
         }
@@ -852,10 +853,12 @@ impl<A: FluorApp> DesktopShell<A> {
         for si in 0..self.surfaces.len() {
             let inv = intersect_rect(r, self.surfaces[si].rect()).is_some();
             if inv && self.surfaces[si].dormant {
+                log::info!("FLUOR-MON: surface {} WAKES (window=({},{}) {}x{} ∩ surface={:?})", si, r.0, r.1, r.2, r.3, self.surfaces[si].rect());
                 self.surfaces[si].dormant = false;
                 self.surfaces[si].needs_full_blit = true;
                 self.push_input_region(si);
             } else if !inv && !self.surfaces[si].dormant && si != self.home {
+                log::info!("FLUOR-MON: surface {} EVACUATES (window left it)", si);
                 self.surfaces[si].persistent_screen.fill(0);
                 self.present_surface_raw(si);
                 self.surfaces[si].dormant = true;
@@ -1333,6 +1336,13 @@ impl<A: FluorApp> DesktopShell<A> {
         // Persistent buffer at backing pixels (== desktop units on X11/Windows, points × scale on macOS).
         let bw = ((size.0 as f64) * pixel_ratio).round().max(1.0) as usize;
         let bh = ((size.1 as f64) * pixel_ratio).round().max(1.0) as usize;
+        // Multi-monitor diagnostic (rides the consumer's log bridge into the pullable app log): the raw winit monitor geometry AND the derived desktop-unit rect. The macOS cross-monitor vanish investigation hinges on whether these origins land in ONE coherent point space when the two monitors carry different scales — a wrong origin makes involved() miss the second surface forever.
+        log::info!(
+            "FLUOR-MON: surface for {:?} anchor={} raw_pos=({},{}) raw_size={}x{} scale={} → origin=({},{}) size={}x{} ratio={} work_area={:?}",
+            monitor.name(), is_anchor, monitor.position().x, monitor.position().y,
+            monitor.size().width, monitor.size().height, scale,
+            origin.0, origin.1, size.0, size.1, pixel_ratio, work_area
+        );
         MonitorSurface {
             window,
             monitor,
@@ -1689,11 +1699,16 @@ impl<A: FluorApp> DesktopShell<A> {
         #[cfg(feature = "text")]
         let strip_active = crate::paint::DEBUG_SHOW_FPS.load(std::sync::atomic::Ordering::Relaxed);
         // Per-surface full repaint: the frame-level flag OR this surface's one-shot needs_full_blit (set when the window enters a surface in phase B); the one-shot is consumed here.
-        let full_repaint = full_repaint || self.surfaces[si].needs_full_blit;
+        let first_after_wake = self.surfaces[si].needs_full_blit;
+        let full_repaint = full_repaint || first_after_wake;
         self.surfaces[si].needs_full_blit = false;
 
         let (scr_w, scr_h) = self.surfaces[si].backing();
         let pr = self.surfaces[si].pixel_ratio;
+        // The wake composite is the make-or-break moment of a cross-monitor drag — log its geometry once so a remote repro (macbook) shows whether the blit landed on-buffer.
+        if first_after_wake {
+            log::info!("FLUOR-MON: surface {} first composite after wake: blit_origin=({},{}) win_px={}x{} backing={}x{} ratio={}", si, ((self.window_rect.x - self.surfaces[si].origin.0) as f64 * pr).round() as i32, ((self.window_rect.y - self.surfaces[si].origin.1) as f64 * pr).round() as i32, ((self.window_rect.w as f64) * pr).round() as i32, ((self.window_rect.h as f64) * pr).round() as i32, scr_w, scr_h, pr);
+        }
         // Per-surface blit origin in surface BACKING pixels: the window's GLOBAL desktop-unit rect translated into this surface's local space, then × pixel_ratio under the ONE unit→backing rounding convention (multiply, then `.round()`, ties away from zero) — every conversion in this function uses it.
         let rect_x = (((self.window_rect.x - self.surfaces[si].origin.0) as f64) * pr).round() as i32;
         let rect_y = (((self.window_rect.y - self.surfaces[si].origin.1) as f64) * pr).round() as i32;
