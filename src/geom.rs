@@ -57,6 +57,12 @@ impl Viewport {
         }
     }
 
+    /// Override the size-driving `span` with a caller-held basis while layout extents (`width_px`/`height_px`, `half_*`) stay the live surface. Android pins its basis to the last FULL-HEIGHT span and only recomputes when the WIDTH changes (rotation): the soft keyboard shrinks only the height, and under the live harmonic mean every IME open shrank the whole UI (user decision 2026-07-25: width is the scale invariant on Android — the surface is always full-screen wide).
+    pub fn with_span(mut self, span: Coord) -> Self {
+        self.span = span;
+        self
+    }
+
     /// Override the RU multiplier. Returns a new `Viewport` with all other derived units preserved.
     pub fn with_ru(mut self, ru: Coord) -> Self {
         self.ru = ru;
