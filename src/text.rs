@@ -155,8 +155,10 @@ struct BundledFallback;
 
 impl Fallback for BundledFallback {
     fn common_fallback(&self) -> &[&'static str] {
-        // After the primary font misses, try our symbol font (hearts ♥♡, stars, checks, weather, geometric shapes). Extend this list as more bundled fonts are added — never with a host family name.
-        &["Noto Sans Symbols 2"]
+        // After the primary font misses, try our symbol font (hearts ♥♡, stars, checks, weather, geometric shapes), then the colour-emoji font (snowman ☃, faces, hands, flags, ZWJ families, skin tones).
+        // Order matters: Symbols 2 is monochrome and covers dingbat/geometric ranges Open Sans lacks; Noto Color Emoji is last so a codepoint neither Latin nor mono-symbol resolves lands on a colour glyph.
+        // Extend this list as more bundled fonts are added — never with a host family name.
+        &["Noto Sans Symbols 2", "Noto Color Emoji"]
     }
     fn forbidden_fallback(&self) -> &[&'static str] {
         &[]
@@ -177,10 +179,12 @@ impl TextRenderer {
             include_bytes!("../assets/Open_Sans/static/OpenSans-Regular.ttf").to_vec(),
         );
         db.load_font_data(include_bytes!("../assets/Open_Sans/static/OpenSans-Bold.ttf").to_vec());
-        // Noto Sans Symbols 2 — the deterministic symbol fallback (monochrome, so swash rasterizes it; color-emoji COLR/CBDT fonts don't rasterize cleanly here). Covers the hearts + common symbols Open Sans lacks.
+        // Noto Sans Symbols 2 — the deterministic MONOCHROME symbol fallback. Covers hearts ♥♡, stars, checks, weather, geometric shapes, arrows, dingbats, box-drawing, and math that Open Sans lacks. Swash rasterizes these as a coverage Mask (tinted with the style colour like any glyph).
         db.load_font_data(
             include_bytes!("../assets/Noto_Sans_Symbols2/NotoSansSymbols2-Regular.ttf").to_vec(),
         );
+        // Noto Color Emoji — the deterministic COLOUR-emoji fallback (CBDT/CBLC bitmap strikes, family name "Noto Color Emoji"). swash returns these as `Content::Color` RGBA images (not a coverage mask), and the blit's Color branch composites the glyph's OWN sRGB pixels into the darkness buffer, ignoring the style colour — snowman ☃, faces, hands, flags, ZWJ families, and skin tones show in true colour. The old "doesn't rasterize cleanly" note is obsolete now the Color path exists. ~10.7 MB embedded so a fluor build renders emoji with NO host-font read.
+        db.load_font_data(include_bytes!("../assets/NotoColorEmoji.ttf").to_vec());
 
         db.set_sans_serif_family("Open Sans");
 
@@ -686,7 +690,8 @@ impl TextRenderer {
                 let zeno_transform =
                     contour_transform.map(|t| ZenoTransform::new(t.a, t.c, t.b, t.d, 0.0, 0.0));
 
-                let (glyph_data, placement_left, placement_top, placement_w, placement_h) =
+                // `glyph_is_colour` distinguishes a `Content::Color` RGBA bitmap (colour emoji — 4 bytes/pixel, composite its own sRGB) from a `Content::Mask` coverage image (every other glyph — 1 byte/pixel, tint with the style colour). Carried out of the match so the shared blit below branches on it once.
+                let (glyph_data, glyph_is_colour, placement_left, placement_top, placement_w, placement_h) =
                     match zeno_transform {
                         None => {
                             // Identity fast path: cosmic-text's SwashCache owns the rasterized-image cache for non-transformed glyphs.
@@ -697,7 +702,8 @@ impl TextRenderer {
                                 continue;
                             };
                             let p = image.placement;
-                            (&image.data[..], p.left, p.top, p.width, p.height)
+                            let is_colour = image.content == swash::scale::image::Content::Color;
+                            (&image.data[..], is_colour, p.left, p.top, p.width, p.height)
                         }
                         Some(zt) => {
                             // Transform path: check our own LRU cache first; on miss, rasterize via swash directly (contour transformed in font space → proper hinting + AA), then insert at front. Cache key uses the *snapped* linear part so consecutive frames in the same rotation bin hit.
@@ -723,7 +729,12 @@ impl TextRenderer {
                                         .builder(swash_font)
                                         .size(glyph.font_size)
                                         .build();
-                                    let Some(img) = Render::new(&[Source::Outline])
+                                    // Request the colour-bitmap and colour-outline sources ALONGSIDE the outline so a rotated colour emoji still produces a `Content::Color` image (swash picks the first source the face supports; Open Sans/Symbols glyphs fall thru to Outline as before). The zeno transform rotates the colour strike in place, so rotated emoji show in true colour rather than being skipped.
+                                    let Some(img) = Render::new(&[
+                                        Source::ColorBitmap(swash::scale::StrikeWith::BestFit),
+                                        Source::ColorOutline(0),
+                                        Source::Outline,
+                                    ])
                                         .transform(Some(zt))
                                         .render(&mut scaler, glyph.glyph_id)
                                     else {
@@ -736,7 +747,8 @@ impl TextRenderer {
                             // Cache front entry is the one we just looked up or inserted.
                             let entry = &self.transform_cache.entries[0];
                             let p = entry.1.placement;
-                            (&entry.1.data[..], p.left, p.top, p.width, p.height)
+                            let is_colour = entry.1.content == swash::scale::image::Content::Color;
+                            (&entry.1.data[..], is_colour, p.left, p.top, p.width, p.height)
                         }
                     };
 
@@ -766,29 +778,66 @@ impl TextRenderer {
                 }
 
                 let gw_us = gw as usize;
-                for cy in cy_min..cy_max {
-                    let final_y = (glyph_y + cy as i32) as usize;
-                    let row_offset_buf = final_y * buf_w;
-                    let row_offset_glyph = cy * gw_us;
-                    for cx in cx_min..cx_max {
-                        let alpha = glyph_data[row_offset_glyph + cx];
-                        if alpha == 0 {
-                            continue;
-                        }
-                        let final_x = (glyph_x + cx as i32) as usize;
-                        let idx = row_offset_buf + final_x;
+                if glyph_is_colour {
+                    // COLOUR-EMOJI blit. `glyph_data` is RGBA, 4 bytes/pixel (swash `Content::Color` is straight/unpremultiplied sRGB — verified against swash's CBDT/CBLC decoder, which copies the strike's RGBA through without premultiply). The glyph carries its OWN colour, so the style `colour` is IGNORED for the RGB payload; only its α (`colour_alpha`) and the optional mask still modulate opacity, so a fading-out toast fades the emoji too.
+                    // COLOUR DOCTRINE (photon): this bitmap is sRGB. fluor emits visible-sRGB and photon's theme.rs `to_display` owns the sRGB→BT.2020 edge on every platform, so we do NOT colour-convert here — we just land true sRGB into the darkness buffer exactly as fluor does for any other RGB it rasterizes. Darkness = 255 − channel per the crate's α+darkness convention (see pixel.rs); after finalize's `^ 0x00FFFFFF` the emoji reappears in true colour.
+                    for cy in cy_min..cy_max {
+                        let final_y = (glyph_y + cy as i32) as usize;
+                        let row_offset_buf = final_y * buf_w;
+                        let row_offset_glyph = (cy * gw_us) * 4;
+                        for cx in cx_min..cx_max {
+                            let px = row_offset_glyph + cx * 4;
+                            let sa = glyph_data[px + 3];
+                            if sa == 0 {
+                                continue;
+                            }
+                            let final_x = (glyph_x + cx as i32) as usize;
+                            let idx = row_offset_buf + final_x;
 
-                        let mask_alpha = match mask {
-                            Some(m) => m.pixels[idx] as u32,
-                            None => 0xFF,
-                        };
-                        let effective_alpha =
-                            (alpha as u32 * colour_alpha * mask_alpha) / (255 * 255);
-                        if effective_alpha == 0 {
-                            continue;
+                            let mask_alpha = match mask {
+                                Some(m) => m.pixels[idx] as u32,
+                                None => 0xFF,
+                            };
+                            // Combine the glyph's own α with the style α and the mask, same product the Mask path uses (just with `sa` in place of the coverage byte).
+                            let effective_alpha =
+                                (sa as u32 * colour_alpha * mask_alpha) / (255 * 255);
+                            if effective_alpha == 0 {
+                                continue;
+                            }
+                            // Per-pixel darkness payload = bitwise-complement of the source's visible sRGB. `under()` reads these RGB bytes straight thru as the "bottom" darkness (BlendMode::Normal), identical to how `colour_dark` feeds the Mask path — so the domain matches exactly.
+                            let dark_r = 255 - glyph_data[px] as u32;
+                            let dark_g = 255 - glyph_data[px + 1] as u32;
+                            let dark_b = 255 - glyph_data[px + 2] as u32;
+                            let glyph_pixel =
+                                (effective_alpha << 24) | (dark_r << 16) | (dark_g << 8) | dark_b;
+                            pixels[idx] = pixels[idx].under(glyph_pixel, BlendMode::Normal);
                         }
-                        let glyph_pixel = (effective_alpha << 24) | colour_dark;
-                        pixels[idx] = pixels[idx].under(glyph_pixel, BlendMode::Normal);
+                    }
+                } else {
+                    for cy in cy_min..cy_max {
+                        let final_y = (glyph_y + cy as i32) as usize;
+                        let row_offset_buf = final_y * buf_w;
+                        let row_offset_glyph = cy * gw_us;
+                        for cx in cx_min..cx_max {
+                            let alpha = glyph_data[row_offset_glyph + cx];
+                            if alpha == 0 {
+                                continue;
+                            }
+                            let final_x = (glyph_x + cx as i32) as usize;
+                            let idx = row_offset_buf + final_x;
+
+                            let mask_alpha = match mask {
+                                Some(m) => m.pixels[idx] as u32,
+                                None => 0xFF,
+                            };
+                            let effective_alpha =
+                                (alpha as u32 * colour_alpha * mask_alpha) / (255 * 255);
+                            if effective_alpha == 0 {
+                                continue;
+                            }
+                            let glyph_pixel = (effective_alpha << 24) | colour_dark;
+                            pixels[idx] = pixels[idx].under(glyph_pixel, BlendMode::Normal);
+                        }
                     }
                 }
             }
@@ -835,10 +884,17 @@ impl TextRenderer {
                     // Draw the glyph bitmap
                     let glyph_width = image.placement.width as usize;
                     let glyph_height = image.placement.height as usize;
+                    // This LEGACY path composites in VISIBLE-RGB byte space (raw channel bytes over-blended with the visible tint `colour[c]`), NOT the u32 α+darkness domain of `render_buffer_u32`. So the Color branch here writes the source's visible sRGB channels DIRECTLY (no darkness complement) — the buffer isn't XOR-flipped at finalize. Colour glyph = `Content::Color` RGBA (4 bytes/pixel); Mask glyph = 1-byte coverage.
+                    let is_colour = image.content == swash::scale::image::Content::Color;
 
                     for cy in 0..glyph_height {
                         for cx in 0..glyph_width {
-                            let alpha = image.data[cy * glyph_width + cx];
+                            // Source α: coverage byte for a Mask, the RGBA α for a colour glyph.
+                            let alpha = if is_colour {
+                                image.data[(cy * glyph_width + cx) * 4 + 3]
+                            } else {
+                                image.data[cy * glyph_width + cx]
+                            };
                             if alpha > 0 {
                                 let py_base = glyph_y + cy as i32;
                                 let px_base = glyph_x + cx as i32;
@@ -872,11 +928,27 @@ impl TextRenderer {
                                 let alpha_u16 = alpha as u16;
                                 let inv_alpha = 256 - alpha_u16;
 
-                                for c in 0..channels {
-                                    pixels[offset + c] = ((pixels[offset + c] as u16 * inv_alpha
-                                        + colour[c] as u16 * alpha_u16)
-                                        >> 8)
-                                        as u8;
+                                if is_colour {
+                                    // Composite the glyph's OWN visible sRGB, ignoring the style `colour`. Map source r,g,b onto the first three channels; any 4th (alpha) channel keeps the mask-path behaviour of tinting toward `colour[3]`.
+                                    let base = (cy * glyph_width + cx) * 4;
+                                    for c in 0..channels {
+                                        let src = if c < 3 {
+                                            image.data[base + c] as u16
+                                        } else {
+                                            colour[c] as u16
+                                        };
+                                        pixels[offset + c] = ((pixels[offset + c] as u16 * inv_alpha
+                                            + src * alpha_u16)
+                                            >> 8)
+                                            as u8;
+                                    }
+                                } else {
+                                    for c in 0..channels {
+                                        pixels[offset + c] = ((pixels[offset + c] as u16 * inv_alpha
+                                            + colour[c] as u16 * alpha_u16)
+                                            >> 8)
+                                            as u8;
+                                    }
                                 }
                             }
                         }
@@ -1558,5 +1630,67 @@ impl TextRenderer {
         }
 
         char_width
+    }
+}
+
+#[cfg(test)]
+mod colour_emoji_tests {
+    use super::*;
+    use crate::canvas::{Canvas, Damage};
+
+    /// Finalize-domain read: fluor stores α+darkness; the host applies `^ 0x00FFFFFF` at present to flip darkness → visible RGB. Mirror that here so the test reasons in the visible colours a screen would show.
+    fn visible_rgb(pixel: u32) -> (u8, u8, u8) {
+        let v = pixel ^ 0x00FF_FFFF;
+        (((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8)
+    }
+
+    /// A colour emoji ("hi ☃😀") must (a) not panic, and (b) deposit at least one NON-GREYSCALE pixel (r≠g or g≠b) — proving it composited the glyph's own colour, not a monochrome tint.
+    #[test]
+    fn colour_emoji_renders_non_greyscale() {
+        let mut text = TextRenderer::new();
+        let w = 128usize;
+        let h = 48usize;
+        let mut pixels = vec![0u32; w * h];
+        let mut damage = Damage::new();
+        let mut canvas = Canvas::new(&mut pixels, w, h, &mut damage);
+
+        // Opaque BLACK text tint (α=0xFF, darkness=0xFFFFFF). Any monochrome glyph tinted with this stays r=g=b in visible space, so a non-greyscale pixel can ONLY come from the colour-emoji Color path.
+        let style = TextStyle::new(28.0, 0xFFFF_FFFF);
+        text.draw_text_left(&mut canvas, "hi \u{2603}\u{1F600}", 2.0, 24.0, &style, None, None);
+
+        let mut found_colour = false;
+        for &p in pixels.iter() {
+            let (r, g, b) = visible_rgb(p);
+            if r != g || g != b {
+                found_colour = true;
+                break;
+            }
+        }
+        assert!(found_colour, "expected at least one non-greyscale (colour-emoji) pixel; got an all-greyscale buffer");
+    }
+
+    /// Pure text must render IDENTICALLY across two renders (the Mask path is untouched) AND stay fully greyscale (a monochrome tint never introduces colour). Guards the Color branch against leaking into the text path.
+    #[test]
+    fn pure_text_is_greyscale_and_stable() {
+        let render = |s: &str| -> Vec<u32> {
+            let mut text = TextRenderer::new();
+            let w = 96usize;
+            let h = 32usize;
+            let mut pixels = vec![0u32; w * h];
+            let mut damage = Damage::new();
+            let mut canvas = Canvas::new(&mut pixels, w, h, &mut damage);
+            let style = TextStyle::new(22.0, 0xFFFF_FFFF);
+            text.draw_text_left(&mut canvas, s, 2.0, 16.0, &style, None, None);
+            pixels
+        };
+
+        let a = render("hello world");
+        let b = render("hello world");
+        assert_eq!(a, b, "pure-text render must be deterministic (Mask path unchanged)");
+
+        for &p in a.iter() {
+            let (r, g, b) = visible_rgb(p);
+            assert!(r == g && g == b, "pure text tinted black must be greyscale; found ({r},{g},{b})");
+        }
     }
 }
