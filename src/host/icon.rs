@@ -19,6 +19,7 @@ use vsf::file_format::{VsfField, VsfHeader};
 use vsf::types::VsfType;
 
 /// Decoded image ready to composite. Square or rectangular; the rasterizer crops/masks at draw time.
+#[derive(Clone)]
 pub struct Icon {
     pub width: u32,
     pub height: u32,
