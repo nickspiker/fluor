@@ -808,8 +808,9 @@ impl TextRenderer {
                             let dark_r = 255 - glyph_data[px] as u32;
                             let dark_g = 255 - glyph_data[px + 1] as u32;
                             let dark_b = 255 - glyph_data[px + 2] as u32;
-                            let glyph_pixel =
-                                (effective_alpha << 24) | (dark_r << 16) | (dark_g << 8) | dark_b;
+                            // Platform channel order via theme::fmt (identity on desktop, R↔B on Android) — every colour that reaches the buffer rides fmt; the emoji payload skipping it was the "R and B emoji colours appear swapped" Android bug (same class as the old swapped ring). fmt reorders only the RGB bytes and preserves α, so it's correct on the darkness-packed value.
+                            let glyph_pixel = (effective_alpha << 24)
+                                | crate::theme::fmt((dark_r << 16) | (dark_g << 8) | dark_b);
                             pixels[idx] = pixels[idx].under(glyph_pixel, BlendMode::Normal);
                         }
                     }
