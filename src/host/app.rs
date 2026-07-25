@@ -2386,8 +2386,10 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
             self.app.init(&mut ctx);
         }
 
-        // Surface is created at the requested monitor size — we can paint immediately. The Resized handler still flips this flag if it sees a different first size, but with the non-fullscreen approach we expect the surface to come up at the right size on the first frame.
-        self.surfaces[0].surface_ready = true;
+        // Surfaces are created at their requested monitor sizes — we can paint immediately. The Resized handler still re-derives if a different first size arrives (X11 always sends the initial ConfigureNotify; Windows resizes during creation under DPI virtualization). Marking ready applies to EVERY surface, not just the anchor: macOS never delivers an initial Resized for a window created at its final size, so a non-anchor surface waiting on one stayed !surface_ready forever — and the moment a cross-monitor drag flipped `home` onto it, render_frame's ready-gate bailed while dormancy had already evacuated the old surface: the window VANISHED (macbook repro 2026-07-25, "Safari moves fine, photon disappears").
+        for s in self.surfaces.iter_mut() {
+            s.surface_ready = true;
+        }
 
         // Click-thru: tell the OS each surface's hittable area is just its window_rect intersection — the anchor gets the real region, every dormant surface gets the empty (fully click-thru) one. Drag-to-move + resize-drag re-push these on every rect change.
         for si in 0..self.surfaces.len() {
