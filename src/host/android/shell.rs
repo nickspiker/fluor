@@ -279,7 +279,8 @@ impl<A: FluorApp> AndroidShell<A> {
             return;
         }
         let new_ru = self.viewport.ru * scale_factor;
-        self.viewport = self.viewport.with_ru(new_ru);
+        // Thru set_zoom, NOT with_ru: pinch was the one zoom writer skipping the production clamp (12.5%–300%), which is how a phone could pinch `ru` into oblivion while desktop Ctrl+zoom stayed bounded.
+        self.viewport.set_zoom(new_ru);
         self.window.mark_dirty();
         let (w, h) = (self.viewport.width_px, self.viewport.height_px);
         self.with_context(|app, ctx| app.on_resize(w, h, ctx));
