@@ -487,6 +487,14 @@ pub trait FluorApp {
         None
     }
 
+    /// HONEST IME EDITOR, read half: the focused textbox's full text + cursor (in CHARS — the host converts to UTF-16). The Android host mirrors this to the InputConnection so `getTextBeforeCursor`-style queries answer TRUTHFULLY — Google voice typing reads the field back continuously and aborts mid-sentence against an editor that claims to be empty. Default: no editor (`None`).
+    fn ime_editor_state(&mut self) -> Option<(alloc::string::String, usize)> {
+        None
+    }
+
+    /// HONEST IME EDITOR, write half: replace char range `[start, end)` of the focused textbox with `s` (cursor lands after the insertion). This is how commitText / setComposingText / setComposingRegion / deleteSurroundingText express themselves as TRUE range edits instead of backspace-replay at the cursor. Default: no-op.
+    fn ime_replace_chars(&mut self, _start: usize, _end: usize, _s: &str, _text: &mut TextRenderer) {}
+
     /// One-shot: the app cleared its text field programmatically (e.g. sent a message), so the Android host should `InputMethodManager.restartInput` to reset the IME's stale composing buffer — otherwise a predictive keyboard re-materialises the just-sent text on the next keystroke. Default `false` (no-op); drained per poll like [`FluorApp::wants_keyboard`].
     fn wants_input_reset(&mut self) -> bool {
         false

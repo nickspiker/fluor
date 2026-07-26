@@ -600,6 +600,20 @@ impl Textbox {
     }
 
     /// Replace selection (or insert at cursor) with string.
+    /// Replace the char range `[start, end)` with `s`, cursor landing after the insertion — the honest-IME editor op (voice dictation and predictive keyboards rewrite EARLIER words via setComposingRegion, which needs true range replacement, not backspace-replay at the cursor). Indices clamp to the text; start > end swaps.
+    pub fn replace_char_range(&mut self, start: usize, end: usize, s: &str, text: &mut TextRenderer) {
+        let n = self.chars.len();
+        let (mut a, mut b) = (start.min(n), end.min(n));
+        if a > b {
+            core::mem::swap(&mut a, &mut b);
+        }
+        self.selection_anchor = None;
+        self.chars.splice(a..b, s.chars());
+        self.cursor = a + s.chars().count();
+        self.recalc_widths(text);
+        self.update_scroll();
+    }
+
     pub fn insert_str(&mut self, s: &str, text: &mut TextRenderer) {
         self.delete_selection(text);
         for c in s.chars() {
