@@ -233,6 +233,19 @@ impl<A: FluorApp> AndroidShell<A> {
         self.app.wants_input_reset() as i32
     }
 
+    /// Honest-IME read: the focused textbox's (text, cursor-in-chars), or ("", 0) when nothing editable has focus.
+    pub fn ime_editor_state(&mut self) -> (alloc::string::String, usize) {
+        self.app.ime_editor_state().unwrap_or_default()
+    }
+
+    /// Honest-IME write: range-replace on the focused textbox (chars). No-op without an editable focus.
+    pub fn ime_replace_chars(&mut self, start: usize, end: usize, s: &str) {
+        if let Some(text) = self.text.as_mut() {
+            self.app.ime_replace_chars(start, end, s, text);
+        }
+        self.window.mark_dirty();
+    }
+
     /// Key event from `nativeOnKeyEvent`. Returns true if the host handled it (app's response was `Handled`). Untranslated keys (Key::Unidentified) return false so Android's default behavior runs.
     pub fn on_key_event(&mut self, key_code: i32) -> bool {
         let Some(ev) = events::key_press_from_keycode(key_code) else {
