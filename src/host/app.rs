@@ -2038,6 +2038,10 @@ impl<A: FluorApp> DesktopShell<A> {
                 // Surface a hidden resident window: un-hide EVERY monitor surface (hide-on-close hid them all), focus the home one, and repaint everything — the surface content is stale (or never-painted, on a start_hidden boot). Dormant surfaces stay all-zero, so showing them is invisible.
                 for s in self.surfaces.iter() {
                     s.window.set_visible(true);
+                    // Un-minimize too. A minimized window is VISIBLE-but-minimized, so set_visible(true)
+                    // and focus_window() are both no-ops against it and it stays parked in the Dock/taskbar.
+                    // This is why "Show" from the tray menu did nothing after a minimize.
+                    s.window.set_minimized(false);
                 }
                 window.focus_window();
                 self.pending_full_repaint = true;
@@ -2309,6 +2313,10 @@ impl<A: FluorApp> DesktopShell<A> {
 #[cfg(feature = "host-winit")]
 impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // Watch app activation so a Dock click can reach the window layer at all — see macos_reopen.
+        #[cfg(target_os = "macos")]
+        super::macos_reopen::install();
+
         if !self.surfaces.is_empty() {
             return;
         }
@@ -2425,6 +2433,22 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Dock icon clicked. macOS asks the APPLICATION delegate, never the window, which is why this
+        // cannot be handled in `window_event` and why it was silently dropped before (see macos_reopen).
+        #[cfg(target_os = "macos")]
+        if super::macos_reopen::take_reopen() {
+            log::info!("FLUOR-REOPEN: Dock reopen (#{})", super::macos_reopen::reopen_count());
+            for s in self.surfaces.iter() {
+                s.window.set_minimized(false);
+                s.window.set_visible(true);
+            }
+            if let Some(window) = self.home_window() {
+                window.focus_window();
+                window.request_redraw();
+            }
+            self.pending_full_repaint = true;
+        }
+
         // App-requested absolute zoom (restored setting): set the ru, then run the standard zoom propagation with a zero-step change (factor 1.0 — the set already happened) so chrome/widgets re-rasterize exactly like a user zoom.
         if let Some(ru) = self.app.take_zoom_request() {
             self.viewport.set_zoom(ru);

@@ -52,6 +52,10 @@ pub mod winit_compat;
 #[cfg(all(feature = "host-winit", target_os = "macos"))]
 pub(crate) mod macos_hittest;
 
+/// macOS app-activation observer: how a Dock click reaches the window layer.
+#[cfg(all(feature = "host-winit", target_os = "macos"))]
+pub(crate) mod macos_reopen;
+
 /// Windows present path: layered-window per-pixel alpha + click-thru via UpdateLayeredWindow.
 #[cfg(all(feature = "host-winit", target_os = "windows"))]
 pub(crate) mod windows_layered;
