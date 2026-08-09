@@ -140,19 +140,28 @@ impl MultiTextbox {
 
     // ---- Layout ----
 
-    /// Recompute the wrap: per-char widths, then greedy word wrap with a last-space backtrack (an over-long word breaks mid-word). `'\n'` is a hard break with zero width.
-    fn relayout(&mut self, text: &mut TextRenderer) {
+    fn measure_char(&self, c: char, text: &mut TextRenderer) -> Coord {
+        if c == '\n' {
+            return 0.0;
+        }
         let style = TextStyle::new(self.font_size, theme::TEXTBOX_TEXT).font(self.font);
+        text.measure_text(c.encode_utf8(&mut [0u8; 4]), &style)
+    }
+
+    /// Full re-measure + rewrap — geometry/font changes only. EDITS splice `widths` incrementally and call `rewrap` alone: re-measuring the whole buffer per keystroke was O(chars) cosmic-text shapes per key, tens of ms on a real draft (the 2026-08-09 compose lag).
+    fn relayout(&mut self, text: &mut TextRenderer) {
         self.widths.clear();
         self.widths.reserve(self.chars.len());
-        for &c in &self.chars {
-            if c == '\n' {
-                self.widths.push(0.0);
-            } else {
-                self.widths
-                    .push(text.measure_text(c.encode_utf8(&mut [0u8; 4]), &style));
-            }
+        for i in 0..self.chars.len() {
+            let c = self.chars[i];
+            let w = self.measure_char(c, text);
+            self.widths.push(w);
         }
+        self.rewrap();
+    }
+
+    /// Rebuild the line table from the EXISTING widths — pure arithmetic, no shaping.
+    fn rewrap(&mut self) {
         let max_w = self.usable_w();
         self.line_starts.clear();
         self.line_starts.push(0);
@@ -311,41 +320,47 @@ impl MultiTextbox {
 
     pub fn insert_char(&mut self, c: char, text: &mut TextRenderer) {
         self.delete_selection_internal();
+        let w = self.measure_char(c, text);
         self.chars.insert(self.cursor, c);
+        self.widths.insert(self.cursor, w);
         self.cursor += 1;
         self.goal_x = None;
-        self.relayout(text);
+        self.rewrap();
         self.ensure_cursor_visible();
     }
     pub fn insert_str(&mut self, s: &str, text: &mut TextRenderer) {
         self.delete_selection_internal();
         for c in s.chars() {
+            let w = self.measure_char(c, text);
             self.chars.insert(self.cursor, c);
+            self.widths.insert(self.cursor, w);
             self.cursor += 1;
         }
         self.goal_x = None;
-        self.relayout(text);
+        self.rewrap();
         self.ensure_cursor_visible();
     }
-    pub fn backspace(&mut self, text: &mut TextRenderer) {
+    pub fn backspace(&mut self, _text: &mut TextRenderer) {
         if self.has_selection() {
             self.delete_selection_internal();
         } else if self.cursor > 0 {
             self.cursor -= 1;
             self.chars.remove(self.cursor);
+            self.widths.remove(self.cursor);
         }
         self.goal_x = None;
-        self.relayout(text);
+        self.rewrap();
         self.ensure_cursor_visible();
     }
-    pub fn delete_forward(&mut self, text: &mut TextRenderer) {
+    pub fn delete_forward(&mut self, _text: &mut TextRenderer) {
         if self.has_selection() {
             self.delete_selection_internal();
         } else if self.cursor < self.chars.len() {
             self.chars.remove(self.cursor);
+            self.widths.remove(self.cursor);
         }
         self.goal_x = None;
-        self.relayout(text);
+        self.rewrap();
         self.ensure_cursor_visible();
     }
     /// TRUE range replacement (the honest-IME write path — voice dictation rewriting earlier words). Caret lands at the end of the inserted text.
@@ -360,15 +375,18 @@ impl MultiTextbox {
         let start = start.min(n);
         let end = end.clamp(start, n);
         self.chars.drain(start..end);
+        self.widths.drain(start..end);
         let mut at = start;
         for c in s.chars() {
+            let w = self.measure_char(c, text);
             self.chars.insert(at, c);
+            self.widths.insert(at, w);
             at += 1;
         }
         self.cursor = at;
         self.selection_anchor = None;
         self.goal_x = None;
-        self.relayout(text);
+        self.rewrap();
         self.ensure_cursor_visible();
     }
 
@@ -408,13 +426,14 @@ impl MultiTextbox {
     fn delete_selection_internal(&mut self) {
         if let Some((s, e)) = self.selection_range() {
             self.chars.drain(s..e);
+            self.widths.drain(s..e);
             self.cursor = s;
         }
         self.selection_anchor = None;
     }
-    pub fn delete_selection(&mut self, text: &mut TextRenderer) {
+    pub fn delete_selection(&mut self, _text: &mut TextRenderer) {
         self.delete_selection_internal();
-        self.relayout(text);
+        self.rewrap();
         self.ensure_cursor_visible();
     }
 
@@ -875,7 +894,7 @@ impl MultiTextbox {
             clip,
         );
 
-        // Blinkey wave — the same per-channel saturating_sub brighten as the single-line box, at the caret's (line, x).
+        // Blinkey — THE canonical painter (paint::draw_blinkey), at the caret's (line, x). The first cut hand-rolled a wave that read as no cursor at all (field, 2026-08-09).
         if self.focused && !self.has_selection() && self.blinkey_visible {
             let cb = self.cursor_bbox();
             let bx = (cb.x + 8.0 - offset_x) as isize;
@@ -883,31 +902,15 @@ impl MultiTextbox {
             let bh = self.row_h() as usize;
             let buf_w = canvas.width;
             let buf_h = canvas.height;
-            if bx >= 7 && (bx as usize) + 7 < buf_w && by_top >= 0 {
-                let by_top = by_top as usize;
-                if by_top + bh <= buf_h {
-                    canvas.damage.add_bounds(
-                        (bx - 7) as usize,
-                        by_top,
-                        (bx + 7) as usize,
-                        by_top + bh,
-                    );
-                    for row in 0..bh {
-                        let t = row as f32 / bh.max(1) as f32;
-                        let phase = if self.blinkey_wave_top { 1.0 - t } else { t };
-                        let w = (phase * phase * 96.0) as u32;
-                        for dx in -6isize..=6 {
-                            let falloff = (7 - dx.abs()) as u32;
-                            let sub = (w * falloff / 7).min(0xFF);
-                            let idx = (by_top + row) * buf_w + (bx + dx) as usize;
-                            let px = canvas.pixels[idx];
-                            let r = ((px >> 16) & 0xFF).saturating_sub(sub);
-                            let g = ((px >> 8) & 0xFF).saturating_sub(sub);
-                            let b = (px & 0xFF).saturating_sub(sub);
-                            canvas.pixels[idx] = (px & 0xFF00_0000) | (r << 16) | (g << 8) | b;
-                        }
-                    }
-                }
+            if bx >= 7 && (bx as usize) + 7 < buf_w && by_top >= 0 && by_top as usize + bh <= buf_h
+            {
+                paint::draw_blinkey(
+                    canvas,
+                    bx as usize,
+                    by_top as usize,
+                    bh,
+                    self.blinkey_wave_top,
+                );
             }
         }
 
