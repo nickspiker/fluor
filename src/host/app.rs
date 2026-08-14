@@ -2351,6 +2351,15 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
         self.anchor = 0;
         self.window_scale = self.surfaces[0].scale;
 
+        // Explicitly activate the home surface on first launch. A borderless, monitor-sized, transparent
+        // surface is exactly what Linux WMs (with focus-stealing prevention) decline to auto-raise/focus on
+        // map — so the app opened un-topmost, sometimes below the previously-active window. winit's
+        // focus_window() issues _NET_ACTIVE_WINDOW (X11) / the platform activate, matching the proven
+        // ShowWindow + macOS-reopen paths. Skipped when starting hidden: a resident boot must NOT grab focus.
+        if !self.app.start_hidden() {
+            window.focus_window();
+        }
+
         // Match the OS window icon (taskbar / alt-tab / title bar) to the app's orb. winit
         // honours this on Windows + X11; it's a no-op on Wayland (icon from .desktop app_id)
         // and macOS (icon from the .app bundle), which source the icon at packaging time.
@@ -2673,6 +2682,15 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
             } => {
                 // Press-hold-release: arm the element under the pointer. The action does NOT fire here — it waits for a release over the same element (drag-off cancels). The raw press is still forwarded so the app can do its press-time work (focus, textbox cursor, drag-select arm, window-drag / resize). Redraw so the "held" colour appears.
                 self.pointer.on_down(self.hit_under_cursor());
+                // Raise-on-click: a press that reached our surface means the pointer is over the visible app, so
+                // bring it to the front if it isn't already. Without this, clicking the app on a fullscreen-surface
+                // model didn't raise the OS window — it could stay behind another window the WM had stacked above.
+                // Gated on `!is_focused` so an already-front window never re-requests activation (no WM flicker/fight).
+                if !self.is_focused {
+                    if let Some(window) = self.home_window() {
+                        window.focus_window();
+                    }
+                }
                 self.dispatch_event(event);
                 if let Some(window) = self.home_window() {
                     window.request_redraw();
