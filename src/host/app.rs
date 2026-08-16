@@ -384,6 +384,16 @@ pub trait FluorApp {
     /// The window resized. Resize internal Groups / widget bboxes to match.
     fn on_resize(&mut self, width: u32, height: u32, ctx: &mut Context);
 
+    /// The OS moved the window — a drag, a WM placement, a restore. Physical outer position of the HOME surface. Fires on the event edge; default: ignored.
+    fn on_window_moved(&mut self, x: i32, y: i32) {
+        let _ = (x, y);
+    }
+
+    /// The app's folded OS focus flipped (focused = any surface focused). Fires once per change — the natural durability edge for "the user looked away". Default: ignored.
+    fn on_focus_changed(&mut self, focused: bool) {
+        let _ = focused;
+    }
+
     /// Window event from the host. Consumer returns an [`EventResponse`] telling the host what to do next. Events are fluor-native [`crate::event::Event`] values — hosts translate platform input at the boundary.
     fn on_event(&mut self, event: &FEvent, ctx: &mut Context) -> EventResponse;
 
@@ -2684,11 +2694,22 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                     window.request_redraw();
                 }
             }
+            WindowEvent::Moved(pos) => {
+                // Home surface only — span surfaces shuffling across monitors are layout, not the user placing the window.
+                if si == self.home {
+                    self.app.on_window_moved(pos.x, pos.y);
+                }
+            }
             WindowEvent::Focused(focused) => {
                 let focused = *focused;
                 // Per-surface focus, folded into the shell-level flag — the app is focused when ANY of its surfaces is.
                 self.surfaces[si].focused = focused;
+                let was_focused = self.is_focused;
                 self.is_focused = self.surfaces.iter().any(|s| s.focused);
+                // The app hears the FOLDED edge only — per-surface flicker while focus hops between spans is not a focus change.
+                if self.is_focused != was_focused {
+                    self.app.on_focus_changed(self.is_focused);
+                }
                 // Cancel any in-progress resize drag if we lose focus mid-drag (the user alt-tabbed or the WM stole focus). Keeps state consistent.
                 if !focused && self.is_dragging_resize {
                     self.is_dragging_resize = false;
