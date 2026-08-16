@@ -384,14 +384,14 @@ pub trait FluorApp {
     /// The window resized. Resize internal Groups / widget bboxes to match.
     fn on_resize(&mut self, width: u32, height: u32, ctx: &mut Context);
 
-    /// The OS moved the window — a drag, a WM placement, a restore. Physical outer position of the HOME surface. Fires on the event edge; default: ignored.
-    fn on_window_moved(&mut self, x: i32, y: i32) {
-        let _ = (x, y);
-    }
-
     /// The app's folded OS focus flipped (focused = any surface focused). Fires once per change — the natural durability edge for "the user looked away". Default: ignored.
     fn on_focus_changed(&mut self, focused: bool) {
         let _ = focused;
+    }
+
+    /// The visible window's rect SETTLED after a user gesture — drag-move release or resize-drag end, never while maximized (a maximized rect is a mode, not a placement). GLOBAL desktop units: the exact currency [`take_window_geometry_request`](Self::take_window_geometry_request) restores. The geometry-persistence edge. Default: ignored.
+    fn on_window_rect_changed(&mut self, x: i32, y: i32, w: u32, h: u32) {
+        let _ = (x, y, w, h);
     }
 
     /// Window event from the host. Consumer returns an [`EventResponse`] telling the host what to do next. Events are fluor-native [`crate::event::Event`] values — hosts translate platform input at the boundary.
@@ -2079,9 +2079,9 @@ impl<A: FluorApp> DesktopShell<A> {
 
     /// Flip `window_rect` between the user-sized rect (saved in `saved_rect_for_maximize`) and the home surface's work area. Mirrors the geometry-change tail of `resize_drag_update`: resize scratch + clip_mask, reflow viewport, notify the consumer via `on_resize`, mark full-repaint, and update the X11 input region. No-op if the home surface's size is still a placeholder — first `Resized` event hasn't landed yet, no real geometry to swap to.
     fn toggle_maximized(&mut self) {
-        let Some(window) = self.home_window() else {
+        if self.home_window().is_none() {
             return;
-        };
+        }
         let (scr_w, scr_h) = self.surfaces[self.home].size;
         if scr_w <= 1 || scr_h <= 1 {
             return;
@@ -2104,6 +2104,14 @@ impl<A: FluorApp> DesktopShell<A> {
             }
         };
 
+        self.apply_window_rect(new_rect);
+    }
+
+    /// Adopt an explicit desktop-unit `window_rect` thru the FULL machinery — home re-election, scale settle, viewport/scratch/clip rebuild, consumer `on_resize`, input region, repaint. The one path every programmatic placement shares (maximize/restore, the geometry-restore setting); raw OS-window calls are meaningless here (the OS window is the fullscreen surface — moving IT was the 2026-08-16 vanish + dead-click field failure).
+    fn apply_window_rect(&mut self, new_rect: WindowRect) {
+        let Some(window) = self.home_window() else {
+            return;
+        };
         if new_rect.w == self.window_rect.w
             && new_rect.h == self.window_rect.h
             && new_rect.x == self.window_rect.x
@@ -2482,26 +2490,18 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
             self.apply_zoom_change(Some(0.0));
         }
 
-        // App-requested window geometry (restored setting): size always; position only if the saved point still lands on a live monitor — a spot remembered on a since-unplugged screen must not strand the window off-desktop.
-        if let Some((x, y, w, h)) = self.app.take_window_geometry_request() {
-            if let Some(window) = self.home_window() {
-                let on_a_monitor = window.available_monitors().any(|m| {
-                    let p = m.position();
-                    let s = m.size();
-                    x >= p.x
-                        && y >= p.y
-                        && x < p.x + s.width as i32
-                        && y < p.y + s.height as i32
-                });
-                if on_a_monitor {
-                    window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
-                }
+        // App-requested window geometry (restored setting): a window_rect in GLOBAL desktop units, applied thru the same machinery maximize uses — clamped into the surviving surfaces so an unplugged monitor's rect snaps on-screen. Taken only once the home surface has real geometry (the toggle_maximized guard), so an early idle pass can't burn the one-shot against placeholder dimensions.
+        if self
+            .surfaces
+            .get(self.home)
+            .is_some_and(|s| s.size.0 > 1 && s.size.1 > 1)
+        {
+            if let Some((x, y, w, h)) = self.app.take_window_geometry_request() {
                 if w > 0 && h > 0 {
-                    let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
+                    let target = self.clamp_rect_to_surfaces(WindowRect { x, y, w, h });
+                    self.apply_window_rect(target);
                 }
-                window.request_redraw();
             }
-            self.pending_full_repaint = true;
         }
         let (ccx, ccy) = self.win_cursor_px();
         let wo = self.ctx_window_origin();
@@ -2697,12 +2697,6 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                     window.request_redraw();
                 }
             }
-            WindowEvent::Moved(pos) => {
-                // Home surface only — span surfaces shuffling across monitors are layout, not the user placing the window.
-                if si == self.home {
-                    self.app.on_window_moved(pos.x, pos.y);
-                }
-            }
             WindowEvent::Focused(focused) => {
                 let focused = *focused;
                 // Per-surface focus, folded into the shell-level flag — the app is focused when ANY of its surfaces is.
@@ -2754,6 +2748,8 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
             } => {
                 // Press-hold-release: a release over the SAME element the press armed is a validated activation; a release after a drag-off fires nothing. Emit the activation BEFORE forwarding the raw release so the app's release-time bookkeeping sees a consistent world.
                 let activate = self.pointer.on_up(self.hit_under_cursor());
+                // Captured BEFORE the end-blocks clear the flags: a committed move or an active resize ending on THIS release is the geometry-persistence edge.
+                let gesture_ended = self.is_dragging_resize || self.is_dragging_move;
                 // End of resize drag — release ownership of the loop. The buffer is already in the final state from the last drag tick; no extra repaint needed.
                 if self.is_dragging_resize {
                     self.is_dragging_resize = false;
@@ -2776,6 +2772,11 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                         window.set_cursor(winit::window::CursorIcon::Default);
                         window.request_redraw();
                     }
+                }
+                // Geometry-persistence edge: the rect the user just settled on, once per gesture. Maximized is a mode, not a placement — its rect never persists.
+                if gesture_ended && self.saved_rect_for_maximize.is_none() {
+                    let r = self.window_rect;
+                    self.app.on_window_rect_changed(r.x, r.y, r.w, r.h);
                 }
                 if let Some(id) = activate {
                     self.dispatch_activate(id);
