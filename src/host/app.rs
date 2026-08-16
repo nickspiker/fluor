@@ -454,6 +454,11 @@ pub trait FluorApp {
         None
     }
 
+    /// One-shot window-geometry restore — `(outer x, outer y, inner w, inner h)` in physical pixels, the same convention [`WindowHandle::outer_position`]/[`inner_size`](WindowHandle::inner_size) report for saving. Polled beside the zoom request; the host applies the size always but the POSITION only when the point still lands on a live monitor (a saved spot on an unplugged screen must not strand the window off-desktop). Take semantics like the zoom.
+    fn take_window_geometry_request(&mut self) -> Option<(i32, i32, u32, u32)> {
+        None
+    }
+
     fn tick(&mut self, ctx: &mut Context) -> bool {
         let _ = ctx;
         false
@@ -2462,6 +2467,28 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
         if let Some(ru) = self.app.take_zoom_request() {
             self.viewport.set_zoom(ru);
             self.apply_zoom_change(Some(0.0));
+        }
+
+        // App-requested window geometry (restored setting): size always; position only if the saved point still lands on a live monitor — a spot remembered on a since-unplugged screen must not strand the window off-desktop.
+        if let Some((x, y, w, h)) = self.app.take_window_geometry_request() {
+            if let Some(window) = self.home_window() {
+                let on_a_monitor = window.available_monitors().any(|m| {
+                    let p = m.position();
+                    let s = m.size();
+                    x >= p.x
+                        && y >= p.y
+                        && x < p.x + s.width as i32
+                        && y < p.y + s.height as i32
+                });
+                if on_a_monitor {
+                    window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+                }
+                if w > 0 && h > 0 {
+                    let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
+                }
+                window.request_redraw();
+            }
+            self.pending_full_repaint = true;
         }
         let (ccx, ccy) = self.win_cursor_px();
         let wo = self.ctx_window_origin();
