@@ -2484,25 +2484,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
             self.pending_full_repaint = true;
         }
 
-        // App-requested absolute zoom (restored setting): set the ru, then run the standard zoom propagation with a zero-step change (factor 1.0 — the set already happened) so chrome/widgets re-rasterize exactly like a user zoom.
-        if let Some(ru) = self.app.take_zoom_request() {
-            self.viewport.set_zoom(ru);
-            self.apply_zoom_change(Some(0.0));
-        }
-
-        // App-requested window geometry (restored setting): a window_rect in GLOBAL desktop units, applied thru the same machinery maximize uses — clamped into the surviving surfaces so an unplugged monitor's rect snaps on-screen. Taken only once the home surface has real geometry (the toggle_maximized guard), so an early idle pass can't burn the one-shot against placeholder dimensions.
-        if self
-            .surfaces
-            .get(self.home)
-            .is_some_and(|s| s.size.0 > 1 && s.size.1 > 1)
-        {
-            if let Some((x, y, w, h)) = self.app.take_window_geometry_request() {
-                if w > 0 && h > 0 {
-                    let target = self.clamp_rect_to_surfaces(WindowRect { x, y, w, h });
-                    self.apply_window_rect(target);
-                }
-            }
-        }
+        self.consume_app_placement_requests();
         let (ccx, ccy) = self.win_cursor_px();
         let wo = self.ctx_window_origin();
         let needs_redraw = if let (Some(window), Some(text)) =
@@ -2820,6 +2802,8 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 if self.is_dragging_resize {
                     self.apply_resize_drag();
                 }
+                // Adopt any restored zoom/geometry BEFORE pixels are presented — the about_to_wait consume runs AFTER the event batch, so frame one would paint at the default placement and flash (field report, 2026-08-16). Ordering: read state, place window, THEN render.
+                self.consume_app_placement_requests();
                 self.render_frame();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -2877,6 +2861,28 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
 #[cfg(feature = "host-winit")]
 impl<A: FluorApp + 'static> DesktopShell<A> {
     /// Apply a zoom change to `self.viewport.ru` and propagate to the consumer. `steps = Some(s)` adjusts by `s` photon-asymmetric log steps (positive in, negative out); `steps = None` resets to 1.0 (Ctrl+0 binding). Calls `app.on_resize` with unchanged pixel dimensions so the consumer's existing resize path picks up the new `ctx.viewport.ru`, marks chrome / widget layers dirty (via their internal Group resize), and re-rasterizes at the new effective span. No separate `on_zoom` callback needed — the consumer's on_resize is the single "viewport changed" entry point.
+    /// Drain the app's one-shot placement requests — restored zoom, then restored window geometry. Called from TWO sites: the top of the home surface's `RedrawRequested` (so frame one adopts the restored placement BEFORE any pixels are presented — the launch-flash fix) and `about_to_wait` (requests armed outside a redraw, e.g. a later settings load). Geometry is taken only once the home surface has real dimensions, so an early pass can't burn the one-shot against placeholders.
+    fn consume_app_placement_requests(&mut self) {
+        // Restored zoom: set the ru, then run the standard zoom propagation with a zero-step change (factor 1.0 — the set already happened) so chrome/widgets re-rasterize exactly like a user zoom.
+        if let Some(ru) = self.app.take_zoom_request() {
+            self.viewport.set_zoom(ru);
+            self.apply_zoom_change(Some(0.0));
+        }
+        // Restored window geometry: a window_rect in GLOBAL desktop units, applied thru the same machinery maximize uses — clamped into the surviving surfaces so an unplugged monitor's rect snaps on-screen.
+        if self
+            .surfaces
+            .get(self.home)
+            .is_some_and(|s| s.size.0 > 1 && s.size.1 > 1)
+        {
+            if let Some((x, y, w, h)) = self.app.take_window_geometry_request() {
+                if w > 0 && h > 0 {
+                    let target = self.clamp_rect_to_surfaces(WindowRect { x, y, w, h });
+                    self.apply_window_rect(target);
+                }
+            }
+        }
+    }
+
     fn apply_zoom_change(&mut self, steps: Option<f32>) {
         match steps {
             Some(s) => self.viewport.adjust_zoom(s),
