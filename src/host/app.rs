@@ -2058,6 +2058,9 @@ impl<A: FluorApp> DesktopShell<A> {
                     // This is why "Show" from the tray menu did nothing after a minimize.
                     s.window.set_minimized(false);
                 }
+                // Muffin (and X11 WMs generally) DENY focus_window from a background app as focus stealing, so the un-hidden window surfaced BEHIND the stack ("shows very briefly, goes behind" — field, 2026-08-16). A window-LEVEL pulse raises unconditionally — restack requests are not focus requests — then drops back to normal; focus_window afterwards has a fighting chance, and the worst case is raised-but-unfocused instead of buried.
+                window.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
+                window.set_window_level(winit::window::WindowLevel::Normal);
                 window.focus_window();
                 self.pending_full_repaint = true;
                 window.request_redraw();
