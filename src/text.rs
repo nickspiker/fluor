@@ -1,4 +1,4 @@
-//! Text rendering — verbatim port of photon's [text_rasterizing.rs](/mnt/Octopus/Code/photon/src/ui/text_rasterizing.rs). Built on cosmic-text + swash. Bundles Open Sans Regular + Bold (OFL-licensed) so the default fluor build renders text out of the box; consumers can load additional fonts via the `font_system_mut()` accessor.
+//! Text rendering — verbatim port of photon's [text_rasterizing.rs](/mnt/Harbor/Code/photon/src/ui/text_rasterizing.rs). Built on cosmic-text + swash. Bundles Open Sans Regular + Bold (OFL-licensed) so the default fluor build renders text out of the box; consumers can load additional fonts via the `font_system_mut()` accessor.
 //!
 //! Photon's full version bundles Oxanium and Josefin Slab too; those are dropped here to keep the v0 crate small (~260 KB instead of ~2 MB). They'll be added back when a consumer needs them.
 
