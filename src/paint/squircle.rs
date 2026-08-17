@@ -597,7 +597,7 @@ fn write_aa(pixels: &mut [u32], idx: usize, colour_rgb: u32, h_aa: u32) {
 ///
 /// `squirdleyness = 2` → circle. `squirdleyness = 3` → photon's textbox pill default (slightly flatter than a circle). Higher = more rectangular. Both `draw_textbox_pill` (AA path) and the textbox widget's hard-pixel renderer route thru this so any tweak to the curve math flows thru both code paths.
 ///
-/// Identical to the per-iteration formula at photon's [`compositing.rs:4567-4570`](/mnt/Octopus/Code/photon/src/ui/compositing.rs).
+/// Identical to the per-iteration formula at photon's [`compositing.rs:4567-4570`](/mnt/Harbor/Code/photon/src/ui/compositing.rs).
 #[inline]
 pub fn squircle_inset(y_from_center: f32, radius: f32, squirdleyness: i32) -> f32 {
     let y_norm = (y_from_center / radius).min(1.0);

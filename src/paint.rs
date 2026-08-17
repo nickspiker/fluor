@@ -1191,7 +1191,7 @@ pub fn draw_blinkey(canvas: &mut Canvas, bx: usize, by: usize, height: usize, to
 }
 
 
-/// Glyph rasterizers for window controls. Ported verbatim from photon's [compositing.rs](/mnt/Octopus/Code/photon/src/ui/compositing.rs) — the squircle minus / squircle ring / capsule X — so chrome looks identical to photon.
+/// Glyph rasterizers for window controls. Ported verbatim from photon's [compositing.rs](/mnt/Harbor/Code/photon/src/ui/compositing.rs) — the squircle minus / squircle ring / capsule X — so chrome looks identical to photon.
 pub mod glyph {
     /// Draw a horizontal squircle "minus" stroke centered at `(x, y)` inside a button of pixel radius `r`. Uses a 4-power squircle with widened axis to make a flat horizontal pill.
     pub fn minimize_symbol(

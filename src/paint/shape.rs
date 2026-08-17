@@ -7,7 +7,7 @@ use crate::canvas::Canvas;
 use crate::coord::Coord;
 use crate::pixel::{Blend, BlendMode};
 
-/// Photon's `blend_rgb_only` helper: weighted RGB blend of two colours with explicit per-pixel weights. Verbatim port from [compositing.rs:5821](/mnt/Octopus/Code/photon/src/ui/compositing.rs#L5821). Used by `draw_window_controls` for AA squircle edges.
+/// Photon's `blend_rgb_only` helper: weighted RGB blend of two colours with explicit per-pixel weights. Verbatim port from [compositing.rs:5821](/mnt/Harbor/Code/photon/src/ui/compositing.rs#L5821). Used by `draw_window_controls` for AA squircle edges.
 pub fn blend_rgb_only(bg_colour: u32, fg_colour: u32, weight_bg: u8, weight_fg: u8) -> u32 {
     let mut bg = bg_colour as u64;
     bg = (bg | (bg << 16)) & 0x0000FFFF0000FFFF;
