@@ -616,11 +616,10 @@ impl Textbox {
 
     pub fn insert_str(&mut self, s: &str, text: &mut TextRenderer) {
         self.delete_selection(text);
+        // VERBATIM, control characters included (photon doctrine 2026-08-18): the widget's job is to hold exactly what the human supplied — a pasted tab or newline is their choice (a handle IS allowed to be "\t"). The old `is_control()` filter silently rewrote pasted input, which is the banned class; single-line-ness is a LAYOUT property, not a license to edit bytes. Control chars render as whatever the shaper gives them (typically invisible) — the bytes are the truth regardless.
         for c in s.chars() {
-            if !c.is_control() {
-                self.chars.insert(self.cursor, c);
-                self.cursor += 1;
-            }
+            self.chars.insert(self.cursor, c);
+            self.cursor += 1;
         }
         self.recalc_widths(text);
         self.update_scroll();
