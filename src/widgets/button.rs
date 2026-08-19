@@ -20,7 +20,7 @@ pub struct Button {
     label: String,
     font: &'static str,
 
-    /// Stroke thickness as a fraction of `font_size`. Final pixel width = `(stroke_ru × font_size) as isize + 1` — the `+ 1` idiom guarantees a minimum 1 px stroke so the edge never disappears on small displays, and the multiplier scales the stroke up smoothly on big ones. Default `1.0 / (1 << 5)` (= 1/32 of font_size) yields 1 px thru typical desktop range and ~2-3 px on 4K + zoom; same convention as Textbox so a Button and Textbox at the same `stroke_ru` render with identical edge weight.
+    /// Stroke thickness as a fraction of `font_size`. Final pixel width = `((stroke_ru × font_size) as isize).max(1)` — floored at a 1 px hairline (the sole sanctioned fixed pixel: a stroke must not vanish sub-pixel), and the multiplier scales it up smoothly on big displays. Default `1.0 / (1 << 5)` (= 1/32 of font_size) yields 1 px thru typical desktop range and ~2-3 px on 4K + zoom; same convention as Textbox so a Button and Textbox at the same `stroke_ru` render with identical edge weight.
     pub stroke_ru: f32,
     pub center_x: Coord,
     pub center_y: Coord,
@@ -232,6 +232,8 @@ impl Button {
             self.focused = false;
             self.hovered = false;
         }
+        // The label colour follows enabled (dim when off — see render), so re-rasterize the glyphs.
+        self.text_cache_dirty = true;
     }
 
     /// Replace the label text. Marks both caches dirty so the next render re-rasterizes glyphs (text_cache) — the pill silhouette doesn't depend on label content so technically only text_cache needs it, but a label swap typically goes with a re-layout, and marking pill dirty too is cheap insurance.
@@ -239,6 +241,14 @@ impl Button {
         let new = label.into();
         if new != self.label {
             self.label = new;
+            self.text_cache_dirty = true;
+        }
+    }
+
+    /// Replace the label font family (e.g. "Oxanium" for the dozenal control-block glyphs Open Sans lacks). Dirties the text cache so the glyphs re-rasterize in the new face. `&'static str` because font names live for the program.
+    pub fn set_font_family(&mut self, font: &'static str) {
+        if font != self.font {
+            self.font = font;
             self.text_cache_dirty = true;
         }
     }
@@ -362,7 +372,7 @@ impl Button {
         let ch = pill_h as usize;
         // Fractional squirdleyness — slots between an ellipse (2) and a diamond (1). `1.5` reads as a noticeably-rounder, slightly-faceted pill: distinctly more curved than the textbox's `3.0` "slightly squared" but not as soft as a full ellipse. Routes thru paint's `_f` (powf) variant; the textbox / chrome keep the integer (powi) fast path. Adjustable per-instance via this constant; future API could expose it as a Button field if more shapes are desired.
         let squirdleyness = 1.75;
-        let stroke_px = (self.stroke_ru * self.font_size) as isize + 1;
+        let stroke_px = ((self.stroke_ru * self.font_size) as isize).max(1);
 
         // Fill for THIS paint: baked-state mode folds hover/pressed/focus into the pill fill (headless
         // hosts have no overlay pass); otherwise just the idle fill and the overlay tints on top. A
@@ -444,7 +454,9 @@ impl Button {
                 let mut text_canvas =
                     crate::canvas::Canvas::new(&mut self.text_cache, cw, ch, &mut text_damage);
                 let mask_buffer = paint::AlphaMask::new(&self.inner_pill_mask, cw, ch);
-                text.draw_text_left(&mut text_canvas, &self.label, local_text_left, local_y_center, &TextStyle::new(self.font_size, theme::TEXTBOX_TEXT).font(self.font), None, Some(&mask_buffer));
+                // Disabled buttons dim their label to the secondary grey (inert, still legible) — the hand-rolled pills did this and callers expect it.
+                let label_colour = if self.enabled { theme::TEXTBOX_TEXT } else { theme::LABEL_COLOUR };
+                text.draw_text_left(&mut text_canvas, &self.label, local_text_left, local_y_center, &TextStyle::new(self.font_size, label_colour).font(self.font), None, Some(&mask_buffer));
             }
             self.text_cache_dirty = false;
         }
