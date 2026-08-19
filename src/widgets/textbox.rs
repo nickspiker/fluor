@@ -785,9 +785,10 @@ impl Textbox {
     /// Bounding rect (viewport coords) of the cursor's wave smear including the 7-pixel decay on each side. Used to size a sub-viewport `cursor_group` so blink ticks touch ~16 × font_size pixels instead of the entire viewport.
     pub fn cursor_bbox(&self) -> Region {
         let cpx = self.cursor_pixel_x();
-        let x = cpx - 8.0;
+        // Smear width scales with the text — the wave decays ~half a glyph either side of the cursor, so one font_size wide, centred on the caret. No fixed pixels.
+        let w = self.font_size;
         let y = self.center_y - self.font_size * 0.5;
-        Region::new(x, y, 16.0, self.font_size)
+        Region::new(cpx - w * 0.5, y, w, self.font_size)
     }
 
     /// Bare textbox bounding rect (viewport coords) — exactly the pill rect, NO glow padding. This is the cache size, the per-keystroke dirty rect, and the per-hover dirty rect — anything that touches just the textbox itself.

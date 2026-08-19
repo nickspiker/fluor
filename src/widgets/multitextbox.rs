@@ -577,7 +577,9 @@ impl MultiTextbox {
         let y = self.center_y - self.height * 0.5 + self.inner_top()
             + line as Coord * self.row_h()
             - self.scroll_y;
-        Region::new(x - 8.0, y, 16.0, self.row_h())
+        // Smear width scales with the text (one font_size wide, centred on the caret) — no fixed pixels.
+        let w = self.font_size;
+        Region::new(x - w * 0.5, y, w, self.row_h())
     }
     pub fn bbox(&self) -> Region {
         Region::new(
@@ -897,7 +899,8 @@ impl MultiTextbox {
         // Blinkey — THE canonical painter (paint::draw_blinkey), at the caret's (line, x). The first cut hand-rolled a wave that read as no cursor at all (field, 2026-08-09).
         if self.focused && !self.has_selection() && self.blinkey_visible {
             let cb = self.cursor_bbox();
-            let bx = (cb.x + 8.0 - offset_x) as isize;
+            // Centre of the smear = left edge + half its (font-scaled) width — tracks cursor_bbox, no magic offset.
+            let bx = (cb.x + cb.w * 0.5 - offset_x) as isize;
             let by_top = (cb.y - offset_y) as isize;
             let bh = self.row_h() as usize;
             let buf_w = canvas.width;
