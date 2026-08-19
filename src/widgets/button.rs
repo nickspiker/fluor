@@ -20,7 +20,7 @@ pub struct Button {
     label: String,
     font: &'static str,
 
-    /// Stroke thickness as a fraction of `font_size`. Final pixel width = `((stroke_ru × font_size) as isize).max(1)` — floored at a 1 px hairline (the sole sanctioned fixed pixel: a stroke must not vanish sub-pixel), and the multiplier scales it up smoothly on big displays. Default `1.0 / (1 << 5)` (= 1/32 of font_size) yields 1 px thru typical desktop range and ~2-3 px on 4K + zoom; same convention as Textbox so a Button and Textbox at the same `stroke_ru` render with identical edge weight.
+    /// Stroke thickness as a fraction of `font_size`. Final pixel width = `(stroke_ru × font_size) as isize` — NO floor: the two-tone edge is the ring between the outer squircle and the inset inner fill, and both are anti-aliased silhouettes, so below 1px the ring just truncates to nothing and the pill reads as a clean filled shape with a soft AA edge (no fixed-pixel hairline needed — that's only for bare LINE strokes with no fill behind them, e.g. a chevron). Default `1.0 / (1 << 5)` (= 1/32 of font_size) yields 0 (borderless) thru typical desktop and a growing ring on 4K + zoom; same convention as Textbox so a Button and Textbox at the same `stroke_ru` render identically.
     pub stroke_ru: f32,
     pub center_x: Coord,
     pub center_y: Coord,
@@ -372,7 +372,7 @@ impl Button {
         let ch = pill_h as usize;
         // Fractional squirdleyness — slots between an ellipse (2) and a diamond (1). `1.5` reads as a noticeably-rounder, slightly-faceted pill: distinctly more curved than the textbox's `3.0` "slightly squared" but not as soft as a full ellipse. Routes thru paint's `_f` (powf) variant; the textbox / chrome keep the integer (powi) fast path. Adjustable per-instance via this constant; future API could expose it as a Button field if more shapes are desired.
         let squirdleyness = 1.75;
-        let stroke_px = ((self.stroke_ru * self.font_size) as isize).max(1);
+        let stroke_px = (self.stroke_ru * self.font_size) as isize; // no floor: the AA silhouette carries the pill, so a sub-pixel ring truncating to 0 just leaves a clean filled edge
 
         // Fill for THIS paint: baked-state mode folds hover/pressed/focus into the pill fill (headless
         // hosts have no overlay pass); otherwise just the idle fill and the overlay tints on top. A
