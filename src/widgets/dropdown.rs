@@ -17,8 +17,6 @@ use crate::widgets::textbox::{blit_cache_to_target, region_to_pixelrect};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// Gap between the pill's bottom edge and the popup's top edge, in stroke widths.
-const POPUP_GAP_PX: Coord = 2.0;
 
 /// One option row. A minimal [`crate::host::widget::Widget`]: carries its own hit id (stamped over the row band while the popup is open), hover state (drives the overlay tint), and a fired flag the parent folds into `selected` at [`Dropdown::take_change`] time.
 pub struct DropdownRow {
@@ -373,9 +371,11 @@ impl Dropdown {
         let h = self.rows.len() as Coord * self.row_height() + pad * 2.0;
         let w = self.width;
         let x = self.center_x - w * 0.5;
-        let below_y = self.center_y + self.height * 0.5 + POPUP_GAP_PX;
+        // Gap between the pill and its popup — a fraction of the pill height, so it scales with everything else (no fixed pixel).
+        let gap = self.height / 16.;
+        let below_y = self.center_y + self.height * 0.5 + gap;
         let y = if below_y + h > viewport_h as Coord {
-            (self.center_y - self.height * 0.5 - POPUP_GAP_PX - h).max(0.0)
+            (self.center_y - self.height * 0.5 - gap - h).max(0.0)
         } else {
             below_y
         };
@@ -620,7 +620,7 @@ impl Dropdown {
             let chev_cx = pill_w as Coord - pad * 1.5 - chev_w * 0.5;
             let chev_cy = local_y_center;
             let seg_len = chev_w * 0.5 * core::f32::consts::SQRT_2;
-            let seg_th = (self.stroke_ru * self.font_size + 1.5).max(1.5);
+            let seg_th = (self.stroke_ru * self.font_size).max(1.0); // 1px hairline floor — the sole sanctioned fixed pixel (a stroke must not vanish sub-pixel)
             let angle = core::f32::consts::FRAC_PI_4;
             paint::draw_rect_rotated(
                 &mut text_canvas,
@@ -703,7 +703,7 @@ impl Dropdown {
 
 /// Same RU-invariant glow factor as Button's.
 fn glow_factor_256(font_size: f32, radius_scale: f32) -> u32 {
-    let target_radius = (font_size * radius_scale).max(8.0);
+    let target_radius = font_size * radius_scale;
     let drop = (1240.0 / target_radius) as u32;
     (256u32.saturating_sub(drop)).clamp(96, 254)
 }

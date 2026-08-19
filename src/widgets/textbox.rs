@@ -802,7 +802,7 @@ impl Textbox {
 
     /// Compute the `factor_256` decay multiplier for this textbox's current `font_size`, parameterised by `radius_scale` (the multiplier on `font_size` that defines the half-life-ish reach). Single source of truth for both [`Self::glow_bbox`] (sizing the bbox padding to the actual ray reach) and the focus-glow render pass (driving the per-pixel α taper). Matches the chrome shadow's `target_radius`/`drop` formula — RU-invariant since `target_radius` scales with `font_size`. Smaller `radius_scale` → steeper decay → shorter reach (intensity at each pixel stays the same, gradient just compresses).
     fn glow_factor_256(font_size: f32, radius_scale: f32) -> u32 {
-        let target_radius = (font_size * radius_scale).max(8.0);
+        let target_radius = font_size * radius_scale;
         let drop = (1240.0 / target_radius) as u32;
         (256u32.saturating_sub(drop)).clamp(96, 254)
     }

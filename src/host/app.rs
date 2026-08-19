@@ -1797,7 +1797,7 @@ impl<A: FluorApp> DesktopShell<A> {
         if full_repaint && !hitmask_now && self.saved_rect_for_maximize.is_none() {
             // Span of the pass this surface composites from, so the shadow radius matches the density it casts over.
             let span = src_vp.effective_span();
-            let target_radius = (span / 16.0).max(8.0);
+            let target_radius = span / 16.0;
             let drop = (1240.0 / target_radius) as u32;
             let factor_256 = (256u32.saturating_sub(drop)).clamp(96, 254);
             let shadow_seed: u32 = if self.is_focused { 0x80 } else { 0x40 };
