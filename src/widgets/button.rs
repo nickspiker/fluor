@@ -543,6 +543,121 @@ impl Button {
         self.last_painted_hovered = self.hovered;
     }
 
+    /// Immediate-mode pill draw (no retained cache): THE canonical Button look — squircle fill + two-tone raised edge + centred label, fit to `rect`, hit-stamped — for a host with MANY one-off action pills where a persistent Button per pill isn't worth the click-counter state (photon's settings panel). Visually indistinguishable from a retained Button because it draws with the same primitives, the same `1.75` squirdleyness, the same two-tone edge, and the same no-floor `1/32·font_size` stroke.
+    /// State fill mirrors [`Self::effective_fill`] precedence (pressed > hover > idle) using the same brightness factors, so an immediate pill hovers and presses identically to a retained one — this is the hover the hand-rolled pills never had. `fill = None` uses the theme navy; `Some((idle, held))` overrides for a ramp (Security's green→red destructiveness). Disabled dims the label to the theme grey; pass `hit_map = None` for a disabled pill so it stamps nothing and a dead tap dispatches nowhere.
+    /// Fit-to-slot: the font shrinks so a label never overruns its slot (pills sharing a row don't collide), scaling all the way down; the pill grows only when the label needs more than `rect.w` (never shrinks the pill).
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_pill_immediate(
+        canvas: &mut crate::canvas::Canvas,
+        text: &mut TextRenderer,
+        hit_map: Option<&mut [HitId]>,
+        buf_w: usize,
+        buf_h: usize,
+        rect: Region,
+        label: &str,
+        font: &'static str,
+        hit_id: HitId,
+        hovered: bool,
+        pressed: bool,
+        enabled: bool,
+        fill: Option<(u32, u32)>,
+    ) {
+        if rect.w <= 0.0 || rect.h <= 0.0 {
+            return;
+        }
+        let idle = fill.map(|f| f.0).unwrap_or(theme::BUTTON_FILL);
+        // State fill — same precedence and factors as effective_fill (no focus for immediate pills). Only an enabled pill lights up; a disabled one stays at idle.
+        let state_fill = if pressed && enabled {
+            fill.map(|f| f.1).unwrap_or_else(|| match fill {
+                Some(_) => paint::scale_brightness(idle, Self::HELD_FACTOR.0, Self::HELD_FACTOR.1),
+                None => theme::BUTTON_HELD,
+            })
+        } else if hovered && enabled {
+            match fill {
+                Some(_) => paint::scale_brightness(idle, Self::HOVER_FACTOR.0, Self::HOVER_FACTOR.1),
+                None => theme::BUTTON_HOVER,
+            }
+        } else {
+            idle
+        };
+        // Fit order: SHRINK the font toward the slot so pills sharing a row don't collide; the shrink is capped at the original size (never grows a label) and floored by nothing — a smaller slot yields smaller text, scaling all the way down like everything else.
+        let mut font_size = rect.h * 0.5;
+        let mut tw = text.measure_text(label, &TextStyle::new(font_size, 0).font(font));
+        let max_w = rect.w * 0.96;
+        if tw + font_size * 1.6 > max_w {
+            let scaled = font_size * max_w / (tw + font_size * 1.6);
+            font_size = scaled.min(font_size);
+            tw = text.measure_text(label, &TextStyle::new(font_size, 0).font(font));
+        }
+        let need_w = tw + font_size * 1.6;
+        let (px, pw) = if need_w > rect.w {
+            (rect.center_x() - need_w * 0.5, need_w)
+        } else {
+            (rect.x, rect.w)
+        };
+        let w = pw as isize;
+        let h = rect.h as isize;
+        let x0 = px as isize;
+        let y0 = rect.y as isize;
+        // Same stroke_ru default as a retained Button (1/32 of font_size), no floor: the AA silhouette carries the shape below 1px.
+        let stroke = (font_size * (1.0 / (1u32 << 5) as f32)) as isize;
+        // Disabled dims the label to the secondary grey (inert, still legible) — same fill and edges, so the pill reads "present but inert" rather than vanished. Matches a retained Button's disabled label.
+        let label_colour = if enabled {
+            theme::TEXTBOX_TEXT
+        } else {
+            theme::LABEL_COLOUR
+        };
+        // Label first (topmost under-blend), centred in the SLOT (not the grown pill) so it stays put.
+        text.draw_text_left(
+            canvas,
+            label,
+            rect.center_x() - tw * 0.5,
+            rect.center_y(),
+            &TextStyle::new(font_size, label_colour).font(font),
+            None,
+            None,
+        );
+        let inner_w = (w - 2 * stroke).max(0);
+        let inner_h = (h - 2 * stroke).max(0);
+        if inner_w > 0 && inner_h > 0 {
+            paint::draw_squircle_pill_f(
+                canvas,
+                x0 + stroke,
+                y0 + stroke,
+                inner_w,
+                inner_h,
+                state_fill,
+                1.75,
+            );
+        }
+        // Two-tone raised edge — shadow top/left, light bottom/right (protrudes toward the viewer).
+        paint::draw_squircle_pill_two_tone_f(
+            canvas,
+            x0,
+            y0,
+            w,
+            h,
+            theme::TEXTBOX_SHADOW_EDGE,
+            theme::TEXTBOX_LIGHT_EDGE,
+            1.75,
+            None,
+            0,
+        );
+        // Stamp the whole pill bbox so the entire pill is clickable (the two-tone pass only stamps the edge band). Bbox over-stamp — corners outside the silhouette claim a few extra pixels inside the pill anyway. A disabled pill passes hit_map = None and stamps nothing.
+        if let Some(hm) = hit_map {
+            let x1 = (x0 + w).clamp(0, buf_w as isize);
+            let y1 = (y0 + h).clamp(0, buf_h as isize);
+            let sx = x0.max(0);
+            let sy = y0.max(0);
+            for py in sy..y1 {
+                let row = py as usize * buf_w;
+                for px in sx..x1 {
+                    hm[row + px as usize] = hit_id;
+                }
+            }
+        }
+    }
+
     /// Stamp this button's `hit_id` into `hit_map` at every pixel its pill (fill + two-tone stroke) touches — the true squircle silhouette, not a bbox rectangle.
     /// Call AFTER any widget that overlaps this button (e.g. a textbox this button is overlaid inside): those widgets stamp their own id over the button's during their colour blit, so this re-wins the button's hit region as the last writer. `render_content_into` must have run first this frame to populate `pill_cache`.
     /// Anything the pill covers → this id (α > 0 catches the AA edge too), so the whole visible button — including a glyph painted over it by the host — dispatches to this button.
