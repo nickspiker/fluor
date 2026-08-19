@@ -4,12 +4,14 @@
 
 pub mod blink;
 pub mod button;
+pub mod checkbox;
 pub mod dropdown;
 pub mod multitextbox;
 pub mod slider;
 pub mod textbox;
 pub use blink::BlinkTimer;
 pub use button::Button;
+pub use checkbox::Checkbox;
 pub use dropdown::Dropdown;
 pub use multitextbox::MultiTextbox;
 pub use slider::Slider;
