@@ -1029,8 +1029,8 @@ pub fn draw_chord_hint(
 
     let line_count = hints.len() as f32 + 1.5;
     let panel_h = line_count * line_h + pad * 2.0;
-    // Width clamped against the font_size so the panel never gets narrower than a long binding line. Upper clamp keeps it from spanning the whole viewport on wide windows.
-    let panel_w = (span * 0.45).clamp(font_size * 22.0, font_size * 36.0);
+    // A span fraction — the old `.clamp(font_size*22, font_size*36)` was a dead no-op (span*0.45 always sits in [0.308span, 0.504span] since font_size = span*0.014). No clamp, no pixels; photon's matching bbox math uses the identical expression.
+    let panel_w = span * 0.45;
 
     let cx = canvas.width as f32 * 0.5;
     let cy = canvas.height as f32 * 0.4;

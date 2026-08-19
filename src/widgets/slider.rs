@@ -194,10 +194,10 @@ impl Slider {
         };
 
         // Track: a strip 1/4 of the band height, vertically centred. The handle circle overhangs it.
-        let track_h = (band_h / 4).max(2);
+        let track_h = band_h / 4;
         let track_y = band_y + (band_h - track_h) / 2;
         let handle_x = band_x + (self.value as Coord * self.width) as isize;
-        let radius = (band_h / 2 - 1).max(2);
+        let radius = band_h / 2;
 
         // Handle first: topmost-first doctrine, the circle wins where it overlaps the track.
         paint::circle_filled(
