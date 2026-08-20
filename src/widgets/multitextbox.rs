@@ -1079,14 +1079,23 @@ impl Key for MultiTextbox {
                 self.select_all();
                 changed = true;
             }
+            // Ctrl+Tab types a literal tab — Tab/Shift+Tab are the focus-traversal pair (intercepted upstream), and paste is the other verbatim route.
+            FKey::Named(NamedKey::Tab) if ctrl => {
+                self.insert_char('\t', text);
+                changed = true;
+            }
             _ => {
-                if !ctrl {
+                // Same verbatim rule as Textbox: gated to typing keys (Character + Named Space) so command payloads never insert; everything a typing key carries lands byte-for-byte, control codepoints included.
+                if !ctrl
+                    && matches!(
+                        &kev.logical_key,
+                        FKey::Character(_) | FKey::Named(NamedKey::Space)
+                    )
+                {
                     if let Some(s) = &kev.text {
                         for c in s.chars() {
-                            if !c.is_control() {
-                                self.insert_char(c, text);
-                                changed = true;
-                            }
+                            self.insert_char(c, text);
+                            changed = true;
                         }
                     }
                 }
