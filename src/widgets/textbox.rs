@@ -473,9 +473,7 @@ impl Textbox {
     // --- Editing ---
 
     pub fn insert_char(&mut self, c: char, text: &mut TextRenderer) {
-        if c.is_control() {
-            return;
-        }
+        // VERBATIM, no exceptions (photon doctrine 2026-08-18): control codepoints, bidi overrides, whitespace — all the human's bytes. Command keys never reach here (their arms are explicit in on_key); anything that does is content.
         self.delete_selection(text);
         self.chars.insert(self.cursor, c);
         self.cursor += 1;
@@ -1438,15 +1436,23 @@ mod widget_impls {
                     self.select_all();
                     changed = true;
                 }
+                // Ctrl+Tab types a literal tab — Tab/Shift+Tab are the focus-traversal pair (intercepted upstream), and paste is the other verbatim route.
+                FKey::Named(NamedKey::Tab) if ctrl => {
+                    self.insert_char('\t', text);
+                    changed = true;
+                }
                 _ => {
-                    // Character insertion via the OS's text payload (so dead-keys / IME composition produce the right glyph rather than us reconstructing it from logical_key). Skip while Ctrl is held — Ctrl+letter combos that aren't handled above (Ctrl+S, Ctrl+Z, etc.) shouldn't type their letter. Skip control codepoints so Backspace / Enter / Tab fallthroughs don't get inserted as glyphs.
-                    if !ctrl {
+                    // Character insertion via the OS's text payload (so dead-keys / IME composition produce the right glyph rather than us reconstructing it from logical_key). Skip while Ctrl is held — Ctrl+letter combos that aren't handled above (Ctrl+S, Ctrl+Z, etc.) shouldn't type their letter. Gated to Character keys (+ Space, which arrives Named) so command keys' payloads (Backspace "\u{8}", Enter "\r", Escape "\u{1b}") never insert as glyphs; what a typing key carries inserts VERBATIM, control codepoints included — the bytes are the human's choice, never the widget's.
+                    if !ctrl
+                        && matches!(
+                            &kev.logical_key,
+                            FKey::Character(_) | FKey::Named(NamedKey::Space)
+                        )
+                    {
                         if let Some(s) = &kev.text {
                             for c in s.chars() {
-                                if !c.is_control() {
-                                    self.insert_char(c, text);
-                                    changed = true;
-                                }
+                                self.insert_char(c, text);
+                                changed = true;
                             }
                         }
                     }
