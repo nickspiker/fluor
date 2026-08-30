@@ -2,8 +2,7 @@
 //!
 //! Lives outside `host::app` because widget capability traits (which return `EventResponse`) compile without `host-winit`. Same enum, just relocated so the dependency graph works on every host.
 
-/// Resize-edge classification (see `chrome::get_resize_edge` for the classifier). Lives here
-/// rather than in `chrome` so `EventResponse::StartResize` compiles without the `icon` feature
+/// Resize-edge classification (see `chrome::get_resize_edge` for the classifier). Lives here rather than in `chrome` so `EventResponse::StartResize` compiles without the `icon` feature
 /// (chrome is icon-gated; this enum is pure geometry). Re-exported from `chrome` for old paths.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResizeEdge {

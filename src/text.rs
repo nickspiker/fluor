@@ -211,8 +211,7 @@ impl TextRenderer {
     }
 
     /// Load a font from raw bytes and return its primary family name, for use as the `font: &str`
-    /// argument to the `draw_text_*` methods. Consumers that ship their own font (e.g. a capsule
-    /// carrying a monospace face) call this once and cache the returned family name. Returns `None`
+    /// argument to the `draw_text_*` methods. Consumers that ship their own font (e.g. a capsule carrying a monospace face) call this once and cache the returned family name. Returns `None`
     /// if the bytes register no face.
     pub fn load_font_data_named(&mut self, data: Vec<u8>) -> Option<String> {
         let db = self.font_system.db_mut();
@@ -1330,11 +1329,8 @@ impl TextRenderer {
         buffer.set_size(&mut self.font_system, Some(10000.0), Some(size * 2.0));
         buffer.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced);
 
-        // Sum each glyph's ADVANCE (glyph.w), don't take max(glyph.x + glyph.w). A trailing space has
-        // zero visual extent, so cosmic-text gives it glyph.x = glyph.w = 0 when it's the last (or only)
-        // glyph in the run — max(x+w) then returns 0, so a lone " " measures 0 and words that end in a
-        // space collapse into the next (text looks truncated / spaces vanish). Summing advances counts
-        // the space's advance regardless of position, matching `measure_text_widths_per_char` below.
+        // Sum each glyph's ADVANCE (glyph.w), don't take max(glyph.x + glyph.w). A trailing space has zero visual extent, so cosmic-text gives it glyph.x = glyph.w = 0 when it's the last (or only)
+        // glyph in the run — max(x+w) then returns 0, so a lone " " measures 0 and words that end in a space collapse into the next (text looks truncated / spaces vanish). Summing advances counts the space's advance regardless of position, matching `measure_text_widths_per_char` below.
         buffer.layout_runs().fold(0.0, |max_width, run| {
             let run_width = run.glyphs.iter().fold(0.0, |w, glyph| w + glyph.w);
             max_width.max(run_width)

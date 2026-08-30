@@ -511,9 +511,7 @@ pub fn unpack_argb(packed: u32) -> (u8, u8, u8, u8) {
 }
 
 /// Scale a fluor internal pixel's VISIBLE brightness by `num/den`, clamping each channel to
-/// `[0, 255]` and preserving α. Derives a lighter/darker variant of a fill in the same hue — e.g. a
-/// custom-coloured button's hover/held fills off its resting fill, so any tint gets the same
-/// luminance ramp the `BUTTON_FILL/HOVER/HELD` constants encode (dark idle → ~1.5× hover → ~2.2×
+/// `[0, 255]` and preserving α. Derives a lighter/darker variant of a fill in the same hue — e.g. a custom-coloured button's hover/held fills off its resting fill, so any tint gets the same luminance ramp the `BUTTON_FILL/HOVER/HELD` constants encode (dark idle → ~1.5× hover → ~2.2×
 /// held) instead of a hand-picked pair per colour. `(num, den) = (1, 1)` is identity.
 #[inline]
 pub fn scale_brightness(packed: u32, num: u16, den: u16) -> u32 {
@@ -856,8 +854,7 @@ fn background_row(
     const CHUNK: usize = 64;
     let mut noise_buf = [0u32; CHUNK];
     let ones = 0x0001_0101u32;
-    // RNG chain is explicitly u64 (not usize) so the noise pattern is bit-identical on 32-bit
-    // targets (wasm32 browser renderer) and 64-bit desktops — same seed, same wrap points.
+    // RNG chain is explicitly u64 (not usize) so the noise pattern is bit-identical on 32-bit targets (wasm32 browser renderer) and 64-bit desktops — same seed, same wrap points.
     // Each half's seed is keyed by its OWN scrolled row, so equal scroll → identical seed → the two halves stay mirror-locked (the chat case); different scroll → each half's texture tracks its pane (the split settings case).
     let seed_for = |logical_row: isize| -> u64 {
         0xDEAD_BEEF_0123_4567u64
@@ -1174,11 +1171,7 @@ pub fn draw_blinkey(canvas: &mut Canvas, bx: usize, by: usize, height: usize, to
         };
         let w = wave as u32;
         for dx in -7i32..=7 {
-            // The cursor is a BRIGHT wave. In the α + darkness convention (RGB bytes are
-            // darkness, `0 = white`), brightening means REDUCING darkness — a per-channel
-            // saturating subtract, NOT the add the visible-RGB original used. (Photon's
-            // buffer was visible-space, so it added; the port kept the `+=` which silently
-            // darkened the cursor into invisibility against a dark field.) α is preserved.
+            // The cursor is a BRIGHT wave. In the α + darkness convention (RGB bytes are darkness, `0 = white`), brightening means REDUCING darkness — a per-channel saturating subtract, NOT the add the visible-RGB original used. (Photon's buffer was visible-space, so it added; the port kept the `+=` which silently darkened the cursor into invisibility against a dark field.) α is preserved.
             let k = w >> dx.unsigned_abs();
             let p = &mut pixels[(idx as isize + dx as isize) as usize];
             let a = *p & 0xFF00_0000;

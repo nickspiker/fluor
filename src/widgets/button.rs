@@ -130,15 +130,13 @@ impl Button {
         self.hovered
     }
     /// Give this button a specific hovered fill colour (α+darkness), instead of the shared
-    /// [`theme::BUTTON_HOVER`]. `None` restores the default. Used to reproduce the pre-fluor
-    /// per-control hover colours (e.g. a subtle neutral tint on the send/query button).
+    /// [`theme::BUTTON_HOVER`]. `None` restores the default. Used to reproduce the pre-fluor per-control hover colours (e.g. a subtle neutral tint on the send/query button).
     pub fn set_hover_fill(&mut self, colour: Option<u32>) {
         self.hover_fill = colour;
     }
 
     /// Give this button a specific resting pill fill colour (α+darkness), instead of the shared
-    /// [`theme::BUTTON_FILL`]. `None` restores the default. Dirties the pill cache so the new
-    /// colour rasterizes on the next paint.
+    /// [`theme::BUTTON_FILL`]. `None` restores the default. Dirties the pill cache so the new colour rasterizes on the next paint.
     pub fn set_fill(&mut self, colour: Option<u32>) {
         if colour != self.fill {
             self.fill = colour;
@@ -159,15 +157,12 @@ impl Button {
     }
 
     /// Ratios that turn a resting fill into its hover / held variant — chosen so a default
-    /// [`theme::BUTTON_FILL`] scales to ≈[`theme::BUTTON_HOVER`] / ≈[`theme::BUTTON_HELD`], and any
-    /// custom idle fill inherits the same luminance ramp.
+    /// [`theme::BUTTON_FILL`] scales to ≈[`theme::BUTTON_HOVER`] / ≈[`theme::BUTTON_HELD`], and any custom idle fill inherits the same luminance ramp.
     const HOVER_FACTOR: (u16, u16) = (3, 2); // ×1.5
     const HELD_FACTOR: (u16, u16) = (11, 5); // ×2.2
 
     /// The pill fill for the button's CURRENT state, precedence pressed → focused → hovered → idle.
-    /// Each state prefers its explicit override; an unset override on a *custom-idle* button derives
-    /// from the idle fill (so a coloured button gets a matching ramp), while a default button (no idle
-    /// override) falls back to the exact `theme::BUTTON_*` constants — pixel-identical to today.
+    /// Each state prefers its explicit override; an unset override on a *custom-idle* button derives from the idle fill (so a coloured button gets a matching ramp), while a default button (no idle override) falls back to the exact `theme::BUTTON_*` constants — pixel-identical to today.
     fn effective_fill(&self) -> u32 {
         let idle = self.fill.unwrap_or(theme::BUTTON_FILL);
         if self.pressed {
@@ -374,9 +369,7 @@ impl Button {
         let squirdleyness = 1.75;
         let stroke_px = (self.stroke_ru * self.font_size) as isize; // no floor: the AA silhouette carries the pill, so a sub-pixel ring truncating to 0 just leaves a clean filled edge
 
-        // Fill for THIS paint: baked-state mode folds hover/pressed/focus into the pill fill (headless
-        // hosts have no overlay pass); otherwise just the idle fill and the overlay tints on top. A
-        // state transition re-dirties the cache so only the fill re-rasterizes — stroke is unchanged.
+        // Fill for THIS paint: baked-state mode folds hover/pressed/focus into the pill fill (headless hosts have no overlay pass); otherwise just the idle fill and the overlay tints on top. A state transition re-dirties the cache so only the fill re-rasterizes — stroke is unchanged.
         let pill_fill = if self.bake_states {
             self.effective_fill()
         } else {
@@ -785,15 +778,12 @@ mod widget_impls {
             Button::set_hovered(self, hovered);
         }
         fn tint_delta(&self) -> u32 {
-            // Baked-state mode folds the state colour into the pill fill itself, so there is no overlay
-            // tint to add — the delta is zero (a host that runs the overlay must not double-apply).
+            // Baked-state mode folds the state colour into the pill fill itself, so there is no overlay tint to add — the delta is zero (a host that runs the overlay must not double-apply).
             if self.bake_states {
                 return 0;
             }
-            // Otherwise the pill baked its RESTING fill and the host overlay wrap-adds this delta on the
-            // hovered/pressed pixels. `effective_fill()` picks the state colour (held > focused > hover >
-            // idle) honouring per-instance overrides + the derived ramp; the delta carries it there off
-            // the resting fill, so `idle` yields a zero delta (no tint).
+            // Otherwise the pill baked its RESTING fill and the host overlay wrap-adds this delta on the hovered/pressed pixels. `effective_fill()` picks the state colour (held > focused > hover >
+            // idle) honouring per-instance overrides + the derived ramp; the delta carries it there off the resting fill, so `idle` yields a zero delta (no tint).
             let idle = self.fill.unwrap_or(crate::theme::BUTTON_FILL);
             crate::paint::wrap_sub_rgb(self.effective_fill(), idle)
         }

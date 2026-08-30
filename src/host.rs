@@ -3,8 +3,7 @@
 //! Per `## API / Implementation Separation` in AGENT.md, hosts are interchangeable: the same `Compositor` API drives the desktop winit+softbuffer host, the future ferros bare-metal framebuffer host, and anything else. Each host is gated by a Cargo feature so consumers compile in only what they need.
 
 // chrome + icon are gated on `icon` (vsf + rav1d app-icon decode) — rav1d can't build for wasm32,
-// and headless paint/text consumers (toka's browser renderer) never draw window chrome. Every real
-// host feature (host-winit / host-softbuffer / host-android) implies `icon`, so hosts see no change.
+// and headless paint/text consumers (toka's browser renderer) never draw window chrome. Every real host feature (host-winit / host-softbuffer / host-android) implies `icon`, so hosts see no change.
 #[cfg(feature = "icon")]
 pub mod chrome;
 pub mod event_response;

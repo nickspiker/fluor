@@ -83,16 +83,9 @@ pub fn draw_rect(
     });
 }
 
-/// Blit a decoded image (`src`, α + darkness packed, row-major `src_w × src_h`) scaled into a dest
-/// rect centred at `(cx, cy)` with px size `(dst_w, dst_h)`. Nearest-neighbour sampling. Each
-/// sampled pixel composes UNDER existing content via [`Blend::under`] exactly like the other
-/// primitives, so draw order controls z. Source pixels are treated as opaque — the VSF image
-/// decoder packs α = `0xFF`; a source pixel's own α still rides thru `under`, so a decoder that
-/// emits transparency (future masked avatars) composites correctly with no change here.
+/// Blit a decoded image (`src`, α + darkness packed, row-major `src_w × src_h`) scaled into a dest rect centred at `(cx, cy)` with px size `(dst_w, dst_h)`. Nearest-neighbour sampling. Each sampled pixel composes UNDER existing content via [`Blend::under`] exactly like the other primitives, so draw order controls z. Source pixels are treated as opaque — the VSF image decoder packs α = `0xFF`; a source pixel's own α still rides thru `under`, so a decoder that emits transparency (future masked avatars) composites correctly with no change here.
 ///
-/// Bounds are clamped/clipped like [`draw_rect`] (the dest rect may be partly off-buffer). Edges
-/// are hard (no boundary AA) — fine behind a rounded mask or at icon scale; add coverage later if
-/// bare-edged blits need softening.
+/// Bounds are clamped/clipped like [`draw_rect`] (the dest rect may be partly off-buffer). Edges are hard (no boundary AA) — fine behind a rounded mask or at icon scale; add coverage later if bare-edged blits need softening.
 pub fn draw_image(
     canvas: &mut Canvas,
     src: &[u32],

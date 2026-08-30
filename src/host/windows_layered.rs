@@ -40,8 +40,7 @@ pub fn make_layered(window: &Arc<Window>) {
 
 /// Present `persistent_screen` (fluor's owned `0xAARRGGBB`-per-pixel screen buffer, `screen_w × screen_h`) to the layered window via `UpdateLayeredWindow`.
 ///
-/// `UpdateLayeredWindow` requires a 32-bit top-down DIB in **premultiplied BGRA**. fluor's buffer is `0xAARRGGBB` (the same packing softbuffer/wgpu consume) NOT premultiplied, so we convert per-pixel
-/// into a freshly-created DIB section, then blit. The whole screen-sized surface is updated each frame;
+/// `UpdateLayeredWindow` requires a 32-bit top-down DIB in **premultiplied BGRA**. fluor's buffer is `0xAARRGGBB` (the same packing softbuffer/wgpu consume) NOT premultiplied, so we convert per-pixel into a freshly-created DIB section, then blit. The whole screen-sized surface is updated each frame;
 /// the cost is one screen-sized copy+premultiply, matching the existing `persistent_screen → back buffer` copy the softbuffer path already pays.
 pub fn present(window: &Arc<Window>, persistent_screen: &[u32], screen_w: u32, screen_h: u32) {
     let Some(hwnd) = hwnd(window) else { return };
