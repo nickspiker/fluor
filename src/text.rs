@@ -184,6 +184,8 @@ impl TextRenderer {
             include_bytes!("../assets/Noto_Sans_Symbols2/NotoSansSymbols2-Regular.ttf").to_vec(),
         );
         // Noto Color Emoji — the deterministic COLOUR-emoji fallback (CBDT/CBLC bitmap strikes, family name "Noto Color Emoji"). swash returns these as `Content::Color` RGBA images (not a coverage mask), and the blit's Color branch composites the glyph's OWN sRGB pixels into the darkness buffer, ignoring the style colour — snowman ☃, faces, hands, flags, ZWJ families, and skin tones show in true colour. The old "doesn't rasterize cleanly" note is obsolete now the Color path exists. ~10.7 MB embedded so a fluor build renders emoji with NO host-font read.
+        // Gated behind the `emoji` feature: the font is 11 MB, which pushes the crate tarball over crates.io's 10 MiB limit, so it is excluded from the published package (see `exclude` in Cargo.toml). Enable `emoji` for a git/local checkout that has assets/NotoColorEmoji.ttf present.
+        #[cfg(feature = "emoji")]
         db.load_font_data(include_bytes!("../assets/NotoColorEmoji.ttf").to_vec());
 
         db.set_sans_serif_family("Open Sans");

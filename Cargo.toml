@@ -11,6 +11,10 @@ documentation = "https://docs.rs/fluor"
 readme = "README.md"
 keywords = ["gui", "compositor", "windowing", "graphics", "ui"]
 categories = ["gui", "graphics", "rendering"]
+# NotoColorEmoji.ttf is 11 MB and pushes the .crate tarball past crates.io's 10 MiB limit.
+# It is include_bytes!'d only under the `emoji` feature (off by default), so the published
+# crate excludes it; a git checkout retains it for `--features emoji` builds.
+exclude = ["assets/NotoColorEmoji.ttf"]
 
 [lib]
 crate-type = ["rlib"]
@@ -24,6 +28,10 @@ crate-type = ["rlib"]
 # `text` IS in default — anything visual needs `TextRenderer`. cosmic-text + swash do compile on Android; if APK size grows uncomfortably the text path can move to a feature gate later (see `host-android` plan).
 default = ["std", "text", "simd", "rayon"]
 std = []
+# emoji — embeds Noto Color Emoji (~11 MB) for deterministic colour-emoji rendering with no host-font read.
+# OFF by default and EXCLUDED from the published crate (tarball would exceed crates.io's 10 MiB cap).
+# Only usable from a git/local checkout where assets/NotoColorEmoji.ttf is present.
+emoji = []
 # amber — the development-build theme: photon's debug orange (#FFA000) swapped into the theme CONSTANTS (bg noise tint, window hairlines, title text). Zero extra drawing steps, pure colour changes; photon's `development` feature enables it so a dev build is never mistaken for release.
 amber = []
 # host-winit transitively requires text — desktop chrome wants real glyphs out of the box.
