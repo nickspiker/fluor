@@ -366,9 +366,7 @@ pub fn draw_status_bar(
     // Damage = full-width band [y_top, height).
     canvas.damage.add_bounds(0, y_top, width, height);
 
-    // Status text FIRST. Chrome composites front-to-back ("topmost paints first wins"), so
-    // the text must be drawn before the band bg — otherwise it under-blends BEHIND the
-    // opaque fill and vanishes. Horizontally centered, vertically centered in the band;
+    // Status text FIRST. Chrome composites front-to-back ("topmost paints first wins"), so the text must be drawn before the band bg — otherwise it under-blends BEHIND the opaque fill and vanishes. Horizontally centered, vertically centered in the band;
     // `band_h / 2` side padding clips long strings off the BL/BR curves.
     if !text.is_empty() {
         let side_margin = band_h / 2;
@@ -392,8 +390,7 @@ pub fn draw_status_bar(
         pixels[idx] = pixels[idx].under(hairline, BlendMode::Normal);
     }
 
-    // BG fill — under-blends beneath the already-drawn text + hairline, filling the rest of
-    // the band interior. (Earlier writers — perimeter hairline, corner curve, status text —
+    // BG fill — under-blends beneath the already-drawn text + hairline, filling the rest of the band interior. (Earlier writers — perimeter hairline, corner curve, status text —
     // keep their pixels; bg only lands where the band is still empty.)
     let bg_opaque = 0xFF000000 | (bg & 0x00FFFFFF);
     for y in (y_top + 1)..height {

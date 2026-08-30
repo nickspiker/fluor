@@ -176,9 +176,7 @@ mod x11_atomic {
     }
 
     /// The desktop work area `(x, y, w, h)` — the monitor minus space reserved by panels /
-    /// taskbars — read from the root window's EWMH `_NET_WORKAREA` property. Used to place
-    /// the visible window so its bottom edge (the chrome status band) doesn't slide under a
-    /// taskbar. `_NET_WORKAREA` holds `[x, y, w, h]` per virtual desktop; we take the first
+    /// taskbars — read from the root window's EWMH `_NET_WORKAREA` property. Used to place the visible window so its bottom edge (the chrome status band) doesn't slide under a taskbar. `_NET_WORKAREA` holds `[x, y, w, h]` per virtual desktop; we take the first
     /// (current/default desktop). Returns `None` if not X11, the atom is unset (no EWMH WM),
     /// or the read fails — caller falls back to the full monitor.
     pub fn work_area() -> Option<(i32, i32, u32, u32)> {
@@ -212,8 +210,7 @@ mod x11_atomic {
     }
 }
 
-/// Windows work-area query — `SystemParametersInfo(SPI_GETWORKAREA)` gives the primary
-/// monitor's work rect (full screen minus the taskbar), in virtual-screen pixels.
+/// Windows work-area query — `SystemParametersInfo(SPI_GETWORKAREA)` gives the primary monitor's work rect (full screen minus the taskbar), in virtual-screen pixels.
 #[cfg(all(feature = "host-winit", target_os = "windows"))]
 fn work_area_windows() -> Option<(i32, i32, u32, u32)> {
     use windows::Win32::Foundation::RECT;
@@ -360,15 +357,10 @@ pub trait FluorApp {
         ""
     }
 
-    /// The app-identity icon for the OS window (taskbar / alt-tab / title bar). The host
-    /// applies it at window creation so the OS-level icon matches the in-chrome orb — apps
-    /// that hold a [`DefaultChrome`] typically return `self.chrome.app_icon.as_ref()`.
+    /// The app-identity icon for the OS window (taskbar / alt-tab / title bar). The host applies it at window creation so the OS-level icon matches the in-chrome orb — apps that hold a [`DefaultChrome`] typically return `self.chrome.app_icon.as_ref()`.
     ///
     /// **Platform reach.** This drives winit's `set_window_icon`, which only takes effect on
-    /// **Windows and X11**. On **Wayland** the icon is sourced from a `.desktop` file matched
-    /// by `app_id`, and on **macOS** from the `.app` bundle's `.icns` — both are build-time
-    /// packaging, not a runtime call, so this hook is a no-op there. Returns `None` by
-    /// default (no OS icon set).
+    /// **Windows and X11**. On **Wayland** the icon is sourced from a `.desktop` file matched by `app_id`, and on **macOS** from the `.app` bundle's `.icns` — both are build-time packaging, not a runtime call, so this hook is a no-op there. Returns `None` by default (no OS icon set).
     fn window_icon(&self) -> Option<&crate::host::icon::Icon> {
         None
     }
@@ -2091,9 +2083,7 @@ impl<A: FluorApp> DesktopShell<A> {
             Some(prev) => self.clamp_rect_to_surfaces(prev),
             None => {
                 self.saved_rect_for_maximize = Some(self.window_rect);
-                // Maximize to the home surface's work area (monitor minus panels), not the raw screen, so
-                // the maximized window's bottom chrome stays clear of the taskbar. Falls
-                // back to the full surface if the work area was never resolved. Both are GLOBAL desktop-unit rects.
+                // Maximize to the home surface's work area (monitor minus panels), not the raw screen, so the maximized window's bottom chrome stays clear of the taskbar. Falls back to the full surface if the work area was never resolved. Both are GLOBAL desktop-unit rects.
                 let (wx, wy, ww, wh) = self.surfaces[self.home].work_area;
                 if ww > 1 && wh > 1 {
                     WindowRect { x: wx, y: wy, w: ww, h: wh }
@@ -2377,17 +2367,13 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
         self.anchor = 0;
         self.window_scale = self.surfaces[0].scale;
 
-        // Explicitly activate the home surface on first launch. A borderless, monitor-sized, transparent
-        // surface is exactly what Linux WMs (with focus-stealing prevention) decline to auto-raise/focus on
-        // map — so the app opened un-topmost, sometimes below the previously-active window. winit's
-        // focus_window() issues _NET_ACTIVE_WINDOW (X11) / the platform activate, matching the proven
+        // Explicitly activate the home surface on first launch. A borderless, monitor-sized, transparent surface is exactly what Linux WMs (with focus-stealing prevention) decline to auto-raise/focus on map — so the app opened un-topmost, sometimes below the previously-active window. winit's focus_window() issues _NET_ACTIVE_WINDOW (X11) / the platform activate, matching the proven
         // ShowWindow + macOS-reopen paths. Skipped when starting hidden: a resident boot must NOT grab focus.
         if !self.app.start_hidden() {
             window.focus_window();
         }
 
-        // Match the OS window icon (taskbar / alt-tab / title bar) to the app's orb. winit
-        // honours this on Windows + X11; it's a no-op on Wayland (icon from .desktop app_id)
+        // Match the OS window icon (taskbar / alt-tab / title bar) to the app's orb. winit honours this on Windows + X11; it's a no-op on Wayland (icon from .desktop app_id)
         // and macOS (icon from the .app bundle), which source the icon at packaging time.
         if let Some(icon) = self.app.window_icon() {
             if let Some(winit_icon) = icon.to_winit_icon() {
@@ -2468,8 +2454,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Dock icon clicked. macOS asks the APPLICATION delegate, never the window, which is why this
-        // cannot be handled in `window_event` and why it was silently dropped before (see macos_reopen).
+        // Dock icon clicked. macOS asks the APPLICATION delegate, never the window, which is why this cannot be handled in `window_event` and why it was silently dropped before (see macos_reopen).
         #[cfg(target_os = "macos")]
         if super::macos_reopen::take_reopen() {
             log::info!("FLUOR-REOPEN: Dock reopen (#{})", super::macos_reopen::reopen_count());
@@ -2709,9 +2694,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
             } => {
                 // Press-hold-release: arm the element under the pointer. The action does NOT fire here — it waits for a release over the same element (drag-off cancels). The raw press is still forwarded so the app can do its press-time work (focus, textbox cursor, drag-select arm, window-drag / resize). Redraw so the "held" colour appears.
                 self.pointer.on_down(self.hit_under_cursor());
-                // Raise-on-click: a press that reached our surface means the pointer is over the visible app, so
-                // bring it to the front if it isn't already. Without this, clicking the app on a fullscreen-surface
-                // model didn't raise the OS window — it could stay behind another window the WM had stacked above.
+                // Raise-on-click: a press that reached our surface means the pointer is over the visible app, so bring it to the front if it isn't already. Without this, clicking the app on a fullscreen-surface model didn't raise the OS window — it could stay behind another window the WM had stacked above.
                 // Gated on `!is_focused` so an already-front window never re-requests activation (no WM flicker/fight).
                 if !self.is_focused {
                     if let Some(window) = self.home_window() {
