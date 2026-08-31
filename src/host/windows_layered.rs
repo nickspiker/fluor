@@ -21,6 +21,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, SetWindowLongPtrW, UpdateLayeredWindow, GWL_EXSTYLE, ULW_ALPHA, WS_EX_LAYERED,
 };
 
+/// Latched present-failure state so the failure EDGE logs once per streak instead of per-frame spam.
+static PRESENT_FAILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Pull the Win32 `HWND` out of a winit window. Returns `None` if the window isn't a Win32 window (shouldn't happen on this target, but the present path no-ops rather than panicking if so).
 fn hwnd(window: &Window) -> Option<HWND> {
     match window.window_handle().ok()?.as_raw() {
@@ -113,7 +116,8 @@ pub fn present(window: &Arc<Window>, persistent_screen: &[u32], screen_w: u32, s
             AlphaFormat: windows::Win32::Graphics::Gdi::AC_SRC_ALPHA as u8,
         };
 
-        let _ = UpdateLayeredWindow(
+        // The result was silently dropped for months — a failing ULW after a hide→show leaves the app alive but permanently invisible AND fully click-thru (every α=0 pixel passes input), which reads as "frozen empty window" in the field. Log the failure edge (first failure of a streak) so a submitted log convicts this path instead of ending in silence.
+        if let Err(e) = UpdateLayeredWindow(
             hwnd,
             screen_dc,
             Some(&mut dst_pos),
@@ -123,7 +127,13 @@ pub fn present(window: &Arc<Window>, persistent_screen: &[u32], screen_w: u32, s
             windows::Win32::Foundation::COLORREF(0),
             Some(&blend),
             ULW_ALPHA,
-        );
+        ) {
+            if !PRESENT_FAILING.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!("FLUOR-WIN: UpdateLayeredWindow FAILED ({e}) — window is invisible+click-thru until a present succeeds");
+            }
+        } else if PRESENT_FAILING.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            log::info!("FLUOR-WIN: UpdateLayeredWindow recovered — presents flowing again");
+        }
 
         // Tear down GDI objects (must restore the old bitmap before deleting the DIB).
         SelectObject(mem_dc, old);
