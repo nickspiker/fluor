@@ -93,6 +93,7 @@ pub fn key_press_from_keycode(key_code: i32) -> Option<Event> {
             state: ElementState::Pressed,
             repeat: false,
             text: None,
+            physical_key: 0, // Android soft-key: no physical scancode
         },
     })
 }

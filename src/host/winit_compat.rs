@@ -117,6 +117,54 @@ pub fn from_winit_key_event(kev: &winit::event::KeyEvent) -> KeyEvent {
         state: from_winit_element_state(kev.state),
         repeat: kev.repeat,
         text: kev.text.as_ref().map(|s| s.as_str().to_string()),
+        physical_key: winit_physical_to_scancode(&kev.physical_key),
+    }
+}
+
+/// winit's layout-neutral `KeyCode` → standard PC Set-1 scancode (== Windows `position_code`).
+/// Extended keys carry the `0xE0` high byte (arrows, right-hand modifiers, nav cluster). `0` for
+/// anything we don't map. This is the one place fluor knows winit's key names, so the mapping
+/// lives here; every consumer just reads the neutral `physical_key` u16.
+fn winit_physical_to_scancode(pk: &winit::keyboard::PhysicalKey) -> u16 {
+    use winit::keyboard::{KeyCode as K, PhysicalKey};
+    let PhysicalKey::Code(c) = pk else { return 0 };
+    match c {
+        // ── letters ──
+        K::KeyA => 0x1E, K::KeyB => 0x30, K::KeyC => 0x2E, K::KeyD => 0x20, K::KeyE => 0x12,
+        K::KeyF => 0x21, K::KeyG => 0x22, K::KeyH => 0x23, K::KeyI => 0x17, K::KeyJ => 0x24,
+        K::KeyK => 0x25, K::KeyL => 0x26, K::KeyM => 0x32, K::KeyN => 0x31, K::KeyO => 0x18,
+        K::KeyP => 0x19, K::KeyQ => 0x10, K::KeyR => 0x13, K::KeyS => 0x1F, K::KeyT => 0x14,
+        K::KeyU => 0x16, K::KeyV => 0x2F, K::KeyW => 0x11, K::KeyX => 0x2D, K::KeyY => 0x15,
+        K::KeyZ => 0x2C,
+        // ── digit row ──
+        K::Digit1 => 0x02, K::Digit2 => 0x03, K::Digit3 => 0x04, K::Digit4 => 0x05,
+        K::Digit5 => 0x06, K::Digit6 => 0x07, K::Digit7 => 0x08, K::Digit8 => 0x09,
+        K::Digit9 => 0x0A, K::Digit0 => 0x0B,
+        // ── symbols ──
+        K::Minus => 0x0C, K::Equal => 0x0D, K::BracketLeft => 0x1A, K::BracketRight => 0x1B,
+        K::Backslash => 0x2B, K::Semicolon => 0x27, K::Quote => 0x28, K::Backquote => 0x29,
+        K::Comma => 0x33, K::Period => 0x34, K::Slash => 0x35,
+        // ── whitespace / edit ──
+        K::Space => 0x39, K::Enter => 0x1C, K::Tab => 0x0F, K::Backspace => 0x0E,
+        K::Escape => 0x01, K::CapsLock => 0x3A,
+        // ── modifiers (right-hand ones are 0xE0-extended) ──
+        K::ShiftLeft => 0x2A, K::ShiftRight => 0x36, K::ControlLeft => 0x1D,
+        K::ControlRight => 0xE01D, K::AltLeft => 0x38, K::AltRight => 0xE038,
+        K::SuperLeft => 0xE05B, K::SuperRight => 0xE05C, K::ContextMenu => 0xE05D,
+        // ── nav cluster (extended) ──
+        K::Insert => 0xE052, K::Delete => 0xE053, K::Home => 0xE047, K::End => 0xE04F,
+        K::PageUp => 0xE049, K::PageDown => 0xE051, K::ArrowUp => 0xE048, K::ArrowDown => 0xE050,
+        K::ArrowLeft => 0xE04B, K::ArrowRight => 0xE04D,
+        // ── function row ──
+        K::F1 => 0x3B, K::F2 => 0x3C, K::F3 => 0x3D, K::F4 => 0x3E, K::F5 => 0x3F, K::F6 => 0x40,
+        K::F7 => 0x41, K::F8 => 0x42, K::F9 => 0x43, K::F10 => 0x44, K::F11 => 0x57, K::F12 => 0x58,
+        // ── numpad ──
+        K::Numpad0 => 0x52, K::Numpad1 => 0x4F, K::Numpad2 => 0x50, K::Numpad3 => 0x51,
+        K::Numpad4 => 0x4B, K::Numpad5 => 0x4C, K::Numpad6 => 0x4D, K::Numpad7 => 0x47,
+        K::Numpad8 => 0x48, K::Numpad9 => 0x49, K::NumpadAdd => 0x4E, K::NumpadSubtract => 0x4A,
+        K::NumpadMultiply => 0x37, K::NumpadDivide => 0xE035, K::NumpadDecimal => 0x53,
+        K::NumpadEnter => 0xE01C, K::NumLock => 0x45,
+        _ => 0,
     }
 }
 

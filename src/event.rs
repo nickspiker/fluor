@@ -166,6 +166,12 @@ pub struct KeyEvent {
     pub repeat: bool,
     /// Text the keystroke would produce if accepted (printable character). `None` on releases, non-printable keys, modifier presses, and IME-composed text (IME flows thru [`Event::Ime`]).
     pub text: Option<String>,
+    /// The PHYSICAL key position as a standard PC scancode (Set-1 / Windows `position_code`),
+    /// independent of the active keyboard layout — `KeyT` is `0x14` whether the layout is QWERTY,
+    /// Dvorak, or Azerty. `0` when the position is unknown (Android touch, unmapped key).
+    /// Layout-neutral consumers (remote-desktop physical passthrough, key remapping, macro
+    /// capture) use this; character consumers use `text`/`logical_key`.
+    pub physical_key: u16,
 }
 
 // ============================================================================ IME ========================================================================
