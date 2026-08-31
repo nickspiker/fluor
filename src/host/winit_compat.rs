@@ -117,53 +117,52 @@ pub fn from_winit_key_event(kev: &winit::event::KeyEvent) -> KeyEvent {
         state: from_winit_element_state(kev.state),
         repeat: kev.repeat,
         text: kev.text.as_ref().map(|s| s.as_str().to_string()),
-        physical_key: winit_physical_to_scancode(&kev.physical_key),
+        physical_key: winit_physical_to_hid(&kev.physical_key),
     }
 }
 
-/// winit's layout-neutral `KeyCode` → standard PC Set-1 scancode (== Windows `position_code`).
-/// Extended keys carry the `0xE0` high byte (arrows, right-hand modifiers, nav cluster). `0` for
-/// anything we don't map. This is the one place fluor knows winit's key names, so the mapping
-/// lives here; every consumer just reads the neutral `physical_key` u16.
-fn winit_physical_to_scancode(pk: &winit::keyboard::PhysicalKey) -> u16 {
+/// winit's layout-neutral `KeyCode` → USB HID usage ID (Keyboard/Keypad page `0x07`). winit's
+/// `KeyCode` is the W3C `KeyboardEvent.code` set, which is *defined against* HID, so this is a
+/// straight 1:1 relabel to the vendor-neutral standard. `0` for anything we don't map. This is
+/// the one place fluor touches winit's key names; every consumer reads the neutral `physical_key`.
+fn winit_physical_to_hid(pk: &winit::keyboard::PhysicalKey) -> u16 {
     use winit::keyboard::{KeyCode as K, PhysicalKey};
     let PhysicalKey::Code(c) = pk else { return 0 };
     match c {
-        // ── letters ──
-        K::KeyA => 0x1E, K::KeyB => 0x30, K::KeyC => 0x2E, K::KeyD => 0x20, K::KeyE => 0x12,
-        K::KeyF => 0x21, K::KeyG => 0x22, K::KeyH => 0x23, K::KeyI => 0x17, K::KeyJ => 0x24,
-        K::KeyK => 0x25, K::KeyL => 0x26, K::KeyM => 0x32, K::KeyN => 0x31, K::KeyO => 0x18,
-        K::KeyP => 0x19, K::KeyQ => 0x10, K::KeyR => 0x13, K::KeyS => 0x1F, K::KeyT => 0x14,
-        K::KeyU => 0x16, K::KeyV => 0x2F, K::KeyW => 0x11, K::KeyX => 0x2D, K::KeyY => 0x15,
-        K::KeyZ => 0x2C,
-        // ── digit row ──
-        K::Digit1 => 0x02, K::Digit2 => 0x03, K::Digit3 => 0x04, K::Digit4 => 0x05,
-        K::Digit5 => 0x06, K::Digit6 => 0x07, K::Digit7 => 0x08, K::Digit8 => 0x09,
-        K::Digit9 => 0x0A, K::Digit0 => 0x0B,
-        // ── symbols ──
-        K::Minus => 0x0C, K::Equal => 0x0D, K::BracketLeft => 0x1A, K::BracketRight => 0x1B,
-        K::Backslash => 0x2B, K::Semicolon => 0x27, K::Quote => 0x28, K::Backquote => 0x29,
-        K::Comma => 0x33, K::Period => 0x34, K::Slash => 0x35,
+        // ── letters (HID a=0x04 … z=0x1D) ──
+        K::KeyA => 0x04, K::KeyB => 0x05, K::KeyC => 0x06, K::KeyD => 0x07, K::KeyE => 0x08,
+        K::KeyF => 0x09, K::KeyG => 0x0A, K::KeyH => 0x0B, K::KeyI => 0x0C, K::KeyJ => 0x0D,
+        K::KeyK => 0x0E, K::KeyL => 0x0F, K::KeyM => 0x10, K::KeyN => 0x11, K::KeyO => 0x12,
+        K::KeyP => 0x13, K::KeyQ => 0x14, K::KeyR => 0x15, K::KeyS => 0x16, K::KeyT => 0x17,
+        K::KeyU => 0x18, K::KeyV => 0x19, K::KeyW => 0x1A, K::KeyX => 0x1B, K::KeyY => 0x1C,
+        K::KeyZ => 0x1D,
+        // ── digit row (1=0x1E … 9=0x26, 0=0x27) ──
+        K::Digit1 => 0x1E, K::Digit2 => 0x1F, K::Digit3 => 0x20, K::Digit4 => 0x21,
+        K::Digit5 => 0x22, K::Digit6 => 0x23, K::Digit7 => 0x24, K::Digit8 => 0x25,
+        K::Digit9 => 0x26, K::Digit0 => 0x27,
         // ── whitespace / edit ──
-        K::Space => 0x39, K::Enter => 0x1C, K::Tab => 0x0F, K::Backspace => 0x0E,
-        K::Escape => 0x01, K::CapsLock => 0x3A,
-        // ── modifiers (right-hand ones are 0xE0-extended) ──
-        K::ShiftLeft => 0x2A, K::ShiftRight => 0x36, K::ControlLeft => 0x1D,
-        K::ControlRight => 0xE01D, K::AltLeft => 0x38, K::AltRight => 0xE038,
-        K::SuperLeft => 0xE05B, K::SuperRight => 0xE05C, K::ContextMenu => 0xE05D,
-        // ── nav cluster (extended) ──
-        K::Insert => 0xE052, K::Delete => 0xE053, K::Home => 0xE047, K::End => 0xE04F,
-        K::PageUp => 0xE049, K::PageDown => 0xE051, K::ArrowUp => 0xE048, K::ArrowDown => 0xE050,
-        K::ArrowLeft => 0xE04B, K::ArrowRight => 0xE04D,
-        // ── function row ──
-        K::F1 => 0x3B, K::F2 => 0x3C, K::F3 => 0x3D, K::F4 => 0x3E, K::F5 => 0x3F, K::F6 => 0x40,
-        K::F7 => 0x41, K::F8 => 0x42, K::F9 => 0x43, K::F10 => 0x44, K::F11 => 0x57, K::F12 => 0x58,
+        K::Enter => 0x28, K::Escape => 0x29, K::Backspace => 0x2A, K::Tab => 0x2B,
+        K::Space => 0x2C, K::CapsLock => 0x39,
+        // ── symbols ──
+        K::Minus => 0x2D, K::Equal => 0x2E, K::BracketLeft => 0x2F, K::BracketRight => 0x30,
+        K::Backslash => 0x31, K::Semicolon => 0x33, K::Quote => 0x34, K::Backquote => 0x35,
+        K::Comma => 0x36, K::Period => 0x37, K::Slash => 0x38,
+        // ── function row (F1=0x3A … F12=0x45) ──
+        K::F1 => 0x3A, K::F2 => 0x3B, K::F3 => 0x3C, K::F4 => 0x3D, K::F5 => 0x3E, K::F6 => 0x3F,
+        K::F7 => 0x40, K::F8 => 0x41, K::F9 => 0x42, K::F10 => 0x43, K::F11 => 0x44, K::F12 => 0x45,
+        // ── nav cluster ──
+        K::Insert => 0x49, K::Home => 0x4A, K::PageUp => 0x4B, K::Delete => 0x4C, K::End => 0x4D,
+        K::PageDown => 0x4E, K::ArrowRight => 0x4F, K::ArrowLeft => 0x50, K::ArrowDown => 0x51,
+        K::ArrowUp => 0x52, K::NumLock => 0x53, K::ContextMenu => 0x65,
         // ── numpad ──
-        K::Numpad0 => 0x52, K::Numpad1 => 0x4F, K::Numpad2 => 0x50, K::Numpad3 => 0x51,
-        K::Numpad4 => 0x4B, K::Numpad5 => 0x4C, K::Numpad6 => 0x4D, K::Numpad7 => 0x47,
-        K::Numpad8 => 0x48, K::Numpad9 => 0x49, K::NumpadAdd => 0x4E, K::NumpadSubtract => 0x4A,
-        K::NumpadMultiply => 0x37, K::NumpadDivide => 0xE035, K::NumpadDecimal => 0x53,
-        K::NumpadEnter => 0xE01C, K::NumLock => 0x45,
+        K::NumpadDivide => 0x54, K::NumpadMultiply => 0x55, K::NumpadSubtract => 0x56,
+        K::NumpadAdd => 0x57, K::NumpadEnter => 0x58, K::Numpad1 => 0x59, K::Numpad2 => 0x5A,
+        K::Numpad3 => 0x5B, K::Numpad4 => 0x5C, K::Numpad5 => 0x5D, K::Numpad6 => 0x5E,
+        K::Numpad7 => 0x5F, K::Numpad8 => 0x60, K::Numpad9 => 0x61, K::Numpad0 => 0x62,
+        K::NumpadDecimal => 0x63,
+        // ── modifiers (HID 0xE0..0xE7) ──
+        K::ControlLeft => 0xE0, K::ShiftLeft => 0xE1, K::AltLeft => 0xE2, K::SuperLeft => 0xE3,
+        K::ControlRight => 0xE4, K::ShiftRight => 0xE5, K::AltRight => 0xE6, K::SuperRight => 0xE7,
         _ => 0,
     }
 }

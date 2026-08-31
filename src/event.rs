@@ -166,11 +166,13 @@ pub struct KeyEvent {
     pub repeat: bool,
     /// Text the keystroke would produce if accepted (printable character). `None` on releases, non-printable keys, modifier presses, and IME-composed text (IME flows thru [`Event::Ime`]).
     pub text: Option<String>,
-    /// The PHYSICAL key position as a standard PC scancode (Set-1 / Windows `position_code`),
-    /// independent of the active keyboard layout — `KeyT` is `0x14` whether the layout is QWERTY,
-    /// Dvorak, or Azerty. `0` when the position is unknown (Android touch, unmapped key).
-    /// Layout-neutral consumers (remote-desktop physical passthrough, key remapping, macro
-    /// capture) use this; character consumers use `text`/`logical_key`.
+    /// The PHYSICAL key as a **USB HID usage ID** (HID Usage Tables, Keyboard/Keypad page `0x07`)
+    /// — the vendor-neutral hardware identity every USB keyboard emits and every OS maps *from*,
+    /// so it's layout- AND platform-independent (the `T` key is `0x17` on QWERTY, Dvorak, Windows,
+    /// Linux, or macOS alike). `0` when unknown (Android touch, unmapped key). Layout-neutral
+    /// consumers (remote-desktop physical passthrough, remapping, macro capture) read this;
+    /// character consumers read `text`/`logical_key`. Callers convert to an OS-specific keycode
+    /// only at the boundary where they actually inject.
     pub physical_key: u16,
 }
 
