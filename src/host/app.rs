@@ -1389,6 +1389,7 @@ impl<A: FluorApp> DesktopShell<A> {
         }
         // Windows reports minimize as a Resized with the caption-stub geometry (~160×24), NOT 0×0 — adopting it clamps window_rect down to the stub, and the restore's Resized then "preserves the user's current size" at that clamped stub: the restore-from-minimize super-tiny-window bug. A minimized window has no visible surface to size against; ignore the event wholesale (is_minimized is None where the platform can't say, which safely falls thru).
         if self.surfaces[si].window.is_minimized() == Some(true) {
+            log::info!("FLUOR: Resized {}x{} while minimized — ignored", size.width, size.height);
             return;
         }
         if size.width == self.surfaces[si].size.0
@@ -2043,7 +2044,11 @@ impl<A: FluorApp> DesktopShell<A> {
             }
             EventResponse::ShowWindow => {
                 // Surface a hidden resident window: un-hide EVERY monitor surface (hide-on-close hid them all), focus the home one, and repaint everything — the surface content is stale (or never-painted, on a start_hidden boot). Dormant surfaces stay all-zero, so showing them is invisible.
+                log::info!("FLUOR: ShowWindow — surfacing (home ready={})", self.surfaces.get(self.home).is_some_and(|s| s.surface_ready));
                 for s in self.surfaces.iter() {
+                    // Windows: a layered window whose style bit got dropped anywhere in the hide/show shuffle presents into the void — re-asserting is a no-op when it's still set.
+                    #[cfg(target_os = "windows")]
+                    super::windows_layered::make_layered(&s.window);
                     s.window.set_visible(true);
                     // Un-minimize too. A minimized window is VISIBLE-but-minimized, so set_visible(true)
                     // and focus_window() are both no-ops against it and it stays parked in the Dock/taskbar.
@@ -2063,6 +2068,7 @@ impl<A: FluorApp> DesktopShell<A> {
                 false
             }
             EventResponse::Minimize => {
+                log::info!("FLUOR: minimize requested");
                 window.set_minimized(true);
                 false
             }
