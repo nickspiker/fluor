@@ -415,6 +415,15 @@ pub trait FluorApp {
         Some(crate::canvas::PixelRect::new(0, 0, w, h))
     }
 
+    /// Optional scroll-copy hint for THIS frame: `(rect, dy)` declaring that the contents of `rect` (viewport pixels) translated RIGIDLY by `dy` viewport pixels since the last frame — positive `dy` = moved down. When present and this is NOT a full repaint, the host `memmove`s that region of `persistent_screen` by `dy` (scaled to backing pixels) BEFORE finalize, so the only pixels that get redrawn are the freshly-exposed band the app reports through [`Self::damage_rect`] — a scroll becomes a copy plus a sliver instead of a whole-pane redraw.
+    ///
+    /// Contract the app must honour for this to be correct: (1) `rect` contains ONLY content that translated rigidly — pin nothing inside it that stayed put or animated independently (put those outside `rect`, or list them in `damage_rect` so they repaint); (2) `damage_rect` this frame covers the `|dy|`-tall exposed band inside `rect` (plus anything else that changed); (3) `dy` is an integer count of viewport pixels that matches how far the content actually moved — the host snaps to backing pixels, so drive the content from an integer-quantised scroll offset to avoid sub-pixel drift accumulating in the un-repainted bulk.
+    ///
+    /// Default `None`: no scroll-copy; `damage_rect` alone drives a normal (possibly full) repaint.
+    fn scroll_hint(&mut self, _viewport: Viewport) -> Option<(crate::canvas::PixelRect, i32)> {
+        None
+    }
+
     /// Per-frame paint into the host's CPU present buffer. Flatten owned Groups onto `target`. The damage clip computed pre-render is in `ctx.damage_clip`; thread it thru every flatten / blit / glow call to skip pixels outside the dirty region.
     fn render(&mut self, target: &mut [u32], ctx: &mut Context);
 
@@ -1624,6 +1633,13 @@ impl<A: FluorApp> DesktopShell<A> {
         let outline_active =
             crate::paint::DEBUG_SHOW_DAMAGE.load(std::sync::atomic::Ordering::Relaxed);
 
+        // Scroll-copy hint for this frame: the app declares a rigidly-translated region so `composite_and_present` can memmove persistent_screen instead of forcing a full repaint. Only meaningful on an INCREMENTAL frame — a full repaint wipes and redraws everything, so there's nothing to copy forward. Queried here (before the text borrow) so the per-surface composite loop below can apply it.
+        let scroll_hint = if full_repaint {
+            None
+        } else {
+            self.app.scroll_hint(self.viewport)
+        };
+
         clear_scratch_rect(&mut self.scratch, win_w, damage_clip);
 
         let (ccx, ccy) = self.win_cursor_px();
@@ -1662,7 +1678,7 @@ impl<A: FluorApp> DesktopShell<A> {
         let mut shadow_dt = 0.0f32;
         for si in self.involved() {
             let (f1, f2, f3) =
-                self.composite_and_present(si, damage_clip, full_repaint, outline_active);
+                self.composite_and_present(si, damage_clip, full_repaint, outline_active, scroll_hint);
             fill_dt += f1;
             finalize_dt += f2;
             shadow_dt += f3;
@@ -1694,6 +1710,7 @@ impl<A: FluorApp> DesktopShell<A> {
         damage_clip: crate::canvas::PixelRect,
         full_repaint: bool,
         outline_active: bool,
+        scroll_hint: Option<(crate::canvas::PixelRect, i32)>,
     ) -> (f32, f32, f32) {
         // Pass selection (phase C): composite from the raster pass matching this surface's scale; pass 0 (the shell's viewport/scratch/clip_mask trio) when the scale matches `window_scale`, when dual-raster is off, or when the pass isn't built — the documented fallback.
         let pass = self.pass_for_surface(si);
@@ -1753,6 +1770,27 @@ impl<A: FluorApp> DesktopShell<A> {
             self.surfaces[si].persistent_screen.fill(0);
         }
         let fill_dt = t.elapsed().as_secs_f32();
+
+        // Scroll-copy: before finalize, memmove the rigidly-translated region of persistent_screen so only the exposed band (in `damage_clip`) needs finalizing. Gated on `!full_repaint` — a full repaint (frame-level, first_after_wake, or an extra pass) wipes and redraws the surface, so there's nothing to carry forward. The hint is in viewport pixels; translate the rect corners and the delta into this surface's BACKING pixels with the same `(rect_x, rect_y)` blit origin + `pr` scale finalize uses, so the copy lands exactly where the finalized pixels will.
+        if !full_repaint {
+            if let Some((rect, dy)) = scroll_hint {
+                let bx0 = (rect_x + (rect.x0 as f64 * pr).round() as i32).max(0) as usize;
+                let by0 = (rect_y + (rect.y0 as f64 * pr).round() as i32).max(0) as usize;
+                let bx1 = (rect_x + (rect.x1 as f64 * pr).round() as i32).max(0) as usize;
+                let by1 = (rect_y + (rect.y1 as f64 * pr).round() as i32).max(0) as usize;
+                let dy_backing = (dy as f64 * pr).round() as i32;
+                crate::paint::scroll_copy_rect(
+                    &mut self.surfaces[si].persistent_screen,
+                    scr_w,
+                    scr_h,
+                    bx0,
+                    by0,
+                    bx1,
+                    by1,
+                    dy_backing,
+                );
+            }
+        }
 
         // Debug fade: saturating-subtract `FADE_STEP` from every persistent_screen RGB byte. Runs BEFORE finalize so pixels that finalize / overlay / strip overwrite this frame land at full brightness while pixels that nobody touches visibly decay toward black — diagnoses whether the incremental opaque-scan finalize is actually copying the regions it should. Skipped on full_repaint since persistent_screen is being wiped anyway.
         let fade_active = crate::paint::DEBUG_SHOW_FADE.load(std::sync::atomic::Ordering::Relaxed);

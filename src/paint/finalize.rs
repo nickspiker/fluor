@@ -194,6 +194,56 @@ pub fn shift_screen_wrap(screen: &mut [u32], scr_w: usize, scr_h: usize, dx: i32
     }
 }
 
+/// Scroll-copy fast path: vertically shift the contents of a sub-rectangle `[x0,x1) × [y0,y1)` of the surface buffer by `dy` backing pixels, IN PLACE and NON-wrapping. The rigid bulk of a scrolling pane is a `memmove`; the caller repaints ONLY the freshly-exposed band (via the frame's damage clip) instead of redrawing the whole pane — a scroll becomes a copy plus a sliver.
+///
+/// Distinct from [`shift_screen_wrap`] in three ways that matter for scrolling (not window-dragging): (1) confined to a rect, so pinned chrome OUTSIDE the rect (title bar, perimeter, a compose bar) is never touched; (2) never wraps — content that scrolls off the far edge is dropped, not brought around; (3) vertical only. The `|dy|`-tall band vacated at the near edge is left as whatever was there — correctness depends on the caller including that band in `damage_clip` so finalize overwrites it with the newly-scrolled-in content this frame.
+///
+/// Sign: `dy > 0` moves content DOWN (band exposed at the TOP of the rect); `dy < 0` moves content UP (band exposed at the BOTTOM). `|dy| ≥ rect height` is a no-op — nothing survives the shift, so the caller should just repaint the whole rect (a full repaint, not a scroll-copy). All bounds are clamped to the buffer, so out-of-range input is safe (no panic, no-op on a degenerate rect).
+///
+/// Per row: one `copy_within` (lowers to `memmove`). Rows are copied in the order that never reads an already-overwritten source (bottom-up for a down-shift, top-down for an up-shift); source and destination rows are always distinct, so no single copy overlaps itself.
+#[allow(clippy::too_many_arguments)]
+pub fn scroll_copy_rect(
+    screen: &mut [u32],
+    scr_w: usize,
+    scr_h: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    dy: i32,
+) {
+    let x0 = x0.min(scr_w);
+    let x1 = x1.min(scr_w);
+    let y0 = y0.min(scr_h);
+    let y1 = y1.min(scr_h);
+    if dy == 0 || x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let rows = y1 - y0;
+    let n = dy.unsigned_abs() as usize;
+    if n >= rows {
+        return; // Shifted entirely out — nothing survives; caller repaints the whole rect.
+    }
+    let span = x1 - x0;
+    if dy > 0 {
+        // Content moves DOWN: dst row (y0+n .. y1) ← src row (y0 .. y1−n). Walk bottom-up so a source row is copied before a lower destination overwrites it.
+        for dst in (y0 + n..y1).rev() {
+            let src = dst - n;
+            let s = src * scr_w + x0;
+            let d = dst * scr_w + x0;
+            screen.copy_within(s..s + span, d);
+        }
+    } else {
+        // Content moves UP: dst row (y0 .. y1−n) ← src row (y0+n .. y1). Walk top-down for the same non-clobber reason.
+        for dst in y0..y1 - n {
+            let src = dst + n;
+            let s = src * scr_w + x0;
+            let d = dst * scr_w + x0;
+            screen.copy_within(s..s + span, d);
+        }
+    }
+}
+
 /// Combined finalize + blit: same per-pixel math as [`finalize_for_os`] (XOR darkness→visible, multiply clip_mask into α, Linux RGB×α premultiply) but reads from a `(win_w × win_h)` scratch buffer and writes into a `(scr_w × scr_h)` screen buffer at the offset `(rect_x, rect_y)`. Used by the fullscreen-compositor host path: the consumer renders into the scratch (window-space, contiguous), this function reads scratch + clip_mask once per pixel and writes the OS-ready ARGB into the screen buffer's sub-rect. The scratch buffer is **not mutated** — its α + darkness convention is preserved so a future incremental-rendering path can reuse it across frames without forcing a full re-render.
 ///
 /// Pre-conditions: `rect_x + win_w ≤ scr_w` and `rect_y + win_h ≤ scr_h` (rect fits inside the screen). Caller is responsible for clearing the destination region (typically the whole screen buffer cleared to `0` so pixels outside `rect` stay α=0 and the OS compositor shows whatever's behind us).
