@@ -2023,6 +2023,11 @@ impl<A: FluorApp> DesktopShell<A> {
                 //
                 // Maximized state suppresses drag entirely. Most WMs handle this with "drag a maximized window → unmaximize and resume drag at cursor"; that's the right ergonomic but more involved (need to compute the unmaximized origin relative to cursor, then begin the drag). For v0 the simpler rule is "ignore the drag request" — title-bar clicks while maximized do nothing instead of producing nonsense (the drag would translate the fullscreen-sized rect into negative offsets and clip_through the input region). Revisit when we add the unmaximize-then-drag flow.
                 if self.saved_rect_for_maximize.is_none() {
+                    // Same capture rule as start_resize: the move gesture must see its own release wherever it lands.
+                    #[cfg(target_os = "windows")]
+                    if let Some(w) = self.home_window() {
+                        super::windows_layered::capture_mouse(&w);
+                    }
                     self.move_drag_armed = true;
                     self.drag_move_anchor_screen = (self.cursor_x as i32, self.cursor_y as i32);
                     self.drag_move_rect_start = (self.window_rect.x, self.window_rect.y);
@@ -2168,6 +2173,11 @@ impl<A: FluorApp> DesktopShell<A> {
 
     /// Begin a self-driven resize drag. In the fullscreen-compositor model we resize `window_rect` inside our own screen buffer instead of asking the OS to resize the OS window (which is fullscreen). Captures the start geometry (window_rect size + position) and the desktop-unit cursor anchor; subsequent cursor moves compute the new (w, h, x, y) by delta from these starting values.
     fn start_resize(&mut self, edge: ResizeEdge) {
+        // Windows: own the mouse for the gesture — a release over an α=0 click-thru pixel otherwise goes to the window underneath and the drag never ends (see windows_layered::capture_mouse).
+        #[cfg(target_os = "windows")]
+        if let Some(w) = self.home_window() {
+            super::windows_layered::capture_mouse(&w);
+        }
         self.is_dragging_resize = true;
         self.resize_edge = edge;
         self.drag_start_size = (self.window_rect.w, self.window_rect.h);
@@ -2723,6 +2733,11 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 let activate = self.pointer.on_up(self.hit_under_cursor());
                 // Captured BEFORE the end-blocks clear the flags: a committed move or an active resize ending on THIS release is the geometry-persistence edge.
                 let gesture_ended = self.is_dragging_resize || self.is_dragging_move;
+                // Windows: hand the mouse back the moment any gesture's press ends (no-op when nothing was captured).
+                #[cfg(target_os = "windows")]
+                if self.is_dragging_resize || self.move_drag_armed {
+                    super::windows_layered::release_mouse();
+                }
                 // End of resize drag — release ownership of the loop. The buffer is already in the final state from the last drag tick; no extra repaint needed.
                 if self.is_dragging_resize {
                     self.is_dragging_resize = false;

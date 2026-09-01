@@ -111,6 +111,8 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
+    # SetCapture/ReleaseCapture — the self-driven drag loops must own the mouse for their whole gesture (windows_layered.rs).
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
 # objc2 + AppKit bindings for macOS click-thru: NSEvent global mouse monitor + NSWindow mouseLocationOutsideOfEventStream. wgpu/Metal + pollster live here too — the GPU present path is macOS-only (host/app.rs gates it on `cfg(target_os = "macos")`), so no other target compiles wgpu.
