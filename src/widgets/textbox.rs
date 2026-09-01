@@ -108,10 +108,11 @@ pub(crate) fn region_to_pixelrect(
 ) -> PixelRect {
     let vw = viewport_w as f32;
     let vh = viewport_h as f32;
-    let x0 = region.x.max(0.0).min(vw) as usize;
-    let y0 = region.y.max(0.0).min(vh) as usize;
-    let x1 = (region.x + region.w).max(0.0).min(vw) as usize;
-    let y1 = (region.y + region.h).max(0.0).min(vh) as usize;
+    // Min edge floors, MAX edge CEILS. A damage rect must be a superset of the painted pixels: a region whose right/bottom edge lands on a fractional coordinate (glow reach, sub-pixel pill geometry after a zoom) paints INTO that boundary pixel, so truncating the max down leaves the last column/row unclaimed — a 1px stale sliver of pill edge or focus glow that the dirty-gated bg never repaints under (the contacts search box's "glow clips/lingers on deselect"). Ceil claims that pixel.
+    let x0 = region.x.max(0.0).min(vw).floor() as usize;
+    let y0 = region.y.max(0.0).min(vh).floor() as usize;
+    let x1 = (region.x + region.w).max(0.0).min(vw).ceil() as usize;
+    let y1 = (region.y + region.h).max(0.0).min(vh).ceil() as usize;
     PixelRect::new(x0, y0, x1, y1)
 }
 
@@ -265,8 +266,15 @@ impl Textbox {
         let focus_changed = self.focused != self.last_painted_focused;
         // Selection range change (extend / contract / new / clear) doesn't dirty either cache — pill unchanged, glyphs unchanged — but DOES require the bbox to repaint so the selection rect reflects the new range. Treat as pill-dirty for damage purposes.
         let selection_changed = self.selection_range() != self.last_painted_selection;
-        let pill_dirty =
-            self.pill_cache_dirty || self.text_cache_dirty || focus_changed || selection_changed;
+        // Position change since the last paint: a textbox that SCROLLS with its block (the contacts search box riding `contacts_scroll`) moves without dirtying either cache or its focus — the pill cache is position-independent (rasterized at local coords, blit-translated). Without noticing the move, damage narrows to nothing and the box (and its glow) smears a trail up the pane. Compared against the bare pill rect the same way `record_painted` stores it.
+        let moved = self
+            .last_painted_bbox
+            .map_or(false, |prev| prev != region_to_pixelrect(self.bbox(), viewport_w, viewport_h));
+        let pill_dirty = self.pill_cache_dirty
+            || self.text_cache_dirty
+            || focus_changed
+            || selection_changed
+            || moved;
 
         // Blinkey contribution: if it'll be on this frame OR was on last frame, the cursor_bbox needs to be in damage so it can be redrawn (or cleared). Tiny rect — typically ~16 × font_size.
         let blinkey_want = self.focused && !self.has_selection() && self.blinkey_visible;
@@ -294,7 +302,8 @@ impl Textbox {
 
         // Pill bbox (current + prev) — contributes only when pill is dirty. Glow padding is included ONLY when the glow itself is changing this frame: focus transition (paint or clear glow), or pill geometry change (glow moves with the pill). Steady-state text editing while focused keeps the glow exactly where it was last frame — glow rays source from the pill silhouette which doesn't move with text edits — so damage stays inside the bare pill `bbox` and the glow region in `persistent_screen` is untouched. Cuts damage area ~3× on every keystroke compared to including the glow envelope.
         if pill_dirty {
-            let need_glow_damage = focus_changed || self.pill_cache_dirty;
+            // Glow envelope enters damage on a focus transition, a pill-geometry change, OR a move while focused (the glow rode along and left a halo at the old spot). Steady-state text editing keeps damage inside the bare pill (the ~3× keystroke saving).
+            let need_glow_damage = focus_changed || self.pill_cache_dirty || (moved && self.focused);
             let current_region = if need_glow_damage {
                 self.glow_bbox()
             } else {
@@ -303,7 +312,19 @@ impl Textbox {
             let current_rect = region_to_pixelrect(current_region, viewport_w, viewport_h);
             union_in(&mut combined, current_rect);
             if let Some(prev) = self.last_painted_bbox {
-                union_in(&mut combined, prev);
+                // The previous painted rect is the BARE pill; if the box was glowing when it moved, its old halo reached `glow_pad` past that rect — inflate so the trail is fully cleared.
+                let prev_region = if moved && self.focused {
+                    let (hp, vp) = self.glow_pad();
+                    PixelRect::new(
+                        (prev.x0 as f32 - hp).max(0.0) as usize,
+                        (prev.y0 as f32 - vp).max(0.0) as usize,
+                        (prev.x1 as f32 + hp).min(viewport_w as f32).ceil() as usize,
+                        (prev.y1 as f32 + vp).min(viewport_h as f32).ceil() as usize,
+                    )
+                } else {
+                    prev
+                };
+                union_in(&mut combined, prev_region);
             }
         }
 
@@ -808,15 +829,22 @@ impl Textbox {
 
     /// Larger bbox with the actual focus-glow ray reach added on every side. Horizontal sides use the 0x80 seed reach with the horizontal radius scale (`1.5`); vertical sides use the 0x40 seed reach with the vertical radius scale (`0.75`, half the horizontal so the top/bottom halo is more contained while keeping the same per-pixel intensity at the boundary). Both derived from the same `factor_256` math the render pass uses, so the bbox exactly contains what `apply_textbox_glow_{right,left,top,bottom}` will paint — no early cutoff, no over-clearing. Use this for the focus-on / focus-off transition (glow appearing / disappearing) — the only time we need to repaint the wider halo region. Keep off the per-keystroke hot path.
     pub fn glow_bbox(&self) -> Region {
-        let horiz_factor = Self::glow_factor_256(self.font_size, 1.5);
-        let vert_factor = Self::glow_factor_256(self.font_size, 0.75);
-        let horiz_pad = crate::paint::ray_reach_px(0x80, horiz_factor) as f32;
-        let vert_pad = crate::paint::ray_reach_px(0x40, vert_factor) as f32;
+        let (horiz_pad, vert_pad) = self.glow_pad();
         Region::new(
             self.center_x - self.width * 0.5 - horiz_pad,
             self.center_y - self.height * 0.5 - vert_pad,
             self.width + 2.0 * horiz_pad,
             self.height + 2.0 * vert_pad,
+        )
+    }
+
+    /// The focus-glow ray reach (horizontal, vertical) in pixels — the halo padding [`Self::glow_bbox`] adds on every side. Factored out so [`Self::damage_rect`] can inflate the PREVIOUS painted position by the same reach when a focused box moves (clearing the old halo trail).
+    fn glow_pad(&self) -> (f32, f32) {
+        let horiz_factor = Self::glow_factor_256(self.font_size, 1.5);
+        let vert_factor = Self::glow_factor_256(self.font_size, 0.75);
+        (
+            crate::paint::ray_reach_px(0x80, horiz_factor) as f32,
+            crate::paint::ray_reach_px(0x40, vert_factor) as f32,
         )
     }
 
