@@ -21,6 +21,21 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, SetWindowLongPtrW, UpdateLayeredWindow, GWL_EXSTYLE, ULW_ALPHA, WS_EX_LAYERED,
 };
 
+/// Win32 mouse capture for the self-driven drag loops. The fullscreen layered window's click-thru is per-pixel alpha, so a resize/move RELEASE over an α=0 region is delivered to the window UNDERNEATH — fluor never sees it, `is_dragging_resize` stays armed forever, the resize cursor persists desktop-wide and every click feeds the dead drag (Emma's Windows box, 2026-09-01). Capture for the gesture's duration guarantees the release comes home wherever it lands; Windows auto-breaks capture on focus loss, which the focus-edge drag-cancel already handles.
+pub fn capture_mouse(window: &Arc<Window>) {
+    if let Some(h) = hwnd(window) {
+        unsafe {
+            windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(h);
+        }
+    }
+}
+
+pub fn release_mouse() {
+    unsafe {
+        let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
+    }
+}
+
 /// Latched present-failure state so the failure EDGE logs once per streak instead of per-frame spam.
 static PRESENT_FAILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
