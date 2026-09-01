@@ -25,6 +25,8 @@ pub struct Checkbox {
     hovered: bool,
     change_counter: u32,
     last_seen_change_counter: u32,
+    /// Optional fill override for the UNCHECKED box (e.g. an app scolding the user for unticking something opinionated); `None` = the standard textbox-dark.
+    empty_fill: Option<u32>,
 }
 
 impl Checkbox {
@@ -52,7 +54,13 @@ impl Checkbox {
             hovered: false,
             change_counter: 0,
             last_seen_change_counter: 0,
+            empty_fill: None,
         }
+    }
+
+    /// Override the unchecked-state box fill (`None` restores the default). The checked fill is never overridden — on always reads as the one action-blue.
+    pub fn set_empty_fill(&mut self, fill: Option<u32>) {
+        self.empty_fill = fill;
     }
 
     pub fn hit_id(&self) -> HitId {
@@ -168,7 +176,7 @@ impl Checkbox {
         let fill = if self.checked {
             theme::BUTTON_FILL
         } else {
-            theme::TEXTBOX_FILL
+            self.empty_fill.unwrap_or(theme::TEXTBOX_FILL)
         };
         let inner = (side as isize - 2 * stroke).max(0);
         if inner > 0 {
