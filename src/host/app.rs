@@ -2685,6 +2685,8 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                     self.is_dragging_resize = false;
                     self.resize_edge = ResizeEdge::None;
                 }
+                // STALE MODIFIERS on the focus edge: Windows in particular releases keys while another window holds focus and never tells us — a Shift held at alt-tab stayed latched forever, and the next plain click on the close button read as the Shift+close deliberate-quit chord (Emma's Windows log 2026-09-01: 'deliberate quit' on an ordinary red-X press, app fully exited instead of hiding to tray). Clear on BOTH edges: keys released while we were away are unknowable, and winit re-sends ModifiersChanged after focus for keys still genuinely down.
+                self.modifiers = ModifiersState::empty();
                 // Shadow seed depends on focus (full strength vs quarter strength) → re-cast shadow over a fresh band, which only happens on the full-repaint path.
                 self.pending_full_repaint = true;
                 self.dispatch_event(event);
