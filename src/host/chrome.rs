@@ -409,7 +409,7 @@ pub fn draw_status_bar(
 /// Hit-test: every pixel inside `r_outer²` (excluding the AA fringe) is tagged with `hit_id` so the host can route clicks to the chrome's app-icon widget. Decorative-only consumers can pass `None` for `hit_test_map` to skip the tag (in which case `hit_id` is ignored).
 /// Rasterize the top-left app-icon orb: the icon sampled into a circle of radius `r−1`, wrapped in a thin ring of `ring_colour`. Integer `dist²` bands — same approach as the avatar / window-edge rasterizers: icon interior (`≤ (r−1)²`), then a `stroke_width`-px solid ring, then a 1-px outer AA against the chrome (`(r_aa²−dist²) << 8 / diff`). No floating point, no sqrt.
 ///
-/// `stroke_width = (r >> 5) + 1`: the `+1` is the textbox "minimum 1-px stroke" idiom (an additive floor, not a clamp), and `r >> 5` adds a proportional pixel only on large / zoomed orbs.
+/// `stroke_width = (r >> 5) + 2`: the additive floor was +1 (the textbox minimum-stroke idiom) and read too skinny against the +1px-fattened avatar rings — Nick bumped it to match (2026-09-02); `r >> 5` still adds a proportional pixel only on large / zoomed orbs.
 ///
 /// Precondition: the orb is the fixed top-left chrome badge, always fully on-screen (`cx, cy ≥ r_aa` and `cx+r_aa, cy+r_aa < dims` for the chrome's `button_size/2`-centred, `button_size/4`-radius orb), so the bbox is in-bounds by construction — no clamping. A violated precondition wraps a `usize` and panics on the index (fail loud). Without an `icon`, the interior fills with `ring_colour` as a solid disk; `hit_test_map` (when present) tags every pixel inside the solid ring with `hit_id`.
 /// The orb's press glow: the wordmark-family light, disk form. Rasterize the disk's coverage at the glow grey into a full-width band scratch, run the soft IIR blurs (horizontal factor 3/4, vertical 1/2 — the same character as photon's wordmark + text halos), then composite as a WHITE light layer via real `under()` — called AFTER the orb paints, so earliest-wins layering keeps every opaque disk pixel untouched and the bloom lands only in the transparent surround.
@@ -503,7 +503,7 @@ pub fn draw_app_icon(
     if r < 2 {
         return; // Contract relied on by chrome_widget.rs:309 — degenerate sizes pass thru without drawing, so the layout needs no min-size guard. r ≥ 2 keeps (r-2) non-negative below.
     }
-    let stroke_width = (r >> 5) + 1;
+    let stroke_width = (r >> 5) + 2;
     // TOP-DOWN, not partitioned. The icon is the top layer; the ring sits beneath it. Paint the icon FIRST with a soft edge, then fill the ring as a FULL disk underneath. Under-blend is "topmost paints first, the layer beneath shows thru", so the ring bleeds thru the icon's partial-alpha rim → the icon↔ring boundary anti-aliases with no hard step; the background, painted under the whole orb afterward, gives the outer AA.
     //
     // Each edge is a 1-px coverage ramp biased INWARD, not centred and not a band tacked outside. From d ≈ R + (dist²−R²)/2R, coverage = (R²−dist²)/(2R−1): full (255) at dist²=(R−1)², zero at dist²=R², the single AA pixel landing at R. Biasing inward (rather than half-straddling R) lands the edge cleanly on the grid with no 50%-at-the-radius pixel and pulls the solid radius in by 1. BOTH edges are biased the same way so the icon reaches 0 exactly where the ring is still solid — two straddling ramps would overlap into a translucent dip (a see-thru ring) at the boundary. The icon image is unchanged: same sampling, just a clean AA rim.
