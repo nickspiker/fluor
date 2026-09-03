@@ -702,6 +702,15 @@ struct DesktopShell<A: FluorApp> {
     last_strip_active: bool,
     /// Set by any event that destroys the chrome perimeter + shadow band content in the surfaces' `persistent_screen` buffers: drag release, resize, zoom, focus change. Consumed once per `render_frame` to switch from incremental mode to full-repaint mode (wipe the involved surfaces' buffers, finalize copies every pixel, paint_shadow runs once into the fresh band). Replaces every prior geometric-equality check on `damage_clip`.
     pending_full_repaint: bool,
+    /// Frames of extra self-driven redraw to pump after a surface wakes (cross-monitor move / window
+    /// entering a dormant surface). A freshly-reconfigured macOS `CAMetalLayer`, newly attached to a
+    /// window just shown on a different display, routinely doesn't display its FIRST presented
+    /// drawable — it needs a vsync cycle or two. On a live video feed later frames cover for that,
+    /// but on a static screen no further redraws arrive and the one undisplayed frame stays black
+    /// (the "move to the other monitor → solid black, stays black" field report). Set on wake,
+    /// decremented each home `RedrawRequested`, each tick re-requesting a redraw so the reconfigured
+    /// layer gets several presents of the (already-correct) persistent_screen regardless of input.
+    wake_pump: u8,
     /// Which hit-ids the overlay wrote to persistent_screen LAST frame. Used so a transition (an id that was tinted, no longer is) still gets its pixels rewritten from scratch this frame to clear the prior tint. No tint magnitude is kept — the overlay just reads scratch and conditionally subtracts the current frame's delta. Re-sized to match the consumer's `overlay_deltas().len()` each frame (extended with `false` if the app registered new IDs since last frame; shrunk only on a full repaint). Cleared whenever `persistent_screen` is wiped.
     last_overlay_active: Vec<bool>,
     /// Last-seen value of `paint::DEBUG_SHOW_HITMASK`. When this differs from the current atomic value at the top of `render_frame`, we promote to a full repaint so the new finalize behavior (FORCE_OPAQUE-style scalar debug path / no shadow) lands across the whole window in one frame.
@@ -763,6 +772,7 @@ impl<A: FluorApp> DesktopShell<A> {
             pending_damage: crate::canvas::Damage::new(),
             last_strip_active: false,
             pending_full_repaint: true,
+            wake_pump: 0,
             last_hitmask: false,
             last_alpha_mode: 0,
             last_opaque_scan: false,
@@ -899,6 +909,9 @@ impl<A: FluorApp> DesktopShell<A> {
                 log::info!("FLUOR-MON: surface {} WAKES (window=({},{}) {}x{} ∩ surface={:?})", si, r.0, r.1, r.2, r.3, self.surfaces[si].rect());
                 self.surfaces[si].dormant = false;
                 self.surfaces[si].needs_full_blit = true;
+                // Pump several presents so the reconfigured Metal layer actually displays even on a
+                // static screen (see `wake_pump`). ~8 frames ≈ a few vsyncs of headroom.
+                self.wake_pump = self.wake_pump.max(8);
                 self.push_input_region(si);
             } else if !inv && !self.surfaces[si].dormant && si != self.home {
                 log::info!("FLUOR-MON: surface {} EVACUATES (window left it)", si);
@@ -2973,6 +2986,15 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 // Adopt any restored zoom/geometry BEFORE pixels are presented — the about_to_wait consume runs AFTER the event batch, so frame one would paint at the default placement and flash (field report, 2026-08-16). Ordering: read state, place window, THEN render.
                 self.consume_app_placement_requests();
                 self.render_frame();
+                // Post-wake present pump: keep re-presenting the (already-correct) buffer for a few
+                // frames so a freshly-reconfigured Metal layer on a just-shown window actually
+                // displays, even with no video/input to drive further redraws. See `wake_pump`.
+                if self.wake_pump > 0 {
+                    self.wake_pump -= 1;
+                    if let Some(window) = self.home_window() {
+                        window.request_redraw();
+                    }
+                }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 // A monitor's scale changed under a surface (display-settings change, or the OS reporting the true per-monitor scale post-create). Adopt it on the surface; if it's the home surface the window re-anchors immediately — there's no drag mid-flight when the OS emits this, so it's a settle point. The matching Resized (new backing size) follows separately and flows thru handle_surface_resized.
