@@ -32,7 +32,7 @@ mod imp {
     use alloc::vec::Vec;
     use objc2::rc::Retained;
     use objc2::runtime::NSObject;
-    use objc2::{define_class, msg_send, sel};
+    use objc2::{define_class, msg_send, sel, AllocAnyThread};
     use objc2_app_kit::{NSApplication, NSMenu, NSMenuItem};
     use objc2_foundation::{MainThreadMarker, NSString};
     use std::sync::Mutex;
