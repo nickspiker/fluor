@@ -2123,7 +2123,34 @@ impl<A: FluorApp> DesktopShell<A> {
                 window.set_minimized(true);
                 false
             }
+            EventResponse::MoveToMonitor(delta) => {
+                self.move_to_monitor(delta);
+                false
+            }
         }
+    }
+
+    /// Move the visible window to another connected monitor, cycling `home` by `delta` (wrapping)
+    /// and filling that surface's work area through the full `apply_window_rect` machinery. No-op
+    /// with a single surface. Clears any saved-for-maximize rect so a later maximize toggle
+    /// re-captures against the new monitor.
+    fn move_to_monitor(&mut self, delta: i32) {
+        let n = self.surfaces.len() as i32;
+        if n <= 1 {
+            return;
+        }
+        let target = (self.home as i32 + delta).rem_euclid(n) as usize;
+        let s = &self.surfaces[target];
+        let (wx, wy, ww, wh) = s.work_area;
+        let rect = if ww > 1 && wh > 1 {
+            WindowRect { x: wx, y: wy, w: ww, h: wh }
+        } else {
+            let o = s.origin;
+            WindowRect { x: o.0, y: o.1, w: s.size.0, h: s.size.1 }
+        };
+        log::info!("FLUOR-MON: move window to monitor {target}/{n} rect={rect:?}");
+        self.saved_rect_for_maximize = None;
+        self.apply_window_rect(rect);
     }
 
     /// Flip `window_rect` between the user-sized rect (saved in `saved_rect_for_maximize`) and the home surface's work area. Mirrors the geometry-change tail of `resize_drag_update`: resize scratch + clip_mask, reflow viewport, notify the consumer via `on_resize`, mark full-repaint, and update the X11 input region. No-op if the home surface's size is still a placeholder — first `Resized` event hasn't landed yet, no real geometry to swap to.
