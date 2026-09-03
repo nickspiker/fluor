@@ -1939,6 +1939,16 @@ impl<A: FluorApp> DesktopShell<A> {
             let Some(renderer) = s.renderer.as_mut() else {
                 return (fill_dt, finalize_dt, shadow_dt);
             };
+            // First composite after a wake (cross-monitor move / window entering a dormant surface):
+            // the renderer's wgpu surface was `configure`d back at creation time, while this window
+            // was dormant/off-screen, so its CAMetalLayer drawable is stale — `get_current_texture`
+            // hands back a black drawable and every later present inherits it (root cause of the
+            // "move to the other monitor → solid black, stays black" field report). Re-configure the
+            // surface to its current backing here so the layer re-establishes a live drawable bound
+            // to the monitor it's actually showing on. One-shot: `first_after_wake` was consumed above.
+            if first_after_wake {
+                renderer.resize(scr_w as u32, scr_h as u32);
+            }
             let mut buffer = renderer.lock_buffer();
             // A transient mismatch (scale change announced before the matching Resized lands) skips one present rather than panicking in copy_from_slice.
             if buffer.len() != s.persistent_screen.len() {
