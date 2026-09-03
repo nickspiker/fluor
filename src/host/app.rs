@@ -2198,6 +2198,11 @@ impl<A: FluorApp> DesktopShell<A> {
         self.window_rect = new_rect;
         // Maximize targets the (pre-toggle) home; restore may land the rect on a different surface — re-elect before the scale sync below.
         self.update_home();
+        // Waking the target surface is NOT optional when the rect crosses monitors: a bare home
+        // re-election leaves the destination surface dormant, so it keeps presenting its all-zero
+        // (black) frame. This is the fix for "Move to Next Monitor briefly shows content, then goes
+        // black" — relocating home must also wake its surface (and evacuate the one we left).
+        self.refresh_involvement();
         // Maximize/restore hands us an explicit desktop-unit rect, so no geometric w/h rebase applies — just adopt the (possibly new) home scale before the pass-0 rebuild so the viewport lands at the right density (phase C settle semantics).
         let scale_changed = self
             .surfaces
@@ -2241,7 +2246,11 @@ impl<A: FluorApp> DesktopShell<A> {
 
         self.push_input_region(self.home);
 
-        window.request_redraw();
+        // Redraw the NEW home window, not the stale `window` captured before `update_home` may have
+        // moved us to another surface — otherwise the destination monitor never repaints (black).
+        if let Some(w) = self.home_window() {
+            w.request_redraw();
+        }
     }
 
     /// Begin a self-driven resize drag. In the fullscreen-compositor model we resize `window_rect` inside our own screen buffer instead of asking the OS to resize the OS window (which is fullscreen). Captures the start geometry (window_rect size + position) and the desktop-unit cursor anchor; subsequent cursor moves compute the new (w, h, x, y) by delta from these starting values.
