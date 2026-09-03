@@ -2203,6 +2203,20 @@ impl<A: FluorApp> DesktopShell<A> {
         // (black) frame. This is the fix for "Move to Next Monitor briefly shows content, then goes
         // black" — relocating home must also wake its surface (and evacuate the one we left).
         self.refresh_involvement();
+        // macOS click-thru: a programmatic move (esp. from the menu bar) happens with the cursor
+        // OUTSIDE the window, so `hittest_off` is stale-true and the just-woken destination surface
+        // would keep ignoring clicks — worst on a secondary monitor, where cursor re-entry may not
+        // re-toggle it. Point the global hittest monitor at the new rect and re-enable mouse
+        // acceptance on the new home now; the normal cursor-outside logic re-engages on next move.
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(m) = self.hittest_monitor.as_ref() {
+                let r = &self.window_rect;
+                m.update_rect(r.x, r.y, r.w, r.h);
+            }
+            self.hittest_off = false;
+            self.apply_macos_hittest();
+        }
         // Maximize/restore hands us an explicit desktop-unit rect, so no geometric w/h rebase applies — just adopt the (possibly new) home scale before the pass-0 rebuild so the viewport lands at the right density (phase C settle semantics).
         let scale_changed = self
             .surfaces
