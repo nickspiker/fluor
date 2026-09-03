@@ -169,6 +169,14 @@ impl Dropdown {
             && (hit == self.hit_id || self.rows.iter().any(|r| r.hit_id == hit))
     }
 
+    /// Re-label the options in place (e.g. a UI-language switch) — count must match construction (row hit-ids are fixed at birth); selection is preserved.
+    pub fn set_options(&mut self, options: Vec<String>) {
+        assert_eq!(options.len(), self.options.len(), "Dropdown::set_options must keep the option count (row hit-ids are fixed at construction)");
+        self.options = options;
+        self.text_cache_dirty = true;
+        self.popup_dirty = true;
+    }
+
     /// Programmatic selection (no change-counter bump — that's for user actions).
     pub fn set_selected(&mut self, index: usize) {
         let index = index.min(self.options.len() - 1);
