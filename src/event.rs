@@ -53,6 +53,8 @@ pub enum Event {
     Ime(Ime),
     /// A file was drag-and-dropped onto the window. Carries the OS path as a String (lossy UTF-8); the app reads + interprets it. Desktop only today — winit emits `WindowEvent::DroppedFile`; Android has no equivalent (it uses the system image picker instead).
     DroppedFile(String),
+    /// A native menu-bar item was chosen. Carries the `id` the app assigned in [`crate::host::menu::MenuItem`]. macOS builds a real `NSMenu` from the app's [`crate::host::app::FluorApp::menu`] spec and delivers clicks here; other platforms don't surface a menu yet, so this never fires there.
+    MenuItem(u32),
 }
 
 // ============================================================================ Element state / mouse button ===============================================

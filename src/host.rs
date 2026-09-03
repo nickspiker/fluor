@@ -7,12 +7,14 @@
 #[cfg(feature = "icon")]
 pub mod chrome;
 pub mod event_response;
+pub mod menu;
 #[cfg(feature = "icon")]
 pub mod icon;
 pub mod wake;
 pub mod window_handle;
 
 pub use event_response::EventResponse;
+pub use menu::MenuItem;
 pub use wake::{NoopWakeSender, WakeError, WakeSender};
 pub use window_handle::WindowHandle;
 
@@ -54,6 +56,11 @@ pub(crate) mod macos_hittest;
 /// macOS app-activation observer: how a Dock click reaches the window layer.
 #[cfg(all(feature = "host-winit", target_os = "macos"))]
 pub(crate) mod macos_reopen;
+
+/// Native menu bar (hand-rolled NSMenu on macOS; no-op elsewhere). install()/drain() are the
+/// host's hooks — build from `FluorApp::menu()`, deliver clicks as `Event::MenuItem`.
+#[cfg(feature = "host-winit")]
+pub(crate) mod macos_menu;
 
 /// Windows present path: layered-window per-pixel alpha + click-thru via UpdateLayeredWindow.
 #[cfg(all(feature = "host-winit", target_os = "windows"))]

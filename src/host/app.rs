@@ -357,6 +357,14 @@ pub trait FluorApp {
         ""
     }
 
+    /// The app's native menu-bar spec, read ONCE at window creation and built into a real OS menu
+    /// (macOS `NSMenu`; other platforms ignore it for now). Choosing an [`super::menu::MenuItem::Action`]
+    /// delivers its `id` back via [`crate::event::Event::MenuItem`]. Default: no menu. Keep it
+    /// static for now — the host builds it once and doesn't yet rebuild on the fly.
+    fn menu(&self) -> alloc::vec::Vec<super::menu::MenuItem> {
+        alloc::vec::Vec::new()
+    }
+
     /// The app-identity icon for the OS window (taskbar / alt-tab / title bar). The host applies it at window creation so the OS-level icon matches the in-chrome orb — apps that hold a [`DefaultChrome`] typically return `self.chrome.app_icon.as_ref()`.
     ///
     /// **Platform reach.** This drives winit's `set_window_icon`, which only takes effect on
@@ -2442,6 +2450,10 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 super::macos_hittest::HittestMonitor::install(self.surfaces[0].size.1);
         }
 
+        // Build the app's native menu bar once (macOS NSMenu; no-op on other platforms). Clicks
+        // come back via the queue drained in `about_to_wait` and dispatched as Event::MenuItem.
+        super::macos_menu::install(&self.app.menu());
+
         // Initial visible-window size: app-supplied (defaults to half the screen in each axis), clamped to the surface's work area and centred within it — the work area is already in GLOBAL desktop units, so the centering math places the window correctly even when the primary monitor isn't at (0, 0). Apps with aspect-ratio opinions override [`FluorApp::initial_size`].
         let (wa_x, wa_y, wa_w, wa_h) = self.surfaces[0].work_area;
         let (req_w, req_h) = self.app.initial_size((wa_w, wa_h));
@@ -2524,6 +2536,47 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
         }
 
         self.consume_app_placement_requests();
+
+        // Native menu clicks queued (on the main thread) since the last loop: dispatch each as
+        // Event::MenuItem, apply any window-level response (e.g. a menu Fullscreen → ToggleMaximized),
+        // then repaint. Empty (and free) on platforms without a menu bar.
+        let menu_ids = super::macos_menu::drain();
+        if !menu_ids.is_empty() {
+            let (mcx, mcy) = self.win_cursor_px();
+            let mwo = self.ctx_window_origin();
+            let mut responses: Vec<EventResponse> = Vec::new();
+            if let (Some(window), Some(text)) = (self.home_window(), self.text.as_mut()) {
+                let mut ctx = Context {
+                    pressed_hit: self.pointer.held_id(),
+                    viewport: self.viewport,
+                    text,
+                    clip_mask: &mut self.clip_mask,
+                    damage: &mut self.pending_damage,
+                    window: &*window,
+                    modifiers: winit_compat::from_winit_mods(self.modifiers),
+                    cursor_x: mcx,
+                    cursor_y: mcy,
+                    is_maximized: self.saved_rect_for_maximize.is_some(),
+                    window_origin: mwo,
+                    damage_clip: crate::canvas::PixelRect::new(
+                        0,
+                        0,
+                        self.viewport.width_px as usize,
+                        self.viewport.height_px as usize,
+                    ),
+                };
+                for id in menu_ids {
+                    responses.push(self.app.on_event(&FEvent::MenuItem(id), &mut ctx));
+                }
+            }
+            for r in responses {
+                self.apply_response(r);
+            }
+            if let Some(window) = self.home_window() {
+                window.request_redraw();
+            }
+        }
+
         let (ccx, ccy) = self.win_cursor_px();
         let wo = self.ctx_window_origin();
         let needs_redraw = if let (Some(window), Some(text)) =
