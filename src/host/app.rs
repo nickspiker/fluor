@@ -807,12 +807,23 @@ impl<A: FluorApp> DesktopShell<A> {
         )
     }
 
-    /// `Context::window_origin` — the window's top-left in pass-0 PIXEL space (apps compensate content by origin deltas in pixels, so on macOS the point origin is scaled up by `window_scale` under the standard rounding convention).
+    /// `Context::window_origin` — the window's top-left in pass-0 PIXEL space, measured RELATIVE TO
+    /// THE HOME SURFACE (apps compensate content by origin deltas in pixels, so on macOS the point
+    /// origin is scaled up by `window_scale` under the standard rounding convention).
+    ///
+    /// Surface-relative, NOT global desktop space: `FEvent::CursorMoved` carries winit's raw
+    /// surface-LOCAL position (0-based within the reporting surface), so a consumer computing
+    /// `raw_position − window_origin` to get a window-relative coordinate needs the origin in that
+    /// same surface-local space. On the anchor surface (origin 0,0) the two are identical; on a
+    /// monitor at a non-zero origin — e.g. a 4K panel placed at desktop (−434,−2160) — using the
+    /// global origin put every click off by the surface origin (the "move to the other monitor →
+    /// clicks way off" field report: ~+2130px in y). Subtracting the home surface's origin lands it.
     fn ctx_window_origin(&self) -> (i32, i32) {
         let k = self.unit_to_px() as f64;
+        let (sox, soy) = self.surfaces.get(self.home).map_or((0, 0), |s| s.origin);
         (
-            ((self.window_rect.x as f64) * k).round() as i32,
-            ((self.window_rect.y as f64) * k).round() as i32,
+            (((self.window_rect.x - sox) as f64) * k).round() as i32,
+            (((self.window_rect.y - soy) as f64) * k).round() as i32,
         )
     }
 
