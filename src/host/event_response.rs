@@ -36,4 +36,10 @@ pub enum EventResponse {
     Minimize,
     /// Surface a hidden resident window: `set_visible(true)` + focus + full repaint. The counterpart of a `Close` that `FluorApp::on_close_requested` turned into a hide — typically returned from `on_user_event` when a second launch hands off "show yourself" to the resident instance.
     ShowWindow,
+    /// Move the visible window to another physical monitor, cycling by the given signed delta
+    /// (`+1` next, `-1` previous) over the connected displays, wrapping. The host picks the target
+    /// surface, fills its work area, and runs the full `apply_window_rect` machinery (home
+    /// re-election, viewport/scratch/clip rebuild, `on_resize`, input region, repaint). No-op with
+    /// a single monitor. Multi-monitor is desktop-only; Android ignores it.
+    MoveToMonitor(i32),
 }
