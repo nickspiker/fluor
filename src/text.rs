@@ -1643,7 +1643,8 @@ mod colour_emoji_tests {
         (((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8)
     }
 
-    /// A colour emoji ("hi ☃😀") must (a) not panic, and (b) deposit at least one NON-GREYSCALE pixel (r≠g or g≠b) — proving it composited the glyph's own colour, not a monochrome tint.
+    /// A colour emoji ("hi ☃😀") must (a) not panic, and (b) deposit at least one NON-GREYSCALE pixel (r≠g or g≠b) — proving it composited the glyph's own colour, not a monochrome tint. Gated on the emoji feature: without the Noto Color Emoji bundle the fallback renders monochrome BY DESIGN and this assertion is testing a font that isn't there.
+    #[cfg(feature = "emoji")]
     #[test]
     fn colour_emoji_renders_non_greyscale() {
         let mut text = TextRenderer::new();
