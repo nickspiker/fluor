@@ -527,14 +527,25 @@ pub trait FluorApp {
 
 /// Run the desktop host until the window closes. Builds an `EventLoop` typed on `A::UserEvent` so background-thread wake-ups via the WakeSender route thru [`FluorApp::on_user_event`]. The proxy is created up-front, wrapped in a [`winit_compat::WinitWakeSender`], and handed to the app via [`FluorApp::set_event_proxy`] BEFORE the event loop starts, so apps can clone-and-ship the Arc to background tasks during their own constructor or [`FluorApp::init`].
 #[cfg(feature = "host-winit")]
-pub fn run_app<A: FluorApp + 'static>(mut app: A) -> Result<(), EventLoopError> {
-    let event_loop = EventLoop::<A::UserEvent>::with_user_event().build()?;
+pub fn run_app<A: FluorApp + 'static>(app: A) -> Result<(), EventLoopError> {
+    run_app_recoverable(app).1
+}
+
+/// Like [`run_app`] but the app SURVIVES the loop: on return the caller gets it back alongside the verdict — `Err` means the loop died out from under a living app (the X-death class: winit's x11rb dispatch error exits the loop with a code instead of killing the process), and the caller may keep running it display-free (photon's headless lifeline, docs/headless-lifeline.md there).
+pub fn run_app_recoverable<A: FluorApp + 'static>(
+    mut app: A,
+) -> (A, Result<(), EventLoopError>) {
+    let event_loop = match EventLoop::<A::UserEvent>::with_user_event().build() {
+        Ok(l) => l,
+        Err(e) => return (app, Err(e)),
+    };
     let proxy = event_loop.create_proxy();
     let wake: alloc::sync::Arc<dyn super::WakeSender<A::UserEvent>> =
         alloc::sync::Arc::new(winit_compat::WinitWakeSender::new(proxy));
     app.set_event_proxy(wake);
     let mut shell = DesktopShell::new(app);
-    event_loop.run_app(&mut shell)
+    let res = event_loop.run_app(&mut shell);
+    (shell.into_app(), res)
 }
 
 // ============================================================================ Everything below this point is `host-winit`-only — DesktopShell + winit event loop. AndroidShell lives at [`crate::host::android::shell`]. ============================================================================
@@ -730,6 +741,11 @@ struct DesktopShell<A: FluorApp> {
 
 #[cfg(feature = "host-winit")]
 impl<A: FluorApp> DesktopShell<A> {
+    /// Hand the app back after the loop ends — the recoverable-run contract (surfaces and their dead window handles drop here).
+    fn into_app(self) -> A {
+        self.app
+    }
+
     fn new(app: A) -> Self {
         Self {
             app,
