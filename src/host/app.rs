@@ -175,6 +175,33 @@ mod x11_atomic {
         true
     }
 
+    /// Give the keyboard to this window via `XSetInputFocus`. Needed because our surfaces are
+    /// override-redirect (see `create_monitor_surface`): the WM never assigns them focus, so a
+    /// borderless compositor surface would receive no key events at all until we claim it. Called
+    /// for the anchor once its surface is mapped. `revert_to = PointerRoot` so focus falls back
+    /// sanely if the window later unmaps. Returns `false` off X11 / on failure (e.g. not yet
+    /// mapped — a later call from the first `Resized` covers that).
+    pub fn focus(window: &winit::window::Window) -> bool {
+        use x11rb::protocol::xproto::{ConnectionExt as _, InputFocus};
+
+        let Ok(handle) = window.window_handle() else {
+            return false;
+        };
+        let xid = match handle.as_raw() {
+            RawWindowHandle::Xcb(h) => h.window.get(),
+            RawWindowHandle::Xlib(h) => h.window as u32,
+            _ => return false,
+        };
+        let Some(conn) = conn() else {
+            return false;
+        };
+        let ok = conn
+            .set_input_focus(InputFocus::POINTER_ROOT, xid, x11rb::CURRENT_TIME)
+            .is_ok();
+        let _ = conn.flush();
+        ok
+    }
+
     /// The desktop work area `(x, y, w, h)` — the monitor minus space reserved by panels /
     /// taskbars — read from the root window's EWMH `_NET_WORKAREA` property. Used to place the visible window so its bottom edge (the chrome status band) doesn't slide under a taskbar. `_NET_WORKAREA` holds `[x, y, w, h]` per virtual desktop; we take the first
     /// (current/default desktop). Returns `None` if not X11, the atom is unset (no EWMH WM),
@@ -1355,6 +1382,20 @@ impl<A: FluorApp> DesktopShell<A> {
         let attrs = attrs
             .with_inner_size(winit::dpi::PhysicalSize::new(size.0, size.1))
             .with_position(winit::dpi::PhysicalPosition::new(origin.0, origin.1));
+        // X11: OVERRIDE-REDIRECT — take the surface out of WM management entirely. The
+        // fullscreen-compositor already owns everything the WM would do (placement, the XShape
+        // click-thru input region, compositing), and Mutter-family WMs (Muffin) actively fight the
+        // per-monitor placement on a multi-monitor desktop — ignoring PPosition, USPosition AND
+        // explicit moves, stranding the anchor off its monitor so the app renders into an
+        // off-screen window (field: leviathan dummy+real, 2026-09). Override-redirect means the WM
+        // never places, moves, maximizes, reparents, or restacks these windows: position is exactly
+        // what we set. Cost we take on ourselves: no WM taskbar/alt-tab entry, no WM stacking, and
+        // we must set keyboard focus by hand (`x11_atomic::focus` below).
+        #[cfg(target_os = "linux")]
+        let attrs = {
+            use winit::platform::x11::WindowAttributesExtX11;
+            attrs.with_override_redirect(true)
+        };
         let window = Arc::new(event_loop.create_window(attrs).expect("create_window"));
         // Pin the surface to its monitor's origin post-create — some WMs apply their own placement to the pre-map with_position request, and the compositor model requires the surface to sit exactly on its monitor.
         #[cfg(target_os = "macos")]
@@ -1589,6 +1630,13 @@ impl<A: FluorApp> DesktopShell<A> {
 
         // First Resized confirms the OS surface is actually allocated — safe to start painting.
         self.surfaces[si].surface_ready = true;
+        // Override-redirect surfaces get no focus from the WM, so the anchor must claim the
+        // keyboard itself once it's actually mapped (a pre-map XSetInputFocus BadMatches). Do it
+        // here — the first Resized is the post-map settle point — for the anchor only.
+        #[cfg(target_os = "linux")]
+        if si == self.anchor && !self.surfaces[si].dormant {
+            x11_atomic::focus(&self.surfaces[si].window);
+        }
         self.render_frame();
     }
 
