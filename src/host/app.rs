@@ -531,6 +531,12 @@ pub trait FluorApp {
     fn cursor_for(&self, x: Coord, y: Coord, ctx: &Context) -> FCursorIcon;
 
     /// When to wake up next (animation timers, blinks). `None` = wait for input only. The host calls this once per `about_to_wait` cycle and feeds it into `ControlFlow::WaitUntil`.
+    ///
+    /// Returning an instant that is already due means "wake me every frame" — the usual way to
+    /// drive an animation. The host FLOORS such a deadline one frame into the future: a real
+    /// animator still runs at ~vsync, while a condition that never clears degrades to a bounded
+    /// frame rate instead of spinning the event loop as fast as the CPU allows. Deadlines in the
+    /// future are honoured exactly, so short timers keep their schedule.
     fn wake_at(&self) -> Option<Instant> {
         None
     }
@@ -3054,6 +3060,18 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
         }
 
         if let Some(when) = self.app.wake_at() {
+            // FLOOR a deadline that is already due. `WaitUntil(past)` wakes instantly, so the loop
+            // re-enters, re-renders and re-sets the same past instant — an unbounded busy-loop that
+            // pins a core with nothing in the log to show for it. Apps ask for this legitimately
+            // (returning `Instant::now()` means "wake me every frame" to drive an animation), but an
+            // animation flag that never clears then spins as fast as the CPU allows (field: photon
+            // 2026-09, ~100% on the main thread for minutes). One frame of floor keeps a real
+            // animator at ~vsync — which is all it wanted — and turns a stuck flag into bounded
+            // 60 Hz instead of a hard spin. Deadlines genuinely in the future are left alone, so
+            // short timers (a 5 ms cursor blink) keep their exact schedule.
+            const MIN_WAKE: std::time::Duration = std::time::Duration::from_millis(16);
+            let now = Instant::now();
+            let when = if when <= now { now + MIN_WAKE } else { when };
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(when));
         }
     }
