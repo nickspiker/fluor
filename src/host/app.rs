@@ -1237,6 +1237,9 @@ impl<A: FluorApp> DesktopShell<A> {
             w.set_outer_position(winit::dpi::PhysicalPosition::new(origin.0, origin.1));
             let _ = w.request_inner_size(winit::dpi::PhysicalSize::new(size.0, size.1));
         }
+        // The region is clipped against the surface we just moved/resized — re-assert it now rather
+        // than waiting for a Resized that may not come (origin-only changes produce none).
+        self.push_input_region(0);
         let want = if self.desired_size.0 > 0 && self.desired_size.1 > 0 {
             WindowRect {
                 x: self.window_rect.x,
@@ -1510,6 +1513,16 @@ impl<A: FluorApp> DesktopShell<A> {
         };
         if region == s.last_input_region {
             return;
+        }
+        // An EMPTY region makes the whole surface click-thru — correct for a dormant/evacuated
+        // surface, but on the live home surface it means every press falls to the window
+        // underneath. It should be unreachable there; shout if it happens so an intermittent
+        // "click passed through" stops being guesswork.
+        if region == (0, 0, 0, 0) && si == self.home && !s.dormant {
+            log::warn!(
+                "FLUOR-MON: EMPTY input region on live home surface {si} — window={:?} surface origin={:?} size={:?}; clicks will pass thru",
+                self.window_rect, s.origin, s.size
+            );
         }
         s.last_input_region = region;
         #[cfg(target_os = "linux")]
@@ -1863,6 +1876,13 @@ impl<A: FluorApp> DesktopShell<A> {
 
         // First Resized confirms the OS surface is actually allocated — safe to start painting.
         self.surfaces[si].surface_ready = true;
+        // Re-assert the click-thru region on EVERY surface geometry change, not just when the
+        // window rect moved: `push_input_region` clips the region against the surface rect, so a
+        // surface that resized under a stationary window silently invalidates it — and a region
+        // that clips to empty is (0,0,0,0), i.e. the whole window becomes click-thru and presses
+        // fall to whatever is underneath (intermittent "click passed to the window below"). The
+        // push dedups against `last_input_region`, so re-asserting costs nothing when it matches.
+        self.push_input_region(si);
         self.render_frame();
     }
 
