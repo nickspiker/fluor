@@ -155,10 +155,11 @@ struct BundledFallback;
 
 impl Fallback for BundledFallback {
     fn common_fallback(&self) -> &[&'static str] {
-        // After the primary font misses, try our symbol font (hearts ♥♡, stars, checks, weather, geometric shapes), then the colour-emoji font (snowman ☃, faces, hands, flags, ZWJ families, skin tones).
-        // Order matters: Symbols 2 is monochrome and covers dingbat/geometric ranges Open Sans lacks; Noto Color Emoji is last so a codepoint neither Latin nor mono-symbol resolves lands on a colour glyph.
+        // After the primary font misses: the app's glyph face (photon's Oxanium `+glyphs` carries the dozenal digits at 0x10..0x1B), then our monochrome symbol font, then colour emoji.
+        // Oxanium FIRST and by name (Nick 2026-09-08: route the glyph set to Oxanium so it renders regardless of the surrounding font, IFF that font lacks its own): cosmic-text tries the PRIMARY face before any of this, so a font carrying matching glyphs still wins — this only catches the miss. Naming it makes the routing deliberate; it previously worked only by falling off the end of the chain into cosmic-text's last-resort scan of every loaded face, which is ordering luck rather than a contract. A family that isn't loaded is skipped, so naming it costs fluor users who don't bundle it nothing.
+        // MEASURED coverage, not assumed — the previous comment claimed Symbols 2 covers "arrows, dingbats, box-drawing, and math", and it does NOT. Symbols 2 is 2641 codepoints: hearts ♥♡, stars, weather ☃, dice, geometric shapes. Arrows (U+2190-21FF), box drawing (U+2500-257F), math operators (U+2200-22FF) and ☮/♻ live in Noto Sans Symbols (the FIRST one) and Noto Sans Math — neither is bundled, so those tofu today.
         // Extend this list as more bundled fonts are added — never with a host family name.
-        &["Noto Sans Symbols 2", "Noto Color Emoji"]
+        &["Oxanium", "Noto Sans Symbols 2", "Noto Color Emoji"]
     }
     fn forbidden_fallback(&self) -> &[&'static str] {
         &[]
