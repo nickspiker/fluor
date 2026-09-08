@@ -155,19 +155,61 @@ struct BundledFallback;
 
 impl Fallback for BundledFallback {
     fn common_fallback(&self) -> &[&'static str] {
-        // After the primary font misses: the app's glyph face (photon's Oxanium `+glyphs` carries the dozenal digits at 0x10..0x1B), then our monochrome symbol font, then colour emoji.
-        // Oxanium FIRST and by name (Nick 2026-09-08: route the glyph set to Oxanium so it renders regardless of the surrounding font, IFF that font lacks its own): cosmic-text tries the PRIMARY face before any of this, so a font carrying matching glyphs still wins — this only catches the miss. Naming it makes the routing deliberate; it previously worked only by falling off the end of the chain into cosmic-text's last-resort scan of every loaded face, which is ordering luck rather than a contract. A family that isn't loaded is skipped, so naming it costs fluor users who don't bundle it nothing.
-        // MEASURED coverage, not assumed — the previous comment claimed Symbols 2 covers "arrows, dingbats, box-drawing, and math", and it does NOT. Symbols 2 is 2641 codepoints: hearts ♥♡, stars, weather ☃, dice, geometric shapes. Arrows (U+2190-21FF), box drawing (U+2500-257F), math operators (U+2200-22FF) and ☮/♻ live in Noto Sans Symbols (the FIRST one) and Noto Sans Math — neither is bundled, so those tofu today.
-        // Extend this list as more bundled fonts are added — never with a host family name.
-        &["Oxanium", "Noto Sans Symbols 2", "Noto Color Emoji"]
+        // After the primary font misses, in order:
+        //   Oxanium — the app's glyph face (photon's `+glyphs` carries the dozenal digits at 0x10..0x1B). First and by name: cosmic-text tries the PRIMARY face before any of this, so a font carrying its own matching glyphs still wins; this only catches the miss. A family that isn't loaded is skipped, so naming it costs nothing to fluor users who don't bundle it.
+        //   Noto Color Emoji BEFORE the monochrome symbol fonts (Nick 2026-09-08: ☎ ☠ ☢ came out as tinted line-art while ☮ ☯ 😀 🍄 came out in colour — the only difference was which font sat earlier in this list). Colour wins whenever a colour glyph exists; a string that wants a symbol as a tinted ICON pins it with U+FE0E (see set_text_vs).
+        //   Then the monochrome coverage, broad to narrow: Symbols 2 (hearts, stars, weather, dice, geometric), Symbols (☮ ☯ ♻ and the dingbat/misc-technical ranges), Math (arrows U+2190–21FF, operators U+2200–22FF, the mathematical alphanumerics), Mono (box drawing U+2500–257F in full, currency U+20A0–20CF).
+        // Every family here is a bundled file — the app loads them into this db at startup. NEVER a host family name.
+        &["Oxanium", "Noto Color Emoji", "Noto Sans Symbols 2", "Noto Sans Symbols", "Noto Sans Math", "Noto Sans Mono"]
     }
     fn forbidden_fallback(&self) -> &[&'static str] {
         &[]
     }
-    fn script_fallback(&self, _script: Script, _locale: &str) -> &[&'static str] {
-        // No per-script host fonts; the common chain above is the whole story. A future CJK/RTL bundle would be named here, still hardcoded.
-        &[]
+    fn script_fallback(&self, script: Script, _locale: &str) -> &[&'static str] {
+        // Per-script bundled faces, tried right after the primary font and before the common chain. Still hardcoded, still bundle-only. CJK is deliberately absent (Nick 2026-09-08: skipped for now — a pan-CJK face is 10–20 MB and roughly doubles the binary; revisit when it earns its place).
+        match script {
+            Script::Arabic => &["Noto Sans Arabic"],
+            Script::Devanagari => &["Noto Sans Devanagari"],
+            Script::Thai => &["Noto Sans Thai"],
+            Script::Armenian => &["Noto Sans Armenian"],
+            Script::Georgian => &["Noto Sans Georgian"],
+            Script::Runic => &["Noto Sans Runic"],
+            _ => &[],
+        }
     }
+}
+
+
+/// Emoji-presentation routing by VARIATION SELECTOR, done at span level before shaping.
+/// U+FE0F after a base character forces the colour-emoji face for that character; U+FE0E forces the monochrome symbol face; a bare character follows the fallback chain (colour first — see BundledFallback).
+/// Why here and not in the font: cosmic-text's fallback triggers per MISSING glyph, not per selector. A selector the winning font doesn't map is just a default-ignorable zero-width glyph, so `☎\u{FE0E}` would still land on whichever face the chain reached first. Splitting the pair into its own span with an explicit family is the only lever that actually chooses the face.
+/// The selector stays in the span's text: the face it routes to treats it as default-ignorable, so it draws nothing and costs no advance.
+fn set_text_vs(buffer: &mut Buffer, fs: &mut FontSystem, text: &str, attrs: &Attrs) {
+    if !text.contains(['\u{FE0E}', '\u{FE0F}']) {
+        buffer.set_text(fs, text, attrs, Shaping::Advanced);
+        return;
+    }
+    let mut spans: Vec<(&str, Attrs)> = Vec::new();
+    let mut plain_start = 0usize;
+    let mut it = text.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        let Some(&(_, vs)) = it.peek() else { break };
+        if vs != '\u{FE0E}' && vs != '\u{FE0F}' {
+            continue;
+        }
+        let end = i + c.len_utf8() + vs.len_utf8();
+        if plain_start < i {
+            spans.push((&text[plain_start..i], attrs.clone()));
+        }
+        let family = if vs == '\u{FE0F}' { "Noto Color Emoji" } else { "Noto Sans Symbols 2" };
+        spans.push((&text[i..end], attrs.clone().family(Family::Name(family))));
+        it.next();
+        plain_start = end;
+    }
+    if plain_start < text.len() {
+        spans.push((&text[plain_start..], attrs.clone()));
+    }
+    buffer.set_rich_text(fs, spans, attrs, Shaping::Advanced, None);
 }
 
 impl TextRenderer {
@@ -263,7 +305,7 @@ impl TextRenderer {
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(&mut self.font_system, None, None);
-        buffer.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced);
+        set_text_vs(&mut buffer, &mut self.font_system, text, &attrs);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -330,7 +372,7 @@ impl TextRenderer {
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(&mut self.font_system, None, None);
-        buffer.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced);
+        set_text_vs(&mut buffer, &mut self.font_system, text, &attrs);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -394,7 +436,7 @@ impl TextRenderer {
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(&mut self.font_system, None, None);
-        buffer.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced);
+        set_text_vs(&mut buffer, &mut self.font_system, text, &attrs);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -457,7 +499,7 @@ impl TextRenderer {
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 
         buffer.set_size(&mut self.font_system, None, None);
-        buffer.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced);
+        set_text_vs(&mut buffer, &mut self.font_system, text, &attrs);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -515,7 +557,7 @@ impl TextRenderer {
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 
         buffer.set_size(&mut self.font_system, None, None);
-        buffer.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced);
+        set_text_vs(&mut buffer, &mut self.font_system, text, &attrs);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -567,7 +609,7 @@ impl TextRenderer {
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 
         buffer.set_size(&mut self.font_system, None, None);
-        buffer.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced);
+        set_text_vs(&mut buffer, &mut self.font_system, text, &attrs);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -983,7 +1025,7 @@ impl TextRenderer {
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 
         buffer.set_size(&mut self.font_system, None, None);
-        buffer.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced);
+        set_text_vs(&mut buffer, &mut self.font_system, text, &attrs);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -1032,7 +1074,7 @@ impl TextRenderer {
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 
         buffer.set_size(&mut self.font_system, None, None);
-        buffer.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced);
+        set_text_vs(&mut buffer, &mut self.font_system, text, &attrs);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -1081,7 +1123,7 @@ impl TextRenderer {
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 
         buffer.set_size(&mut self.font_system, None, None);
-        buffer.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced);
+        set_text_vs(&mut buffer, &mut self.font_system, text, &attrs);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -1328,7 +1370,7 @@ impl TextRenderer {
 
         let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(size, size));
         buffer.set_size(&mut self.font_system, Some(10000.0), Some(size * 2.0));
-        buffer.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced);
+        set_text_vs(&mut buffer, &mut self.font_system, text, &attrs);
 
         // Sum each glyph's ADVANCE (glyph.w), don't take max(glyph.x + glyph.w). A trailing space has zero visual extent, so cosmic-text gives it glyph.x = glyph.w = 0 when it's the last (or only)
         // glyph in the run — max(x+w) then returns 0, so a lone " " measures 0 and words that end in a space collapse into the next (text looks truncated / spaces vanish). Summing advances counts the space's advance regardless of position, matching `measure_text_widths_per_char` below.
@@ -1364,7 +1406,7 @@ impl TextRenderer {
             .weight(Weight(weight));
         let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(size, size));
         buffer.set_size(&mut self.font_system, Some(10000.0), Some(size * 2.0));
-        buffer.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced);
+        set_text_vs(&mut buffer, &mut self.font_system, text, &attrs);
         for run in buffer.layout_runs() {
             for glyph in run.glyphs {
                 // Binary search for the largest byte_idx <= glyph.start: that's the char whose UTF-8 encoding starts at or before this glyph's source byte.
