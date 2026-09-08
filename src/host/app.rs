@@ -742,6 +742,12 @@ struct DesktopShell<A: FluorApp> {
     /// runs a single desktop-spanning surface: this is the only place that still knows where one
     /// monitor ends and the next begins (maximize, move-to-monitor, initial centring).
     monitors: Vec<MonitorRect>,
+    /// The window size actually CHOSEN — the app's `initial_size`, or whatever the user last
+    /// resized to — as opposed to whatever currently fits. A geometry change that shrinks the
+    /// desktop clamps the window down; without remembering the intent, a screen that shrinks and
+    /// grows back (the fgtw host resolution tracking a remote viewer's window, which cycles all
+    /// session) would ratchet the window smaller every time and never restore it. `(0, 0)` = unset.
+    desired_size: (u32, u32),
     /// Index of the surface that owns tick/render/maximize — the surface the window (mostly) lives on; re-elected by [`Self::update_home`] on every `window_rect` mutation.
     home: usize,
     /// Index of the taskbar-visible surface (the one that keeps title + icon + alt-tab presence); every other surface is skip-taskbar'd at creation.
@@ -836,6 +842,7 @@ impl<A: FluorApp> DesktopShell<A> {
             app,
             surfaces: Vec::new(),
             monitors: Vec::new(),
+            desired_size: (0, 0),
             home: 0,
             anchor: 0,
             window_scale: 1.0,
@@ -1230,7 +1237,17 @@ impl<A: FluorApp> DesktopShell<A> {
             w.set_outer_position(winit::dpi::PhysicalPosition::new(origin.0, origin.1));
             let _ = w.request_inner_size(winit::dpi::PhysicalSize::new(size.0, size.1));
         }
-        let rect = self.clamp_rect_to_monitors(self.window_rect);
+        let want = if self.desired_size.0 > 0 && self.desired_size.1 > 0 {
+            WindowRect {
+                x: self.window_rect.x,
+                y: self.window_rect.y,
+                w: self.desired_size.0,
+                h: self.desired_size.1,
+            }
+        } else {
+            self.window_rect
+        };
+        let rect = self.clamp_rect_to_monitors(want);
         self.pending_full_repaint = true;
         self.apply_window_rect(rect);
     }
@@ -1765,33 +1782,43 @@ impl<A: FluorApp> DesktopShell<A> {
                 self.window_monitor()
             };
             let (mw, mh) = mon.size;
-            let (new_w, new_h) = if !was_ready {
-                let (rw, rh) = self.app.initial_size((mw, mh));
-                (rw.max(1).min(mw), rh.max(1).min(mh))
+            // Re-expand toward the size that was CHOSEN, not whatever a previous shrink left
+            // behind (see `desired_size`) — then clamp to what the monitor can actually hold.
+            let (want_w, want_h) = if !was_ready {
+                self.app.initial_size((mw, mh))
+            } else if self.desired_size.0 > 0 && self.desired_size.1 > 0 {
+                self.desired_size
             } else {
-                (
-                    self.window_rect.w.max(1).min(mw),
-                    self.window_rect.h.max(1).min(mh),
-                )
+                (self.window_rect.w, self.window_rect.h)
             };
+            let (new_w, new_h) = (want_w.max(1).min(mw), want_h.max(1).min(mh));
             // FIRST placement centres on the monitor. LATER ones keep the user's placement and only
             // pull it back in bounds — re-centring on every surface resize would make the window
             // hop around all session long, since the fgtw host's resolution follows the remote
             // viewer's window and so the screen geometry changes constantly.
-            let (new_x, new_y) = if !was_ready {
-                (
-                    mon.origin.0 + ((mw as i32) - (new_w as i32)) / 2,
-                    mon.origin.1 + ((mh as i32) - (new_h as i32)) / 2,
-                )
+            let placed = if !was_ready {
+                WindowRect {
+                    x: mon.origin.0 + ((mw as i32) - (new_w as i32)) / 2,
+                    y: mon.origin.1 + ((mh as i32) - (new_h as i32)) / 2,
+                    w: new_w,
+                    h: new_h,
+                }
             } else {
-                let c = self.clamp_rect_to_monitors(WindowRect {
+                // FULL clamp — size shrinks to the work area FIRST, then the position is corrected
+                // using that size, so a window bigger than the new canvas lands wholly on-screen
+                // instead of being positioned as if it still fit.
+                self.clamp_rect_to_monitors(WindowRect {
                     x: self.window_rect.x,
                     y: self.window_rect.y,
                     w: new_w,
                     h: new_h,
-                });
-                (c.x, c.y)
+                })
             };
+            let (new_x, new_y, new_w, new_h) = (placed.x, placed.y, placed.w, placed.h);
+            // The app's own first choice is the size to come back to later.
+            if !was_ready {
+                self.desired_size = (new_w, new_h);
+            }
             let rect_changed = new_w != self.window_rect.w
                 || new_h != self.window_rect.h
                 || new_x != self.window_rect.x
@@ -3250,6 +3277,9 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 // Geometry-persistence edge: the rect the user just settled on, once per gesture. Maximized is a mode, not a placement — its rect never persists.
                 if gesture_ended && self.saved_rect_for_maximize.is_none() {
                     let r = self.window_rect;
+                    // A settled drag/resize IS the user's intent — the size to restore toward after
+                    // any later clamp (see `desired_size`).
+                    self.desired_size = (r.w, r.h);
                     self.app.on_window_rect_changed(r.x, r.y, r.w, r.h);
                 }
                 if let Some(id) = activate {
