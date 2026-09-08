@@ -127,6 +127,10 @@ mod x11_atomic {
     }
 
     /// Ask the WM to keep this window OUT of the taskbar and pager via an EWMH `_NET_WM_STATE` client message carrying `_NET_WM_STATE_SKIP_TASKBAR` + `_NET_WM_STATE_SKIP_PAGER` (action add when `skip`, remove otherwise). Sent on every non-anchor monitor surface so alt-tab and the taskbar show ONE entry for the app instead of one per monitor. Returns `true` if the message was sent; `false` if the window isn't X11 or the connection failed (a WM that ignores the hint just shows extra entries — cosmetic, not fatal).
+    // Unused since Linux moved to ONE desktop-spanning surface (there are no secondary surfaces to
+    // hide from the taskbar any more). Kept because it is the correct call the moment per-monitor
+    // surfaces return here — and it documents the EWMH dance.
+    #[allow(dead_code)]
     pub fn set_skip_taskbar(window: &winit::window::Window, skip: bool) -> bool {
         use x11rb::protocol::xproto::{ClientMessageEvent, ConnectionExt as _, EventMask};
 
@@ -173,33 +177,6 @@ mod x11_atomic {
         }
         let _ = conn.flush();
         true
-    }
-
-    /// Give the keyboard to this window via `XSetInputFocus`. Needed because our surfaces are
-    /// override-redirect (see `create_monitor_surface`): the WM never assigns them focus, so a
-    /// borderless compositor surface would receive no key events at all until we claim it. Called
-    /// for the anchor once its surface is mapped. `revert_to = PointerRoot` so focus falls back
-    /// sanely if the window later unmaps. Returns `false` off X11 / on failure (e.g. not yet
-    /// mapped — a later call from the first `Resized` covers that).
-    pub fn focus(window: &winit::window::Window) -> bool {
-        use x11rb::protocol::xproto::{ConnectionExt as _, InputFocus};
-
-        let Ok(handle) = window.window_handle() else {
-            return false;
-        };
-        let xid = match handle.as_raw() {
-            RawWindowHandle::Xcb(h) => h.window.get(),
-            RawWindowHandle::Xlib(h) => h.window as u32,
-            _ => return false,
-        };
-        let Some(conn) = conn() else {
-            return false;
-        };
-        let ok = conn
-            .set_input_focus(InputFocus::POINTER_ROOT, xid, x11rb::CURRENT_TIME)
-            .is_ok();
-        let _ = conn.flush();
-        ok
     }
 
     /// The desktop work area `(x, y, w, h)` — the monitor minus space reserved by panels /
@@ -313,6 +290,34 @@ fn intersect_rect(
     } else {
         None
     }
+}
+
+/// A `MonitorHandle`'s geometry as a [`MonitorRect`] in GLOBAL desktop units — points on macOS
+/// (winit derives physical FROM the point layout, so dividing back is exact), physical px
+/// everywhere else. Same convention [`DesktopShell::create_monitor_surface`] uses.
+#[cfg(feature = "host-winit")]
+fn monitor_rect_of(monitor: &winit::monitor::MonitorHandle) -> MonitorRect {
+    let scale = monitor.scale_factor();
+    #[cfg(target_os = "macos")]
+    let (origin, size) = (
+        (
+            ((monitor.position().x as f64) / scale).round() as i32,
+            ((monitor.position().y as f64) / scale).round() as i32,
+        ),
+        (
+            ((monitor.size().width.max(1) as f64) / scale).round().max(1.0) as u32,
+            ((monitor.size().height.max(1) as f64) / scale).round().max(1.0) as u32,
+        ),
+    );
+    #[cfg(not(target_os = "macos"))]
+    let (origin, size) = {
+        let _ = scale;
+        (
+            (monitor.position().x, monitor.position().y),
+            (monitor.size().width.max(1), monitor.size().height.max(1)),
+        )
+    };
+    MonitorRect { origin, size, work_area: monitor_work_area(origin, size) }
 }
 
 /// Per-monitor work area `(x, y, w, h)` in GLOBAL desktop units — the monitor rect at `origin`/`size` minus space reserved by panels / taskbars / the menu bar + Dock. The platform queries are GLOBAL (X11 `_NET_WORKAREA` is per-virtual-desktop, Windows `SPI_GETWORKAREA` is the primary monitor in virtual-screen coords), so we intersect the global work area with this monitor's rect; per-strut per-monitor refinement is a phase-D note. Falls back to the full monitor rect on Wayland (no client-side work-area query), when the rects don't overlap, and anywhere the query is unavailable.
@@ -610,6 +615,18 @@ fn clear_scratch_rect(scratch: &mut [u32], win_w: usize, rect: crate::canvas::Pi
 
 /// One per-monitor OS surface in the fullscreen-compositor model — a fullscreen borderless transparent window pinned to its monitor, plus the per-surface presentation state.
 /// Phase A holds exactly ONE of these (the primary monitor); the multi-monitor phases spawn one per output and route events by `WindowId`.
+/// A connected monitor's geometry in GLOBAL desktop units, tracked independently of the OS
+/// surfaces. On macOS/Windows there is one surface per monitor so the two lists line up; on Linux
+/// ONE surface spans the entire desktop (Mutter-family WMs refuse to leave per-monitor windows on
+/// their monitors — see `resumed`), so monitor geometry has to live somewhere other than `surfaces`.
+#[cfg(feature = "host-winit")]
+#[derive(Clone, Copy, Debug)]
+struct MonitorRect {
+    origin: (i32, i32),
+    size: (u32, u32),
+    work_area: (i32, i32, u32, u32),
+}
+
 #[cfg(feature = "host-winit")]
 struct MonitorSurface {
     /// The fullscreen borderless transparent OS window covering this monitor.
@@ -685,6 +702,10 @@ struct DesktopShell<A: FluorApp> {
     app: A,
     /// Per-monitor OS surfaces. Phase A: exactly one entry (the primary monitor), created in `resumed`; empty until then.
     surfaces: Vec<MonitorSurface>,
+    /// Every connected monitor's geometry, PRIMARY FIRST. Distinct from `surfaces` because Linux
+    /// runs a single desktop-spanning surface: this is the only place that still knows where one
+    /// monitor ends and the next begins (maximize, move-to-monitor, initial centring).
+    monitors: Vec<MonitorRect>,
     /// Index of the surface that owns tick/render/maximize — the surface the window (mostly) lives on; re-elected by [`Self::update_home`] on every `window_rect` mutation.
     home: usize,
     /// Index of the taskbar-visible surface (the one that keeps title + icon + alt-tab presence); every other surface is skip-taskbar'd at creation.
@@ -778,6 +799,7 @@ impl<A: FluorApp> DesktopShell<A> {
         Self {
             app,
             surfaces: Vec::new(),
+            monitors: Vec::new(),
             home: 0,
             anchor: 0,
             window_scale: 1.0,
@@ -903,6 +925,42 @@ impl<A: FluorApp> DesktopShell<A> {
             .filter(|(_, s)| intersect_rect(r, s.rect()).is_some())
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// The monitor whose rect contains `(x, y)`, else the one whose centre is nearest, else a
+    /// degenerate fallback. With Linux on a single desktop-spanning surface, "which monitor is the
+    /// window on?" can no longer be answered from `surfaces` — it comes from `monitors` via this.
+    fn monitor_for(&self, x: i32, y: i32) -> MonitorRect {
+        if let Some(m) = self.monitors.iter().find(|m| {
+            x >= m.origin.0
+                && x < m.origin.0 + m.size.0 as i32
+                && y >= m.origin.1
+                && y < m.origin.1 + m.size.1 as i32
+        }) {
+            return *m;
+        }
+        // Outside every monitor (a gap between mismatched panels): nearest centre wins.
+        let mut best: Option<(i64, MonitorRect)> = None;
+        for m in &self.monitors {
+            let cx = m.origin.0 as i64 + (m.size.0 as i64) / 2;
+            let cy = m.origin.1 as i64 + (m.size.1 as i64) / 2;
+            let d = (cx - x as i64).pow(2) + (cy - y as i64).pow(2);
+            if best.map_or(true, |(bd, _)| d < bd) {
+                best = Some((d, *m));
+            }
+        }
+        best.map(|(_, m)| m).unwrap_or(MonitorRect {
+            origin: (0, 0),
+            size: (1, 1),
+            work_area: (0, 0, 1, 1),
+        })
+    }
+
+    /// The monitor the visible window currently sits on, by its centre point.
+    fn window_monitor(&self) -> MonitorRect {
+        let cx = self.window_rect.x + (self.window_rect.w as i32) / 2;
+        let cy = self.window_rect.y + (self.window_rect.h as i32) / 2;
+        self.monitor_for(cx, cy)
     }
 
     /// Re-elect the home surface = argmax window-overlap area, ties keep the current home. Called after EVERY `window_rect` mutation (drag tick, resize tick, maximize, surface-resize clamp). A home change invalidates the composited chrome state (shadow band, AA edges were built against the old home), so it promotes to a full repaint. `window_scale` is NOT touched here — the DPI rebase waits for a settle point ([`Self::settle_rebase`]).
@@ -1070,8 +1128,8 @@ impl<A: FluorApp> DesktopShell<A> {
             self.window_rect.y += (self.window_rect.h as i32 - new_h as i32) / 2;
             self.window_rect.w = new_w;
             self.window_rect.h = new_h;
-            // Position-only clamp into the home work area — the size was just chosen to preserve apparent size, so only the placement gets corrected.
-            let (wx, wy, ww, wh) = self.surfaces[self.home].work_area;
+            // Position-only clamp into the WINDOW'S MONITOR work area — the size was just chosen to preserve apparent size, so only the placement gets corrected.
+            let (wx, wy, ww, wh) = self.window_monitor().work_area;
             if ww > 1 && wh > 1 {
                 self.window_rect.x = self
                     .window_rect
@@ -1329,7 +1387,9 @@ impl<A: FluorApp> DesktopShell<A> {
         event_loop: &ActiveEventLoop,
         monitor: winit::monitor::MonitorHandle,
         is_anchor: bool,
+        span: Option<((i32, i32), (u32, u32))>,
     ) -> MonitorSurface {
+        let _ = &span;
         let scale = monitor.scale_factor();
         // Desktop units: winit reports monitor position/size in PHYSICAL px on every platform. On macOS the native space is POINTS and winit derives the physical values FROM the point layout by multiplying by scale, so dividing back is an exact recovery of the point rect. Everywhere else desktop units ARE physical px.
         #[cfg(target_os = "macos")]
@@ -1343,11 +1403,16 @@ impl<A: FluorApp> DesktopShell<A> {
                 ((monitor.size().height.max(1) as f64) / scale).round().max(1.0) as u32,
             ),
         );
+        // `span` overrides the monitor rect when one surface must cover MORE than its monitor —
+        // the Linux desktop-spanning surface (see `resumed`). None = pin to this monitor exactly.
         #[cfg(not(target_os = "macos"))]
-        let (origin, mut size) = (
-            (monitor.position().x, monitor.position().y),
-            (monitor.size().width.max(1), monitor.size().height.max(1)),
-        );
+        let (origin, mut size) = match span {
+            Some((o, sz)) => (o, sz),
+            None => (
+                (monitor.position().x, monitor.position().y),
+                (monitor.size().width.max(1), monitor.size().height.max(1)),
+            ),
+        };
         // Linux/X11: undersize the surface by ONE pixel row. An undecorated window EXACTLY monitor-sized gets auto-promoted to legacy FULLSCREEN by Mutter-family WMs (Muffin 6.4 verified live 2026-07-25: _NET_WM_STATE grew FULLSCREEN unrequested) — fullscreen-layer stacking sits ABOVE the panel, burying the taskbar (the "black taskbar" lockup; _NET_WM_BYPASS_COMPOSITOR=2 and the unredirect gsetting were both red herrings). h−1 defeats the exact-size match; the missing row is imperceptible — maximize targets the work area, and the bottom row usually sits over the panel anyway.
         #[cfg(target_os = "linux")]
         {
@@ -1382,20 +1447,6 @@ impl<A: FluorApp> DesktopShell<A> {
         let attrs = attrs
             .with_inner_size(winit::dpi::PhysicalSize::new(size.0, size.1))
             .with_position(winit::dpi::PhysicalPosition::new(origin.0, origin.1));
-        // X11: OVERRIDE-REDIRECT — take the surface out of WM management entirely. The
-        // fullscreen-compositor already owns everything the WM would do (placement, the XShape
-        // click-thru input region, compositing), and Mutter-family WMs (Muffin) actively fight the
-        // per-monitor placement on a multi-monitor desktop — ignoring PPosition, USPosition AND
-        // explicit moves, stranding the anchor off its monitor so the app renders into an
-        // off-screen window (field: leviathan dummy+real, 2026-09). Override-redirect means the WM
-        // never places, moves, maximizes, reparents, or restacks these windows: position is exactly
-        // what we set. Cost we take on ourselves: no WM taskbar/alt-tab entry, no WM stacking, and
-        // we must set keyboard focus by hand (`x11_atomic::focus` below).
-        #[cfg(target_os = "linux")]
-        let attrs = {
-            use winit::platform::x11::WindowAttributesExtX11;
-            attrs.with_override_redirect(true)
-        };
         let window = Arc::new(event_loop.create_window(attrs).expect("create_window"));
         // Pin the surface to its monitor's origin post-create — some WMs apply their own placement to the pre-map with_position request, and the compositor model requires the surface to sit exactly on its monitor.
         #[cfg(target_os = "macos")]
@@ -1575,17 +1626,31 @@ impl<A: FluorApp> DesktopShell<A> {
             && si == self.home
             && (intersects || !was_ready)
         {
+            // Size and centre against a MONITOR, never the surface: on Linux one surface spans the
+            // whole desktop, so centring on it would park the window across the seam between two
+            // screens. Before the first placement that's the primary monitor; after it, whichever
+            // monitor the window currently sits on.
+            let mon = if !was_ready {
+                self.monitors.first().copied().unwrap_or(MonitorRect {
+                    origin,
+                    size: (uw, uh),
+                    work_area: (origin.0, origin.1, uw, uh),
+                })
+            } else {
+                self.window_monitor()
+            };
+            let (mw, mh) = mon.size;
             let (new_w, new_h) = if !was_ready {
-                let (rw, rh) = self.app.initial_size((uw, uh));
-                (rw.max(1).min(uw), rh.max(1).min(uh))
+                let (rw, rh) = self.app.initial_size((mw, mh));
+                (rw.max(1).min(mw), rh.max(1).min(mh))
             } else {
                 (
-                    self.window_rect.w.max(1).min(uw),
-                    self.window_rect.h.max(1).min(uh),
+                    self.window_rect.w.max(1).min(mw),
+                    self.window_rect.h.max(1).min(mh),
                 )
             };
-            let new_x = origin.0 + ((uw as i32) - (new_w as i32)) / 2;
-            let new_y = origin.1 + ((uh as i32) - (new_h as i32)) / 2;
+            let new_x = mon.origin.0 + ((mw as i32) - (new_w as i32)) / 2;
+            let new_y = mon.origin.1 + ((mh as i32) - (new_h as i32)) / 2;
             let rect_changed = new_w != self.window_rect.w
                 || new_h != self.window_rect.h
                 || new_x != self.window_rect.x
@@ -1630,13 +1695,6 @@ impl<A: FluorApp> DesktopShell<A> {
 
         // First Resized confirms the OS surface is actually allocated — safe to start painting.
         self.surfaces[si].surface_ready = true;
-        // Override-redirect surfaces get no focus from the WM, so the anchor must claim the
-        // keyboard itself once it's actually mapped (a pre-map XSetInputFocus BadMatches). Do it
-        // here — the first Resized is the post-map settle point — for the anchor only.
-        #[cfg(target_os = "linux")]
-        if si == self.anchor && !self.surfaces[si].dormant {
-            x11_atomic::focus(&self.surfaces[si].window);
-        }
         self.render_frame();
     }
 
@@ -2234,18 +2292,26 @@ impl<A: FluorApp> DesktopShell<A> {
     /// with a single surface. Clears any saved-for-maximize rect so a later maximize toggle
     /// re-captures against the new monitor.
     fn move_to_monitor(&mut self, delta: i32) {
-        let n = self.surfaces.len() as i32;
+        let n = self.monitors.len() as i32;
         if n <= 1 {
             return;
         }
-        let target = (self.home as i32 + delta).rem_euclid(n) as usize;
-        let s = &self.surfaces[target];
-        let (wx, wy, ww, wh) = s.work_area;
+        // Cycle over MONITORS, not surfaces — Linux has a single surface spanning them all, and the
+        // visible window is placed by its global rect either way.
+        let here = self.window_monitor();
+        let cur = self
+            .monitors
+            .iter()
+            .position(|m| m.origin == here.origin)
+            .unwrap_or(0) as i32;
+        let target = (cur + delta).rem_euclid(n) as usize;
+        let m = self.monitors[target];
+        let (wx, wy, ww, wh) = m.work_area;
         let rect = if ww > 1 && wh > 1 {
             WindowRect { x: wx, y: wy, w: ww, h: wh }
         } else {
-            let o = s.origin;
-            WindowRect { x: o.0, y: o.1, w: s.size.0, h: s.size.1 }
+            let o = m.origin;
+            WindowRect { x: o.0, y: o.1, w: m.size.0, h: m.size.1 }
         };
         log::info!("FLUOR-MON: move window to monitor {target}/{n} rect={rect:?}");
         self.saved_rect_for_maximize = None;
@@ -2257,7 +2323,8 @@ impl<A: FluorApp> DesktopShell<A> {
         if self.home_window().is_none() {
             return;
         }
-        let (scr_w, scr_h) = self.surfaces[self.home].size;
+        let mon = self.window_monitor();
+        let (scr_w, scr_h) = mon.size;
         if scr_w <= 1 || scr_h <= 1 {
             return;
         }
@@ -2266,12 +2333,12 @@ impl<A: FluorApp> DesktopShell<A> {
             Some(prev) => self.clamp_rect_to_surfaces(prev),
             None => {
                 self.saved_rect_for_maximize = Some(self.window_rect);
-                // Maximize to the home surface's work area (monitor minus panels), not the raw screen, so the maximized window's bottom chrome stays clear of the taskbar. Falls back to the full surface if the work area was never resolved. Both are GLOBAL desktop-unit rects.
-                let (wx, wy, ww, wh) = self.surfaces[self.home].work_area;
+                // Maximize to the WINDOW'S MONITOR work area (monitor minus panels), not the raw screen — and emphatically not the surface, which on Linux spans every monitor. Falls back to the full monitor if the work area was never resolved. Both are GLOBAL desktop-unit rects.
+                let (wx, wy, ww, wh) = mon.work_area;
                 if ww > 1 && wh > 1 {
                     WindowRect { x: wx, y: wy, w: ww, h: wh }
                 } else {
-                    let o = self.surfaces[self.home].origin;
+                    let o = mon.origin;
                     WindowRect { x: o.0, y: o.1, w: scr_w, h: scr_h }
                 }
             }
@@ -2562,13 +2629,42 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
             // No monitor to pin a surface to (headless X server mid-teardown); nothing to create.
             return;
         }
+        // Monitor geometry is recorded independently of the surfaces — on Linux one surface spans
+        // them all, so this is the only remaining source of per-monitor rects (maximize,
+        // move-to-monitor, initial centring).
+        self.monitors = monitors.iter().map(monitor_rect_of).collect();
+        log::info!("FLUOR-MON: {} monitor(s): {:?}", self.monitors.len(), self.monitors);
+
+        // LINUX: ONE surface spanning every monitor. Mutter-family WMs run their own placement
+        // policy on per-monitor windows and strand them off their monitors — ignoring PPosition,
+        // USPosition and explicit moves alike — so the app ends up rendering into an off-screen
+        // window. A single desktop-spanning window is the same shape as the single-monitor case
+        // that has always worked: the WM places it, and it keeps its taskbar entry, normal stacking
+        // and normal focus while fluor composites the per-monitor regions inside it. Sound here
+        // because the Linux path is ONE uniform pixel space (`pixel_ratio` is 1.0 for every
+        // surface); macOS genuinely needs a surface per display since each NSScreen carries its own
+        // backing scale, so it keeps the per-monitor split below.
+        #[cfg(target_os = "linux")]
+        {
+            let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+            for m in &self.monitors {
+                x0 = x0.min(m.origin.0);
+                y0 = y0.min(m.origin.1);
+                x1 = x1.max(m.origin.0 + m.size.0 as i32);
+                y1 = y1.max(m.origin.1 + m.size.1 as i32);
+            }
+            let span = ((x0, y0), ((x1 - x0).max(1) as u32, (y1 - y0).max(1) as u32));
+            log::info!("FLUOR-MON: single spanning surface {span:?}");
+            let primary = monitors.into_iter().next().expect("monitors is non-empty");
+            let surface = self.create_monitor_surface(event_loop, primary, true, Some(span));
+            self.surfaces.push(surface);
+        }
+        #[cfg(not(target_os = "linux"))]
         for (i, monitor) in monitors.into_iter().enumerate() {
-            let mut surface = self.create_monitor_surface(event_loop, monitor, i == 0);
+            let mut surface = self.create_monitor_surface(event_loop, monitor, i == 0, None);
             if i != 0 {
                 // Non-anchor surfaces start DORMANT: no input region, no taskbar/pager entry, and their first Resized presents one all-zero (fully transparent) frame instead of ticking the render loop.
                 surface.dormant = true;
-                #[cfg(target_os = "linux")]
-                x11_atomic::set_skip_taskbar(&surface.window, true);
                 // macOS needs no skip-taskbar equivalent — auxiliary NSWindows don't get their own Dock/cmd-tab entries.
             }
             self.surfaces.push(surface);
