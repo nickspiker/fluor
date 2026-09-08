@@ -130,6 +130,11 @@ objc2-core-foundation = { version = "0.3", features = ["CFData"] }
 [dev-dependencies]
 proptest = "1.5"
 
+# Auto-discovered examples inherit NO feature requirements, so a default-feature `cargo test`/`cargo build --examples` tries to compile winit examples in the headless config and dies on the host-winit gates. Name the requirement explicitly.
+[[example]]
+name = "panes"
+required-features = ["host-winit"]
+
 [profile.dev]
 opt-level = 2
 overflow-checks = false

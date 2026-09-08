@@ -532,6 +532,7 @@ pub fn run_app<A: FluorApp + 'static>(app: A) -> Result<(), EventLoopError> {
 }
 
 /// Like [`run_app`] but the app SURVIVES the loop: on return the caller gets it back alongside the verdict — `Err` means the loop died out from under a living app (the X-death class: winit's x11rb dispatch error exits the loop with a code instead of killing the process), and the caller may keep running it display-free (photon's headless lifeline, docs/headless-lifeline.md there).
+#[cfg(feature = "host-winit")]
 pub fn run_app_recoverable<A: FluorApp + 'static>(
     mut app: A,
 ) -> (A, Result<(), EventLoopError>) {
