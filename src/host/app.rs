@@ -179,6 +179,42 @@ mod x11_atomic {
         true
     }
 
+    /// Ask the X server to report screen-layout changes — RandR
+    /// `SCREEN_CHANGE | CRTC_CHANGE | OUTPUT_CHANGE` on the root. Called once at startup. Linux runs
+    /// ONE surface spanning every monitor, so a layout change invalidates that span: a monitor
+    /// hotplug, or the fgtw host resizing its own framebuffer to follow a remote viewer's window
+    /// (which repeats throughout a session, not just at connect). Returns `false` off X11.
+    pub fn watch_screen_changes() -> bool {
+        use x11rb::protocol::randr::{ConnectionExt as _, NotifyMask};
+        let Some(conn) = conn() else { return false };
+        let Some(root) = conn.setup().roots.first().map(|s| s.root) else {
+            return false;
+        };
+        let ok = conn
+            .randr_select_input(
+                root,
+                NotifyMask::SCREEN_CHANGE | NotifyMask::CRTC_CHANGE | NotifyMask::OUTPUT_CHANGE,
+            )
+            .is_ok();
+        let _ = conn.flush();
+        ok
+    }
+
+    /// Drain queued X events and report whether any RandR layout change arrived. NON-BLOCKING: it
+    /// empties a queue that is already there rather than asking the server anything, so calling it
+    /// once per event-loop cycle costs nothing while the layout is quiet — no timer, no polling.
+    pub fn screen_changed() -> bool {
+        use x11rb::protocol::Event;
+        let Some(conn) = conn() else { return false };
+        let mut changed = false;
+        while let Ok(Some(ev)) = conn.poll_for_event() {
+            if matches!(ev, Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_)) {
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// The desktop work area `(x, y, w, h)` — the monitor minus space reserved by panels /
     /// taskbars — read from the root window's EWMH `_NET_WORKAREA` property. Used to place the visible window so its bottom edge (the chrome status band) doesn't slide under a taskbar. `_NET_WORKAREA` holds `[x, y, w, h]` per virtual desktop; we take the first
     /// (current/default desktop). Returns `None` if not X11, the atom is unset (no EWMH WM),
@@ -1110,6 +1146,95 @@ impl<A: FluorApp> DesktopShell<A> {
         WindowRect { x, y, w, h }
     }
 
+    /// Pull `r` fully inside a real monitor's work area: kept where it is when it already sits on
+    /// one, otherwise snapped into the nearest. Size is clamped to fit first, then position. This is
+    /// the safety net for geometry changes that invalidate the old rect — the screen shrinking under
+    /// the window (the fgtw host resolution following a remote viewer) or a monitor unplugged.
+    fn clamp_rect_to_monitors(&self, r: WindowRect) -> WindowRect {
+        if self.monitors.is_empty() {
+            return r;
+        }
+        let m = self.monitor_for(r.x + (r.w as i32) / 2, r.y + (r.h as i32) / 2);
+        let (wx, wy, ww, wh) = if m.work_area.2 > 1 && m.work_area.3 > 1 {
+            m.work_area
+        } else {
+            (m.origin.0, m.origin.1, m.size.0, m.size.1)
+        };
+        let w = r.w.min(ww.max(1));
+        let h = r.h.min(wh.max(1));
+        let x = r.x.max(wx).min(wx + ww as i32 - w as i32);
+        let y = r.y.max(wy).min(wy + wh as i32 - h as i32);
+        WindowRect { x, y, w, h }
+    }
+
+    /// Re-derive the desktop-spanning surface after a RandR layout change (monitor hotplug, or the
+    /// fgtw host resizing its framebuffer to follow a remote viewer). Re-enumerates the monitors,
+    /// recomputes the union, resizes + repositions the single OS window to match, and pulls the
+    /// visible window back onto a real monitor — its old rect can be entirely outside the new
+    /// desktop when the screen shrank. No-op when nothing actually moved.
+    #[cfg(target_os = "linux")]
+    fn rebuild_span(&mut self, event_loop: &ActiveEventLoop) {
+        // PRIMARY FIRST, same ordering rule as `resumed`.
+        let mut mons: Vec<winit::monitor::MonitorHandle> = Vec::new();
+        if let Some(p) = event_loop.primary_monitor() {
+            mons.push(p);
+        }
+        for m in event_loop.available_monitors() {
+            if !mons.iter().any(|q| *q == m) {
+                mons.push(m);
+            }
+        }
+        if mons.is_empty() {
+            return;
+        }
+        let new_mons: Vec<MonitorRect> = mons.iter().map(monitor_rect_of).collect();
+        let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        for m in &new_mons {
+            x0 = x0.min(m.origin.0);
+            y0 = y0.min(m.origin.1);
+            x1 = x1.max(m.origin.0 + m.size.0 as i32);
+            y1 = y1.max(m.origin.1 + m.size.1 as i32);
+        }
+        let origin = (x0, y0);
+        // Same one-row undersize `create_monitor_surface` applies, for the same anti-fullscreen reason.
+        let size = (
+            (x1 - x0).max(1) as u32,
+            (((y1 - y0).max(1) as u32).saturating_sub(1)).max(1),
+        );
+
+        let same_monitors = self.monitors.len() == new_mons.len()
+            && self
+                .monitors
+                .iter()
+                .zip(&new_mons)
+                .all(|(a, b)| a.origin == b.origin && a.size == b.size);
+        let same_span = self
+            .surfaces
+            .first()
+            .is_some_and(|s| s.origin == origin && s.size == size);
+        if same_monitors && same_span {
+            return;
+        }
+        log::info!(
+            "FLUOR-MON: layout changed → {} monitor(s), span origin={:?} size={:?}",
+            new_mons.len(),
+            origin,
+            size
+        );
+        self.monitors = new_mons;
+        if let Some(s) = self.surfaces.first_mut() {
+            s.origin = origin;
+            s.size = size;
+            s.work_area = monitor_work_area(origin, size);
+            let w = s.window.clone();
+            w.set_outer_position(winit::dpi::PhysicalPosition::new(origin.0, origin.1));
+            let _ = w.request_inner_size(winit::dpi::PhysicalSize::new(size.0, size.1));
+        }
+        let rect = self.clamp_rect_to_monitors(self.window_rect);
+        self.pending_full_repaint = true;
+        self.apply_window_rect(rect);
+    }
+
     /// DPI settle rebase (phase C): once the window SETTLES on a home surface whose scale differs from `window_scale` — drag release, resize release, restore-from-maximize, a home `ScaleFactorChanged` — re-anchor the geometry to the new scale so apparent size stays constant and the straddle passes collapse back to one.
     /// macOS: `window_rect` is in POINTS, so w/h don't change — apparent size is constant by construction and the rebase is just `window_scale` adoption + a pass-0 rebuild at the new density. X11/Windows: desktop units are physical px, so w/h scale by `home.scale ÷ window_scale` about the center, then the position clamps into the home work area. User zoom (`viewport.ru`) is untouched — it stays a separate multiplier by design.
     fn settle_rebase(&mut self) {
@@ -1649,8 +1774,24 @@ impl<A: FluorApp> DesktopShell<A> {
                     self.window_rect.h.max(1).min(mh),
                 )
             };
-            let new_x = mon.origin.0 + ((mw as i32) - (new_w as i32)) / 2;
-            let new_y = mon.origin.1 + ((mh as i32) - (new_h as i32)) / 2;
+            // FIRST placement centres on the monitor. LATER ones keep the user's placement and only
+            // pull it back in bounds — re-centring on every surface resize would make the window
+            // hop around all session long, since the fgtw host's resolution follows the remote
+            // viewer's window and so the screen geometry changes constantly.
+            let (new_x, new_y) = if !was_ready {
+                (
+                    mon.origin.0 + ((mw as i32) - (new_w as i32)) / 2,
+                    mon.origin.1 + ((mh as i32) - (new_h as i32)) / 2,
+                )
+            } else {
+                let c = self.clamp_rect_to_monitors(WindowRect {
+                    x: self.window_rect.x,
+                    y: self.window_rect.y,
+                    w: new_w,
+                    h: new_h,
+                });
+                (c.x, c.y)
+            };
             let rect_changed = new_w != self.window_rect.w
                 || new_h != self.window_rect.h
                 || new_x != self.window_rect.x
@@ -2633,6 +2774,9 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
         // them all, so this is the only remaining source of per-monitor rects (maximize,
         // move-to-monitor, initial centring).
         self.monitors = monitors.iter().map(monitor_rect_of).collect();
+        // Layout changes invalidate the spanning surface below — subscribe before it can happen.
+        #[cfg(target_os = "linux")]
+        x11_atomic::watch_screen_changes();
         log::info!("FLUOR-MON: {} monitor(s): {:?}", self.monitors.len(), self.monitors);
 
         // LINUX: ONE surface spanning every monitor. Mutter-family WMs run their own placement
@@ -2765,6 +2909,12 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // RandR layout change (hotplug, or the fgtw host's framebuffer following a remote viewer)?
+        // Draining the queue is free when nothing happened — see `x11_atomic::screen_changed`.
+        #[cfg(target_os = "linux")]
+        if x11_atomic::screen_changed() {
+            self.rebuild_span(event_loop);
+        }
         // Dock icon clicked. macOS asks the APPLICATION delegate, never the window, which is why this cannot be handled in `window_event` and why it was silently dropped before (see macos_reopen).
         #[cfg(target_os = "macos")]
         if super::macos_reopen::take_reopen() {
