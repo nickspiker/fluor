@@ -222,21 +222,55 @@ impl MultiTextbox {
         self.edit_seq += 1;
     }
 
-    /// A character that may continue a URL (RFC 3986 unreserved + reserved + percent) — everything else, whitespace first of all, ENDS a link being typed.
-    pub fn is_url_char(c: char) -> bool {
-        c.is_ascii_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c)
+    /// The link being labelled — the caret paints in its colour only while the relabel is pending (the button pressed, the label not yet accepted). An accepted link is ordinary text to the caret.
+    pub fn caret_span(&self) -> Option<&Span> {
+        if !self.relabel_pending {
+            return None;
+        }
+        self.spans.iter().find(|s| s.dest.is_some() && s.start <= self.cursor && self.cursor <= s.end)
     }
 
-    /// The tagged link the caret is INSIDE or at the END of — the caret paints in that link's colour while this is Some.
-    pub fn caret_span(&self) -> Option<&Span> {
-        self.spans.iter().find(|s| s.dest.is_some() && s.start < self.cursor && self.cursor <= s.end)
+    /// The span a pending relabel is editing: the tagged link the caret (or the selection) sits in.
+    fn pending_span_index(&self) -> Option<usize> {
+        if !self.relabel_pending {
+            return None;
+        }
+        let lo = self.selection_anchor.map_or(self.cursor, |a| a.min(self.cursor));
+        let hi = self.selection_anchor.map_or(self.cursor, |a| a.max(self.cursor));
+        self.spans.iter().position(|s| s.dest.is_some() && s.start <= lo && hi <= s.end)
+    }
+
+    /// ACCEPT the label as it stands: the selection collapses to the link's end and the caret goes back to plain. Space, a right arrow, a click, any caret move.
+    pub fn accept_relabel(&mut self) {
+        if !self.relabel_pending {
+            return;
+        }
+        if let Some(i) = self.pending_span_index() {
+            if self.selection_range().is_some() {
+                self.cursor = self.spans[i].end;
+            }
+        }
+        self.selection_anchor = None;
+        self.relabel_pending = false;
+        self.text_cache_dirty = true;
+    }
+
+    /// REVERT a pending relabel: the label goes back to the plain address it stood for and the link is gone — consent withdrawn. Backspace or Delete on the still-selected label, or Escape.
+    pub fn revert_relabel(&mut self, text: &mut TextRenderer) {
+        let Some(i) = self.pending_span_index() else { return };
+        let (s0, s1) = (self.spans[i].start, self.spans[i].end);
+        let url = self.spans[i].dest.clone().unwrap_or_default();
+        self.spans.remove(i);
+        self.selection_anchor = None;
+        self.relabel_pending = false;
+        self.replace_char_range(s0, s1, &url, text);
     }
 
     pub fn relabel_pending(&self) -> bool {
         self.relabel_pending
     }
 
-    /// Turn `start..end` into a tagged link whose VISIBLE text is `label` and whose destination is `dest` (the link button: "https://passless.org/photon/" shows as "passless.org/photon"). The caret lands at the label's end in the link's colour, and the next valid URL char typed REPLACES the label.
+    /// Turn `start..end` into a tagged link whose VISIBLE text is `label` and whose destination is `dest` (the link button: "https://passless.org/photon/" shows as "passless.org/photon"). The label comes back selected in the link's colour: typing replaces it, whitespace / a right arrow / a click accept it, backspace on the selection reverts to the plain address. This is the ONLY way text becomes a link on its own — nothing is detected or coloured before the press.
     pub fn relabel_span(&mut self, start: usize, end: usize, label: &str, dest: String, colour: u32, text: &mut TextRenderer) {
         let n = self.chars.len();
         let (start, end) = (start.min(n), end.min(n));
@@ -248,8 +282,9 @@ impl MultiTextbox {
         self.spans.retain(|s| s.end <= start || s.start >= start + label_len);
         self.spans.push(Span { start, end: start + label_len, colour, dest: Some(dest) });
         self.spans.sort_by_key(|s| s.start);
+        // The label is SELECTED: typing replaces it, space / right arrow / a click accept it, backspace reverts it.
+        self.selection_anchor = Some(start);
         self.cursor = start + label_len;
-        self.selection_anchor = None;
         self.relabel_pending = true;
         self.text_cache_dirty = true;
     }
@@ -435,54 +470,85 @@ impl MultiTextbox {
     // ---- Edits (each: mutate → relayout → cursor visible → caches dirty) ----
 
     pub fn insert_char(&mut self, c: char, text: &mut TextRenderer) {
-        self.delete_selection_internal();
-        let url_char = Self::is_url_char(c);
-        // LABEL EDIT: the first valid URL char after a relabel replaces the whole label — the link keeps its destination, the text becomes what the user types.
         if self.relabel_pending {
-            self.relabel_pending = false;
-            let pending = self.spans.iter().position(|s| s.dest.is_some() && s.end == self.cursor);
-            if let (true, Some(i)) = (url_char, pending) {
+            if c.is_whitespace() {
+                // Whitespace ACCEPTS the label as it stands and lands after the link.
+                self.accept_relabel();
+            } else if let Some(i) = self.pending_span_index() {
                 let (s0, s1) = (self.spans[i].start, self.spans[i].end);
-                self.chars.drain(s0..s1);
-                self.widths.drain(s0..s1);
-                let w = self.measure_char(c, text);
-                self.chars.insert(s0, c);
-                self.widths.insert(s0, w);
-                // Shift every OTHER span past the edit; this one becomes the single typed char.
-                let delta = (s1 - s0) as isize - 1;
-                for (j, s) in self.spans.iter_mut().enumerate() {
-                    if j != i && s.start >= s1 {
-                        s.start = (s.start as isize - delta) as usize;
-                        s.end = (s.end as isize - delta) as usize;
+                if self.selection_range() == Some((s0, s1)) {
+                    // The selected label is replaced by what the user types; the link keeps its destination.
+                    self.chars.drain(s0..s1);
+                    self.widths.drain(s0..s1);
+                    let w = self.measure_char(c, text);
+                    self.chars.insert(s0, c);
+                    self.widths.insert(s0, w);
+                    let delta = (s1 - s0) as isize - 1;
+                    for (j, s) in self.spans.iter_mut().enumerate() {
+                        if j != i && s.start >= s1 {
+                            s.start = (s.start as isize - delta) as usize;
+                            s.end = (s.end as isize - delta) as usize;
+                        }
                     }
+                    self.spans[i].end = s0 + 1;
+                    self.selection_anchor = None;
+                    self.cursor = s0 + 1;
+                    self.edit_seq += 1;
+                    self.goal_x = None;
+                    self.text_cache_dirty = true;
+                    self.rewrap();
+                    self.ensure_cursor_visible();
+                    return;
+                } else if self.selection_anchor.is_none() && self.cursor == s1 {
+                    // Still labelling: a char at the label's end extends the link.
+                    let w = self.measure_char(c, text);
+                    self.chars.insert(self.cursor, c);
+                    self.widths.insert(self.cursor, w);
+                    self.spans_on_insert(self.cursor, 1);
+                    self.spans[i].end += 1;
+                    self.cursor += 1;
+                    self.goal_x = None;
+                    self.text_cache_dirty = true;
+                    self.rewrap();
+                    self.ensure_cursor_visible();
+                    return;
+                } else {
+                    self.relabel_pending = false;
                 }
-                self.spans[i].end = s0 + 1;
-                self.edit_seq += 1;
-                self.cursor = s0 + 1;
-                self.goal_x = None;
-                self.rewrap();
-                self.ensure_cursor_visible();
-                return;
+            } else {
+                self.relabel_pending = false;
             }
         }
+        self.delete_selection_internal();
         let w = self.measure_char(c, text);
         self.chars.insert(self.cursor, c);
         self.widths.insert(self.cursor, w);
+        // A char at an accepted link's end lands OUTSIDE it (spans_on_insert grows only a span the point is strictly inside): a link's extent is what was consented to.
         self.spans_on_insert(self.cursor, 1);
-        // A valid URL char typed at a tagged link's END extends the link; an invalid one (space first of all) lands outside it, which is how a link ends.
-        if url_char {
-            let at = self.cursor;
-            if let Some(s) = self.spans.iter_mut().find(|s| s.dest.is_some() && s.end == at) {
-                s.end += 1;
-                self.text_cache_dirty = true;
-            }
-        }
         self.cursor += 1;
         self.goal_x = None;
         self.rewrap();
         self.ensure_cursor_visible();
     }
     pub fn insert_str(&mut self, s: &str, text: &mut TextRenderer) {
+        if let Some(i) = self.pending_span_index() {
+            let (s0, s1) = (self.spans[i].start, self.spans[i].end);
+            if self.selection_range() == Some((s0, s1)) && !s.is_empty() {
+                // Pasting over the selected label: the pasted text becomes the label, the link keeps its destination.
+                let dest = self.spans[i].dest.clone();
+                let colour = self.spans[i].colour;
+                self.selection_anchor = None;
+                self.replace_char_range(s0, s1, s, text);
+                let end = s0 + s.chars().count();
+                self.spans.retain(|sp| sp.end <= s0 || sp.start >= end);
+                self.spans.push(Span { start: s0, end, colour, dest });
+                self.spans.sort_by_key(|sp| sp.start);
+                self.cursor = end;
+                self.relabel_pending = true;
+                self.text_cache_dirty = true;
+                return;
+            }
+        }
         self.delete_selection_internal();
         self.relabel_pending = false;
         let at = self.cursor;
@@ -497,7 +563,11 @@ impl MultiTextbox {
         self.rewrap();
         self.ensure_cursor_visible();
     }
-    pub fn backspace(&mut self, _text: &mut TextRenderer) {
+    pub fn backspace(&mut self, text: &mut TextRenderer) {
+        if self.label_still_selected() {
+            self.revert_relabel(text);
+            return;
+        }
         if self.has_selection() {
             self.delete_selection_internal();
         } else if self.cursor > 0 {
@@ -510,7 +580,15 @@ impl MultiTextbox {
         self.rewrap();
         self.ensure_cursor_visible();
     }
-    pub fn delete_forward(&mut self, _text: &mut TextRenderer) {
+    /// Is a pending relabel's label still the whole selection? Backspace / Delete then REVERT rather than delete: the link goes back to the plain address it stood for.
+    fn label_still_selected(&self) -> bool {
+        self.pending_span_index().is_some_and(|i| self.selection_range() == Some((self.spans[i].start, self.spans[i].end)))
+    }
+    pub fn delete_forward(&mut self, text: &mut TextRenderer) {
+        if self.label_still_selected() {
+            self.revert_relabel(text);
+            return;
+        }
         if self.has_selection() {
             self.delete_selection_internal();
         } else if self.cursor < self.chars.len() {
@@ -1134,6 +1212,8 @@ impl Widget for MultiTextbox {
 
 impl Click for MultiTextbox {
     fn on_click(&mut self, x: Coord, y: Coord, _mods: ModifiersState) -> crate::host::EventResponse {
+        // A click accepts a pending label where it stands.
+        self.relabel_pending = false;
         self.cursor = self.cursor_index_from_xy(x, y);
         self.selection_anchor = None;
         self.goal_x = None;
@@ -1186,6 +1266,17 @@ impl Key for MultiTextbox {
         let shift = mods.shift_key();
         let ctrl = mods.super_key() || mods.control_key();
         let mut changed = false;
+        // A caret move accepts a pending label (a right arrow collapses the selection to the link's end — the natural "done"); Escape reverts it.
+        if self.relabel_pending {
+            match &kev.logical_key {
+                FKey::Named(NamedKey::ArrowLeft | NamedKey::ArrowRight | NamedKey::ArrowUp | NamedKey::ArrowDown | NamedKey::Home | NamedKey::End) => self.relabel_pending = false,
+                FKey::Named(NamedKey::Escape) => {
+                    self.revert_relabel(text);
+                    return crate::host::EventResponse::Handled;
+                }
+                _ => {}
+            }
+        }
         let start_selection_if_needed = |slf: &mut MultiTextbox| {
             if shift && slf.selection_anchor.is_none() {
                 slf.selection_anchor = Some(slf.cursor);
@@ -1332,5 +1423,50 @@ mod span_tests {
         tb.tag_link(3, 5, "https://y".into(), 2);
         assert_eq!(tb.spans().len(), 1, "the tagged range replaced the overlapping span");
         assert_eq!(tb.spans()[0].dest.as_deref(), Some("https://y"));
+    }
+
+    fn typed(tb: &MultiTextbox) -> String {
+        tb.chars.iter().collect()
+    }
+
+    /// The consent flow: the relabel selects the label, typing replaces it and extends it, whitespace accepts and lands outside, and an accepted link no longer grows.
+    #[test]
+    fn relabel_selects_then_typing_replaces_and_whitespace_accepts() {
+        let mut text = TextRenderer::new();
+        let mut tb = boxed();
+        tb.chars = "see https://passless.org/photon/ now".chars().collect();
+        tb.widths = alloc::vec![1.0; tb.chars.len()];
+        tb.relabel_span(4, 32, "passless.org/photon", "https://passless.org/photon/".into(), 7, &mut text);
+        assert_eq!(typed(&tb), "see passless.org/photon now");
+        assert_eq!(tb.selection_range(), Some((4, 23)), "the label comes back selected");
+        assert!(tb.relabel_pending() && tb.caret_span().is_some());
+        tb.insert_char('P', &mut text);
+        tb.insert_char('h', &mut text);
+        assert_eq!(typed(&tb), "see Ph now");
+        assert_eq!((tb.spans()[0].start, tb.spans()[0].end), (4, 6));
+        assert_eq!(tb.spans()[0].dest.as_deref(), Some("https://passless.org/photon/"));
+        tb.insert_char(' ', &mut text);
+        assert!(!tb.relabel_pending() && tb.caret_span().is_none(), "whitespace accepted the label");
+        assert_eq!((tb.spans()[0].start, tb.spans()[0].end), (4, 6), "the space landed outside the link");
+        tb.insert_char('x', &mut text);
+        assert_eq!((tb.spans()[0].start, tb.spans()[0].end), (4, 6), "an accepted link does not grow");
+    }
+
+    /// Backspace on the still-selected label reverts to the plain address and drops the link; a right arrow accepts instead.
+    #[test]
+    fn backspace_on_the_selected_label_reverts_and_a_move_accepts() {
+        let mut text = TextRenderer::new();
+        let mut tb = boxed();
+        tb.chars = "https://x.org/".chars().collect();
+        tb.widths = alloc::vec![1.0; tb.chars.len()];
+        tb.relabel_span(0, 14, "x.org", "https://x.org/".into(), 7, &mut text);
+        tb.backspace(&mut text);
+        assert_eq!(typed(&tb), "https://x.org/");
+        assert!(tb.spans().is_empty() && !tb.relabel_pending());
+        tb.relabel_span(0, 14, "x.org", "https://x.org/".into(), 7, &mut text);
+        tb.accept_relabel();
+        assert_eq!(tb.cursor, 5);
+        assert!(tb.selection_range().is_none() && !tb.relabel_pending());
+        assert_eq!(tb.spans()[0].dest.as_deref(), Some("https://x.org/"));
     }
 }
