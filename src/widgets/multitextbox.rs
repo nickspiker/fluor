@@ -62,6 +62,8 @@ pub struct MultiTextbox {
     spans: Vec<Span>,
     /// Bumped by every mutation of `chars` — the app's change EDGE for re-running its detectors (never a timer, never per frame).
     edit_seq: u64,
+    /// LINK LABEL EDIT (2026-09-09): set by `relabel_span` — the next VALID URL char typed at the link's end REPLACES the label (so "passless.org/photon" can become "Photon"); any other char, or a paste, ends the mode.
+    relabel_pending: bool,
 
     // --- Blinkey ---
     pub blinkey_visible: bool,
@@ -108,6 +110,7 @@ impl MultiTextbox {
             goal_x: None,
             spans: Vec::new(),
             edit_seq: 0,
+            relabel_pending: false,
             blinkey_visible: true,
             blinkey_wave_top: true,
             pill_cache: Vec::new(),
@@ -217,6 +220,38 @@ impl MultiTextbox {
             self.spans.retain(|s| s.end > s.start);
         }
         self.edit_seq += 1;
+    }
+
+    /// A character that may continue a URL (RFC 3986 unreserved + reserved + percent) — everything else, whitespace first of all, ENDS a link being typed.
+    pub fn is_url_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c)
+    }
+
+    /// The tagged link the caret is INSIDE or at the END of — the caret paints in that link's colour while this is Some.
+    pub fn caret_span(&self) -> Option<&Span> {
+        self.spans.iter().find(|s| s.dest.is_some() && s.start < self.cursor && self.cursor <= s.end)
+    }
+
+    pub fn relabel_pending(&self) -> bool {
+        self.relabel_pending
+    }
+
+    /// Turn `start..end` into a tagged link whose VISIBLE text is `label` and whose destination is `dest` (the link button: "https://passless.org/photon/" shows as "passless.org/photon"). The caret lands at the label's end in the link's colour, and the next valid URL char typed REPLACES the label.
+    pub fn relabel_span(&mut self, start: usize, end: usize, label: &str, dest: String, colour: u32, text: &mut TextRenderer) {
+        let n = self.chars.len();
+        let (start, end) = (start.min(n), end.min(n));
+        if end <= start {
+            return;
+        }
+        self.replace_char_range(start, end, label, text);
+        let label_len = label.chars().count();
+        self.spans.retain(|s| s.end <= start || s.start >= start + label_len);
+        self.spans.push(Span { start, end: start + label_len, colour, dest: Some(dest) });
+        self.spans.sort_by_key(|s| s.start);
+        self.cursor = start + label_len;
+        self.selection_anchor = None;
+        self.relabel_pending = true;
+        self.text_cache_dirty = true;
     }
 
     // ---- Layout ----
@@ -401,10 +436,47 @@ impl MultiTextbox {
 
     pub fn insert_char(&mut self, c: char, text: &mut TextRenderer) {
         self.delete_selection_internal();
+        let url_char = Self::is_url_char(c);
+        // LABEL EDIT: the first valid URL char after a relabel replaces the whole label — the link keeps its destination, the text becomes what the user types.
+        if self.relabel_pending {
+            self.relabel_pending = false;
+            let pending = self.spans.iter().position(|s| s.dest.is_some() && s.end == self.cursor);
+            if let (true, Some(i)) = (url_char, pending) {
+                let (s0, s1) = (self.spans[i].start, self.spans[i].end);
+                self.chars.drain(s0..s1);
+                self.widths.drain(s0..s1);
+                let w = self.measure_char(c, text);
+                self.chars.insert(s0, c);
+                self.widths.insert(s0, w);
+                // Shift every OTHER span past the edit; this one becomes the single typed char.
+                let delta = (s1 - s0) as isize - 1;
+                for (j, s) in self.spans.iter_mut().enumerate() {
+                    if j != i && s.start >= s1 {
+                        s.start = (s.start as isize - delta) as usize;
+                        s.end = (s.end as isize - delta) as usize;
+                    }
+                }
+                self.spans[i].end = s0 + 1;
+                self.edit_seq += 1;
+                self.cursor = s0 + 1;
+                self.goal_x = None;
+                self.rewrap();
+                self.ensure_cursor_visible();
+                return;
+            }
+        }
         let w = self.measure_char(c, text);
         self.chars.insert(self.cursor, c);
         self.widths.insert(self.cursor, w);
         self.spans_on_insert(self.cursor, 1);
+        // A valid URL char typed at a tagged link's END extends the link; an invalid one (space first of all) lands outside it, which is how a link ends.
+        if url_char {
+            let at = self.cursor;
+            if let Some(s) = self.spans.iter_mut().find(|s| s.dest.is_some() && s.end == at) {
+                s.end += 1;
+                self.text_cache_dirty = true;
+            }
+        }
         self.cursor += 1;
         self.goal_x = None;
         self.rewrap();
@@ -412,6 +484,7 @@ impl MultiTextbox {
     }
     pub fn insert_str(&mut self, s: &str, text: &mut TextRenderer) {
         self.delete_selection_internal();
+        self.relabel_pending = false;
         let at = self.cursor;
         for c in s.chars() {
             let w = self.measure_char(c, text);
@@ -481,6 +554,7 @@ impl MultiTextbox {
     pub fn clear(&mut self) {
         self.chars.clear();
         self.spans.clear();
+        self.relabel_pending = false;
         self.edit_seq += 1;
         self.cursor = 0;
         self.selection_anchor = None;
@@ -1011,12 +1085,18 @@ impl MultiTextbox {
             let buf_h = canvas.height;
             if bx >= 7 && (bx as usize) + 7 < buf_w && by_top >= 0 && by_top as usize + bh <= buf_h
             {
-                paint::draw_blinkey(
+                // Inside a tagged link the caret takes the link's colour (darkness bytes → brightness tint), so "am I still typing the link?" is answered by the caret itself.
+                let tint = match self.caret_span() {
+                    Some(s) => (255 - ((s.colour >> 16) & 0xFF) as u8, 255 - ((s.colour >> 8) & 0xFF) as u8, 255 - (s.colour & 0xFF) as u8),
+                    None => (255, 255, 255),
+                };
+                paint::draw_blinkey_tinted(
                     canvas,
                     bx as usize,
                     by_top as usize,
                     bh,
                     self.blinkey_wave_top,
+                    tint,
                 );
             }
         }

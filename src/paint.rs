@@ -1156,6 +1156,11 @@ pub const DEBUG_STRIP_H: usize = 24;
 
 
 pub fn draw_blinkey(canvas: &mut Canvas, bx: usize, by: usize, height: usize, top_bright: bool) {
+    draw_blinkey_tinted(canvas, bx, by, height, top_bright, (255, 255, 255));
+}
+
+/// The blinkey in a COLOUR: the same brightness wave, scaled per channel by `tint` (255 = the full wave, 0 = that channel stays dark). White tint = the plain blinkey; a link-purple caret is (160, 80, 255). Same bounds contract as [`draw_blinkey`].
+pub fn draw_blinkey_tinted(canvas: &mut Canvas, bx: usize, by: usize, height: usize, top_bright: bool, tint: (u8, u8, u8)) {
     let buf_w = canvas.width;
     // Damage: ±7 horizontal spread × `height` vertical band. Caller's bounds invariant (bx ≥ 7, bx < buf_w-7) guarantees this stays in-buffer.
     canvas.damage.add_bounds(bx - 7, by, bx + 8, by + height);
@@ -1173,11 +1178,12 @@ pub fn draw_blinkey(canvas: &mut Canvas, bx: usize, by: usize, height: usize, to
         for dx in -7i32..=7 {
             // The cursor is a BRIGHT wave. In the α + darkness convention (RGB bytes are darkness, `0 = white`), brightening means REDUCING darkness — a per-channel saturating subtract, NOT the add the visible-RGB original used. (Photon's buffer was visible-space, so it added; the port kept the `+=` which silently darkened the cursor into invisibility against a dark field.) α is preserved.
             let k = w >> dx.unsigned_abs();
+            let (kr, kg, kb) = (k * tint.0 as u32 / 255, k * tint.1 as u32 / 255, k * tint.2 as u32 / 255);
             let p = &mut pixels[(idx as isize + dx as isize) as usize];
             let a = *p & 0xFF00_0000;
-            let r = ((*p >> 16) & 0xFF).saturating_sub(k);
-            let g = ((*p >> 8) & 0xFF).saturating_sub(k);
-            let b = (*p & 0xFF).saturating_sub(k);
+            let r = ((*p >> 16) & 0xFF).saturating_sub(kr);
+            let g = ((*p >> 8) & 0xFF).saturating_sub(kg);
+            let b = (*p & 0xFF).saturating_sub(kb);
             *p = a | (r << 16) | (g << 8) | b;
         }
     }
