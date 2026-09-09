@@ -76,6 +76,45 @@ impl Checkbox {
         self.hovered
     }
 
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// The box is one square of `font_size × 1.3`, never the widget height: the height is the LABEL's, which may wrap to several lines (a scaled-up font on a phone), while the box stays a box.
+    pub fn box_side(&self) -> Coord {
+        (self.font_size * 1.3).min(self.height.max(self.font_size))
+    }
+
+    /// The label wrapped to the width left of the box — one entry per drawn line. Photon 2026-09-09: "Auto-attest on reboot", "Be a custodian", "Vibrate on incoming" all clipped at the pane edge under a large font because the label was one unbreakable line.
+    pub fn label_lines(&self, text: &mut TextRenderer) -> Vec<String> {
+        if self.label.is_empty() {
+            return Vec::new();
+        }
+        let style = TextStyle::new(self.font_size, theme::TEXTBOX_TEXT);
+        let max_w = (self.width - self.box_side() - self.font_size * 0.8).max(self.font_size);
+        let mut lines = Vec::new();
+        let mut cur = String::new();
+        for word in self.label.split_whitespace() {
+            let cand = if cur.is_empty() { word.to_string() } else { format!("{cur} {word}") };
+            if !cur.is_empty() && text.measure_text(&cand, &style) > max_w {
+                lines.push(core::mem::take(&mut cur));
+                cur = word.to_string();
+            } else {
+                cur = cand;
+            }
+        }
+        if !cur.is_empty() {
+            lines.push(cur);
+        }
+        lines
+    }
+
+    /// The height this widget needs at its current width and font: the box, or the wrapped label if that is taller. Callers size their band from this BEFORE the final `set_rect`.
+    pub fn needed_height(&self, text: &mut TextRenderer) -> Coord {
+        let n = self.label_lines(text).len().max(1) as Coord;
+        (self.font_size * 1.3).max(n * self.font_size * 1.25)
+    }
+
     pub fn set_label(&mut self, label: impl Into<String>) {
         self.label = label.into();
     }
@@ -137,7 +176,7 @@ impl Checkbox {
         clip: Option<Clip>,
         mut hit_map: Option<&mut [HitId]>,
     ) {
-        let side = self.height;
+        let side = self.box_side();
         let box_x0 = self.center_x - self.width * 0.5;
         let box_y0 = self.center_y - side * 0.5;
         let stroke = (self.font_size / 32.0) as isize; // no floor: the AA box silhouette carries it below 1px
@@ -205,15 +244,21 @@ impl Checkbox {
 
         // Label to the right of the box.
         if !self.label.is_empty() {
-            text.draw_text_left(
-                canvas,
-                &self.label,
-                box_x0 + side + self.font_size * 0.5,
-                self.center_y,
-                &TextStyle::new(self.font_size, theme::TEXTBOX_TEXT),
-                clip,
-                None,
-            );
+            // Wrapped label, vertically centred on the widget: one line sits on center_y exactly as before; more lines stack around it.
+            let lines = self.label_lines(text);
+            let step = self.font_size * 1.25;
+            let first_y = self.center_y - step * (lines.len().saturating_sub(1) as Coord) * 0.5;
+            for (i, line) in lines.iter().enumerate() {
+                text.draw_text_left(
+                    canvas,
+                    line,
+                    box_x0 + side + self.font_size * 0.5,
+                    first_y + step * i as Coord,
+                    &TextStyle::new(self.font_size, theme::TEXTBOX_TEXT),
+                    clip,
+                    None,
+                );
+            }
         }
 
         // Stamp the hit id over the whole widget rect (box + label) so the entire row is clickable.
