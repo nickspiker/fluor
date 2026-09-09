@@ -278,12 +278,27 @@ impl<A: FluorApp> AndroidShell<A> {
         if scale_factor <= 0.0 || !scale_factor.is_finite() {
             return;
         }
+        let ru_before = self.viewport.ru;
         let new_ru = self.viewport.ru * scale_factor;
         // Thru set_zoom, NOT with_ru: pinch was the one zoom writer skipping the production clamp (12.5%–300%), which is how a phone could pinch `ru` into oblivion while desktop Ctrl+zoom stayed bounded.
         self.viewport.set_zoom(new_ru);
         self.window.mark_dirty();
         let (w, h) = (self.viewport.width_px, self.viewport.height_px);
-        self.with_context(|app, ctx| app.on_resize(w, h, ctx));
+        // The applied ratio (post-clamp) and the anchor for `on_zoom`: the last touch point when it's on the surface — the nearest thing to the pinch focus the shell holds — else the surface centre.
+        let factor = self.viewport.ru / ru_before;
+        let (cx, cy) = (self.cursor_x, self.cursor_y);
+        let (vw, vh) = (w as Coord, h as Coord);
+        let (ax, ay) = if cx >= 0.0 && cx < vw && cy >= 0.0 && cy < vh {
+            (cx, cy)
+        } else {
+            (vw / 2.0, vh / 2.0)
+        };
+        self.with_context(|app, ctx| {
+            if factor != 1.0 {
+                app.on_zoom(factor, ax, ay, ctx);
+            }
+            app.on_resize(w, h, ctx)
+        });
     }
 
     /// Borrow the underlying app. Lets photon's JNI shim wire app-specific functionality that doesn't fit fluor's compositor surface (avatar picker, FCM peer updates).

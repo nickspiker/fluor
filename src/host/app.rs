@@ -452,6 +452,11 @@ pub trait FluorApp {
     /// The window resized. Resize internal Groups / widget bboxes to match.
     fn on_resize(&mut self, width: u32, height: u32, ctx: &mut Context);
 
+    /// The USER zoomed: `factor` = new `ru` ÷ old `ru` (>1 in, <1 out), `(anchor_x, anchor_y)` = the window-relative pass-0 pixel the zoom should hold still — the cursor while it's inside the window, else the window centre. Fires BEFORE the `on_resize` that carries the new `ru`, and ONLY for user zooms (Ctrl/Cmd chords, wheel, pinch): a restored zoom setting and a mixed-DPI raster-pass viewport swap both change `ru` without landing here, so an app can scale its scroll offsets about the anchor without a boot-time or per-pass double application. Default: nothing — an app with no scrollable content has nothing to anchor.
+    fn on_zoom(&mut self, factor: f32, anchor_x: Coord, anchor_y: Coord, ctx: &mut Context) {
+        let _ = (factor, anchor_x, anchor_y, ctx);
+    }
+
     /// The app's folded OS focus flipped (focused = any surface focused). Fires once per change — the natural durability edge for "the user looked away". Default: ignored.
     fn on_focus_changed(&mut self, focused: bool) {
         let _ = focused;
@@ -3453,13 +3458,22 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
     }
 
     fn apply_zoom_change(&mut self, steps: Option<f32>) {
+        let ru_before = self.viewport.ru;
         match steps {
             Some(s) => self.viewport.adjust_zoom(s),
             None => self.viewport.reset_zoom(),
         }
+        // The consumer's anchor: the ratio the zoom actually applied (post-clamp — a pinned ru moves nothing) and the pixel to hold still. The cursor when it's inside the window; the window centre otherwise (a Ctrl+/− chord with the pointer parked on another screen, or no pointer known yet).
+        let factor = self.viewport.ru / ru_before;
+        let (ccx, ccy) = self.win_cursor_px();
+        let (vw, vh) = (self.viewport.width_px as Coord, self.viewport.height_px as Coord);
+        let (ax, ay) = if ccx >= 0.0 && ccx < vw && ccy >= 0.0 && ccy < vh {
+            (ccx, ccy)
+        } else {
+            (vw / 2.0, vh / 2.0)
+        };
         // Zoom changes effective_span → chrome perimeter, AA edges, glyphs, shadow ray length all scale. Full repaint required.
         self.pending_full_repaint = true;
-        let (ccx, ccy) = self.win_cursor_px();
         let wo = self.ctx_window_origin();
         if let (Some(window), Some(text)) = (self.home_window(), self.text.as_mut()) {
             let mut ctx = Context {
@@ -3481,6 +3495,9 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
                     self.viewport.height_px as usize,
                 ),
             };
+            if factor != 1.0 {
+                self.app.on_zoom(factor, ax, ay, &mut ctx);
+            }
             self.app
                 .on_resize(self.viewport.width_px, self.viewport.height_px, &mut ctx);
             drop(ctx);

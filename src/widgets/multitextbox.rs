@@ -16,6 +16,15 @@ use crate::theme;
 
 use super::textbox::{blit_cache_to_target, region_to_pixelrect};
 
+/// One styled range of a [`MultiTextbox`]: `start..end` in CHAR indices, painted `colour`; `dest` = the link destination when the range is a tagged link (an app-detected bare URL carries None — its text IS the destination).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+    pub colour: u32,
+    pub dest: Option<String>,
+}
+
 pub struct MultiTextbox {
     /// Text content as a `Vec<char>` — `'\n'` lives inline (a newline is a character of the text, zero-width, terminating its visual line).
     pub chars: Vec<char>,
@@ -49,6 +58,10 @@ pub struct MultiTextbox {
     scroll_y: Coord,
     /// The pixel x the caret aims to keep across Up/Down moves (standard editor column memory). Cleared by any horizontal move or edit.
     goal_x: Option<Coord>,
+    /// STYLED RANGES over `chars` (2026-09-09, live link marks in the compose box): each span paints its char range in its own colour, and may carry a DESTINATION the app reads back at send (a phrase tagged as a link). Spans ride every edit — indices shift with insertions and deletions, a deletion overlapping a span trims it, an emptied span dies — so a tagged phrase survives typing around it.
+    spans: Vec<Span>,
+    /// Bumped by every mutation of `chars` — the app's change EDGE for re-running its detectors (never a timer, never per frame).
+    edit_seq: u64,
 
     // --- Blinkey ---
     pub blinkey_visible: bool,
@@ -93,6 +106,8 @@ impl MultiTextbox {
             line_starts: vec![0],
             scroll_y: 0.0,
             goal_x: None,
+            spans: Vec::new(),
+            edit_seq: 0,
             blinkey_visible: true,
             blinkey_wave_top: true,
             pill_cache: Vec::new(),
@@ -136,6 +151,72 @@ impl MultiTextbox {
     }
     pub fn line_count(&self) -> usize {
         self.line_starts.len()
+    }
+
+    // ---- Spans ----
+    /// Replace the styled ranges. Ranges are clamped to the text; an app-detected set that equals the current one is a no-op (no cache dirt).
+    pub fn set_spans(&mut self, spans: Vec<Span>) {
+        let n = self.chars.len();
+        let mut clean: Vec<Span> = spans.into_iter().map(|mut s| { s.start = s.start.min(n); s.end = s.end.clamp(s.start, n); s }).filter(|s| s.end > s.start).collect();
+        clean.sort_by_key(|s| s.start);
+        if clean != self.spans {
+            self.spans = clean;
+            self.text_cache_dirty = true;
+        }
+    }
+
+    pub fn spans(&self) -> &[Span] {
+        &self.spans
+    }
+
+    /// Tag a char range as a link with `dest` (the paste-onto-selection gesture): replaces any span it overlaps.
+    pub fn tag_link(&mut self, start: usize, end: usize, dest: String, colour: u32) {
+        let n = self.chars.len();
+        let (start, end) = (start.min(n), end.min(n));
+        if end <= start {
+            return;
+        }
+        self.spans.retain(|s| s.end <= start || s.start >= end);
+        self.spans.push(Span { start, end, colour, dest: Some(dest) });
+        self.spans.sort_by_key(|s| s.start);
+        self.text_cache_dirty = true;
+    }
+
+    /// The mutation counter — compare against the last value you acted on.
+    pub fn edit_seq(&self) -> u64 {
+        self.edit_seq
+    }
+
+    /// `n` chars were inserted at `at`: a span containing the point grows, one after it slides.
+    fn spans_on_insert(&mut self, at: usize, n: usize) {
+        for s in self.spans.iter_mut() {
+            if s.start >= at {
+                s.start += n;
+                s.end += n;
+            } else if s.end > at {
+                s.end += n;
+            }
+        }
+        self.edit_seq += 1;
+    }
+
+    /// `start..end` was deleted: spans after it slide back, spans overlapping it lose the overlap, emptied spans die.
+    fn spans_on_delete(&mut self, start: usize, end: usize) {
+        let n = end.saturating_sub(start);
+        if n > 0 {
+            for s in self.spans.iter_mut() {
+                if s.start >= end {
+                    s.start -= n;
+                    s.end -= n;
+                } else if s.end <= start {
+                } else {
+                    s.start = s.start.min(start);
+                    s.end = if s.end >= end { s.end - n } else { start };
+                }
+            }
+            self.spans.retain(|s| s.end > s.start);
+        }
+        self.edit_seq += 1;
     }
 
     // ---- Layout ----
@@ -323,6 +404,7 @@ impl MultiTextbox {
         let w = self.measure_char(c, text);
         self.chars.insert(self.cursor, c);
         self.widths.insert(self.cursor, w);
+        self.spans_on_insert(self.cursor, 1);
         self.cursor += 1;
         self.goal_x = None;
         self.rewrap();
@@ -330,12 +412,14 @@ impl MultiTextbox {
     }
     pub fn insert_str(&mut self, s: &str, text: &mut TextRenderer) {
         self.delete_selection_internal();
+        let at = self.cursor;
         for c in s.chars() {
             let w = self.measure_char(c, text);
             self.chars.insert(self.cursor, c);
             self.widths.insert(self.cursor, w);
             self.cursor += 1;
         }
+        self.spans_on_insert(at, self.cursor - at);
         self.goal_x = None;
         self.rewrap();
         self.ensure_cursor_visible();
@@ -347,6 +431,7 @@ impl MultiTextbox {
             self.cursor -= 1;
             self.chars.remove(self.cursor);
             self.widths.remove(self.cursor);
+            self.spans_on_delete(self.cursor, self.cursor + 1);
         }
         self.goal_x = None;
         self.rewrap();
@@ -358,6 +443,7 @@ impl MultiTextbox {
         } else if self.cursor < self.chars.len() {
             self.chars.remove(self.cursor);
             self.widths.remove(self.cursor);
+            self.spans_on_delete(self.cursor, self.cursor + 1);
         }
         self.goal_x = None;
         self.rewrap();
@@ -376,6 +462,7 @@ impl MultiTextbox {
         let end = end.clamp(start, n);
         self.chars.drain(start..end);
         self.widths.drain(start..end);
+        self.spans_on_delete(start, end);
         let mut at = start;
         for c in s.chars() {
             let w = self.measure_char(c, text);
@@ -383,6 +470,7 @@ impl MultiTextbox {
             self.widths.insert(at, w);
             at += 1;
         }
+        self.spans_on_insert(start, at - start);
         self.cursor = at;
         self.selection_anchor = None;
         self.goal_x = None;
@@ -392,6 +480,8 @@ impl MultiTextbox {
 
     pub fn clear(&mut self) {
         self.chars.clear();
+        self.spans.clear();
+        self.edit_seq += 1;
         self.cursor = 0;
         self.selection_anchor = None;
         self.goal_x = None;
@@ -427,6 +517,7 @@ impl MultiTextbox {
         if let Some((s, e)) = self.selection_range() {
             self.chars.drain(s..e);
             self.widths.drain(s..e);
+            self.spans_on_delete(s, e);
             self.cursor = s;
         }
         self.selection_anchor = None;
@@ -794,7 +885,6 @@ impl MultiTextbox {
             self.text_cache.resize(cw * ch, 0);
             self.text_cache_w = cw;
             self.text_cache_h = ch;
-            let style = TextStyle::new(self.font_size, theme::TEXTBOX_TEXT).font(self.font);
             let local_left = self.pad_x();
             let row_h = self.row_h();
             let sel = self.selection_range();
@@ -807,7 +897,8 @@ impl MultiTextbox {
 
             // Per-line draw work precomputed BEFORE the cache borrow (line text, y centre, selection rect) — the borrow of text_cache below can't coexist with &self reads.
             struct LineDraw {
-                s: String,
+                /// (text, x offset from local_left, colour) per run — a line with no span is one run in the text colour.
+                runs: Vec<(String, Coord, u32)>,
                 y_center: Coord,
                 sel: Option<(Coord, Coord)>,
             }
@@ -832,11 +923,20 @@ impl MultiTextbox {
                     let x1: Coord = x0 + self.widths[ls..le].iter().sum::<Coord>();
                     Some((x0, x1))
                 });
-                draws.push(LineDraw {
-                    s: self.chars[ds..de].iter().collect(),
-                    y_center,
-                    sel: sel_rect,
-                });
+                // Split the line at span edges: each run keeps its own colour and starts at the summed advance of everything before it.
+                let mut runs: Vec<(String, Coord, u32)> = Vec::new();
+                let mut i = ds;
+                while i < de {
+                    let span = self.spans.iter().find(|s| s.start <= i && i < s.end);
+                    let (run_end, colour) = match span {
+                        Some(s) => (s.end.min(de), s.colour),
+                        None => (self.spans.iter().filter(|s| s.start > i).map(|s| s.start).min().unwrap_or(de).min(de), theme::TEXTBOX_TEXT),
+                    };
+                    let x_off: Coord = self.widths[ds..i].iter().sum();
+                    runs.push((self.chars[i..run_end].iter().collect(), x_off, colour));
+                    i = run_end;
+                }
+                draws.push(LineDraw { runs, y_center, sel: sel_rect });
             }
 
             let mut text_damage = crate::canvas::Damage::new();
@@ -844,13 +944,17 @@ impl MultiTextbox {
                 crate::canvas::Canvas::new(&mut self.text_cache, cw, ch, &mut text_damage);
             let mask_buffer = paint::AlphaMask::new(&self.inner_pill_mask, cw, ch);
             for d in &draws {
-                if !d.s.is_empty() {
+                for (s, x_off, colour) in &d.runs {
+                    if s.is_empty() {
+                        continue;
+                    }
+                    let run_style = TextStyle::new(self.font_size, *colour).font(self.font);
                     text.draw_text_left(
                         &mut text_canvas,
-                        &d.s,
-                        local_left,
+                        s,
+                        local_left + x_off,
                         d.y_center,
-                        &style,
+                        &run_style,
                         None,
                         Some(&mask_buffer),
                     );
@@ -1106,5 +1210,47 @@ impl Key for MultiTextbox {
         } else {
             crate::host::EventResponse::Pass
         }
+    }
+}
+
+#[cfg(test)]
+mod span_tests {
+    use super::*;
+
+    fn boxed() -> MultiTextbox {
+        let mut c: HitId = 1;
+        MultiTextbox::new(&mut c, 12.0, "Oxanium")
+    }
+
+    /// Spans ride edits: an insertion before slides, inside grows, after is untouched; a deletion overlapping trims and an emptied span dies.
+    #[test]
+    fn spans_follow_insertions_and_deletions() {
+        let mut tb = boxed();
+        tb.chars = "hello world".chars().collect();
+        tb.set_spans(alloc::vec![Span { start: 6, end: 11, colour: 1, dest: Some("https://x".into()) }]);
+        tb.spans_on_insert(0, 3); // "abchello world"
+        assert_eq!((tb.spans[0].start, tb.spans[0].end), (9, 14));
+        tb.spans_on_insert(10, 2); // inside → grows
+        assert_eq!((tb.spans[0].start, tb.spans[0].end), (9, 16));
+        tb.spans_on_delete(0, 3); // before → slides back
+        assert_eq!((tb.spans[0].start, tb.spans[0].end), (6, 13));
+        tb.spans_on_delete(10, 13); // tail trimmed
+        assert_eq!((tb.spans[0].start, tb.spans[0].end), (6, 10));
+        tb.spans_on_delete(6, 10); // emptied → gone
+        assert!(tb.spans.is_empty());
+        assert_eq!(tb.edit_seq(), 5);
+    }
+
+    /// set_spans clamps to the text, drops empties, and is a no-op on equal input; tag_link replaces what it overlaps.
+    #[test]
+    fn set_and_tag_are_clamped_and_replace_overlaps() {
+        let mut tb = boxed();
+        tb.chars = "abcdef".chars().collect();
+        tb.set_spans(alloc::vec![Span { start: 4, end: 99, colour: 1, dest: None }, Span { start: 2, end: 2, colour: 1, dest: None }]);
+        assert_eq!(tb.spans().len(), 1);
+        assert_eq!((tb.spans()[0].start, tb.spans()[0].end), (4, 6));
+        tb.tag_link(3, 5, "https://y".into(), 2);
+        assert_eq!(tb.spans().len(), 1, "the tagged range replaced the overlapping span");
+        assert_eq!(tb.spans()[0].dest.as_deref(), Some("https://y"));
     }
 }

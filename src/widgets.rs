@@ -13,6 +13,6 @@ pub use blink::BlinkTimer;
 pub use button::Button;
 pub use checkbox::Checkbox;
 pub use dropdown::Dropdown;
-pub use multitextbox::MultiTextbox;
+pub use multitextbox::{MultiTextbox, Span};
 pub use slider::Slider;
 pub use textbox::Textbox;
