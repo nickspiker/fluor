@@ -935,6 +935,10 @@ pub static DEBUG_SHOW_FADE: std::sync::atomic::AtomicBool =
 pub static DEBUG_SHOW_OPAQUE_SCAN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// OPAQUE BACKDROP (Nick 2026-09-09: "on fullscreen/android, blank with no border… whatever the buffer colour is, black"). When set, finalize hands the OS an α=255 frame: the premultiplied RGB it already computed IS the colour composited over black, so every partly-transparent pixel — the background field, the AA rims, anything the app left thin — lands on black instead of whatever the compositor keeps behind the surface. Flipped by the chrome's full-edge mode (maximized / Android), where there is no desktop to see thru to. Not a debug toggle.
+pub static OPAQUE_BACKDROP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Debug toggle that suppresses chrome layer rasterization (perimeter hairline + future controls + title) so consumers can see the background / panes / textbox underneath without chrome on top. Bound to the `[]c` chord. The clip_mask is still carved at the boundary, so the window-shape trim remains visible. Stays `false` by default.
 pub static DEBUG_SKIP_CHROME: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);

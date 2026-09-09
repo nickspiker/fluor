@@ -607,3 +607,229 @@ pub fn squircle_inset(y_from_center: f32, radius: f32, squirdleyness: i32) -> f3
     );
     radius - x_norm * radius
 }
+
+/// Corner radii for [`draw_squircle_rrect`] / [`draw_squircle_rrect_two_tone`], clockwise from top-left: `[tl, tr, br, bl]` in pixels. The chrome's asymmetric split (TL+BR deep, TR+BL shallow) is `[big, small, big, small]`.
+pub type CornerRadii = [f32; 4];
+
+/// Squircle ROUNDED RECT with a radius per corner — the pill kernel's corner quadrant walk (row pass + column pass, AA on both curves) run once per corner with that corner's own crossings table, plus a per-row solid fill between the corner quadrants. Unlike the pill, the radius is the caller's, not `h/2`: a multi-line textbox keeps the corner of its one-line self instead of growing a half-height cap, and the four corners can differ (Nick 2026-09-09: "based on text height, not textbox height… asymmetric, same idea as the outer edges"). Every write composes UNDER the buffer like the pill. Radii clamp to half the box on each axis.
+pub fn draw_squircle_rrect(
+    canvas: &mut Canvas,
+    x: isize,
+    y: isize,
+    w: isize,
+    h: isize,
+    colour: u32,
+    radii: CornerRadii,
+    squirdleyness: i32,
+) {
+    let solid = (colour & 0x00FF_FFFF) | 0xFF000000;
+    let rgb = colour & 0x00FF_FFFF;
+    let curve = |r: f32| squircle_crossings(r, squirdleyness);
+    draw_squircle_rrect_kernel(canvas, x, y, w, h, radii, &curve, &|_, _| (rgb, solid), None, 0);
+}
+
+/// Fractional-exponent variant of [`draw_squircle_rrect`] (the button family's 1.75).
+pub fn draw_squircle_rrect_f(
+    canvas: &mut Canvas,
+    x: isize,
+    y: isize,
+    w: isize,
+    h: isize,
+    colour: u32,
+    radii: CornerRadii,
+    squirdleyness: f32,
+) {
+    let solid = (colour & 0x00FF_FFFF) | 0xFF000000;
+    let rgb = colour & 0x00FF_FFFF;
+    let curve = |r: f32| squircle_crossings_f(r, squirdleyness);
+    draw_squircle_rrect_kernel(canvas, x, y, w, h, radii, &curve, &|_, _| (rgb, solid), None, 0);
+}
+
+/// The house asymmetric corner set from one radius: TL+BR at `big`, TR+BL at half of it — the window perimeter's split, now on textboxes and buttons too (Nick 2026-09-09).
+pub fn asymmetric_radii(big: f32) -> CornerRadii {
+    [big, big * 0.5, big, big * 0.5]
+}
+
+/// Two-tone variant of [`draw_squircle_rrect`]: `light` on the top-left side of the box's anti-diagonal, `shadow` below it (the pill's football seam collapses to exactly this for a square, and a rounded rect with small corners reads the same way). Optional hit stamping like the pill.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_squircle_rrect_two_tone(
+    canvas: &mut Canvas,
+    x: isize,
+    y: isize,
+    w: isize,
+    h: isize,
+    light: u32,
+    shadow: u32,
+    radii: CornerRadii,
+    squirdleyness: i32,
+    hit_map: Option<&mut [HitId]>,
+    hit_id: HitId,
+) {
+    let light_solid = (light & 0x00FF_FFFF) | 0xFF000000;
+    let shadow_solid = (shadow & 0x00FF_FFFF) | 0xFF000000;
+    let light_rgb = light & 0x00FF_FFFF;
+    let shadow_rgb = shadow & 0x00FF_FFFF;
+    let (wf, hf) = (w.max(1) as f32, h.max(1) as f32);
+    let pick = move |dx: isize, dy: isize| -> (u32, u32) {
+        // Anti-diagonal seam: dx/w + dy/h ≤ 1 is the light (top-left) side.
+        if dx as f32 / wf + dy as f32 / hf <= 1.0 {
+            (light_rgb, light_solid)
+        } else {
+            (shadow_rgb, shadow_solid)
+        }
+    };
+    let curve = |r: f32| squircle_crossings(r, squirdleyness);
+    draw_squircle_rrect_kernel(canvas, x, y, w, h, radii, &curve, &pick, hit_map, hit_id);
+}
+
+/// Fractional-exponent variant of [`draw_squircle_rrect_two_tone`].
+#[allow(clippy::too_many_arguments)]
+pub fn draw_squircle_rrect_two_tone_f(
+    canvas: &mut Canvas,
+    x: isize,
+    y: isize,
+    w: isize,
+    h: isize,
+    light: u32,
+    shadow: u32,
+    radii: CornerRadii,
+    squirdleyness: f32,
+    hit_map: Option<&mut [HitId]>,
+    hit_id: HitId,
+) {
+    let light_solid = (light & 0x00FF_FFFF) | 0xFF000000;
+    let shadow_solid = (shadow & 0x00FF_FFFF) | 0xFF000000;
+    let light_rgb = light & 0x00FF_FFFF;
+    let shadow_rgb = shadow & 0x00FF_FFFF;
+    let (wf, hf) = (w.max(1) as f32, h.max(1) as f32);
+    let pick = move |dx: isize, dy: isize| -> (u32, u32) {
+        if dx as f32 / wf + dy as f32 / hf <= 1.0 {
+            (light_rgb, light_solid)
+        } else {
+            (shadow_rgb, shadow_solid)
+        }
+    };
+    let curve = |r: f32| squircle_crossings_f(r, squirdleyness);
+    draw_squircle_rrect_kernel(canvas, x, y, w, h, radii, &curve, &pick, hit_map, hit_id);
+}
+
+/// The shared rounded-rect rasterizer: `pick(dx, dy) → (rgb, solid)` chooses the colour per pixel (a constant for the plain fill, the seam for two-tone). Bounds-checked per write, so partial overhangs are safe.
+#[allow(clippy::too_many_arguments)]
+fn draw_squircle_rrect_kernel(
+    canvas: &mut Canvas,
+    x: isize,
+    y: isize,
+    w: isize,
+    h: isize,
+    radii: CornerRadii,
+    crossings_for: &dyn Fn(f32) -> alloc::vec::Vec<(u16, u8, u8)>,
+    pick: &dyn Fn(isize, isize) -> (u32, u32),
+    hit_map: Option<&mut [HitId]>,
+    hit_id: HitId,
+) {
+    let buf_w = canvas.width;
+    let buf_h = canvas.height;
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let buf_w_i = buf_w as isize;
+    let buf_h_i = buf_h as isize;
+    if x + w <= 0 || y + h <= 0 || x >= buf_w_i || y >= buf_h_i {
+        return;
+    }
+    {
+        let dx0 = x.max(0) as usize;
+        let dy0 = y.max(0) as usize;
+        let dx1 = (x + w).min(buf_w_i).max(0) as usize;
+        let dy1 = (y + h).min(buf_h_i).max(0) as usize;
+        canvas.damage.add_bounds(dx0, dy0, dx1, dy1);
+    }
+    // Each radius clamps to half the box on both axes; the corner quadrant is radius × radius at its corner.
+    let cap = ((w / 2).min(h / 2)).max(0) as f32;
+    let r: [isize; 4] = [
+        radii[0].clamp(0.0, cap) as isize,
+        radii[1].clamp(0.0, cap) as isize,
+        radii[2].clamp(0.0, cap) as isize,
+        radii[3].clamp(0.0, cap) as isize,
+    ];
+    let pixels: &mut [u32] = canvas.pixels;
+    let mut hit_map = hit_map;
+
+    // Corner quadrants: (flip_x, flip_y) → which corner; the pill kernel's walk verbatim, with this corner's radius and table.
+    for (ci, &(flip_x, flip_y)) in [(false, false), (true, false), (true, true), (false, true)].iter().enumerate() {
+        let radius = r[ci];
+        if radius <= 0 {
+            continue;
+        }
+        let crossings = crossings_for(radius as f32);
+        for (i, &(inset, _l, hh)) in crossings.iter().enumerate() {
+            if inset as usize > i {
+                break;
+            }
+            let i_iso = i as isize;
+            let inset_iso = inset as isize;
+            let h_u32 = hh as u32;
+            let v_row = if flip_y { y + h - 1 - radius + i_iso } else { y + radius - i_iso };
+            let h_col = if flip_x { x + w - 1 - radius + i_iso } else { x + radius - i_iso };
+            if v_row >= 0 && v_row < buf_h_i {
+                let row_base = v_row as usize * buf_w;
+                let v_aa_col = if flip_x { x + w - 1 - inset_iso } else { x + inset_iso };
+                if v_aa_col >= 0 && v_aa_col < buf_w_i {
+                    let (rgb, _) = pick(v_aa_col - x, v_row - y);
+                    write_aa(pixels, row_base + v_aa_col as usize, rgb, h_u32);
+                }
+                let (fx_start, fx_end) = if flip_x { (h_col, v_aa_col) } else { (v_aa_col + 1, h_col + 1) };
+                let fs = fx_start.max(0) as usize;
+                let fe = fx_end.max(0).min(buf_w_i) as usize;
+                for fx in fs..fe {
+                    let idx = row_base + fx;
+                    let (_, solid) = pick(fx as isize - x, v_row - y);
+                    pixels[idx] = pixels[idx].under(solid, BlendMode::Normal);
+                    if let Some(hm) = hit_map.as_deref_mut() {
+                        hm[idx] = hit_id;
+                    }
+                }
+            }
+            if h_col >= 0 && h_col < buf_w_i {
+                let col_us = h_col as usize;
+                let h_aa_row = if flip_y { y + h - 1 - inset_iso } else { y + inset_iso };
+                if h_aa_row >= 0 && h_aa_row < buf_h_i {
+                    let (rgb, _) = pick(h_col - x, h_aa_row - y);
+                    write_aa(pixels, h_aa_row as usize * buf_w + col_us, rgb, h_u32);
+                }
+                let (fy_start, fy_end) = if flip_y { (v_row, h_aa_row) } else { (h_aa_row + 1, v_row + 1) };
+                let fs = fy_start.max(0) as usize;
+                let fe = fy_end.max(0).min(buf_h_i) as usize;
+                for fy in fs..fe {
+                    let idx = fy * buf_w + col_us;
+                    let (_, solid) = pick(h_col - x, fy as isize - y);
+                    pixels[idx] = pixels[idx].under(solid, BlendMode::Normal);
+                    if let Some(hm) = hit_map.as_deref_mut() {
+                        hm[idx] = hit_id;
+                    }
+                }
+            }
+        }
+    }
+
+    // Everything outside the corner quadrants: per row, the solid run between the left corner's extent and the right corner's.
+    let (r_tl, r_tr, r_br, r_bl) = (r[0], r[1], r[2], r[3]);
+    let ry0 = y.max(0);
+    let ry1 = (y + h).min(buf_h_i);
+    for fy in ry0..ry1 {
+        let dy = fy - y;
+        let left = if dy < r_tl { r_tl } else if dy >= h - r_bl { r_bl } else { 0 };
+        let right = if dy < r_tr { r_tr } else if dy >= h - r_br { r_br } else { 0 };
+        let fx0 = (x + left).max(0) as usize;
+        let fx1 = (x + w - right).min(buf_w_i).max(0) as usize;
+        let row_base = fy as usize * buf_w;
+        for fx in fx0..fx1 {
+            let idx = row_base + fx;
+            let (_, solid) = pick(fx as isize - x, dy);
+            pixels[idx] = pixels[idx].under(solid, BlendMode::Normal);
+            if let Some(hm) = hit_map.as_deref_mut() {
+                hm[idx] = hit_id;
+            }
+        }
+    }
+}

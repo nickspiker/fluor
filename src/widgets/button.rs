@@ -395,13 +395,15 @@ impl Button {
                 let mut cache_canvas =
                     crate::canvas::Canvas::new(&mut self.pill_cache, cw, ch, &mut cache_damage);
                 if inner_w > 0 && inner_h > 0 {
-                    paint::draw_squircle_pill_f(
+                    // Asymmetric corners like the window perimeter: TL+BR at the pill's natural radius, TR+BL at half (Nick 2026-09-09); the inner fill's corners sit one stroke inside the edge's.
+                    paint::draw_squircle_rrect_f(
                         &mut cache_canvas,
                         inner_x,
                         inner_y,
                         inner_w,
                         inner_h,
                         pill_fill,
+                        paint::asymmetric_radii((pill_h as f32 * 0.5 - stroke_px as f32).max(1.0)),
                         squirdleyness,
                     );
                 }
@@ -415,7 +417,7 @@ impl Button {
                 let mut cache_canvas =
                     crate::canvas::Canvas::new(&mut self.pill_cache, cw, ch, &mut cache_damage);
                 // Bevel direction is INVERTED relative to Textbox: shadow on the top/left (where light would normally hit a sunken edge), light on the bottom/right. Reads visually as "raised" — the button protrudes toward the viewer — whereas a textbox with the canonical orientation reads as "inset / carved into the surface." Single argument swap, zero extra render cost, classic UI lighting convention preserved.
-                paint::draw_squircle_pill_two_tone_f(
+                paint::draw_squircle_rrect_two_tone_f(
                     &mut cache_canvas,
                     0,
                     0,
@@ -423,6 +425,7 @@ impl Button {
                     pill_h,
                     theme::TEXTBOX_SHADOW_EDGE,
                     theme::TEXTBOX_LIGHT_EDGE,
+                    paint::asymmetric_radii(pill_h as f32 * 0.5),
                     squirdleyness,
                     None,
                     0,
@@ -613,18 +616,20 @@ impl Button {
         let inner_w = (w - 2 * stroke).max(0);
         let inner_h = (h - 2 * stroke).max(0);
         if inner_w > 0 && inner_h > 0 {
-            paint::draw_squircle_pill_f(
+            // Asymmetric corners (TL+BR deep, TR+BL half) — the same split the retained Button and the window perimeter carry.
+            paint::draw_squircle_rrect_f(
                 canvas,
                 x0 + stroke,
                 y0 + stroke,
                 inner_w,
                 inner_h,
                 state_fill,
+                paint::asymmetric_radii((h as f32 * 0.5 - stroke as f32).max(1.0)),
                 1.75,
             );
         }
         // Two-tone raised edge — shadow top/left, light bottom/right (protrudes toward the viewer).
-        paint::draw_squircle_pill_two_tone_f(
+        paint::draw_squircle_rrect_two_tone_f(
             canvas,
             x0,
             y0,
@@ -632,6 +637,7 @@ impl Button {
             h,
             theme::TEXTBOX_SHADOW_EDGE,
             theme::TEXTBOX_LIGHT_EDGE,
+            paint::asymmetric_radii(h as f32 * 0.5),
             1.75,
             None,
             0,

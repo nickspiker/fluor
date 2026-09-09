@@ -907,13 +907,15 @@ impl Textbox {
                 let mut cache_canvas =
                     crate::canvas::Canvas::new(&mut self.pill_cache, cw, ch, &mut cache_damage);
                 if inner_w > 0 && inner_h > 0 {
-                    paint::draw_squircle_pill(
+                    // Asymmetric corners like the window perimeter (TL+BR at the pill's natural radius, TR+BL at half) — the same split the compose box and every button carry (Nick 2026-09-09).
+                    paint::draw_squircle_rrect(
                         &mut cache_canvas,
                         inner_x,
                         inner_y,
                         inner_w,
                         inner_h,
                         theme::TEXTBOX_FILL,
+                        paint::asymmetric_radii((pill_h as f32 * 0.5 - stroke_px as f32).max(1.0)),
                         squirdleyness,
                     );
                 }
@@ -937,7 +939,7 @@ impl Textbox {
             {
                 let mut cache_canvas =
                     crate::canvas::Canvas::new(&mut self.pill_cache, cw, ch, &mut cache_damage);
-                paint::draw_squircle_pill_two_tone(
+                paint::draw_squircle_rrect_two_tone(
                     &mut cache_canvas,
                     0,
                     0,
@@ -945,6 +947,7 @@ impl Textbox {
                     pill_h,
                     theme::TEXTBOX_LIGHT_EDGE,
                     theme::TEXTBOX_SHADOW_EDGE,
+                    paint::asymmetric_radii(pill_h as f32 * 0.5),
                     squirdleyness,
                     None,
                     0,

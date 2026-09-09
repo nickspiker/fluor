@@ -757,6 +757,8 @@ impl DefaultChrome {
             return false;
         }
         self.full_edge = full_edge;
+        // Full edge = the surface fills a screen: nothing behind it to see, so finalize composites over opaque black instead of leaving thin pixels to the compositor (Nick 2026-09-09).
+        crate::paint::OPAQUE_BACKDROP.store(full_edge, std::sync::atomic::Ordering::Relaxed);
         self.group.rpn.layers[self.layer_chrome].dirty = true;
         true
     }

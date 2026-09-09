@@ -788,6 +788,11 @@ impl MultiTextbox {
         self.cursor = e;
         self.text_cache_dirty = true;
     }
+    /// How far the internal band can scroll — zero when every line fits (the wheel then belongs to the pane behind the box).
+    pub fn max_scroll(&self) -> Coord {
+        (self.line_starts.len() as Coord * self.row_h() - self.inner_h()).max(0.0)
+    }
+
     /// Wheel/fling scroll of the internal band. Returns true when the offset moved.
     pub fn scroll_by(&mut self, dy: Coord) -> bool {
         let before = self.scroll_y;
@@ -968,6 +973,16 @@ impl MultiTextbox {
         let ch = pill_h as usize;
         let squirdleyness = 3;
         let stroke_px = (self.stroke_ru * self.font_size) as isize + 1;
+        // Corners come from the TEXT height, never the box height: a multi-line box keeps the corner its one-line self had instead of growing half-height caps. Asymmetric like the window perimeter — TL+BR deep, TR+BL half as deep (Nick 2026-09-09).
+        let r_big = (self.font_size * 0.95).min(pill_h as f32 * 0.5).min(pill_w as f32 * 0.5);
+        let r_small = r_big * 0.5;
+        let outer_radii: paint::CornerRadii = [r_big, r_small, r_big, r_small];
+        let inner_radii: paint::CornerRadii = [
+            (r_big - stroke_px as f32).max(1.0),
+            (r_small - stroke_px as f32).max(1.0),
+            (r_big - stroke_px as f32).max(1.0),
+            (r_small - stroke_px as f32).max(1.0),
+        ];
 
         if self.pill_cache_dirty {
             paint::RASTERIZE_OPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -984,13 +999,14 @@ impl MultiTextbox {
                 let mut cache_canvas =
                     crate::canvas::Canvas::new(&mut self.pill_cache, cw, ch, &mut cache_damage);
                 if inner_w > 0 && inner_h > 0 {
-                    paint::draw_squircle_pill(
+                    paint::draw_squircle_rrect(
                         &mut cache_canvas,
                         inner_x,
                         inner_y,
                         inner_w,
                         inner_h,
                         theme::TEXTBOX_FILL,
+                        inner_radii,
                         squirdleyness,
                     );
                 }
@@ -1011,7 +1027,7 @@ impl MultiTextbox {
             {
                 let mut cache_canvas =
                     crate::canvas::Canvas::new(&mut self.pill_cache, cw, ch, &mut cache_damage);
-                paint::draw_squircle_pill_two_tone(
+                paint::draw_squircle_rrect_two_tone(
                     &mut cache_canvas,
                     0,
                     0,
@@ -1019,6 +1035,7 @@ impl MultiTextbox {
                     pill_h,
                     theme::TEXTBOX_LIGHT_EDGE,
                     theme::TEXTBOX_SHADOW_EDGE,
+                    outer_radii,
                     squirdleyness,
                     None,
                     0,

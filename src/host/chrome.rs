@@ -336,13 +336,54 @@ pub fn draw_title_text(
     if left_margin >= clip_x_end {
         return;
     }
-    let font_size = button_size as Coord * 0.825; // 1.5× the former 0.55·button_size.
-    // Clip band centred on the title's row. Widened to 0.6·button_size (from 0.5) so the 1.5×-larger glyphs clear the band — the controls strip is 2·button_size tall now, so there's ample room.
-    let half_band = button_size as Coord * 0.6;
+    let mut font_size = button_size as Coord * 0.825; // 1.5× the former 0.55·button_size.
+    // MULTI-LINE TITLES (2026-09-09): a title honours its own line returns (a contact's chosen name may carry one on purpose) and word-wraps at the band width; the lines stack CENTRED on `y_center` — the orb's row — so the orb sits between the lines rather than beside the first. More than one line shrinks the face so the block stays inside the 2·button_size strip.
+    let avail_w = (clip_x_end - left_margin) as Coord;
+    let wrap = |text_renderer: &mut TextRenderer, size: Coord| -> alloc::vec::Vec<alloc::string::String> {
+        let style = TextStyle::new(size, colour);
+        let space_w = text_renderer.measure_text(" ", &style);
+        let mut lines: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        for seg in title.split('\n') {
+            let mut cur = alloc::string::String::new();
+            let mut cur_w = 0.0;
+            for word in seg.split(' ') {
+                let ww = text_renderer.measure_text(word, &style);
+                if cur.is_empty() {
+                    cur.push_str(word);
+                    cur_w = ww;
+                } else if cur_w + space_w + ww <= avail_w {
+                    cur.push(' ');
+                    cur.push_str(word);
+                    cur_w += space_w + ww;
+                } else {
+                    lines.push(core::mem::take(&mut cur));
+                    cur.push_str(word);
+                    cur_w = ww;
+                }
+            }
+            lines.push(cur);
+        }
+        lines
+    };
+    let mut lines = wrap(text_renderer, font_size);
+    if lines.len() > 1 {
+        // Fit n lines into the strip: line step 1.15·font, block ≤ 1.8·button_size.
+        let fit = button_size as Coord * 1.8 / (lines.len() as Coord * 1.15);
+        if fit < font_size {
+            font_size = fit.max(button_size as Coord * 0.35);
+            lines = wrap(text_renderer, font_size);
+        }
+    }
+    let n = lines.len().max(1);
+    let step = font_size * 1.15;
+    let half_band = button_size as Coord;
     let clip_y0 = (y_center - half_band).max(0.0) as usize;
     let clip_y1 = (y_center + half_band) as usize;
     let clip = Clip::new(left_margin, clip_y0, clip_x_end, clip_y1);
-    text_renderer.draw_text_left(canvas, title, left_margin as f32, y_center, &TextStyle::new(font_size, colour), Some(clip), None);
+    for (k, line) in lines.iter().enumerate() {
+        let ly = y_center - (n as Coord - 1.0) * 0.5 * step + k as Coord * step;
+        text_renderer.draw_text_left(canvas, line, left_margin as f32, ly, &TextStyle::new(font_size, colour), Some(clip), None);
+    }
 }
 
 /// Rasterize the bottom status band: a thin strip at `height − band_h .. height` filled with `bg`, topped by a 1-px `hairline_colour` divider where the band meets the pane content. Optional left-aligned `text` paints in `text_colour` (Open Sans, font size = `band_h × 0.55`). The band is short — `band_h` is typically `button_size / 2` — so it reads as a secondary surface, distinct from the top controls strip.

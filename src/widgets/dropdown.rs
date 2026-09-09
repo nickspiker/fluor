@@ -506,16 +506,19 @@ impl Dropdown {
         }
 
         // Popup pill: opaque fill + two-tone edge, drawn LAST so text/marker won the pixels they need and the fill claims the rest.
-        paint::draw_squircle_pill_f(
+        // Popup corners come from the ROW height (text-sized, like the compose box), asymmetric like the window perimeter — a tall list never grows half-height caps.
+        let popup_r = (row_h * 0.5) as f32;
+        paint::draw_squircle_rrect_f(
             canvas,
             x + stroke_px,
             y + stroke_px,
             (w - 2 * stroke_px).max(0),
             (h - 2 * stroke_px).max(0),
             theme::TEXTBOX_FILL,
+            paint::asymmetric_radii((popup_r - stroke_px as f32).max(1.0)),
             squirdleyness,
         );
-        paint::draw_squircle_pill_two_tone_f(
+        paint::draw_squircle_rrect_two_tone_f(
             canvas,
             x,
             y,
@@ -523,6 +526,7 @@ impl Dropdown {
             h,
             theme::TEXTBOX_LIGHT_EDGE,
             theme::TEXTBOX_SHADOW_EDGE,
+            paint::asymmetric_radii(popup_r),
             squirdleyness,
             None,
             0,
@@ -573,13 +577,15 @@ impl Dropdown {
                 let inner_w = (pill_w - 2 * stroke_px).max(0);
                 let inner_h = (pill_h - 2 * stroke_px).max(0);
                 if inner_w > 0 && inner_h > 0 {
-                    paint::draw_squircle_pill_f(
+                    // Asymmetric corners (TL+BR deep, TR+BL half) — the button family's split.
+                    paint::draw_squircle_rrect_f(
                         &mut cache_canvas,
                         stroke_px,
                         stroke_px,
                         inner_w,
                         inner_h,
                         theme::BUTTON_FILL,
+                        paint::asymmetric_radii((pill_h as f32 * 0.5 - stroke_px as f32).max(1.0)),
                         squirdleyness,
                     );
                 }
@@ -592,7 +598,7 @@ impl Dropdown {
             {
                 let mut cache_canvas =
                     crate::canvas::Canvas::new(&mut self.pill_cache, cw, ch, &mut cache_damage);
-                paint::draw_squircle_pill_two_tone_f(
+                paint::draw_squircle_rrect_two_tone_f(
                     &mut cache_canvas,
                     0,
                     0,
@@ -600,6 +606,7 @@ impl Dropdown {
                     pill_h,
                     theme::TEXTBOX_SHADOW_EDGE,
                     theme::TEXTBOX_LIGHT_EDGE,
+                    paint::asymmetric_radii(pill_h as f32 * 0.5),
                     squirdleyness,
                     None,
                     0,

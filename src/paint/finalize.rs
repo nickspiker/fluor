@@ -47,9 +47,16 @@ pub fn finalize_for_os(pixels: &mut [u32], clip_mask: &[u8]) {
     // Chunk size of 4096 pixels (16 KiB of u32). Large enough to amortize Rayon's ~1 µs task-dispatch overhead against ~10 µs of SIMD work per chunk; small enough that a typical 8-core system pulls hundreds of tasks from a 4K (8M pixel) finalize and load-balances cleanly. On non-Rayon builds, this is just a sequential walk in 4096-pixel windows.
     const CHUNK: usize = 4096;
 
+    let opaque = crate::paint::OPAQUE_BACKDROP.load(std::sync::atomic::Ordering::Relaxed);
     crate::par::par_chunks(pixels, CHUNK, |off, chunk| {
         let clip_chunk = &clip[off..off + chunk.len()];
         finalize_chunk_dispatch(chunk, clip_chunk, skip_premult);
+        if opaque {
+            // Premultiplied RGB over black with α forced solid — the backdrop is black, never the compositor's.
+            for px in chunk.iter_mut() {
+                *px |= 0xFF00_0000;
+            }
+        }
     });
 }
 
@@ -311,6 +318,7 @@ pub fn finalize_into_screen(
     }
 
     let skip_premult = DEBUG_SKIP_PREMULT.load(std::sync::atomic::Ordering::Relaxed);
+    let opaque = crate::paint::OPAQUE_BACKDROP.load(std::sync::atomic::Ordering::Relaxed);
 
     let tint_scan = DEBUG_SHOW_OPAQUE_SCAN.load(std::sync::atomic::Ordering::Relaxed);
     if full_repaint {
@@ -321,6 +329,11 @@ pub fn finalize_into_screen(
             let clip_chunk = &clip_mask[scratch_off..scratch_off + row_len];
             let dst_chunk = &mut screen_row[dst_x_min..dst_x_min + row_len];
             finalize_into_chunk_dispatch(src_chunk, clip_chunk, dst_chunk, skip_premult);
+            if opaque {
+                for px in dst_chunk.iter_mut() {
+                    *px |= 0xFF00_0000;
+                }
+            }
         });
     } else {
         crate::par::par_rows(screen, scr_w, dst_y_min, dst_y_max, |dst_y, screen_row| {
@@ -344,6 +357,11 @@ pub fn finalize_into_screen(
             let src_chunk = &src_row[l..l + len];
             let dst_chunk = &mut screen_row[dst_x_min + l..dst_x_min + l + len];
             finalize_into_chunk_dispatch(src_chunk, clip_chunk, dst_chunk, skip_premult);
+            if opaque {
+                for px in dst_chunk.iter_mut() {
+                    *px |= 0xFF00_0000;
+                }
+            }
             if tint_scan {
                 for px in dst_chunk.iter_mut() {
                     let b = ((*px & 0xFF) as u8).saturating_add(16) as u32;
