@@ -367,7 +367,8 @@ impl Button {
         let ch = pill_h as usize;
         // Fractional squirdleyness — slots between an ellipse (2) and a diamond (1). `1.5` reads as a noticeably-rounder, slightly-faceted pill: distinctly more curved than the textbox's `3.0` "slightly squared" but not as soft as a full ellipse. Routes thru paint's `_f` (powf) variant; the textbox / chrome keep the integer (powi) fast path. Adjustable per-instance via this constant; future API could expose it as a Button field if more shapes are desired.
         let squirdleyness = 1.75;
-        let stroke_px = (self.stroke_ru * self.font_size) as isize; // no floor: the AA silhouette carries the pill, so a sub-pixel ring truncating to 0 just leaves a clean filled edge
+        // The `+ 1` idiom every other widget uses (textbox.rs): a 1 px floor on the ring. Without it the ring truncates to 0 below a 32 px font, the inner fill (painted first, so on top under under-blend) covers the whole pill, and the two-tone edge vanishes — the contact-screen action pills lost their hairline while Send kept its (2026-09-10).
+        let stroke_px = (self.stroke_ru * self.font_size) as isize + 1;
 
         // Fill for THIS paint: baked-state mode folds hover/pressed/focus into the pill fill (headless hosts have no overlay pass); otherwise just the idle fill and the overlay tints on top. A state transition re-dirties the cache so only the fill re-rasterizes — stroke is unchanged.
         let pill_fill = if self.bake_states {
@@ -595,8 +596,8 @@ impl Button {
         let h = rect.h as isize;
         let x0 = px as isize;
         let y0 = rect.y as isize;
-        // Same stroke_ru default as a retained Button (1/32 of font_size), no floor: the AA silhouette carries the shape below 1px.
-        let stroke = (font_size * (1.0 / (1u32 << 5) as f32)) as isize;
+        // Same stroke_ru default as a retained Button (1/32 of font_size) with the same `+ 1` floor: below a 32 px font a floorless ring truncates to 0 and the fill hides the edge entirely (2026-09-10).
+        let stroke = (font_size * (1.0 / (1u32 << 5) as f32)) as isize + 1;
         // Disabled dims the label to the secondary grey (inert, still legible) — same fill and edges, so the pill reads "present but inert" rather than vanished. Matches a retained Button's disabled label.
         let label_colour = if enabled {
             theme::TEXTBOX_TEXT
