@@ -2345,6 +2345,10 @@ impl<A: FluorApp> DesktopShell<A> {
                 return (fill_dt, finalize_dt, shadow_dt);
             };
             let mut buffer = surface.buffer_mut().expect("softbuffer buffer_mut");
+            // A monitor layout change can resize the surface between the paint and this present (field 2026-09-10, Nick's desktop: span 2560×1569 arrived mid-frame, 4016640 vs 8290560 bytes) — the same guard the macOS branch already had. Skip this present; the resize repaints at the new size.
+            if buffer.len() != s.persistent_screen.len() {
+                return (fill_dt, finalize_dt, shadow_dt);
+            }
             buffer.copy_from_slice(&s.persistent_screen);
             if outline_active && !damage_clip.is_empty() {
                 crate::paint::stamp_damage_outline_visible(
