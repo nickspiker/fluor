@@ -54,6 +54,8 @@ pub struct AndroidShell<A: FluorApp> {
     /// Last-known good last_tick used by `tick`-style apps.
     #[allow(dead_code)]
     last_tick: Option<Instant>,
+    /// FRAME REPORT (2026-09-10, a phone at 100% CPU on an idle screen): frames, dirty frames and the summed tick / render / present time since the last report; logged once per five seconds only when dirty frames exceed thirty a second.
+    frame_stat: (Option<Instant>, u32, u32, f32, f32, f32),
 }
 
 impl<A: FluorApp> AndroidShell<A> {
@@ -82,6 +84,7 @@ impl<A: FluorApp> AndroidShell<A> {
             touch_down: false,
             touch_last_y: 0.0,
             last_tick: None,
+            frame_stat: (None, 0, 0, 0.0, 0.0, 0.0),
         };
         shell.with_context(|app, ctx| app.init(ctx));
         shell
@@ -106,6 +109,7 @@ impl<A: FluorApp> AndroidShell<A> {
         let now = Instant::now();
         self.last_tick = Some(now);
         let tick_dirty = self.with_context(|app, ctx| app.tick(ctx));
+        let t_tick = now.elapsed().as_secs_f32() * 1000.0;
         if tick_dirty {
             self.window.mark_dirty();
         }
@@ -114,6 +118,7 @@ impl<A: FluorApp> AndroidShell<A> {
         let win_h = self.viewport.height_px as usize;
         let viewport_rect = PixelRect::new(0, 0, win_w, win_h);
         let was_dirty = self.window.take_dirty();
+        let t0 = Instant::now();
 
         if was_dirty {
             let damage_clip = self
@@ -130,7 +135,9 @@ impl<A: FluorApp> AndroidShell<A> {
         }
 
         // Single-pass present: finalize scratch (α + darkness) directly into the locked ANativeWindow bits at the buffer's stride, skipping the intermediate Vec<u32>. The full viewport is passed as the finalize clip — on Android we treat every paint as a full repaint, so on cache-miss frames the locked buffer gets refreshed from scratch's current state regardless of which damage rect drove this frame.
-        self.surface.present(
+        let t_render = t0.elapsed().as_secs_f32() * 1000.0;
+        let t1 = Instant::now();
+        let out = self.surface.present(
             window,
             &self.scratch,
             &self.clip_mask,
@@ -138,7 +145,36 @@ impl<A: FluorApp> AndroidShell<A> {
             win_h,
             viewport_rect,
             was_dirty,
-        )
+        );
+        let t_present = t1.elapsed().as_secs_f32() * 1000.0;
+        // FRAME REPORT: dirty frames a second, and where the frame time goes, once per five seconds and only under a storm — an idle screen redrawing every vsync is the whole-CPU bug this names.
+        {
+            let st = &mut self.frame_stat;
+            let since = *st.0.get_or_insert(now);
+            st.1 += 1;
+            if was_dirty {
+                st.2 += 1;
+            }
+            st.3 += t_tick;
+            st.4 += t_render;
+            st.5 += t_present;
+            let secs = now.duration_since(since).as_secs_f32();
+            if secs >= 5.0 {
+                if st.2 as f32 / secs > 30.0 {
+                    let n = st.1.max(1) as f32;
+                    log::info!(
+                        "FLUOR: frame storm — {:.0} frames/s, {:.0} dirty/s; per frame tick {:.1} ms, render {:.1} ms, present {:.1} ms",
+                        st.1 as f32 / secs,
+                        st.2 as f32 / secs,
+                        st.3 / n,
+                        st.4 / n,
+                        st.5 / n
+                    );
+                }
+                *st = (Some(now), 0, 0, 0.0, 0.0, 0.0);
+            }
+        }
+        out
     }
 
     /// Touch dispatch from `nativeOnTouch`. Translates Android action codes into one or two fluor events, dispatches each thru `app.on_event`. Tracks cursor position on CursorMoved so Context.cursor_x/y stays accurate.
