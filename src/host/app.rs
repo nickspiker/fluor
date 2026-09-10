@@ -48,6 +48,15 @@ mod x11_atomic {
             .as_ref()
     }
 
+    /// The pointer's ROOT-screen position (X11 only): where the operator actually is, which the monitor list cannot tell us when the operator sits on a capture-only virtual display (a remote-desktop vmon beyond every xrandr output, 2026-09-10).
+    pub fn global_pointer() -> Option<(i32, i32)> {
+        use x11rb::protocol::xproto::ConnectionExt as _;
+        let c = conn()?;
+        let root = c.setup().roots.first()?.root;
+        let r = c.query_pointer(root).ok()?.reply().ok()?;
+        Some((r.root_x as i32, r.root_y as i32))
+    }
+
     /// Restrict the window's INPUT region to the given screen-space rectangle. Clicks outside this rect pass thru to whatever window is behind us. Used by the fullscreen-compositor architecture: our OS surface covers the whole screen but the visible window is just a sub-rect, so we tell X11 "I'm only hittable inside that sub-rect" — the rest is mouse-transparent. Call once per `window_rect` change (initial creation, drag-to-move, resize-drag, monitor change).
     ///
     /// The rect is in window-relative coordinates (= surface-local coords when the OS window is fullscreen at its monitor's origin). Negative offsets get clamped to 0 since XShape rectangles must be unsigned. A zero `w` or `h` sends an EMPTY rectangle list, which makes the window fully click-thru — X11's SET with no rectangles yields an empty input region. Returns `true` if the call was sent successfully, `false` if the window isn't X11 or the connection failed.
@@ -2470,6 +2479,23 @@ impl<A: FluorApp> DesktopShell<A> {
                 window.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
                 window.set_window_level(winit::window::WindowLevel::Normal);
                 window.focus_window();
+                // SURFACE WHERE THE OPERATOR IS (2026-09-10): a show that lands on a monitor the operator is not looking at is a show that did not happen (Nick's remote session sat on a virtual display beyond every xrandr output while the window surfaced at the physical monitor's origin). If the pointer is outside the window, move the window to the pointer: onto that monitor's work area when a known monitor holds the pointer, else a 1920×1080 window centred on the pointer.
+                #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+                if let Some((px, py)) = x11_atomic::global_pointer() {
+                    let r = self.window_rect;
+                    let inside = px >= r.x && px < r.x + r.w as i32 && py >= r.y && py < r.y + r.h as i32;
+                    if !inside {
+                        let known = self.monitors.iter().find(|m| px >= m.origin.0 && px < m.origin.0 + m.size.0 as i32 && py >= m.origin.1 && py < m.origin.1 + m.size.1 as i32).copied();
+                        let rect = match known {
+                            Some(m) if m.work_area.2 > 1 && m.work_area.3 > 1 => WindowRect { x: m.work_area.0, y: m.work_area.1, w: m.work_area.2, h: m.work_area.3 },
+                            Some(m) => WindowRect { x: m.origin.0, y: m.origin.1, w: m.size.0, h: m.size.1 },
+                            None => WindowRect { x: px - 960, y: (py - 540).max(0), w: 1920, h: 1080 },
+                        };
+                        log::info!("FLUOR: ShowWindow — pointer at ({px}, {py}) is outside the window, moving to {rect:?}");
+                        self.saved_rect_for_maximize = None;
+                        self.apply_window_rect(rect);
+                    }
+                }
                 self.pending_full_repaint = true;
                 window.request_redraw();
                 false
