@@ -179,7 +179,7 @@ impl Checkbox {
         let side = self.box_side();
         let box_x0 = self.center_x - self.width * 0.5;
         let box_y0 = self.center_y - side * 0.5;
-        let stroke = (self.font_size / 32.0) as isize; // no floor: the AA box silhouette carries it below 1px
+        let stroke = (self.font_size / 32.0) as isize + 1; // the `+ 1` floor every other widget carries (a floorless ring vanishes under the fill below a 32 px font)
 
         // Tick first (topmost) when checked, then the two-tone edge + fill so the fill claims the rest of the box.
         if self.checked {
@@ -217,19 +217,22 @@ impl Checkbox {
         } else {
             self.empty_fill.unwrap_or(theme::TEXTBOX_FILL)
         };
+        // Asymmetric corners like the textbox, button and window perimeter (Nick 2026-09-10): TL+BR at the box's deep radius, TR+BL at half — the inner fill's corners sit one stroke inside the outer ring's.
         let inner = (side as isize - 2 * stroke).max(0);
+        let big = side * 0.32;
         if inner > 0 {
-            paint::draw_squircle_pill_f(
+            paint::draw_squircle_rrect_f(
                 canvas,
                 box_x0 as isize + stroke,
                 box_y0 as isize + stroke,
                 inner,
                 inner,
                 fill,
+                paint::asymmetric_radii((big - stroke as f32).max(1.0)),
                 2.5,
             );
         }
-        paint::draw_squircle_pill_two_tone_f(
+        paint::draw_squircle_rrect_two_tone_f(
             canvas,
             box_x0 as isize,
             box_y0 as isize,
@@ -237,6 +240,7 @@ impl Checkbox {
             side as isize,
             theme::TEXTBOX_SHADOW_EDGE,
             theme::TEXTBOX_LIGHT_EDGE,
+            paint::asymmetric_radii(big),
             2.5,
             None,
             0,
