@@ -159,11 +159,13 @@ impl<A: FluorApp> AndroidShell<A> {
             st.4 += t_render;
             st.5 += t_present;
             let secs = now.duration_since(since).as_secs_f32();
-            if secs >= 5.0 {
-                if st.2 as f32 / secs > 30.0 {
+            // Every 30 s unconditionally (one line — the per-frame cost of an idle screen is exactly what a hot phone needs on record), every 5 s under a dirty storm.
+            let storm = st.2 as f32 / secs > 30.0;
+            if (secs >= 5.0 && storm) || secs >= 30.0 {
+                {
                     let n = st.1.max(1) as f32;
                     log::info!(
-                        "FLUOR: frame storm — {:.0} frames/s, {:.0} dirty/s; per frame tick {:.1} ms, render {:.1} ms, present {:.1} ms",
+                        "FLUOR: frames — {:.0} frames/s, {:.0} dirty/s; per frame tick {:.1} ms, render {:.1} ms, present {:.1} ms",
                         st.1 as f32 / secs,
                         st.2 as f32 / secs,
                         st.3 / n,
