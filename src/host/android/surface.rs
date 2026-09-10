@@ -74,6 +74,8 @@ pub struct Surface {
     content_version: u32,
     /// True once `ANativeWindow_setBuffersDataSpace(BT2020 | GAMMA2_2 | FULL)` has been called for the current `NativeWindow`. Combined with the Activity's `colorMode = WIDE_COLOR_GAMUT` + `preferMinimalPostProcessing`, this gives the consumer pipeline a display-native target: the bytes we write are taken as BT.2020 RGB and land on the panel without an sRGB clamp or vendor saturation pass. Photon does its own colour-management later on the theme constants + chromatic wave, so any OS-side clamp would be actively destructive. Reset to `false` on resize because Android may re-create the buffer queue under a new geometry and lose the dataspace setting.
     dataspace_set: bool,
+    /// Consecutive clean presents that found their buffer already current. At three, every buffer in the queue carries the content — until the next dirty frame there is nothing to lock or post (2026-09-10: an idle phone spent 1.3 ms of every vsync in lock + unlockAndPost for a frame it never changed).
+    clean_streak: u8,
 }
 
 impl Surface {
@@ -83,6 +85,7 @@ impl Surface {
             height,
             content_version: 1,
             dataspace_set: false,
+            clean_streak: 0,
         }
     }
 
@@ -96,6 +99,7 @@ impl Surface {
         if self.content_version == 0 {
             self.content_version = 1;
         }
+        self.clean_streak = 0;
         // Force re-push of the BT.2020 dataspace next frame — surfaceChanged on Android can recreate the back-buffer queue, and a fresh queue defaults back to the implicit sRGB dataspace.
         self.dataspace_set = false;
     }
@@ -119,6 +123,11 @@ impl Surface {
         damage_clip: PixelRect,
         dirty: bool,
     ) -> bool {
+        if dirty {
+            self.clean_streak = 0;
+        } else if self.clean_streak >= 3 {
+            return false; // every buffer already shows this content — no lock, no post
+        }
         unsafe {
             // One-shot per buffer-queue lifetime: declare our pixels are in BT.2020, not sRGB. Without this, the compositor treats the bytes we write as sRGB and runs them thru an sRGB→panel-native colour transform — exactly the desaturation/wash the photon pipeline is going to fight by doing its own colour management on theme + spectrum colours later. Resolved via dlsym (see [`lookup_set_buffers_data_space`]) so the binary stays loadable on pre-API-28 devices that don't ship the symbol.
             if !self.dataspace_set {
@@ -182,8 +191,10 @@ impl Surface {
                 && dst_pixels[magic_idx] == self.content_version;
 
             let wrote = if buffer_is_current {
+                self.clean_streak = self.clean_streak.saturating_add(1);
                 false
             } else {
+                self.clean_streak = 0;
                 let copy_width = dst_width.min(win_w);
                 let copy_height = dst_height.min(win_h);
                 let clip = PixelRect::new(
