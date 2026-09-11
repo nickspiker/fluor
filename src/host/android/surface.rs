@@ -190,11 +190,13 @@ impl Surface {
                 && magic_idx < stride
                 && dst_pixels[magic_idx] == self.content_version;
 
-            let wrote = if buffer_is_current {
+            // A clean present counts toward the streak whether the buffer was already current or had to be refreshed: clean frames write identical content, so three of them leave every queue buffer equal either way. This is what makes the skip reach Samsung, where the magic-pixel cache is off and every idle frame was a full finalize + post (Emma's phone, 2026-09-10: 12–27 ms of present per idle frame).
+            if !dirty {
                 self.clean_streak = self.clean_streak.saturating_add(1);
+            }
+            let wrote = if buffer_is_current {
                 false
             } else {
-                self.clean_streak = 0;
                 let copy_width = dst_width.min(win_w);
                 let copy_height = dst_height.min(win_h);
                 let clip = PixelRect::new(
