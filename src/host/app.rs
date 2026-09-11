@@ -2480,7 +2480,7 @@ impl<A: FluorApp> DesktopShell<A> {
                 window.set_window_level(winit::window::WindowLevel::Normal);
                 window.focus_window();
                 // SURFACE WHERE THE OPERATOR IS (2026-09-10): a show that lands on a monitor the operator is not looking at is a show that did not happen (Nick's remote session sat on a virtual display beyond every xrandr output while the window surfaced at the physical monitor's origin). If the pointer is outside the window, move the window to the pointer: onto that monitor's work area when a known monitor holds the pointer, else a 1920×1080 window centred on the pointer.
-                #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+                #[cfg(all(feature = "host-winit", target_os = "linux"))]
                 if let Some((px, py)) = x11_atomic::global_pointer() {
                     let r = self.window_rect;
                     let inside = px >= r.x && px < r.x + r.w as i32 && py >= r.y && py < r.y + r.h as i32;
@@ -2489,7 +2489,7 @@ impl<A: FluorApp> DesktopShell<A> {
                         let rect = match known {
                             Some(m) if m.work_area.2 > 1 && m.work_area.3 > 1 => WindowRect { x: m.work_area.0, y: m.work_area.1, w: m.work_area.2, h: m.work_area.3 },
                             Some(m) => WindowRect { x: m.origin.0, y: m.origin.1, w: m.size.0, h: m.size.1 },
-                            None => WindowRect { x: px - 960, y: (py - 540).max(0), w: 1920, h: 1080 },
+                            None => WindowRect { x: px - 960, y: (py - 540i32).max(0), w: 1920, h: 1080 },
                         };
                         log::info!("FLUOR: ShowWindow — pointer at ({px}, {py}) is outside the window, moving to {rect:?}");
                         self.saved_rect_for_maximize = None;
