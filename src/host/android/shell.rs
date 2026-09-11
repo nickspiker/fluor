@@ -49,6 +49,7 @@ pub struct AndroidShell<A: FluorApp> {
     pointer: crate::host::pointer::PointerArbiter,
     /// A finger is currently down (between ACTION_DOWN and ACTION_UP/CANCEL). Gates touch-drag → scroll: a MOVE while down emits a synthetic `MouseWheel` so the app's existing wheel handling scrolls (contacts, conversation, settings) — desktop has a wheel, touch didn't.
     touch_down: bool,
+    touch_last_x: Coord,
     /// The finger's y at the last touch event, for the per-move scroll delta.
     touch_last_y: Coord,
     /// Last-known good last_tick used by `tick`-style apps.
@@ -82,6 +83,7 @@ impl<A: FluorApp> AndroidShell<A> {
             pending_damage: Damage::new(),
             pointer: crate::host::pointer::PointerArbiter::new(),
             touch_down: false,
+            touch_last_x: 0.0,
             touch_last_y: 0.0,
             last_tick: None,
             frame_stat: (None, 0, 0, 0.0, 0.0, 0.0),
@@ -196,6 +198,7 @@ impl<A: FluorApp> AndroidShell<A> {
                     self.pointer.on_down(self.hit_under_cursor());
                     // Arm touch-drag scroll from the press position (the DOWN's CursorMoved already updated cursor_y just above).
                     self.touch_down = true;
+                    self.touch_last_x = self.cursor_x;
                     self.touch_last_y = self.cursor_y;
                 }
                 FEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
@@ -217,14 +220,17 @@ impl<A: FluorApp> AndroidShell<A> {
             }
             let _ = self.dispatch(ev);
             // Touch-drag → scroll: a MOVE while the finger is down emits a synthetic MouseWheel so the app's wheel handling scrolls (contacts / conversation / settings). Same sign convention as a trackpad flick — drag up (y decreases) yields a negative pixel delta, which the app's wheel arm turns into "reveal lower". Dispatched AFTER the CursorMoved so the arbiter's drag-off (tap cancel) is already processed. The DOWN's own CursorMoved arrives before `touch_down` is armed, so it never scrolls.
-            if let FEvent::CursorMoved { y: cy, .. } = ev {
+            if let FEvent::CursorMoved { x: cx, y: cy } = ev {
                 if self.touch_down {
                     // Natural touch: dragging the finger UP reveals what's below. The finger delta feeds the app's wheel handling; this sign matches the desktop wheel convention so ONE scroll path serves both. (Corrected here after the first real on-Android test showed touch scrolling inverted vs the mouse wheel — the prior sign was never device-verified.)
+                    // Both axes ride the synthetic wheel: vertical drives the lists as ever, and the horizontal delta is there for the consumers that pan (the fullscreen image viewer) — everyone else ignores x.
+                    let dx = *cx - self.touch_last_x;
                     let dy = *cy - self.touch_last_y;
+                    self.touch_last_x = *cx;
                     self.touch_last_y = *cy;
-                    if dy != 0.0 {
+                    if dx != 0.0 || dy != 0.0 {
                         let _ = self.dispatch(&FEvent::MouseWheel {
-                            delta: crate::event::MouseScrollDelta::Pixels(0.0, dy),
+                            delta: crate::event::MouseScrollDelta::Pixels(dx, dy),
                         });
                     }
                 }
@@ -314,6 +320,15 @@ impl<A: FluorApp> AndroidShell<A> {
     /// Pinch-to-zoom. Multiplies the viewport's `ru` by the scale factor and triggers `on_resize` so layout code re-runs against the new effective span. Matches the desktop Ctrl++/Ctrl-+ semantic.
     pub fn on_scale(&mut self, scale_factor: f32) {
         if scale_factor <= 0.0 || !scale_factor.is_finite() {
+            return;
+        }
+        // The app may own the gesture (a fullscreen viewer zooming its picture): deliver the raw factor and leave the viewport's `ru` alone — otherwise a pinch zoomed the whole UI underneath the image at the same time.
+        if self.app.owns_zoom_gesture() {
+            self.window.mark_dirty();
+            let (cx, cy) = (self.cursor_x, self.cursor_y);
+            let (vw, vh) = (self.viewport.width_px as Coord, self.viewport.height_px as Coord);
+            let (ax, ay) = if cx >= 0.0 && cx < vw && cy >= 0.0 && cy < vh { (cx, cy) } else { (vw / 2.0, vh / 2.0) };
+            self.with_context(|app, ctx| app.on_zoom(scale_factor, ax, ay, ctx));
             return;
         }
         let ru_before = self.viewport.ru;

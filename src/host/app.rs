@@ -466,6 +466,11 @@ pub trait FluorApp {
         let _ = (factor, anchor_x, anchor_y, ctx);
     }
 
+    /// Does the app claim the zoom gesture for itself right now (a fullscreen image viewer scaling its content)? When true the host leaves the viewport's `ru` untouched and still delivers `on_zoom` with the raw gesture factor — the app owns the whole transform, so a pinch or Ctrl+wheel zooms the picture and never the UI under it. Default: false — zoom changes the viewport.
+    fn owns_zoom_gesture(&self) -> bool {
+        false
+    }
+
     /// The app's folded OS focus flipped (focused = any surface focused). Fires once per change — the natural durability edge for "the user looked away". Default: ignored.
     fn on_focus_changed(&mut self, focused: bool) {
         let _ = focused;
@@ -3488,6 +3493,36 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
     }
 
     fn apply_zoom_change(&mut self, steps: Option<f32>) {
+        // The app may own the gesture (a fullscreen viewer zooming its picture): deliver the step factor raw and leave `ru` alone — otherwise Ctrl+wheel zoomed the whole UI underneath the image at the same time. A reset (steps = None, Ctrl+0) stays global: it is a viewport command, not a content gesture.
+        if steps.is_some() && self.app.owns_zoom_gesture() {
+            let factor = crate::geom::zoom_step_factor(steps.unwrap_or(0.0));
+            let (ccx, ccy) = self.win_cursor_px();
+            let (vw, vh) = (self.viewport.width_px as Coord, self.viewport.height_px as Coord);
+            let (ax, ay) = if ccx >= 0.0 && ccx < vw && ccy >= 0.0 && ccy < vh { (ccx, ccy) } else { (vw / 2.0, vh / 2.0) };
+            let wo = self.ctx_window_origin();
+            if let (Some(window), Some(text)) = (self.home_window(), self.text.as_mut()) {
+                let mut ctx = Context {
+                    pressed_hit: self.pointer.held_id(),
+                    viewport: self.viewport,
+                    text,
+                    clip_mask: &mut self.clip_mask,
+                    damage: &mut self.pending_damage,
+                    window: &*window,
+                    modifiers: winit_compat::from_winit_mods(self.modifiers),
+                    cursor_x: ax,
+                    cursor_y: ay,
+                    is_maximized: self.saved_rect_for_maximize.is_some(),
+                    window_origin: wo,
+                    damage_clip: crate::canvas::PixelRect::new(0, 0, self.viewport.width_px as usize, self.viewport.height_px as usize),
+                };
+                if factor != 1.0 {
+                    self.app.on_zoom(factor, ax, ay, &mut ctx);
+                }
+                drop(ctx);
+                window.request_redraw();
+            }
+            return;
+        }
         let ru_before = self.viewport.ru;
         match steps {
             Some(s) => self.viewport.adjust_zoom(s),
