@@ -2490,13 +2490,25 @@ impl<A: FluorApp> DesktopShell<A> {
                     let r = self.window_rect;
                     let inside = px >= r.x && px < r.x + r.w as i32 && py >= r.y && py < r.y + r.h as i32;
                     if !inside {
-                        let known = self.monitors.iter().find(|m| px >= m.origin.0 && px < m.origin.0 + m.size.0 as i32 && py >= m.origin.1 && py < m.origin.1 + m.size.1 as i32).copied();
-                        let rect = match known {
-                            Some(m) if m.work_area.2 > 1 && m.work_area.3 > 1 => WindowRect { x: m.work_area.0, y: m.work_area.1, w: m.work_area.2, h: m.work_area.3 },
-                            Some(m) => WindowRect { x: m.origin.0, y: m.origin.1, w: m.size.0, h: m.size.1 },
-                            None => WindowRect { x: px - 960, y: (py - 540i32).max(0), w: 1920, h: 1080 },
+                        // MOVE the window to the operator — never RESIZE it. The first cut set the
+                        // rect to the pointer's whole monitor work area, which is "maximize on every
+                        // reopen": locally the pointer is always on the one real monitor, so every
+                        // close→reopen blew the window up to fill the screen, and every drag/resize
+                        // back down then ran on a screen-sized rect (leviathan 2026-09-12, caught by
+                        // reading the surface: drawn=(0,0,1920,1078) right after a show). Keep the
+                        // window's own size, centre it on the pointer, and clamp it onto the pointer's
+                        // monitor when one is known. When none is (a virtual head that appeared after
+                        // startup and no RandR notice yet), leave it centred on the pointer unclamped
+                        // so it still lands on the display the operator is actually looking at.
+                        let known = self.monitors.iter().any(|m| px >= m.origin.0 && px < m.origin.0 + m.size.0 as i32 && py >= m.origin.1 && py < m.origin.1 + m.size.1 as i32);
+                        let centred = WindowRect {
+                            x: px - (r.w as i32) / 2,
+                            y: py - (r.h as i32) / 2,
+                            w: r.w,
+                            h: r.h,
                         };
-                        log::info!("FLUOR: ShowWindow — pointer at ({px}, {py}) is outside the window, moving to {rect:?}");
+                        let rect = if known { self.clamp_rect_to_monitors(centred) } else { centred };
+                        log::info!("FLUOR: ShowWindow — pointer at ({px}, {py}) is outside the window, moving {}x{} to {rect:?}", r.w, r.h);
                         self.saved_rect_for_maximize = None;
                         self.apply_window_rect(rect);
                     }
