@@ -110,6 +110,12 @@ impl<A: FluorApp> AndroidShell<A> {
     pub fn draw(&mut self, window: &NativeWindow) -> bool {
         let now = Instant::now();
         self.last_tick = Some(now);
+        // The app's one-shot zoom restore lands before the tick, so the frame that follows a settings load is already at the device's zoom (the winit host drains the same request at the top of its redraw).
+        if let Some(ru) = self.app.take_zoom_request() {
+            if ru.is_finite() && ru > 0.0 {
+                self.set_zoom_and_relayout(ru);
+            }
+        }
         let tick_dirty = self.with_context(|app, ctx| app.tick(ctx));
         let t_tick = now.elapsed().as_secs_f32() * 1000.0;
         if tick_dirty {
@@ -331,8 +337,12 @@ impl<A: FluorApp> AndroidShell<A> {
             self.with_context(|app, ctx| app.on_zoom(scale_factor, ax, ay, ctx));
             return;
         }
+        self.set_zoom_and_relayout(self.viewport.ru * scale_factor);
+    }
+
+    /// Set the viewport's `ru` to an absolute value and re-run layout — the pinch's tail, and the one-shot restore of the persisted per-device zoom (`FluorApp::take_zoom_request`, drained at the top of `draw`). Until 2026-09-13 only the winit host drained that request: Android logged "restoring device zoom" and never applied it (Brittany's Samsung, "the scale didn't remember").
+    fn set_zoom_and_relayout(&mut self, new_ru: f32) {
         let ru_before = self.viewport.ru;
-        let new_ru = self.viewport.ru * scale_factor;
         // Thru set_zoom, NOT with_ru: pinch was the one zoom writer skipping the production clamp (12.5%–300%), which is how a phone could pinch `ru` into oblivion while desktop Ctrl+zoom stayed bounded.
         self.viewport.set_zoom(new_ru);
         self.window.mark_dirty();
