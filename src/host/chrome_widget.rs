@@ -186,6 +186,13 @@ pub struct DefaultChrome {
     pub app_icon_btn: ChromeButton,
 }
 
+/// The app-icon orb's `(cx, cy, radius)` for a chrome `button_size`: diameter 9/4 of the unit (1.5× the 2026-07-17 badge, grown again 2026-09-13 — Nick: the orb itself 1.5× larger, the text beside it unchanged), centre a constant `button_size/2` in from the top-left corner so the tuck into the TL squircle survives the growth. The disk now stands 3/4 of a unit proud of the 2-unit strip; the title stays level with its centre.
+fn orb_layout(button_size: usize) -> (isize, isize, isize) {
+    let orb_radius = (button_size as isize * 9) / 8;
+    let c = orb_radius + button_size as isize / 2;
+    (c, c, orb_radius)
+}
+
 impl DefaultChrome {
     /// Allocate the chrome group + hit_test_map sized to `viewport`. Three layers (bg, chrome, hover) all start dirty so the first frame paints from scratch.
     ///
@@ -262,9 +269,7 @@ impl DefaultChrome {
         }
         let span = self.viewport.effective_span();
         let button_size = crate::math::ceil(span / 32.0) as usize;
-        let orb_radius = (button_size as isize * 3) / 4;
-        let c = orb_radius + button_size as isize / 2;
-        Some((c, c, orb_radius))
+        Some(orb_layout(button_size))
     }
 
     pub fn dims(&self) -> (usize, usize) {
@@ -401,15 +406,12 @@ impl DefaultChrome {
         // Orb slot is also reserved when `OrbTint::Custom` is active even without an icon — that's the "status badge" use case (network indicator, recording light, presence). `draw_app_icon`'s no-icon path fills the disk with `ring_colour`, so the slot reads as a coloured dot.
         let orb_present = self.app_icon.is_some()
             || matches!(self.orb_tint, chrome::OrbTint::Custom { .. });
-        // Orb diameter is 1.5× `button_size` (grown 2026-07-17 from the full-button-size badge — the brand mark earns the real estate). Centre keeps a constant button_size/2 clearance from the top-left corner, so the tuck into the TL squircle survives the growth; the title-margin math below tracks the orb's actual right edge automatically.
-        let orb_diameter = if orb_present {
-            (button_size as isize * 3) / 2
+        // Geometry lives in `orb_layout` (one source for this pass and `orb_geometry()`); the title-margin math below tracks the orb's actual right edge automatically.
+        let (orb_cx, orb_cy, orb_radius) = if orb_present {
+            orb_layout(button_size)
         } else {
-            0
+            (0, 0, 0)
         };
-        let orb_radius = orb_diameter / 2;
-        let orb_cx = orb_radius + button_size as isize / 2;
-        let orb_cy = orb_radius + button_size as isize / 2;
         // Title clears the orb's actual right edge. `draw_title_text`'s base left margin is `button_size/2`, so `left_extra` is the extra push needed to land the title just past `orb_cx + orb_radius` (plus a `button_size/4` gap). Tracks the orb wherever it sits, so moving the orb right keeps the title from sliding under it.
         let title_left_extra = if orb_present {
             ((orb_cx + orb_radius) as usize + button_size / 4).saturating_sub(button_size / 2)
