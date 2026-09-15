@@ -36,6 +36,8 @@ pub enum EventResponse {
     Minimize,
     /// Surface a hidden resident window: `set_visible(true)` + focus + full repaint. The counterpart of a `Close` that `FluorApp::on_close_requested` turned into a hide — typically returned from `on_user_event` when a second launch hands off "show yourself" to the resident instance.
     ShowWindow,
+    /// Bring an already-visible window to the front WITHOUT moving it: un-minimize, the window-level pulse that gets past X11 focus-stealing prevention, focus. `ShowWindow` minus the surface-at-the-pointer relocation — for a second-launch handoff into a window the operator has placed and wants left where it is (opsin, 2026-09-15: "window position goes out the window when I load a new image thru the socket").
+    Raise,
     /// Move the visible window to another physical monitor, cycling by the given signed delta
     /// (`+1` next, `-1` previous) over the connected displays, wrapping. The host picks the target
     /// surface, fills its work area, and runs the full `apply_window_rect` machinery (home

@@ -2535,6 +2535,18 @@ impl<A: FluorApp> DesktopShell<A> {
                 window.request_redraw();
                 false
             }
+            EventResponse::Raise => {
+                // Front + focus only; the rect is the operator's and stays put. Same restack pulse as ShowWindow (focus_window alone is denied as focus stealing on X11 WMs).
+                for s in self.surfaces.iter() {
+                    s.window.set_visible(true);
+                    s.window.set_minimized(false);
+                }
+                window.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
+                window.set_window_level(winit::window::WindowLevel::Normal);
+                window.focus_window();
+                window.request_redraw();
+                false
+            }
             EventResponse::ToggleMaximized => {
                 self.toggle_maximized();
                 false
