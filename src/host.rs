@@ -57,6 +57,10 @@ pub(crate) mod macos_hittest;
 #[cfg(all(feature = "host-winit", target_os = "macos"))]
 pub(crate) mod macos_reopen;
 
+/// macOS presentation options: cover the system menu bar for apps that fill the screen.
+#[cfg(all(feature = "host-winit", target_os = "macos"))]
+pub(crate) mod macos_presentation;
+
 /// Native menu bar (hand-rolled NSMenu on macOS; no-op elsewhere). install()/drain() are the
 /// host's hooks — build from `FluorApp::menu()`, deliver clicks as `Event::MenuItem`.
 #[cfg(feature = "host-winit")]

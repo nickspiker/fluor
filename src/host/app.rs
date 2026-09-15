@@ -434,6 +434,19 @@ pub trait FluorApp {
         ""
     }
 
+    /// Should this app's surface cover the system menu bar?
+    ///
+    /// Only meaningful on macOS, where the menu bar is drawn above ordinary windows and therefore
+    /// eats a strip off a monitor-sized surface — for a remote-desktop viewer, a strip off the
+    /// pixels it streams. Returning `true` asks AppKit to auto-hide the menu bar and Dock while the
+    /// app is active; both return on a mouse-to-edge gesture, and nothing is permanently disabled.
+    /// Other platforms already cover the screen and ignore this.
+    ///
+    /// Default `false`: an ordinary windowed app must not take the menu bar away from the user.
+    fn covers_menu_bar(&self) -> bool {
+        false
+    }
+
     /// The app's native menu-bar spec, read ONCE at window creation and built into a real OS menu
     /// (macOS `NSMenu`; other platforms ignore it for now). Choosing an [`super::menu::MenuItem::Action`]
     /// delivers its `id` back via [`crate::event::Event::MenuItem`]. Default: no menu. Keep it
@@ -1645,6 +1658,11 @@ impl<A: FluorApp> DesktopShell<A> {
         {
             use winit::platform::macos::WindowExtMacOS;
             window.set_has_shadow(false);
+            // Process-global, so the anchor surface alone applies it — a multi-monitor app must not
+            // re-assert it per surface.
+            if is_anchor && self.app.covers_menu_bar() {
+                super::macos_presentation::set_menu_bar_hidden(true);
+            }
         }
 
         // Windows: make the OS window LAYERED so UpdateLayeredWindow can present per-pixel alpha (and route clicks thru the α=0 region). winit's `with_transparent(true)` alone gives an opaque softbuffer surface on Windows — the layered style is what the fullscreen compositor needs.
