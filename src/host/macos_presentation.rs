@@ -33,28 +33,55 @@
 //! stops being frontmost (see the activity note below). An app that hides the menu bar this way
 //! should surface its own controls somewhere the OS chrome isn't — [`super::macos_dock_menu`].
 //!
-//! # Only while active — and why that needs a frame re-assert
+//! # Only while active — and why the work area must not be read from AppKit
 //!
 //! Presentation options are process-global and apply ONLY while the app is frontmost, so this is a
-//! no-op in the background and needs no teardown on focus loss. That property has a sharp edge: at
-//! window-creation time the app is typically NOT yet active, so the menu bar is still up, the
-//! screen's `visibleFrame` still excludes it, and AppKit constrains each new window to that shorter
-//! rect. Hiding the bar afterwards does not give the strip back on its own — the window stays short
-//! and the strip becomes dead space. [`super::app::DesktopShell`] therefore re-asserts each
-//! surface's full monitor rect on the activation edge; see `reassert_monitor_frames`.
+//! no-op in the background and needs no teardown on focus loss. That property has a sharp edge:
+//! `NSScreen.visibleFrame` — which is how [`super::app`] derives every monitor's work area — reports
+//! the menu bar and Dock as reserved whenever they happen to be showing, which includes the entire
+//! startup window before the app first becomes active.
+//!
+//! Reading it at the wrong instant poisons geometry permanently. Measured live: the monitor list was
+//! enumerated a few milliseconds BEFORE the surfaces, so it captured `3840x2130` (30pt reserved for
+//! a bar this very app was about to hide) while the surfaces, enumerated after, captured the true
+//! `3840x2160`. "Move window to this monitor" reads the monitor list, so the visible window came out
+//! 30pt short inside a full-size surface — a dead strip on screen, and a resolution-following viewer
+//! asking its guest for the short size.
+//!
+//! So the work area is not asked of AppKit at all once we have hidden the bar: [`menu_bar_is_hidden`]
+//! short-circuits it to the full monitor rect. That is the truth by construction — we hid the bar AND
+//! the Dock, so nothing is reserved — and it holds no matter when any caller happens to ask.
+
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use objc2_app_kit::{NSApplication, NSApplicationPresentationOptions};
 use objc2_foundation::MainThreadMarker;
+
+/// Set once we have asked AppKit to hide the menu bar and Dock. Read by the work-area derivation,
+/// which must NOT consult `visibleFrame` afterwards — see the module docs.
+static HIDDEN: AtomicBool = AtomicBool::new(false);
+
+/// Have we hidden the menu bar (and, per the pairing rule, the Dock)? When true there is no reserved
+/// strip on any screen and a monitor's work area is simply its full rect.
+pub(crate) fn menu_bar_is_hidden() -> bool {
+    HIDDEN.load(Ordering::Relaxed)
+}
 
 /// Hide (or restore) the system menu bar and Dock for this process.
 ///
 /// Fully hidden, not auto-hidden: no mouse-to-edge reveal. Both return when the app is no longer
 /// frontmost. Safe to call repeatedly with the same value. Does nothing when called off the main
 /// thread, which is where AppKit requires it.
+///
+/// Call this BEFORE enumerating monitors — the flag it sets is what keeps the work-area derivation
+/// away from a `visibleFrame` that still counts the strip we are in the act of claiming.
 pub(crate) fn set_menu_bar_hidden(hidden: bool) {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
+    // Set before the AppKit call, not after: the flag describes our INTENT, and every work-area read
+    // from here on must already agree with it — including any that races the option taking effect.
+    HIDDEN.store(hidden, Ordering::Relaxed);
     let app = NSApplication::sharedApplication(mtm);
     let options = if hidden {
         // HideMenuBar is only legal alongside HideDock — see the pairing rule above.

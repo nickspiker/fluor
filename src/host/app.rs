@@ -293,6 +293,15 @@ fn work_area_windows() -> Option<(i32, i32, u32, u32)> {
 #[cfg(all(feature = "host-winit", target_os = "macos"))]
 fn work_area_macos(origin: (i32, i32), size: (u32, u32)) -> Option<(i32, i32, u32, u32)> {
     use objc2_app_kit::NSScreen;
+    // We hid the menu bar AND the Dock, so nothing is reserved on any screen and the work area is
+    // the full monitor. `None` is how this function says exactly that — the caller falls back to the
+    // monitor rect. Short-circuited rather than measured because `visibleFrame` still reports the
+    // strip whenever the bar happens to be showing, which includes the whole of startup before the
+    // app is first active; a caller that asked in that window got its geometry poisoned for the
+    // process. See `macos_presentation`.
+    if super::macos_presentation::menu_bar_is_hidden() {
+        return None;
+    }
     let mtm = objc2::MainThreadMarker::new()?;
     let screens = NSScreen::screens(mtm);
     let primary_h = screens.iter().next()?.frame().size.height;
@@ -954,66 +963,6 @@ impl<A: FluorApp> DesktopShell<A> {
         self.surfaces.iter().position(|s| s.window.id() == id)
     }
 
-    /// Re-pin every surface to its monitor's FULL rect, undoing AppKit's constrain-to-`visibleFrame`.
-    ///
-    /// Only meaningful for an app that covers the menu bar, and only once the app is active — see
-    /// the activity note in [`super::macos_presentation`]. A surface created while the bar was still
-    /// up came out short by the bar's height and shifted down by the same amount (measured live:
-    /// a 3840×2160 panel produced a 3840×2130 window at y+30), so the strip the app just claimed
-    /// became dead space and a resolution-following viewer asked its guest for the SHORTER size.
-    ///
-    /// Self-healing rather than one-shot: the bar comes back whenever the app is not frontmost, and
-    /// AppKit may re-constrain in the meantime, so this runs on every activation edge. Surfaces that
-    /// already match are left alone, which makes the steady state a pure comparison.
-    #[cfg(target_os = "macos")]
-    fn reassert_monitor_frames(&self) {
-        for s in &self.surfaces {
-            // `size` is POINTS on macOS and the window reports PHYSICAL pixels; compare in points so
-            // the check means the same thing on a Retina panel as on a 1× one.
-            let have = s.window.inner_size();
-            let have_pts = (
-                ((have.width as f64) / s.scale).round() as u32,
-                ((have.height as f64) / s.scale).round() as u32,
-            );
-            if have_pts == s.size {
-                continue;
-            }
-            // Size FIRST, then origin: growing the window while it still sits at the constrained
-            // y would let AppKit push it down again, and the origin write is what lands it back on
-            // the monitor's true top-left.
-            let granted = s.window.request_inner_size(winit::dpi::LogicalSize::new(
-                s.size.0 as f64,
-                s.size.1 as f64,
-            ));
-            s.window
-                .set_outer_position(winit::dpi::LogicalPosition::new(
-                    s.origin.0 as f64,
-                    s.origin.1 as f64,
-                ));
-            // Report what AppKit actually GAVE us, not what we asked for. A request that comes back
-            // still short means the frame is being constrained at this moment — i.e. the menu bar is
-            // not really hidden yet — and no amount of re-asking will help; that is a different fix.
-            let after = s.window.inner_size();
-            let after_pts = (
-                ((after.width as f64) / s.scale).round() as u32,
-                ((after.height as f64) / s.scale).round() as u32,
-            );
-            log::info!(
-                "FLUOR-MON: re-assert surface {}x{} → want {}x{} at ({}, {}); sync={:?} now={}x{} {}",
-                have_pts.0,
-                have_pts.1,
-                s.size.0,
-                s.size.1,
-                s.origin.0,
-                s.origin.1,
-                granted,
-                after_pts.0,
-                after_pts.1,
-                if after_pts == s.size { "RECLAIMED" } else { "STILL CONSTRAINED" }
-            );
-        }
-    }
-
     /// Pass-0 pixels per desktop unit — `window_scale` on macOS (desktop units are points, the app rasterizes at points × scale), 1.0 everywhere else (desktop units ARE physical pixels).
     fn unit_to_px(&self) -> Coord {
         #[cfg(target_os = "macos")]
@@ -1161,13 +1110,6 @@ impl<A: FluorApp> DesktopShell<A> {
             let inv = intersect_rect(r, self.surfaces[si].rect()).is_some();
             if inv && self.surfaces[si].dormant {
                 log::info!("FLUOR-MON: surface {} WAKES (window=({},{}) {}x{} ∩ surface={:?})", si, r.0, r.1, r.2, r.3, self.surfaces[si].rect());
-                // A surface that was constrained at creation is about to start presenting at the
-                // short size — and for a resolution-following viewer, to ask its guest for that
-                // short size. Last chance to reclaim the strip before it becomes the stream's shape.
-                #[cfg(target_os = "macos")]
-                if self.app.covers_menu_bar() {
-                    self.reassert_monitor_frames();
-                }
                 self.surfaces[si].dormant = false;
                 self.surfaces[si].needs_full_blit = true;
                 // Pump several presents so the reconfigured Metal layer actually displays even on a
@@ -1736,11 +1678,6 @@ impl<A: FluorApp> DesktopShell<A> {
         {
             use winit::platform::macos::WindowExtMacOS;
             window.set_has_shadow(false);
-            // Process-global, so the anchor surface alone applies it — a multi-monitor app must not
-            // re-assert it per surface.
-            if is_anchor && self.app.covers_menu_bar() {
-                super::macos_presentation::set_menu_bar_hidden(true);
-            }
         }
 
         // Windows: make the OS window LAYERED so UpdateLayeredWindow can present per-pixel alpha (and route clicks thru the α=0 region). winit's `with_transparent(true)` alone gives an opaque softbuffer surface on Windows — the layered style is what the fullscreen compositor needs.
@@ -2968,6 +2905,15 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
         // (below) — it simply answers null until `install_dock_menu` publishes one.
         #[cfg(target_os = "macos")]
         super::macos_dock_menu::install();
+        // Claim the menu bar BEFORE anything reads a monitor's work area. Process-global, so it
+        // belongs here and not in per-surface creation — and the ordering is load-bearing, not
+        // tidiness: the monitor list is enumerated a few lines down, and if it measures
+        // `visibleFrame` while the bar is still reserved it bakes a 30pt-short work area into every
+        // later "move/maximize to this monitor". See `macos_presentation`.
+        #[cfg(target_os = "macos")]
+        if self.app.covers_menu_bar() {
+            super::macos_presentation::set_menu_bar_hidden(true);
+        }
 
         if !self.surfaces.is_empty() {
             return;
@@ -3404,16 +3350,6 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 self.surfaces[si].focused = focused;
                 let was_focused = self.is_focused;
                 self.is_focused = self.surfaces.iter().any(|s| s.focused);
-                // macOS: the menu-bar-hiding presentation options only bite while the app is ACTIVE,
-                // so at creation time the bar was still up and AppKit constrained every surface to
-                // the screen's shorter `visibleFrame`. Gaining focus is the moment the strip becomes
-                // ours; take it back. NOT gated on the folded edge below — `is_focused` starts life
-                // `true`, so the first genuine activation is not an edge and this would never run on
-                // the one launch that needs it most.
-                #[cfg(target_os = "macos")]
-                if focused && self.app.covers_menu_bar() {
-                    self.reassert_monitor_frames();
-                }
                 // The app hears the FOLDED edge only — per-surface flicker while focus hops between spans is not a focus change.
                 if self.is_focused != was_focused {
                     self.app.on_focus_changed(self.is_focused);
