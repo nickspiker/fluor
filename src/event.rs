@@ -199,6 +199,11 @@ pub enum CursorIcon {
     EwResize,
     NwseResize,
     NeswResize,
+    /// Hide the OS pointer while it is over the window. A visibility, not a shape: for an app
+    /// that draws a pointer itself — a remote-desktop viewer painting the host's own cursor
+    /// shape in place — the native arrow on top of it is exactly what must not show. Any other
+    /// icon re-shows the OS pointer.
+    Hidden,
 }
 
 impl Default for CursorIcon {

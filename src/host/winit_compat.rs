@@ -220,5 +220,7 @@ pub fn to_winit_cursor(c: CursorIcon) -> winit::window::CursorIcon {
         CursorIcon::EwResize => winit::window::CursorIcon::EwResize,
         CursorIcon::NwseResize => winit::window::CursorIcon::NwseResize,
         CursorIcon::NeswResize => winit::window::CursorIcon::NeswResize,
+        // Visibility is applied by the caller (`set_cursor_visible`); the shape underneath is moot.
+        CursorIcon::Hidden => winit::window::CursorIcon::Default,
     }
 }

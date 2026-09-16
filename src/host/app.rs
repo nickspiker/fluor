@@ -3289,7 +3289,15 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                     // Cursor coords must be window-relative — same translation as Context's cursor_x/y — so the consumer's hit_at sees the chrome at origin (0,0). Raw screen-space coords would miss every button when the window_rect isn't at (0,0).
                     let icon = self.app.cursor_for(ctx.cursor_x, ctx.cursor_y, &ctx);
                     drop(ctx);
-                    window.set_cursor(winit_compat::to_winit_cursor(icon));
+                    // `Hidden` is a visibility, not a shape: hide the OS pointer over the window
+                    // (a viewer that paints the host's cursor shape needs the native arrow gone).
+                    // Every other icon re-shows it — winit never un-hides on its own.
+                    if icon == FCursorIcon::Hidden {
+                        window.set_cursor_visible(false);
+                    } else {
+                        window.set_cursor_visible(true);
+                        window.set_cursor(winit_compat::to_winit_cursor(icon));
+                    }
                     self.apply_response(response);
                 }
             }
