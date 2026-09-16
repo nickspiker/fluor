@@ -52,6 +52,8 @@ pub struct AndroidShell<A: FluorApp> {
     touch_last_x: Coord,
     /// The finger's y at the last touch event, for the per-move scroll delta.
     touch_last_y: Coord,
+    /// Distance the finger has travelled since DOWN. Past `TOUCH_SLOP` the gesture is a SCROLL and the tap arbiter is disarmed (Nick 2026-09-16: "disable selecting anything once scroll or zoom is entered until full release") — the arbiter alone only checks that the release lands on the same element, and a list row moves WITH the finger, so a scroll used to select whatever it ended on.
+    touch_travel: Coord,
     /// Last-known good last_tick used by `tick`-style apps.
     #[allow(dead_code)]
     last_tick: Option<Instant>,
@@ -85,6 +87,7 @@ impl<A: FluorApp> AndroidShell<A> {
             touch_down: false,
             touch_last_x: 0.0,
             touch_last_y: 0.0,
+            touch_travel: 0.0,
             last_tick: None,
             frame_stat: (None, 0, 0, 0.0, 0.0, 0.0),
         };
@@ -206,6 +209,7 @@ impl<A: FluorApp> AndroidShell<A> {
                     self.touch_down = true;
                     self.touch_last_x = self.cursor_x;
                     self.touch_last_y = self.cursor_y;
+                    self.touch_travel = 0.0;
                 }
                 FEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
                     if let Some(id) = self.pointer.on_up(self.hit_under_cursor()) {
@@ -234,6 +238,12 @@ impl<A: FluorApp> AndroidShell<A> {
                     let dy = *cy - self.touch_last_y;
                     self.touch_last_x = *cx;
                     self.touch_last_y = *cy;
+                    // A drag past the slop is a scroll: the press is no longer a tap, whatever the release lands on.
+                    self.touch_travel += dx.abs() + dy.abs();
+                    if self.touch_travel > self.touch_slop() && self.pointer.held_id() != HIT_NONE {
+                        self.pointer.on_cancel();
+                        self.window.mark_dirty();
+                    }
                     if dx != 0.0 || dy != 0.0 {
                         let _ = self.dispatch(&FEvent::MouseWheel {
                             delta: crate::event::MouseScrollDelta::Pixels(dx, dy),
@@ -244,6 +254,11 @@ impl<A: FluorApp> AndroidShell<A> {
         }
         self.window.mark_dirty();
         self.poll_keyboard()
+    }
+
+    /// The scroll-vs-tap slop in pixels: a quarter of the effective span (≈ the width of a finger's wobble at any zoom), floored at 8 px.
+    fn touch_slop(&self) -> Coord {
+        (self.viewport.effective_span() * 0.25).max(8.0)
     }
 
     /// Hit id under the finger right now, from the app's [`FluorApp::hit_test_map`] at the surface-local cursor (Android's surface IS the window, so cursor coords need no origin offset). `HIT_NONE` when there is no map or the point is out of bounds. Feeds the [`crate::host::pointer::PointerArbiter`].
