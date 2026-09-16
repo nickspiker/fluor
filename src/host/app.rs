@@ -455,6 +455,17 @@ pub trait FluorApp {
         alloc::vec::Vec::new()
     }
 
+    /// The app's macOS Dock-icon menu, read ONCE at startup. Same [`super::menu::MenuItem`] spec and
+    /// the same [`crate::event::Event::MenuItem`] delivery as [`Self::menu`]; AppKit stacks these
+    /// entries above the stock Options / Show All Windows / Hide / Quit. Ignored off macOS.
+    ///
+    /// Default: empty. An app that returns true from [`Self::covers_menu_bar`] wants this — hiding
+    /// the menu bar hides that app's own menus with it, because on macOS they are the same strip —
+    /// and `self.menu()` is usually the right thing to return.
+    fn dock_menu(&self) -> alloc::vec::Vec<super::menu::MenuItem> {
+        alloc::vec::Vec::new()
+    }
+
     /// The app-identity icon for the OS window (taskbar / alt-tab / title bar). The host applies it at window creation so the OS-level icon matches the in-chrome orb — apps that hold a [`DefaultChrome`] typically return `self.chrome.app_icon.as_ref()`.
     ///
     /// **Platform reach.** This drives winit's `set_window_icon`, which only takes effect on
@@ -941,6 +952,55 @@ impl<A: FluorApp> DesktopShell<A> {
     /// Which surface owns this `WindowId` — linear scan, the vec is at most one-per-monitor small.
     fn surface_for_window(&self, id: WindowId) -> Option<usize> {
         self.surfaces.iter().position(|s| s.window.id() == id)
+    }
+
+    /// Re-pin every surface to its monitor's FULL rect, undoing AppKit's constrain-to-`visibleFrame`.
+    ///
+    /// Only meaningful for an app that covers the menu bar, and only once the app is active — see
+    /// the activity note in [`super::macos_presentation`]. A surface created while the bar was still
+    /// up came out short by the bar's height and shifted down by the same amount (measured live:
+    /// a 3840×2160 panel produced a 3840×2130 window at y+30), so the strip the app just claimed
+    /// became dead space and a resolution-following viewer asked its guest for the SHORTER size.
+    ///
+    /// Self-healing rather than one-shot: the bar comes back whenever the app is not frontmost, and
+    /// AppKit may re-constrain in the meantime, so this runs on every activation edge. Surfaces that
+    /// already match are left alone, which makes the steady state a pure comparison.
+    #[cfg(target_os = "macos")]
+    fn reassert_monitor_frames(&mut self) {
+        for s in &self.surfaces {
+            // `size` is POINTS on macOS and the window reports PHYSICAL pixels; compare in points so
+            // the check means the same thing on a Retina panel as on a 1× one.
+            let have = s.window.inner_size();
+            let have_pts = (
+                ((have.width as f64) / s.scale).round() as u32,
+                ((have.height as f64) / s.scale).round() as u32,
+            );
+            if have_pts == s.size {
+                continue;
+            }
+            log::info!(
+                "FLUOR-MON: re-asserting surface frame {}x{} → {}x{} at ({}, {}) — menu-bar strip reclaimed",
+                have_pts.0,
+                have_pts.1,
+                s.size.0,
+                s.size.1,
+                s.origin.0,
+                s.origin.1
+            );
+            // Size FIRST, then origin: growing the window while it still sits at the constrained
+            // y would let AppKit push it down again, and the origin write is what lands it back on
+            // the monitor's true top-left.
+            let _ = s
+                .window
+                .request_inner_size(winit::dpi::LogicalSize::new(
+                    s.size.0 as f64,
+                    s.size.1 as f64,
+                ));
+            s.window.set_outer_position(winit::dpi::LogicalPosition::new(
+                s.origin.0 as f64,
+                s.origin.1 as f64,
+            ));
+        }
     }
 
     /// Pass-0 pixels per desktop unit — `window_scale` on macOS (desktop units are points, the app rasterizes at points × scale), 1.0 everywhere else (desktop units ARE physical pixels).
@@ -2886,6 +2946,10 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
         // Watch app activation so a Dock click can reach the window layer at all — see macos_reopen.
         #[cfg(target_os = "macos")]
         super::macos_reopen::install();
+        // Teach the same delegate to answer applicationDockMenu:. Wired before the menu spec is read
+        // (below) — it simply answers null until `install_dock_menu` publishes one.
+        #[cfg(target_os = "macos")]
+        super::macos_dock_menu::install();
 
         if !self.surfaces.is_empty() {
             return;
@@ -2977,6 +3041,9 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
         // Build the app's native menu bar once (macOS NSMenu; no-op on other platforms). Clicks
         // come back via the queue drained in `about_to_wait` and dispatched as Event::MenuItem.
         super::macos_menu::install(&self.app.menu());
+        // And its Dock-icon menu, which is where those controls are actually reachable for an app
+        // that covers the menu bar. Same spec, same click queue.
+        super::macos_menu::install_dock_menu(&self.app.dock_menu());
 
         // Initial visible-window size: app-supplied (defaults to half the screen in each axis), clamped to the surface's work area and centred within it — the work area is already in GLOBAL desktop units, so the centering math places the window correctly even when the primary monitor isn't at (0, 0). Apps with aspect-ratio opinions override [`FluorApp::initial_size`].
         let (wa_x, wa_y, wa_w, wa_h) = self.surfaces[0].work_area;
@@ -3321,6 +3388,14 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 self.is_focused = self.surfaces.iter().any(|s| s.focused);
                 // The app hears the FOLDED edge only — per-surface flicker while focus hops between spans is not a focus change.
                 if self.is_focused != was_focused {
+                    // macOS: the menu-bar-hiding presentation options only bite while the app is
+                    // ACTIVE, so at creation time the bar was still up and AppKit constrained every
+                    // surface to the screen's shorter `visibleFrame`. THIS is the edge where the
+                    // strip becomes ours; take it back. See macos_presentation's activity note.
+                    #[cfg(target_os = "macos")]
+                    if self.is_focused && self.app.covers_menu_bar() {
+                        self.reassert_monitor_frames();
+                    }
                     self.app.on_focus_changed(self.is_focused);
                 }
                 // Cancel any in-progress resize drag if we lose focus mid-drag (the user alt-tabbed or the WM stole focus). Keeps state consistent.

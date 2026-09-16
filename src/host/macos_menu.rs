@@ -17,6 +17,9 @@ use alloc::vec::Vec;
 pub(crate) fn install(_items: &[super::menu::MenuItem]) {}
 
 #[cfg(not(target_os = "macos"))]
+pub(crate) fn install_dock_menu(_items: &[super::menu::MenuItem]) {}
+
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn drain() -> Vec<u32> {
     Vec::new()
 }
@@ -24,7 +27,7 @@ pub(crate) fn drain() -> Vec<u32> {
 // ─────────────────────────────────────────── macOS: real NSMenu ───────────────────────────────
 
 #[cfg(target_os = "macos")]
-pub(crate) use imp::{drain, install};
+pub(crate) use imp::{drain, install, install_dock_menu};
 
 #[cfg(target_os = "macos")]
 mod imp {
@@ -42,6 +45,8 @@ mod imp {
     /// The single target object every item points at — `NSMenuItem.target` is unretained, so we
     /// must keep it alive ourselves for the life of the menu (i.e., the process).
     static TARGET: Mutex<Option<Retained<Target>>> = Mutex::new(None);
+    /// Same, for the Dock menu — a separate menu tree, so a separate target to keep alive.
+    static DOCK_TARGET: Mutex<Option<Retained<Target>>> = Mutex::new(None);
 
     pub(crate) fn drain() -> Vec<u32> {
         core::mem::take(&mut *QUEUE.lock().unwrap())
@@ -134,5 +139,26 @@ mod imp {
             add(mtm, &target, &main, spec);
         }
         *TARGET.lock().unwrap() = Some(target);
+    }
+
+    /// Build the menu AppKit shows for the Dock icon, from the same [`MenuItem`] spec and routing
+    /// clicks through the same queue as the menu bar — an app with a hidden menu bar reaches its
+    /// controls here instead. Our entries appear ABOVE the stock Options / Show All Windows /
+    /// Hide / Quit items, which AppKit appends itself.
+    pub(crate) fn install_dock_menu(items: &[MenuItem]) {
+        if items.is_empty() {
+            return;
+        }
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        let target = new_target();
+        let menu = NSMenu::new(mtm);
+        for spec in items {
+            add(mtm, &target, &menu, spec);
+        }
+        *DOCK_TARGET.lock().unwrap() = Some(target);
+        // Leak it: the menu lives for the process, and a `Retained<NSMenu>` is main-thread-only so
+        // it cannot be parked in a static the way `Target` is. `set_menu` takes the +1.
+        let raw = Retained::into_raw(menu) as *mut objc2::runtime::AnyObject;
+        super::super::macos_dock_menu::set_menu(raw);
     }
 }

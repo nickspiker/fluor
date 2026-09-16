@@ -61,6 +61,10 @@ pub(crate) mod macos_reopen;
 #[cfg(all(feature = "host-winit", target_os = "macos"))]
 pub(crate) mod macos_presentation;
 
+/// macOS Dock-icon menu: where an app's controls live once it hides the menu bar.
+#[cfg(all(feature = "host-winit", target_os = "macos"))]
+pub(crate) mod macos_dock_menu;
+
 /// Native menu bar (hand-rolled NSMenu on macOS; no-op elsewhere). install()/drain() are the
 /// host's hooks — build from `FluorApp::menu()`, deliver clicks as `Event::MenuItem`.
 #[cfg(feature = "host-winit")]
