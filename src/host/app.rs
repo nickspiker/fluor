@@ -966,7 +966,7 @@ impl<A: FluorApp> DesktopShell<A> {
     /// AppKit may re-constrain in the meantime, so this runs on every activation edge. Surfaces that
     /// already match are left alone, which makes the steady state a pure comparison.
     #[cfg(target_os = "macos")]
-    fn reassert_monitor_frames(&mut self) {
+    fn reassert_monitor_frames(&self) {
         for s in &self.surfaces {
             // `size` is POINTS on macOS and the window reports PHYSICAL pixels; compare in points so
             // the check means the same thing on a Retina panel as on a 1× one.
@@ -978,28 +978,39 @@ impl<A: FluorApp> DesktopShell<A> {
             if have_pts == s.size {
                 continue;
             }
+            // Size FIRST, then origin: growing the window while it still sits at the constrained
+            // y would let AppKit push it down again, and the origin write is what lands it back on
+            // the monitor's true top-left.
+            let granted = s.window.request_inner_size(winit::dpi::LogicalSize::new(
+                s.size.0 as f64,
+                s.size.1 as f64,
+            ));
+            s.window
+                .set_outer_position(winit::dpi::LogicalPosition::new(
+                    s.origin.0 as f64,
+                    s.origin.1 as f64,
+                ));
+            // Report what AppKit actually GAVE us, not what we asked for. A request that comes back
+            // still short means the frame is being constrained at this moment — i.e. the menu bar is
+            // not really hidden yet — and no amount of re-asking will help; that is a different fix.
+            let after = s.window.inner_size();
+            let after_pts = (
+                ((after.width as f64) / s.scale).round() as u32,
+                ((after.height as f64) / s.scale).round() as u32,
+            );
             log::info!(
-                "FLUOR-MON: re-asserting surface frame {}x{} → {}x{} at ({}, {}) — menu-bar strip reclaimed",
+                "FLUOR-MON: re-assert surface {}x{} → want {}x{} at ({}, {}); sync={:?} now={}x{} {}",
                 have_pts.0,
                 have_pts.1,
                 s.size.0,
                 s.size.1,
                 s.origin.0,
-                s.origin.1
+                s.origin.1,
+                granted,
+                after_pts.0,
+                after_pts.1,
+                if after_pts == s.size { "RECLAIMED" } else { "STILL CONSTRAINED" }
             );
-            // Size FIRST, then origin: growing the window while it still sits at the constrained
-            // y would let AppKit push it down again, and the origin write is what lands it back on
-            // the monitor's true top-left.
-            let _ = s
-                .window
-                .request_inner_size(winit::dpi::LogicalSize::new(
-                    s.size.0 as f64,
-                    s.size.1 as f64,
-                ));
-            s.window.set_outer_position(winit::dpi::LogicalPosition::new(
-                s.origin.0 as f64,
-                s.origin.1 as f64,
-            ));
         }
     }
 
@@ -1150,6 +1161,13 @@ impl<A: FluorApp> DesktopShell<A> {
             let inv = intersect_rect(r, self.surfaces[si].rect()).is_some();
             if inv && self.surfaces[si].dormant {
                 log::info!("FLUOR-MON: surface {} WAKES (window=({},{}) {}x{} ∩ surface={:?})", si, r.0, r.1, r.2, r.3, self.surfaces[si].rect());
+                // A surface that was constrained at creation is about to start presenting at the
+                // short size — and for a resolution-following viewer, to ask its guest for that
+                // short size. Last chance to reclaim the strip before it becomes the stream's shape.
+                #[cfg(target_os = "macos")]
+                if self.app.covers_menu_bar() {
+                    self.reassert_monitor_frames();
+                }
                 self.surfaces[si].dormant = false;
                 self.surfaces[si].needs_full_blit = true;
                 // Pump several presents so the reconfigured Metal layer actually displays even on a
@@ -3386,16 +3404,18 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 self.surfaces[si].focused = focused;
                 let was_focused = self.is_focused;
                 self.is_focused = self.surfaces.iter().any(|s| s.focused);
+                // macOS: the menu-bar-hiding presentation options only bite while the app is ACTIVE,
+                // so at creation time the bar was still up and AppKit constrained every surface to
+                // the screen's shorter `visibleFrame`. Gaining focus is the moment the strip becomes
+                // ours; take it back. NOT gated on the folded edge below — `is_focused` starts life
+                // `true`, so the first genuine activation is not an edge and this would never run on
+                // the one launch that needs it most.
+                #[cfg(target_os = "macos")]
+                if focused && self.app.covers_menu_bar() {
+                    self.reassert_monitor_frames();
+                }
                 // The app hears the FOLDED edge only — per-surface flicker while focus hops between spans is not a focus change.
                 if self.is_focused != was_focused {
-                    // macOS: the menu-bar-hiding presentation options only bite while the app is
-                    // ACTIVE, so at creation time the bar was still up and AppKit constrained every
-                    // surface to the screen's shorter `visibleFrame`. THIS is the edge where the
-                    // strip becomes ours; take it back. See macos_presentation's activity note.
-                    #[cfg(target_os = "macos")]
-                    if self.is_focused && self.app.covers_menu_bar() {
-                        self.reassert_monitor_frames();
-                    }
                     self.app.on_focus_changed(self.is_focused);
                 }
                 // Cancel any in-progress resize drag if we lose focus mid-drag (the user alt-tabbed or the WM stole focus). Keeps state consistent.
