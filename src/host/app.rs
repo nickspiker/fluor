@@ -293,13 +293,13 @@ fn work_area_windows() -> Option<(i32, i32, u32, u32)> {
 #[cfg(all(feature = "host-winit", target_os = "macos"))]
 fn work_area_macos(origin: (i32, i32), size: (u32, u32)) -> Option<(i32, i32, u32, u32)> {
     use objc2_app_kit::NSScreen;
-    // We hid the menu bar AND the Dock, so nothing is reserved on any screen and the work area is
-    // the full monitor. `None` is how this function says exactly that — the caller falls back to the
-    // monitor rect. Short-circuited rather than measured because `visibleFrame` still reports the
+    // The menu bar and Dock auto-hide for us, so nothing is reserved on any screen and the work area
+    // is the full monitor. `None` is how this function says exactly that — the caller falls back to
+    // the monitor rect. Short-circuited rather than measured because `visibleFrame` still reports the
     // strip whenever the bar happens to be showing, which includes the whole of startup before the
     // app is first active; a caller that asked in that window got its geometry poisoned for the
     // process. See `macos_presentation`.
-    if super::macos_presentation::menu_bar_is_hidden() {
+    if super::macos_presentation::nothing_reserved() {
         return None;
     }
     let mtm = objc2::MainThreadMarker::new()?;

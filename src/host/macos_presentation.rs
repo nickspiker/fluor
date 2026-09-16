@@ -25,13 +25,15 @@
 //! | `AutoHideMenuBar` | `AutoHideDock` or `HideDock`|
 //! | `HideMenuBar`     | `HideDock` (only)           |
 //!
-//! We take `HideMenuBar | HideDock`: the bar is GONE, not auto-hidden. Auto-hide was the first cut
-//! and it is wrong for a remote viewer — the reveal gesture is "put the pointer at the top edge",
-//! which is exactly what the viewer forwards to the guest, so the bar kept flickering in over the
-//! stream when the user was reaching for the guest's own menu bar. Nothing is made unreachable:
-//! Cmd-Tab, Cmd-Q and force-quit are untouched, and both bar and Dock return the moment the app
-//! stops being frontmost (see the activity note below). An app that hides the menu bar this way
-//! should surface its own controls somewhere the OS chrome isn't — [`super::macos_dock_menu`].
+//! That asymmetry decides this for us. `HideMenuBar` was tried and it FORCES `HideDock` — there is
+//! no combination that removes the bar outright and leaves the Dock reachable. The result was an app
+//! with no menu bar, no Dock, and therefore no way to reach its own controls without Cmd-Tabbing off
+//! it first. Removing both pieces of chrome is only viable for an app that draws its own.
+//!
+//! So: `AutoHideMenuBar | AutoHideDock`. Both slide away, both come back on a pointer-to-edge
+//! gesture, and the app's menus stay reachable in the bar where a macOS user expects them. The cost
+//! is that a remote viewer forwards that same top-edge gesture to its guest, so reaching for the
+//! guest's own menu bar can pull ours in over the stream — an annoyance, against no access at all.
 //!
 //! # Only while active — and why the work area must not be read from AppKit
 //!
@@ -48,30 +50,33 @@
 //! 30pt short inside a full-size surface — a dead strip on screen, and a resolution-following viewer
 //! asking its guest for the short size.
 //!
-//! So the work area is not asked of AppKit at all once we have hidden the bar: [`menu_bar_is_hidden`]
-//! short-circuits it to the full monitor rect. That is the truth by construction — we hid the bar AND
-//! the Dock, so nothing is reserved — and it holds no matter when any caller happens to ask.
+//! So the work area is not asked of AppKit at all once we have taken the chrome out of the reserved
+//! area: [`nothing_reserved`] short-circuits it to the full monitor rect. That is the truth by
+//! construction — an auto-hiding bar and Dock reserve nothing, which is the whole point of asking —
+//! and it holds no matter when any caller happens to ask.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use objc2_app_kit::{NSApplication, NSApplicationPresentationOptions};
 use objc2_foundation::MainThreadMarker;
 
-/// Set once we have asked AppKit to hide the menu bar and Dock. Read by the work-area derivation,
-/// which must NOT consult `visibleFrame` afterwards — see the module docs.
-static HIDDEN: AtomicBool = AtomicBool::new(false);
+/// Set once we have asked AppKit to auto-hide the menu bar and Dock. Read by the work-area
+/// derivation, which must NOT consult `visibleFrame` afterwards — see the module docs.
+static UNRESERVED: AtomicBool = AtomicBool::new(false);
 
-/// Have we hidden the menu bar (and, per the pairing rule, the Dock)? When true there is no reserved
-/// strip on any screen and a monitor's work area is simply its full rect.
-pub(crate) fn menu_bar_is_hidden() -> bool {
-    HIDDEN.load(Ordering::Relaxed)
+/// Have we taken the menu bar and Dock out of the screen's reserved area? When true, no screen
+/// reserves a strip and a monitor's work area is simply its full rect.
+pub(crate) fn nothing_reserved() -> bool {
+    UNRESERVED.load(Ordering::Relaxed)
 }
 
 /// Hide (or restore) the system menu bar and Dock for this process.
 ///
-/// Fully hidden, not auto-hidden: no mouse-to-edge reveal. Both return when the app is no longer
-/// frontmost. Safe to call repeatedly with the same value. Does nothing when called off the main
-/// thread, which is where AppKit requires it.
+/// Auto-hide (or restore) the system menu bar and Dock for this process.
+///
+/// Both slide away and both come back on a pointer-to-edge gesture, so the app's own menus stay
+/// reachable in the bar. Safe to call repeatedly with the same value. Does nothing when called off
+/// the main thread, which is where AppKit requires it.
 ///
 /// Call this BEFORE enumerating monitors — the flag it sets is what keeps the work-area derivation
 /// away from a `visibleFrame` that still counts the strip we are in the act of claiming.
@@ -81,11 +86,12 @@ pub(crate) fn set_menu_bar_hidden(hidden: bool) {
     };
     // Set before the AppKit call, not after: the flag describes our INTENT, and every work-area read
     // from here on must already agree with it — including any that races the option taking effect.
-    HIDDEN.store(hidden, Ordering::Relaxed);
+    UNRESERVED.store(hidden, Ordering::Relaxed);
     let app = NSApplication::sharedApplication(mtm);
     let options = if hidden {
-        // HideMenuBar is only legal alongside HideDock — see the pairing rule above.
-        NSApplicationPresentationOptions::HideMenuBar | NSApplicationPresentationOptions::HideDock
+        // AutoHideMenuBar is only legal alongside a Dock option — see the pairing rule above.
+        NSApplicationPresentationOptions::AutoHideMenuBar
+            | NSApplicationPresentationOptions::AutoHideDock
     } else {
         NSApplicationPresentationOptions::Default
     };
