@@ -412,6 +412,13 @@ impl DefaultChrome {
         // clip_mask is owned + carved by `rasterize_perimeter` (runs before content, every frame). This pass only READS it (button hit-scan walls below, silhouette restriction post-pass). hit_test_map is still owned here — wiped on each dirty cycle before re-stamping the buttons.
         self.hit_test_map.fill(HIT_NONE);
 
+        // Compute span + button size shared by controls and squircle. Use the viewport's `effective_span` (= `span * ru`) so chrome scales with the user's zoom — Ctrl+/Ctrl-/Ctrl+scroll zoom the chrome together with content.
+        let span = self.viewport.effective_span();
+        // Span-relative: button height is span/32, where span is the harmonic mean of viewport dims times zoom. Strip layout bails downstream if the result is too small to render glyphs.
+        let button_size = crate::math::ceil(span / 32.0) as usize;
+        // The orb inset is read HERE, before the chrome buffer is borrowed: `orb_inset` borrows all of self and the buffer borrow stays live to the end of the pass (E0502 on every target at a4a3090). All three are pure reads, so taking them ahead of the size guard below changes nothing.
+        let orb_inset = self.orb_inset(button_size);
+
         let chrome_buf = &mut self.group.rpn.layers[self.layer_chrome].pixels;
         // α + darkness: transparent init (α=0, dark=0) so the bg shows thru everywhere except the hairline + AA pixels.
         chrome_buf.fill(0);
@@ -420,10 +427,6 @@ impl DefaultChrome {
             return;
         }
 
-        // Compute span + button size shared by controls and squircle. Use the viewport's `effective_span` (= `span * ru`) so chrome scales with the user's zoom — Ctrl+/Ctrl-/Ctrl+scroll zoom the chrome together with content.
-        let span = self.viewport.effective_span();
-        // Span-relative: button height is span/32, where span is the harmonic mean of viewport dims times zoom. Strip layout bails downstream if the result is too small to render glyphs.
-        let button_size = crate::math::ceil(span / 32.0) as usize;
 
         // Controls unit. The close/min/max strip and its buttons are 2× the base button size — a taller strip with bigger glyphs — while the orb and title keep the base size. There's no BL swoop any more: the strip bottom is a straight hairline. The orb/title y-centre is `button_size`, which is exactly `ctl/2`, so they land vertically centred in the taller strip with no position change.
         // ctl ≥ 2 always: button_size = ceil(span/32) ≥ 1 for any live viewport (the vp_w/vp_h < 2 bail above already excluded degenerate surfaces).
@@ -440,7 +443,7 @@ impl DefaultChrome {
             || matches!(self.orb_tint, chrome::OrbTint::Custom { .. });
         // Geometry lives in `orb_layout` (one source for this pass and `orb_geometry()`); the title-margin math below tracks the orb's actual right edge automatically.
         let (orb_cx, orb_cy, orb_radius) = if orb_present {
-            orb_layout(button_size, self.orb_inset(button_size))
+            orb_layout(button_size, orb_inset)
         } else {
             (0, 0, 0)
         };
