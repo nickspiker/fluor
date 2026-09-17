@@ -170,6 +170,8 @@ pub struct DefaultChrome {
     pub orb_tint: chrome::OrbTint,
     /// Currently-hovered button id (HIT_NONE if none). Consumed by the host's overlay pass to derive the visible-RGB tint delta to apply at matching `hit_test_map` pixels in persistent_screen.
     pub hover_state: HitId,
+    /// DEVICE-GLASS CORNERS (photon on Android, Nick 2026-09-16): the physical display's corner radius in pixels, when the platform reports one. Set, it overrides the span-derived squircle sizes — the small (TR/BL) corners take the glass radius, the big (TL/BR) diagonal takes TWICE it, the same 2:1 the desktop window wears — and the perimeter draws EVEN in full-edge mode so the hairline can be lined up against the glass by eye. None = the desktop rule (span/4, span/2, no perimeter when full-edge).
+    pub glass_radius_px: Option<Coord>,
     /// "Full edge" / maximized mode. When `true`, [`Self::rasterize_chrome`] skips [`chrome::draw_window_edges_and_mask`] entirely: no perimeter hairline, no corner cutout in `clip_mask`, no AA fringe — the chrome flows straight to the four screen edges. The OS surface is fullscreen anyway, the WM can't show a shadow against the screen border, and AA on a corner that's flush with the screen is wasted work. Buttons / title / app icon still rasterize as usual. Toggle via [`Self::set_full_edge`]; sync from [`super::app::Context::is_maximized`].
     pub full_edge: bool,
     /// Last viewport passed to `new` or `resize`. Stored so chrome rasterization can read `effective_span` (= `span * ru`) and pick up the user's zoom multiplier automatically — chrome control sizing scales with the same `ceil(effective_span/32)` formula, so Ctrl+/ Ctrl-/ Ctrl+scroll zoom the chrome together with content.
@@ -235,6 +237,7 @@ impl DefaultChrome {
             orb_pressed: false,
             hover_state: HIT_NONE,
             full_edge: false,
+            glass_radius_px: None,
             viewport,
             layer_bg,
             layer_chrome,
@@ -318,17 +321,23 @@ impl DefaultChrome {
         if vp_w < 2 || vp_h < 2 || target_w != buf_w || target_h != buf_h {
             return;
         }
-        if self.full_edge || crate::paint::DEBUG_SKIP_CHROME.load(std::sync::atomic::Ordering::Relaxed) {
+        if (self.full_edge && self.glass_radius_px.is_none()) || crate::paint::DEBUG_SKIP_CHROME.load(std::sync::atomic::Ordering::Relaxed) {
             return; // rectangular window: no perimeter hairline, no corner cutout
         }
 
-        // Geometry shared with `rasterize_chrome` (recomputed here so the perimeter is self-contained per frame). `effective_span` folds in the user's zoom so the corners scale with Ctrl+/Ctrl-/Ctrl+scroll.
-        let span = self.viewport.effective_span();
-        let (start, crossings) = compute_squircle_crossings(span / 4.0, 24);
+        // Geometry shared with `rasterize_chrome` (recomputed here so the perimeter is self-contained per frame). `effective_span` folds in the user's zoom so the corners scale with Ctrl+/Ctrl-/Ctrl+scroll — unless the device glass sets the radius, which zoom must not touch.
+        let (r_small, r_big) = match self.glass_radius_px {
+            Some(g) if g > 0.0 => (g, g * 2.0),
+            _ => {
+                let span = self.viewport.effective_span();
+                (span / 4.0, span / 2.0)
+            }
+        };
+        let (start, crossings) = compute_squircle_crossings(r_small, 24);
         if crossings.is_empty() {
             return;
         }
-        let (start_big, crossings_big) = compute_squircle_crossings(span / 2.0, 24);
+        let (start_big, crossings_big) = compute_squircle_crossings(r_big, 24);
 
         // Same focus-driven bevel palette as `rasterize_chrome` — top/left light, bottom/right shadow, dimmed when unfocused.
         let (edge_light, edge_shadow) = if self.focused {
@@ -754,6 +763,16 @@ impl DefaultChrome {
     }
 
     /// Toggle full-edge / maximized rendering. Returns `true` iff the value changed. App calls this from `on_resize` (or right after [`super::app::EventResponse::ToggleMaximized`] takes effect) — read [`super::app::Context::is_maximized`] for the host's source-of-truth state. Marks the chrome layer dirty so the next paint either drops or restores the perimeter hairline.
+    /// Install (or clear) the device-glass corner radius — see [`Self::glass_radius_px`]. Returns whether it changed (the caller marks the frame dirty).
+    pub fn set_glass_radius(&mut self, radius_px: Option<Coord>) -> bool {
+        if self.glass_radius_px == radius_px {
+            return false;
+        }
+        self.glass_radius_px = radius_px;
+        self.group.rpn.layers[self.layer_chrome].dirty = true;
+        true
+    }
+
     pub fn set_full_edge(&mut self, full_edge: bool) -> bool {
         if full_edge == self.full_edge {
             return false;
