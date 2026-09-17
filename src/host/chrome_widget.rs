@@ -883,11 +883,11 @@ impl Container for DefaultChrome {
 
 /// The glass-mode corner geometry `(r_small, r_big, exponent)`: the superellipse `((R−x)/R)^n + ((R−y)/R)^n = 1` sits INSIDE a circular glass arc of radius `g` iff it cuts at least as deep at the diagonal, where the two curves are closest — the circle cuts `g·(1 − 1/√2)` ≈ 0.293 g in from the corner, the superellipse `R·(1 − 2^(−1/n))` — so the small radius is `R = 0.293 g / (1 − 2^(−1/n))` (a hair more for the AA), and the big TL/BR diagonal is twice it, the desktop's 2:1. At the desktop's exponent 24 that is ~10.3 g — a 68 px glass wants a 700 px small corner and a 1400 px big one, more than a phone's width holds beside each other (the top edge carries one of each). So the exponent is the LARGEST n ≤ 24 whose corners fit: `r_small + r_big ≤ 0.9·min(w,h)`, i.e. `1 − 2^(−1/n) ≥ 3·0.293 g / (0.9·min(w,h))`; a 1008 px portrait phone with 68 px glass lands at n = 10 (297 / 594 px). Never below 3: at 2 the corner is a plain circle and reads as a lozenge.
 pub(crate) fn glass_corner_params(g: Coord, w: Coord, h: Coord) -> (Coord, Coord, i32) {
-    // TWICE the glass (Nick 2026-09-17, "the radius needs to be 2x bigger on all Android corners"): the diagonal inset is doubled, so the small corner sits a full glass-inset inside the arc and the big one four glass-insets in.
-    let cut = 2.0 * (g * (1.0 - core::f32::consts::FRAC_1_SQRT_2) + 1.0);
+    // ONE AND A HALF glass insets at the diagonal, exponent 6 (Nick 2026-09-17: "exponent 6 and 1.5", after 2× at exponent 4 read as a soft blob): the small corner cuts half a glass-inset deeper than the arc, the big one three insets, and the squarer superellipse is what makes the corner read tight rather than round.
+    let cut = 1.5 * (g * (1.0 - core::f32::consts::FRAC_1_SQRT_2) + 1.0);
     // FIT is the renderer's own topology, not a radius sum: an edge splits into straight run + two corner CAPS (the rows where the curve is at least a pixel off the edge — near r itself for a high exponent), and `draw_window_edges_and_mask` falls back to a plain rectangle when the two caps on one edge don't fit. So the exponent is the largest n ≤ 24 whose two caps fit the short edge with a tenth to spare. A doubled inset at high n wants caps wider than a phone (n 9 → 553 + 1106 px on a 1008 px edge), so the phone lands lower (n 4 at 68 px glass: 252 + 504); the desktop keeps 24.
     let short = w.min(h) * 0.9;
-    let mut n = 24;
+    let mut n = 6;
     while n > 3 {
         let r = cut / (1.0 - crate::math::powf(2.0, -1.0 / n as Coord));
         let (s1, c1) = compute_squircle_crossings(r, n);
