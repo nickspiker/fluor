@@ -170,6 +170,8 @@ pub struct DefaultChrome {
     pub orb_tint: chrome::OrbTint,
     /// Currently-hovered button id (HIT_NONE if none). Consumed by the host's overlay pass to derive the visible-RGB tint delta to apply at matching `hit_test_map` pixels in persistent_screen.
     pub hover_state: HitId,
+    /// The orb's inset from the top-left corner on both axes, in pixels: None = the controls strip's height (desktop — the orb clears the strip's band); a phone sets its status-bar height here.
+    pub orb_inset_px: Option<Coord>,
     /// DEVICE-GLASS CORNERS (photon on Android, Nick 2026-09-16): the physical display's corner radius in pixels, when the platform reports one. Set, it overrides the span-derived squircle sizes — the small (TR/BL) corners take the glass radius, the big (TL/BR) diagonal takes TWICE it, the same 2:1 the desktop window wears — and the perimeter draws EVEN in full-edge mode so the hairline can be lined up against the glass by eye. None = the desktop rule (span/4, span/2, no perimeter when full-edge).
     pub glass_radius_px: Option<Coord>,
     /// "Full edge" / maximized mode. When `true`, [`Self::rasterize_chrome`] skips [`chrome::draw_window_edges_and_mask`] entirely: no perimeter hairline, no corner cutout in `clip_mask`, no AA fringe — the chrome flows straight to the four screen edges. The OS surface is fullscreen anyway, the WM can't show a shadow against the screen border, and AA on a corner that's flush with the screen is wasted work. Buttons / title / app icon still rasterize as usual. Toggle via [`Self::set_full_edge`]; sync from [`super::app::Context::is_maximized`].
@@ -189,9 +191,10 @@ pub struct DefaultChrome {
 }
 
 /// The app-icon orb's `(cx, cy, radius)` for a chrome `button_size`: diameter 9/4 of the unit (1.5× the 2026-07-17 badge, grown again 2026-09-13 — Nick: the orb itself 1.5× larger, the text beside it unchanged), centre a constant `button_size/2` in from the top-left corner so the tuck into the TL squircle survives the growth. The disk now stands 3/4 of a unit proud of the 2-unit strip; the title stays level with its centre.
-fn orb_layout(button_size: usize) -> (isize, isize, isize) {
+/// The orb's place: its radius is 9/8 of a button, and its centre sits `inset` in from the corner on both axes (Nick 2026-09-17, "the orb needs moved down and right in whatever height the controls / status bar is") — the controls strip's height on desktop, the status bar's on a phone, handed in by the host thru [`DefaultChrome::orb_inset_px`].
+fn orb_layout(button_size: usize, inset: isize) -> (isize, isize, isize) {
     let orb_radius = (button_size as isize * 9) / 8;
-    let c = orb_radius + button_size as isize / 2;
+    let c = orb_radius + button_size as isize / 2 + inset;
     (c, c, orb_radius)
 }
 
@@ -238,6 +241,7 @@ impl DefaultChrome {
             hover_state: HIT_NONE,
             full_edge: false,
             glass_radius_px: None,
+            orb_inset_px: None,
             viewport,
             layer_bg,
             layer_chrome,
@@ -272,7 +276,25 @@ impl DefaultChrome {
         }
         let span = self.viewport.effective_span();
         let button_size = crate::math::ceil(span / 32.0) as usize;
-        Some(orb_layout(button_size))
+        Some(orb_layout(button_size, self.orb_inset(button_size)))
+    }
+
+    /// The orb inset in pixels: the host's number when set, else the controls strip's height (2× a button).
+    fn orb_inset(&self, button_size: usize) -> isize {
+        match self.orb_inset_px {
+            Some(px) => px as isize,
+            None => (button_size * 2) as isize,
+        }
+    }
+
+    /// Install (or clear) the orb inset — see [`Self::orb_inset_px`]. Returns whether it changed.
+    pub fn set_orb_inset(&mut self, px: Option<Coord>) -> bool {
+        if self.orb_inset_px == px {
+            return false;
+        }
+        self.orb_inset_px = px;
+        self.group.rpn.layers[self.layer_chrome].dirty = true;
+        true
     }
 
     pub fn dims(&self) -> (usize, usize) {
@@ -326,9 +348,9 @@ impl DefaultChrome {
         }
 
         // Geometry shared with `rasterize_chrome` (recomputed here so the perimeter is self-contained per frame). `effective_span` folds in the user's zoom so the corners scale with Ctrl+/Ctrl-/Ctrl+scroll — unless the device glass sets the radius, which zoom must not touch.
-        // THE SHAPE FOLLOWS THE GLASS TOO (Nick 2026-09-16, "the radius is WAY too small"): the desktop squircle is a superellipse of exponent 24 — nearly square, its diagonal cuts only 3% of its "radius" inward — so drawn at the glass radius it rounds almost nothing while the glass itself is a circular arc cutting 29%. In glass mode the corners are CIRCLES (exponent 2) at the glass radius and twice it; the desktop keeps its squircle.
+        // THE SQUIRCLE INSIDE THE GLASS (Nick 2026-09-17, "the same high power radius, tuned so the small radius falls inside the window curve — with a second-order polynomial the corners look like dickass"): keep the desktop's high-power superellipse and size it so its small corner never pokes outside the glass arc. See `glass_corner_params` for the derivation; the desktop keeps span/4 and span/2 at exponent 24.
         let (r_small, r_big, exponent) = match self.glass_radius_px {
-            Some(g) if g > 0.0 => (g, g * 2.0, 2),
+            Some(g) if g > 0.0 => glass_corner_params(g, vp_w as Coord, vp_h as Coord),
             _ => {
                 let span = self.viewport.effective_span();
                 (span / 4.0, span / 2.0, 24)
@@ -418,7 +440,7 @@ impl DefaultChrome {
             || matches!(self.orb_tint, chrome::OrbTint::Custom { .. });
         // Geometry lives in `orb_layout` (one source for this pass and `orb_geometry()`); the title-margin math below tracks the orb's actual right edge automatically.
         let (orb_cx, orb_cy, orb_radius) = if orb_present {
-            orb_layout(button_size)
+            orb_layout(button_size, self.orb_inset(button_size))
         } else {
             (0, 0, 0)
         };
@@ -850,6 +872,22 @@ impl Container for DefaultChrome {
         f(&mut self.max_btn);
         f(&mut self.close_btn);
     }
+}
+
+/// The glass-mode corner geometry `(r_small, r_big, exponent)`: the superellipse `((R−x)/R)^n + ((R−y)/R)^n = 1` sits INSIDE a circular glass arc of radius `g` iff it cuts at least as deep at the diagonal, where the two curves are closest — the circle cuts `g·(1 − 1/√2)` ≈ 0.293 g in from the corner, the superellipse `R·(1 − 2^(−1/n))` — so the small radius is `R = 0.293 g / (1 − 2^(−1/n))` (a hair more for the AA), and the big TL/BR diagonal is twice it, the desktop's 2:1. At the desktop's exponent 24 that is ~10.3 g — a 68 px glass wants a 700 px small corner and a 1400 px big one, more than a phone's width holds beside each other (the top edge carries one of each). So the exponent is the LARGEST n ≤ 24 whose corners fit: `r_small + r_big ≤ 0.9·min(w,h)`, i.e. `1 − 2^(−1/n) ≥ 3·0.293 g / (0.9·min(w,h))`; a 1008 px portrait phone with 68 px glass lands at n = 10 (297 / 594 px). Never below 3: at 2 the corner is a plain circle and reads as a lozenge.
+pub(crate) fn glass_corner_params(g: Coord, w: Coord, h: Coord) -> (Coord, Coord, i32) {
+    let cut = g * (1.0 - core::f32::consts::FRAC_1_SQRT_2) + 1.0;
+    let budget = (w.min(h) * 0.9) / 3.0;
+    let mut n = 24;
+    while n > 3 {
+        let r = cut / (1.0 - crate::math::powf(2.0, -1.0 / n as Coord));
+        if r <= budget {
+            break;
+        }
+        n -= 1;
+    }
+    let r_small = cut / (1.0 - crate::math::powf(2.0, -1.0 / n as Coord));
+    (r_small, r_small * 2.0, n)
 }
 
 /// Compute squircle crossings table for a corner with the given `radius` and `squirdleyness`. Returns `(start, crossings)` where `start` is the distance from the corner-of-corner inward to the curve's first integer-row crossing, and `crossings` is the rev'd table indexed by `i in 0..count` such that at row offset `start + i` the curve is at column `inset_i` with AA values `h_cov_i` and `l_i`. Used for both the window perimeter (radius = span/4) and the controls-strip BL curve (radius = button_size).
