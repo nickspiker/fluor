@@ -326,18 +326,19 @@ impl DefaultChrome {
         }
 
         // Geometry shared with `rasterize_chrome` (recomputed here so the perimeter is self-contained per frame). `effective_span` folds in the user's zoom so the corners scale with Ctrl+/Ctrl-/Ctrl+scroll — unless the device glass sets the radius, which zoom must not touch.
-        let (r_small, r_big) = match self.glass_radius_px {
-            Some(g) if g > 0.0 => (g, g * 2.0),
+        // THE SHAPE FOLLOWS THE GLASS TOO (Nick 2026-09-16, "the radius is WAY too small"): the desktop squircle is a superellipse of exponent 24 — nearly square, its diagonal cuts only 3% of its "radius" inward — so drawn at the glass radius it rounds almost nothing while the glass itself is a circular arc cutting 29%. In glass mode the corners are CIRCLES (exponent 2) at the glass radius and twice it; the desktop keeps its squircle.
+        let (r_small, r_big, exponent) = match self.glass_radius_px {
+            Some(g) if g > 0.0 => (g, g * 2.0, 2),
             _ => {
                 let span = self.viewport.effective_span();
-                (span / 4.0, span / 2.0)
+                (span / 4.0, span / 2.0, 24)
             }
         };
-        let (start, crossings) = compute_squircle_crossings(r_small, 24);
+        let (start, crossings) = compute_squircle_crossings(r_small, exponent);
         if crossings.is_empty() {
             return;
         }
-        let (start_big, crossings_big) = compute_squircle_crossings(r_big, 24);
+        let (start_big, crossings_big) = compute_squircle_crossings(r_big, exponent);
 
         // Same focus-driven bevel palette as `rasterize_chrome` — top/left light, bottom/right shadow, dimmed when unfocused.
         let (edge_light, edge_shadow) = if self.focused {
