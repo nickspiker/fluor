@@ -363,7 +363,11 @@ impl DefaultChrome {
         let (start_big, crossings_big) = compute_squircle_crossings(r_big, exponent);
 
         // Same focus-driven bevel palette as `rasterize_chrome` — top/left light, bottom/right shadow, dimmed when unfocused.
-        let (edge_light, edge_shadow) = if self.focused {
+        // DEVICE GLASS, RELEASE BUILD: no hairline at all — the corner beyond the curve is black glass and the edge is the phone's own (Nick 2026-09-17, "make sure the release build on Android does not have hairlines and just has black"). A debug build keeps the hairline so the curve can still be lined up against the glass by eye.
+        let (edge_light, edge_shadow) = if self.glass_radius_px.is_some() && !cfg!(debug_assertions) {
+            let black = crate::paint::pack_argb(0, 0, 0, 255);
+            (black, black)
+        } else if self.focused {
             (theme::WINDOW_LIGHT_EDGE, theme::WINDOW_SHADOW_EDGE)
         } else {
             (
@@ -893,7 +897,8 @@ pub(crate) fn glass_corner_params(g: Coord, w: Coord, h: Coord) -> (Coord, Coord
         }
         n -= 1;
     }
-    let r_small = cut / (1.0 - crate::math::powf(2.0, -1.0 / n as Coord));
+    // Nine tenths of the fitted size (Nick 2026-09-17, "let's try making both radius on Android 0.9 what they are now (slightly smaller)") — a smaller corner at the same exponent always fits, so the trim is applied after the search.
+    let r_small = cut / (1.0 - crate::math::powf(2.0, -1.0 / n as Coord)) * 0.9;
     (r_small, r_small * 2.0, n)
 }
 
