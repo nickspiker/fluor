@@ -1535,6 +1535,13 @@ impl<A: FluorApp> DesktopShell<A> {
         }
     }
 
+    /// THE hittable rect: `window_rect` inflated on every side by the resize band (`strip_height/4`, the classifier's band), in global desktop units. This is the one definition of "the cursor counts as on the window" — the input region, the macOS click-thru decision and the global re-entry monitor all derive from it, so the invisible grab band past the hairline is real on every platform. Before 2026-09-18 the region was inflated but the macOS decision and monitor tested the BARE rect, so on macOS the outer band flipped the surface click-thru the pixel the cursor crossed the hairline: no arrows, no grab, and "intermittent" depending on which side of the line the hand stopped.
+    fn hittable_rect(&self) -> (i32, i32, u32, u32) {
+        let band = (super::chrome::strip_height(self.viewport) / 4.0).ceil() as i32;
+        let r = &self.window_rect;
+        (r.x - band, r.y - band, r.w + 2 * band as u32, r.h + 2 * band as u32)
+    }
+
     /// Re-assert per-surface `ignoresMouseEvents` from current shell state: a surface accepts events only when the shell isn't in cursor-outside click-thru AND its last-pushed window∩surface input region is non-empty (dormant surfaces are always click-thru; the creation sentinel counts as empty).
     #[cfg(target_os = "macos")]
     fn apply_macos_hittest(&mut self) {
@@ -1549,16 +1556,16 @@ impl<A: FluorApp> DesktopShell<A> {
     fn push_input_region(&mut self, si: usize) {
         #[cfg(target_os = "macos")]
         let hittest_off = self.hittest_off;
+        let hit = self.hittable_rect();
         let Some(s) = self.surfaces.get_mut(si) else {
             return;
         };
-        let r = &self.window_rect;
         // Inflate the hittable region by the resize band so the border extends INVISIBLY past the window edge — the CSD convention. With the region exactly the window rect, a cursor approaching an edge from OUTSIDE parked on pixels that received no events at all (they pass thru to the window below), so resize could only ever be grabbed from inside ("moving mouse in from outside never lets you resize"). get_resize_edge already classifies just-outside (negative window-relative) coords as the matching edge, and hit_at bounds-checks, so the only missing piece was the region. Same band as the classifier: strip_height/4.
-        let band = (super::chrome::strip_height(self.viewport) / 4.0).ceil() as i32;
-        let ix0 = (r.x - band).max(s.origin.0);
-        let iy0 = (r.y - band).max(s.origin.1);
-        let ix1 = (r.x + r.w as i32 + band).min(s.origin.0 + s.size.0 as i32);
-        let iy1 = (r.y + r.h as i32 + band).min(s.origin.1 + s.size.1 as i32);
+        let (hx, hy, hw, hh) = hit;
+        let ix0 = hx.max(s.origin.0);
+        let iy0 = hy.max(s.origin.1);
+        let ix1 = (hx + hw as i32).min(s.origin.0 + s.size.0 as i32);
+        let iy1 = (hy + hh as i32).min(s.origin.1 + s.size.1 as i32);
         let region = if ix0 < ix1 && iy0 < iy1 {
             (
                 ix0 - s.origin.0,
@@ -1950,15 +1957,19 @@ impl<A: FluorApp> DesktopShell<A> {
     fn update_macos_hittest(&mut self) {
         let cx = self.cursor_x as i32;
         let cy = self.cursor_y as i32;
-        let r = &self.window_rect;
-        let inside = cx >= r.x && cx < r.x + r.w as i32
-                  && cy >= r.y && cy < r.y + r.h as i32;
+        // The HITTABLE rect, band included — the same rect the input region and the re-entry monitor use, so the outer resize band never flips the surface click-thru.
+        let (hx, hy, hw, hh) = self.hittable_rect();
+        let inside = cx >= hx && cx < hx + hw as i32 && cy >= hy && cy < hy + hh as i32;
         // NEVER re-engage click-thru mid-drag. A resize-grow (or a move) pushes the cursor to or past the CURRENT rect edge before `apply_resize_drag` catches the rect up; if we flipped hittest off there, macOS would stop delivering the drag and the window could shrink but never grow. Hold hittest ON for the whole drag; the next cursor-move after release recomputes normally.
         let should_ignore = !inside && !self.is_dragging_resize && !self.is_dragging_move;
         if should_ignore != self.hittest_off {
             if should_ignore {
                 if let Some(window) = self.home_window() {
                     window.set_cursor(winit::window::CursorIcon::Default);
+                    // Going click-thru: from here macOS delivers us no cursor moves, so arm the global monitor to wake this window once on the entry edge (and clear any stale flag from the last stay inside).
+                    if let Some(m) = self.hittest_monitor.as_ref() {
+                        m.arm(window);
+                    }
                 }
             }
             self.hittest_off = should_ignore;
@@ -2361,8 +2372,8 @@ impl<A: FluorApp> DesktopShell<A> {
             let _ = buffer.present();
             // Update the global mouse monitor's window rect for re-entry detection — GLOBAL desktop points now (the monitor flips NSEvent's bottom-left mouseLocation against the primary screen height, landing in the same global top-left point space window_rect lives in).
             if let Some(ref monitor) = self.hittest_monitor {
-                let r = &self.window_rect;
-                monitor.update_rect(r.x, r.y, r.w, r.h);
+                let (hx, hy, hw, hh) = self.hittable_rect();
+                monitor.update_rect(hx, hy, hw, hh);
             }
         }
         // Windows: present the owned screen buffer thru the layered window (per-pixel alpha + click-thru on α=0). The damage outline (a dev overlay) is stamped into a scratch copy first so it lives one frame and never touches persistent_screen, matching the softbuffer path.
@@ -2668,8 +2679,8 @@ impl<A: FluorApp> DesktopShell<A> {
         #[cfg(target_os = "macos")]
         {
             if let Some(m) = self.hittest_monitor.as_ref() {
-                let r = &self.window_rect;
-                m.update_rect(r.x, r.y, r.w, r.h);
+                let (hx, hy, hw, hh) = self.hittable_rect();
+                m.update_rect(hx, hy, hw, hh);
             }
             self.hittest_off = false;
             self.apply_macos_hittest();
@@ -3456,16 +3467,13 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                     self.present_surface_raw(si);
                     return;
                 }
-                // macOS click-thru: if the global monitor detected the cursor re-entering an opaque region while hittest was off, flip it back on (fanning the state out to every surface). While hittest is off we keep requesting redraws to poll the monitor flag at vsync rate.
+                // macOS click-thru: the global monitor woke us with one request_redraw on the cursor's entry edge (macos_hittest.rs) — consume the flag and flip hittest back on, fanning the state out to every surface. An edge, not a poll: nothing here re-requests a redraw.
                 #[cfg(target_os = "macos")]
                 if self.hittest_off {
                     if let Some(ref monitor) = self.hittest_monitor {
                         if monitor.check_reenter() {
                             self.hittest_off = false;
                             self.apply_macos_hittest();
-                        } else if let Some(window) = self.home_window() {
-                            // Keep polling — next vsync will check again.
-                            window.request_redraw();
                         }
                     }
                 }

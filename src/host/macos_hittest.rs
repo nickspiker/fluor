@@ -1,10 +1,13 @@
 //! macOS global mouse monitor for click-thru re-entry detection.
 //!
 //! When `ignoresMouseEvents = true`, macOS stops delivering CursorMoved to our window.
-//! We install a global NSEvent monitor that fires on mouseMoved globally, checks the cursor position against the window rect, and flags re-entry when the cursor moves back inside.
+//! We install a global NSEvent monitor that fires on mouseMoved globally, checks the cursor position against the HITTABLE rect (the window rect inflated by the resize band — the same rect the shell's click-thru decision and the input region use, so the three never disagree), and on the entry EDGE flags re-entry and wakes the event loop with one `request_redraw` on the armed home window. The host reads the flag in RedrawRequested and flips hittest back on. One wake per entry, no polling: the flag stays set while the cursor is inside and the host clears it when it next flips hittest off.
+//!
+//! Why an edge and not a poll (2026-09-18): the old design only checked the flag inside RedrawRequested and kept itself alive by requesting another redraw each vsync — but nothing requested the FIRST redraw when hittest flipped off. If the cursor left the window across a hovered widget, the un-hover repaint started the poll; if it left across plain background, no repaint, no poll, and the window stayed click-thru and cursor-blind until some incidental redraw. That was the "resize arrows sometimes don't come back" half of the field report, and while it did run the poll burned a frame per vsync with the cursor parked outside.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use winit::window::Window;
 
 /// Shared state between the global monitor callback and the host event loop.
 pub(super) struct HittestMonitor {
@@ -17,6 +20,8 @@ pub(super) struct HittestMonitor {
     pub win_h: Arc<AtomicU32>,
     /// PRIMARY screen height in POINTS for the Y-flip (NSEvent uses a bottom-left origin whose reference is the primary screen frame).
     pub screen_h: Arc<AtomicU32>,
+    /// The home window to wake on the entry edge — armed by the host when it flips hittest off (the home can change across monitors, so it is re-armed every time). `try_lock` in the callback: a contended lock just defers the wake to the next global move, it never blocks the run loop.
+    wake: Arc<Mutex<Option<Arc<Window>>>>,
     _monitor: *mut objc2::runtime::AnyObject,
 }
 
@@ -37,6 +42,7 @@ impl HittestMonitor {
         let ww = Arc::new(AtomicU32::new(0));
         let wh = Arc::new(AtomicU32::new(0));
         let sh = Arc::new(AtomicU32::new(screen_h));
+        let wake: Arc<Mutex<Option<Arc<Window>>>> = Arc::new(Mutex::new(None));
 
         let flag = reenter_flag.clone();
         let wx2 = wx.clone();
@@ -44,6 +50,7 @@ impl HittestMonitor {
         let ww2 = ww.clone();
         let wh2 = wh.clone();
         let sh2 = sh.clone();
+        let wake2 = wake.clone();
 
         let mask = NSEventMask::MouseMoved
             | NSEventMask::LeftMouseDragged
@@ -62,7 +69,14 @@ impl HittestMonitor {
             let rh = wh2.load(Ordering::Relaxed) as i32;
 
             if cx >= rx && cx < rx + rw && cy >= ry && cy < ry + rh {
-                flag.store(true, Ordering::Relaxed);
+                // The ENTRY edge: the first move inside since the host last cleared the flag wakes the loop once. Later moves inside see the flag already set and do nothing.
+                if !flag.swap(true, Ordering::Relaxed) {
+                    if let Ok(w) = wake2.try_lock() {
+                        if let Some(w) = w.as_ref() {
+                            w.request_redraw();
+                        }
+                    }
+                }
             }
         });
 
@@ -78,12 +92,13 @@ impl HittestMonitor {
                 win_w: ww,
                 win_h: wh,
                 screen_h: sh,
+                wake,
                 _monitor: raw as *mut AnyObject,
             }
         })
     }
 
-    /// Update the window rect (call after move/resize) — GLOBAL desktop points, same space as the shell's `window_rect`.
+    /// Update the HITTABLE rect (call after move/resize) — the window rect inflated by the resize band, GLOBAL desktop points, same space as the shell's `window_rect`. Must be the same rect the shell's click-thru decision uses (`hittable_rect`), or the two disagree in the band.
     pub fn update_rect(&self, x: i32, y: i32, w: u32, h: u32) {
         self.win_x.store(x, Ordering::Relaxed);
         self.win_y.store(y, Ordering::Relaxed);
@@ -94,6 +109,14 @@ impl HittestMonitor {
     /// Check and clear the re-entry flag.
     pub fn check_reenter(&self) -> bool {
         self.reenter_flag.swap(false, Ordering::Relaxed)
+    }
+
+    /// Arm the entry-edge wake on `window` and clear any stale flag — called by the host at the moment it flips hittest OFF, so the next global move inside the hittable rect wakes exactly once.
+    pub fn arm(&self, window: Arc<Window>) {
+        if let Ok(mut g) = self.wake.lock() {
+            *g = Some(window);
+        }
+        self.reenter_flag.store(false, Ordering::Relaxed);
     }
 }
 
