@@ -862,6 +862,9 @@ struct DesktopShell<A: FluorApp> {
     last_strip_active: bool,
     /// Set by any event that destroys the chrome perimeter + shadow band content in the surfaces' `persistent_screen` buffers: drag release, resize, zoom, focus change. Consumed once per `render_frame` to switch from incremental mode to full-repaint mode (wipe the involved surfaces' buffers, finalize copies every pixel, paint_shadow runs once into the fresh band). Replaces every prior geometric-equality check on `damage_clip`.
     pending_full_repaint: bool,
+    /// macOS: whether WE hid the OS pointer with `NSCursor.hide` (counted, so it must be balanced by exactly one `unhide`). winit's `set_cursor_visible(false)` is a cursor RECT with an invisible cursor, which AppKit only honours on a key window whose rects it consults — on this click-thru, multi-surface compositor the arrow simply stayed (field 2026-09-20: "a normal teeny tiny one" beside the painted shape). Hiding the pointer process-wide is what a viewer painting the host's cursor actually wants, and it is undone the moment the app asks for any other icon or the pointer leaves.
+    #[cfg(target_os = "macos")]
+    os_cursor_hidden: bool,
     /// Frames of extra self-driven redraw to pump after a surface wakes (cross-monitor move / window
     /// entering a dormant surface). A freshly-reconfigured macOS `CAMetalLayer`, newly attached to a
     /// window just shown on a different display, routinely doesn't display its FIRST presented
@@ -939,6 +942,8 @@ impl<A: FluorApp> DesktopShell<A> {
             pending_damage: crate::canvas::Damage::new(),
             last_strip_active: false,
             pending_full_repaint: true,
+            #[cfg(target_os = "macos")]
+            os_cursor_hidden: false,
             wake_pump: 0,
             last_hitmask: false,
             last_alpha_mode: 0,
@@ -1953,6 +1958,25 @@ impl<A: FluorApp> DesktopShell<A> {
 
     /// macOS click-thru: only disable hittest when the cursor is outside the window rect.
     /// Inside the window rect we always accept events — checking alpha per-pixel there is too fragile (transparent UI elements, frame transitions, etc. cause false negatives that drop clicks to the app behind us).
+    /// Hide or show the OS pointer process-wide (macOS: `NSCursor.hide`/`unhide`, a counted pair kept balanced by `os_cursor_hidden`). No-op elsewhere — winit's `set_cursor_visible` is honoured there.
+    fn hide_os_cursor(&mut self, hide: bool) {
+        #[cfg(target_os = "macos")]
+        {
+            if hide != self.os_cursor_hidden {
+                if hide {
+                    unsafe { objc2_app_kit::NSCursor::hide() };
+                } else {
+                    unsafe { objc2_app_kit::NSCursor::unhide() };
+                }
+                self.os_cursor_hidden = hide;
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = hide;
+        }
+    }
+
     #[cfg(target_os = "macos")]
     fn update_macos_hittest(&mut self) {
         let cx = self.cursor_x as i32;
@@ -3305,9 +3329,11 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                     // Every other icon re-shows it — winit never un-hides on its own.
                     if icon == FCursorIcon::Hidden {
                         window.set_cursor_visible(false);
+                        self.hide_os_cursor(true);
                     } else {
                         window.set_cursor_visible(true);
                         window.set_cursor(winit_compat::to_winit_cursor(icon));
+                        self.hide_os_cursor(false);
                     }
                     self.apply_response(response);
                 }
