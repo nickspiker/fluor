@@ -1962,11 +1962,12 @@ impl<A: FluorApp> DesktopShell<A> {
     fn hide_os_cursor(&mut self, hide: bool) {
         #[cfg(target_os = "macos")]
         {
+            // CoreGraphics, display-level: CGDisplayHideCursor does not care which window is key or whether the surface is click-thru — NSCursor.hide turned out to be as conditional as winit's cursor rect on this compositor (field 2026-09-20, the arrow stayed). Counted like NSCursor's, so the flag keeps it balanced.
             if hide != self.os_cursor_hidden {
                 if hide {
-                    unsafe { objc2_app_kit::NSCursor::hide() };
+                    unsafe { objc2_core_graphics::CGDisplayHideCursor(0) };
                 } else {
-                    unsafe { objc2_app_kit::NSCursor::unhide() };
+                    unsafe { objc2_core_graphics::CGDisplayShowCursor(0) };
                 }
                 self.os_cursor_hidden = hide;
             }
