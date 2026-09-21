@@ -1989,6 +1989,8 @@ impl<A: FluorApp> DesktopShell<A> {
         let should_ignore = !inside && !self.is_dragging_resize && !self.is_dragging_move;
         if should_ignore != self.hittest_off {
             if should_ignore {
+                // Going click-thru is leaving: the OS pointer must be visible for whatever is behind us.
+                self.hide_os_cursor(false);
                 if let Some(window) = self.home_window() {
                     window.set_cursor(winit::window::CursorIcon::Default);
                     // Going click-thru: from here macOS delivers us no cursor moves, so arm the global monitor to wake this window once on the entry edge (and clear any stale flag from the last stay inside).
@@ -3295,6 +3297,10 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
 
                 let (ccx, ccy) = self.win_cursor_px();
                 let wo = self.ctx_window_origin();
+                    // The pointer leaving us, or focus leaving us, must show the OS cursor again no matter what the app last asked for — a click-thru surface gets no cursor move after the edge, so the per-move icon path never runs (field 2026-09-20: no cursor outside the window until a click).
+                    if matches!(event, WindowEvent::CursorLeft { .. } | WindowEvent::Focused(false)) {
+                        self.hide_os_cursor(false);
+                    }
                 if let (Some(window), Some(text)) =
                     (self.home_window(), self.text.as_mut())
                 {
