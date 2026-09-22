@@ -8,11 +8,18 @@
 pub trait WindowHandle {
     /// Request that the host repaint the window at its earliest convenience. Idempotent within a frame — many calls in one tick coalesce into one render. Apps call this any time they've mutated state that affects the next paint (cursor moves, focus changes, network events arriving on the UI thread, animations driven by tick).
     fn request_redraw(&self);
+
+    /// Set the OS window title — what the task switcher, the window menu, Mission Control and the Dock read. Distinct from any title the app DRAWS: a client-decorated app paints its own bar, and the OS never sees that string unless it is also set here, so a title that tracks the open document has to come through this. Default is a no-op, for hosts with no OS-level title to set (Android's surface IS the window).
+    fn set_title(&self, _title: &str) {}
 }
 
 #[cfg(feature = "host-winit")]
 impl WindowHandle for winit::window::Window {
     fn request_redraw(&self) {
         winit::window::Window::request_redraw(self);
+    }
+
+    fn set_title(&self, title: &str) {
+        winit::window::Window::set_title(self, title);
     }
 }
