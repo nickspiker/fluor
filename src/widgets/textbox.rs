@@ -582,6 +582,12 @@ impl Textbox {
         self.invalidate_cache();
     }
 
+    /// Replace the whole text and put the cursor at its end — the one writer for a prefill, so `cursor ≤ chars.len()` and the width cache hold without every reader clamping.
+    pub fn set_text(&mut self, s: &str, text: &mut TextRenderer) {
+        self.clear();
+        self.insert_str(s, text);
+    }
+
     /// Select the "word" containing or adjacent to `idx`. A word is a maximal run of chars sharing the same class (alphanumeric+underscore / whitespace / punctuation). At end-of-text the probe slides one char left so end-of-text clicks still select the trailing word. Sets `selection_anchor` to the run's start and `cursor` to its end. No-op on empty text.
     pub fn select_word_at(&mut self, idx: usize) {
         let n = self.chars.len();

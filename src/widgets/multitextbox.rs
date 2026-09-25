@@ -629,6 +629,12 @@ impl MultiTextbox {
         self.ensure_cursor_visible();
     }
 
+    /// Replace the whole text (spans dropped) and put the cursor at its end — the one writer for a restore, keeping `cursor ≤ chars.len()` and the width and wrap caches in step.
+    pub fn set_text(&mut self, s: &str, text: &mut TextRenderer) {
+        self.clear();
+        self.insert_str(s, text);
+    }
+
     pub fn clear(&mut self) {
         self.chars.clear();
         self.spans.clear();
