@@ -841,7 +841,7 @@ struct DesktopShell<A: FluorApp> {
     is_dragging_move: bool,
     /// Press-hold-release + drag-off-cancel arbiter (shared with the Android host). Fed the hit id under the cursor at each mouse down / move / up; gates action dispatch to a validated release and surfaces the currently-held id for the "held" colour. See [`crate::host::pointer`].
     pointer: crate::host::pointer::PointerArbiter,
-    /// Click hit a drag-eligible area; the NEXT CursorMoved commits the move-drag (no dead zone — 1:1 tracking from the first pixel of motion). Set on `EventResponse::StartWindowDrag`; cleared on mouse release. A click with zero motion never commits because the commit lives in the CursorMoved arm, so click-without-drag stays free of wrap-shift artefacts.
+    /// Click hit a drag-eligible area; a CursorMoved past the OS drag threshold commits the move-drag (1:1 tracking from the press point) and cancels the press's pending activation. Set on `EventResponse::StartWindowDrag`; cleared on mouse release. A click with zero motion never commits because the commit lives in the CursorMoved arm, so click-without-drag stays free of wrap-shift artefacts.
     move_drag_armed: bool,
     drag_move_anchor_screen: (i32, i32),
     drag_move_rect_start: (i32, i32),
@@ -3268,12 +3268,24 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                     return;
                 }
 
-                // In-buffer drag-to-move: update window_rect.x/y by the cursor delta from the drag anchor. The actual screen-buffer shift + input-region update + present happens at vsync in `apply_move_drag_shift` (called from RedrawRequested), naturally coalescing the 200+ Hz raw input rate down to the display refresh rate. Skip consumer dispatch — they don't need cursor moves during the drag. No dead zone: the drag commits on the first cursor move after the press — 1:1 tracking from the first pixel (the old 4px threshold was a feel papercut; a click-without-motion still never commits because this arm only runs on CursorMoved).
+                // In-buffer drag-to-move: update window_rect.x/y by the cursor delta from the drag anchor. The actual screen-buffer shift + input-region update + present happens at vsync in `apply_move_drag_shift` (called from RedrawRequested), naturally coalescing the 200+ Hz raw input rate down to the display refresh rate. Skip consumer dispatch — they don't need cursor moves during the drag. The drag commits once the pointer passes the OS drag threshold (os_input::drag_threshold_px — 0 where the OS publishes none), then tracks 1:1 from the press point, so the window never lags the cursor by the threshold.
                 if self.move_drag_armed {
                     let dx = (self.cursor_x as i32) - self.drag_move_anchor_screen.0;
                     let dy = (self.cursor_y as i32) - self.drag_move_anchor_screen.1;
+                    // The press becomes a drag only past the user's OS drag threshold (0 where the OS publishes none — then the first pixel commits). Until then it is still a click on whatever it pressed, so the arbiter keeps tracking it below.
+                    let t = crate::host::os_input::drag_threshold_px();
+                    if !self.is_dragging_move && dx.unsigned_abs() <= t && dy.unsigned_abs() <= t {
+                        if self.pointer.on_move(self.hit_under_cursor()) {
+                            if let Some(window) = self.home_window() {
+                                window.request_redraw();
+                            }
+                        }
+                        return;
+                    }
                     if !self.is_dragging_move {
                         self.is_dragging_move = true;
+                        // A committed move is not a click: whatever the press armed (a button, a row) fires nothing on the release.
+                        self.pointer.on_cancel();
                         if let Some(window) = self.home_window() {
                             window.set_cursor(winit::window::CursorIcon::Grabbing);
                         }

@@ -1,6 +1,6 @@
 //! OS-polled input-timing settings. Cross-platform shim around each platform's "what does the user consider a double-click?" setting so widgets don't have to hardcode a guess.
 //!
-//! The current API exposes [`double_click_interval`]; future additions will cover key-repeat rate, scroll-wheel acceleration, etc. Results are cached per-process — these settings change rarely enough that a once-per-session read is correct, and the cost of re-reading on every press would be significant (XSettings round-trip / `gsettings` subprocess).
+//! The current API exposes [`double_click_interval`] and [`drag_threshold_px`]; future additions will cover key-repeat rate, scroll-wheel acceleration, etc. Results are cached per-process — these settings change rarely enough that a once-per-session read is correct, and the cost of re-reading on every press would be significant (XSettings round-trip / `gsettings` subprocess).
 //!
 //! Fallback ladder per platform: * **Linux X11** — read the XSettings `Net/DoubleClickTime` property from the XSettings selection owner. This is what GTK, Qt5, and most toolkits honor on X11. Returns the value verbatim if present.
 //! * **Linux Wayland (or X11 with no XSettings manager)** — shell out to `gsettings get org.gnome.desktop.peripherals.mouse double-click`. Works on GNOME and derivatives; on KDE/sway/etc. without GSettings installed this returns `None` and we fall thru to the default.
@@ -35,12 +35,54 @@ pub fn double_click_interval() -> Duration {
     })
 }
 
+/// Host-injected drag threshold, pixels (`u32::MAX` = unset). The same injection seam as the double-click override (Android's `ViewConfiguration.getScaledTouchSlop()` would arrive here).
+static DRAG_OVERRIDE_PX: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Inject the platform's drag threshold from outside fluor. Later calls still win: the override is checked on every read.
+pub fn set_drag_threshold_px(px: u32) {
+    DRAG_OVERRIDE_PX.store(px, Ordering::Relaxed);
+}
+
+/// How far (pixels, per axis) the pointer may travel from a press before the press becomes a DRAG — the user's own OS setting, never a guess of ours (Nick 2026-09-25: "survey the OS for the actual pixel preference with drag or use the OS itself, otherwise 0").
+/// Windows `SM_CXDRAG`/`SM_CYDRAG` (the larger of the two), X11 XSettings `Net/DndDragThreshold`, then GNOME's `drag-threshold`; where the OS publishes nothing (macOS, bare Wayland) it is 0 — any motion drags.
+/// A move BEYOND the threshold commits: with 0, the first pixel of motion does.
+pub fn drag_threshold_px() -> u32 {
+    let over = DRAG_OVERRIDE_PX.load(Ordering::Relaxed);
+    if over != u32::MAX {
+        return over;
+    }
+    static CACHE: OnceLock<u32> = OnceLock::new();
+    *CACHE.get_or_init(|| query_drag_threshold_px().unwrap_or(0))
+}
+
+#[cfg(target_os = "linux")]
+fn query_drag_threshold_px() -> Option<u32> {
+    if let Some(px) = linux::xsettings_int("Net/DndDragThreshold") {
+        return Some(px);
+    }
+    linux::gsettings_u32("drag-threshold")
+}
+
+#[cfg(target_os = "windows")]
+fn query_drag_threshold_px() -> Option<u32> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXDRAG, SM_CYDRAG};
+    // Pixels on EITHER side of the press point the pointer may move before a drag begins (the Win32 definition) — the same per-axis meaning as ours.
+    let (x, y) = unsafe { (GetSystemMetrics(SM_CXDRAG), GetSystemMetrics(SM_CYDRAG)) };
+    u32::try_from(x.max(y)).ok()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn query_drag_threshold_px() -> Option<u32> {
+    // macOS publishes no drag-distance setting (AppKit decides inside its own tracking loops), and fluor's fullscreen-compositor window cannot hand the move to the OS — so 0.
+    None
+}
+
 #[cfg(target_os = "linux")]
 fn query_double_click_ms() -> Option<u32> {
-    if let Some(ms) = linux::xsettings_double_click_ms() {
+    if let Some(ms) = linux::xsettings_int("Net/DoubleClickTime") {
         return Some(ms);
     }
-    linux::gsettings_double_click_ms()
+    linux::gsettings_u32("double-click")
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -64,8 +106,8 @@ mod linux {
             .map(|(c, s)| (c, *s))
     }
 
-    /// Read `Net/DoubleClickTime` from the XSettings property on the XSettings selection owner. Returns `None` if no XSettings manager is running (common on Wayland / minimal X sessions), the property is missing, the setting isn't present in the property, or any XCB call fails. The XSettings protocol format is documented at https://specifications.freedesktop.org/xsettings-spec/xsettings-spec-0.5.html — we parse just enough to find one int-typed setting by name.
-    pub fn xsettings_double_click_ms() -> Option<u32> {
+    /// Read one int-typed setting (`Net/DoubleClickTime`, `Net/DndDragThreshold`) from the XSettings property on the XSettings selection owner. Returns `None` if no XSettings manager is running (common on Wayland / minimal X sessions), the property is missing, the setting isn't present in the property, or any XCB call fails. The XSettings protocol format is documented at https://specifications.freedesktop.org/xsettings-spec/xsettings-spec-0.5.html — we parse just enough to find one int-typed setting by name.
+    pub fn xsettings_int(name: &str) -> Option<u32> {
         let (conn, screen_num) = conn()?;
         let selection_name = format!("_XSETTINGS_S{}", screen_num);
         let sel_atom = conn
@@ -90,7 +132,7 @@ mod linux {
             .ok()?
             .reply()
             .ok()?;
-        parse_xsettings_int(&reply.value, "Net/DoubleClickTime")
+        parse_xsettings_int(&reply.value, name)
     }
 
     /// Parse XSettings property bytes and return the int value for `name`. Returns `None` on truncation, unknown byte-order, mismatched type, or name-not-found. Truncation is treated as silent failure (don't pretend to honor a setting we couldn't read).
@@ -163,10 +205,10 @@ mod linux {
         None
     }
 
-    /// `gsettings get org.gnome.desktop.peripherals.mouse double-click` returns an integer (ms) as plain text. Works on GNOME, Cinnamon, MATE, Pantheon, Budgie. Returns `None` on KDE/sway/etc. without GSettings, or if the binary is missing. Subprocess runs once per process via the OnceLock cache in the caller.
-    pub fn gsettings_double_click_ms() -> Option<u32> {
+    /// `gsettings get org.gnome.desktop.peripherals.mouse <key>` (`double-click` ms, `drag-threshold` px) returns an integer as plain text. Works on GNOME, Cinnamon, MATE, Pantheon, Budgie. Returns `None` on KDE/sway/etc. without GSettings, or if the binary is missing. Subprocess runs once per process via the OnceLock cache in the caller.
+    pub fn gsettings_u32(key: &str) -> Option<u32> {
         let out = Command::new("gsettings")
-            .args(["get", "org.gnome.desktop.peripherals.mouse", "double-click"])
+            .args(["get", "org.gnome.desktop.peripherals.mouse", key])
             .output()
             .ok()?;
         if !out.status.success() {
