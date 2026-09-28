@@ -446,8 +446,19 @@ pub fn apply_overlay(
 
 /// Compose `src` underneath `dst` where `src` is in *pre-composed* α + darkness form (the result of a chain of `under()` writes starting from empty — so `src.dark` is already attenuated by `src.α`). Unlike [`flatten`] with `BlendMode::Normal`, this kernel scales src's contribution by `(256 − dst.α)` only, NOT by `(256 − dst.α) × src.α`, avoiding the second premult that would dim every AA pixel.
 ///
-/// Use case: blit a cached widget layer (built by repeated `under()` from empty) onto a target buffer.
+/// Use case: blit a cached widget layer (built by repeated `under()` from empty) onto a target buffer — every Stack layer, Group composite and chrome layer is one.
 pub fn flatten_premult(dst: &mut [u32], src: &[u32]) {
+    let n = dst.len().min(src.len());
+    if n == 0 {
+        return;
+    }
+    const CHUNK: usize = 4096;
+    let src = &src[..n];
+    crate::par::par_chunks(&mut dst[..n], CHUNK, |off, chunk| flatten_premult_chunk(chunk, &src[off..off + chunk.len()]));
+}
+
+#[inline]
+fn flatten_premult_chunk(dst: &mut [u32], src: &[u32]) {
     let n = dst.len().min(src.len());
     for i in 0..n {
         let d = dst[i];

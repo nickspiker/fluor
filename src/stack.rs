@@ -118,6 +118,17 @@ impl StackCompositor {
         self.pool.push(buf);
     }
 
+    /// A layer was blitted on its own (not thru [`Self::evaluate`]): mark it clean, and drop the cached composite so a later `evaluate` recomputes rather than returning a composite that predates this layer's paint.
+    pub fn settle_layer(&mut self, idx: usize) {
+        if let Some(l) = self.layers.get_mut(idx) {
+            l.dirty = false;
+        }
+        let old = core::mem::take(&mut self.composite);
+        if !old.is_empty() {
+            self.release_buf(old);
+        }
+    }
+
     /// Evaluate the program. Returns a reference to the final composite.
     ///
     /// If no layer is dirty AND a cached composite exists, returns the cache directly. Otherwise runs the entire program: walks each `Op` in order, allocating temporary buffers from the pool. The per-pixel work inside `Op::Under` is dominated by `Blend::under`'s `dst >= 0xFF000000` (top opaque) early-out, so re-running the whole program is cheap even when only one layer changed — no per-instruction snapshot machinery needed.
@@ -155,8 +166,12 @@ impl StackCompositor {
                 Op::Under(mode) => {
                     let b = self.stack.pop().expect("Stack underflow on Under");
                     let a = self.stack.last_mut().expect("Stack underflow on Under");
-                    // Full-buffer compose. Use [`crate::paint::flatten`] so the SIMD+Rayon path for `Normal` mode (the 99% case) kicks in automatically; other blend modes route thru scalar with Rayon-only chunking.
-                    crate::paint::flatten(a, &b, mode);
+                    // Full-buffer compose. Every operand here is a layer built by `under()` from empty (or an earlier composite), so its darkness is ALREADY attenuated by its α: Normal takes the premultiplied blit (`flatten` would apply the bottom's α a second time and dim every anti-aliased pixel). Other modes keep the per-pixel kernel.
+                    if mode == BlendMode::Normal {
+                        crate::paint::flatten_premult(a, &b);
+                    } else {
+                        crate::paint::flatten(a, &b, mode);
+                    }
                     self.release_buf(b);
                 }
             }

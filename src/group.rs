@@ -145,49 +145,81 @@ impl Group {
         target_h: usize,
         clip: Option<paint::Clip>,
     ) {
-        let composite = self.rpn.evaluate();
-        if composite.is_empty() {
-            return;
+        let blend = self.blend;
+        let (region, composite) = (self.region, self.rpn.evaluate());
+        blit_region(composite, region, blend, target, target_w, target_h, clip);
+    }
+
+    /// Flatten ONE layer onto `target`, outside the program — so a host can put a group's layers at different depths of its own front-to-back chain (the chrome on top of content, the background under it). Marks the layer clean, as [`Self::flatten_into`] does via `evaluate`.
+    pub fn flatten_layer_into(
+        &mut self,
+        idx: usize,
+        target: &mut [u32],
+        target_w: usize,
+        target_h: usize,
+        clip: Option<paint::Clip>,
+    ) {
+        let (region, blend) = (self.region, self.blend);
+        if let Some(layer) = self.rpn.layers.get(idx) {
+            blit_region(&layer.pixels, region, blend, target, target_w, target_h, clip);
         }
+        self.rpn.settle_layer(idx);
+    }
+}
 
-        let (gw, gh) = (self.region.w as usize, self.region.h as usize);
-        let gx = self.region.x as isize;
-        let gy = self.region.y as isize;
+/// Composite a region-sized premultiplied buffer under `target` at the region's origin, clipped to the target and to `clip`. Normal takes the premultiplied blit (the buffer's darkness is already attenuated by its α); other modes the per-pixel kernel.
+fn blit_region(
+    src: &[u32],
+    region: Region,
+    blend: BlendMode,
+    target: &mut [u32],
+    target_w: usize,
+    target_h: usize,
+    clip: Option<paint::Clip>,
+) {
+    if src.is_empty() {
+        return;
+    }
+    let (gw, gh) = (region.w as usize, region.h as usize);
+    let gx = region.x as isize;
+    let gy = region.y as isize;
 
-        // Resolve external clip; intersect with target bounds. `None` → full target buffer.
-        let clip_rect = paint::Clip::resolve(clip, target_w, target_h);
+    // Resolve external clip; intersect with target bounds. `None` → full target buffer.
+    let clip_rect = paint::Clip::resolve(clip, target_w, target_h);
 
-        for row in 0..gh {
-            let ty = gy + row as isize;
-            if ty < 0 || (ty as usize) >= target_h {
-                continue;
-            }
-            let ty_us = ty as usize;
-            if ty_us < clip_rect.y_start || ty_us >= clip_rect.y_end {
-                continue;
-            }
-            let src_row_start = row * gw;
-            let dst_row_start = ty_us * target_w;
+    for row in 0..gh {
+        let ty = gy + row as isize;
+        if ty < 0 || (ty as usize) >= target_h {
+            continue;
+        }
+        let ty_us = ty as usize;
+        if ty_us < clip_rect.y_start || ty_us >= clip_rect.y_end {
+            continue;
+        }
+        let src_row_start = row * gw;
+        let dst_row_start = ty_us * target_w;
 
-            // Horizontal clip: intersect [gx, gx+gw) with [0, target_w) with clip [x_start, x_end).
-            let raw_start = gx.max(0) as usize;
-            let raw_end_isize = (gx + gw as isize).min(target_w as isize);
-            if raw_end_isize <= raw_start as isize {
-                continue;
-            }
-            let raw_end = raw_end_isize as usize;
-            let dst_x_start = raw_start.max(clip_rect.x_start);
-            let dst_x_end = raw_end.min(clip_rect.x_end);
-            if dst_x_end <= dst_x_start {
-                continue;
-            }
-            let src_clip_left = (dst_x_start as isize - gx) as usize;
-            let count = dst_x_end - dst_x_start;
+        // Horizontal clip: intersect [gx, gx+gw) with [0, target_w) with clip [x_start, x_end).
+        let raw_start = gx.max(0) as usize;
+        let raw_end_isize = (gx + gw as isize).min(target_w as isize);
+        if raw_end_isize <= raw_start as isize {
+            continue;
+        }
+        let raw_end = raw_end_isize as usize;
+        let dst_x_start = raw_start.max(clip_rect.x_start);
+        let dst_x_end = raw_end.min(clip_rect.x_end);
+        if dst_x_end <= dst_x_start {
+            continue;
+        }
+        let src_clip_left = (dst_x_start as isize - gx) as usize;
+        let count = dst_x_end - dst_x_start;
 
-            let src_slice =
-                &composite[src_row_start + src_clip_left..src_row_start + src_clip_left + count];
-            let dst_slice = &mut target[dst_row_start + dst_x_start..dst_row_start + dst_x_end];
-            paint::flatten(dst_slice, src_slice, self.blend);
+        let src_slice = &src[src_row_start + src_clip_left..src_row_start + src_clip_left + count];
+        let dst_slice = &mut target[dst_row_start + dst_x_start..dst_row_start + dst_x_end];
+        if blend == BlendMode::Normal {
+            paint::flatten_premult(dst_slice, src_slice);
+        } else {
+            paint::flatten(dst_slice, src_slice, blend);
         }
     }
 }

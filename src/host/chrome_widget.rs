@@ -713,6 +713,28 @@ impl DefaultChrome {
         self.group.flatten_into(target, target_w, target_h, clip);
     }
 
+    /// Flatten ONLY the chrome layer (buttons, orb, controls strip, title) into `target`. Call it BEFORE painting content: fluor is front-to-back, so the chrome then sits on top of everything the app draws — content scrolled up under the title strip, or a full-screen panel, can never bury the window controls. Pair with [`Self::flatten_bg_into`] after the content, in place of [`Self::flatten_into`].
+    pub fn flatten_chrome_into(
+        &mut self,
+        target: &mut [u32],
+        target_w: usize,
+        target_h: usize,
+        clip: Option<crate::paint::Clip>,
+    ) {
+        self.group.flatten_layer_into(self.layer_chrome, target, target_w, target_h, clip);
+    }
+
+    /// Flatten ONLY the bg layer (panes + background noise) into `target`: the LAST paint of the frame, under all content. See [`Self::flatten_chrome_into`].
+    pub fn flatten_bg_into(
+        &mut self,
+        target: &mut [u32],
+        target_w: usize,
+        target_h: usize,
+        clip: Option<crate::paint::Clip>,
+    ) {
+        self.group.flatten_layer_into(self.layer_bg, target, target_w, target_h, clip);
+    }
+
     /// Hit query at `(x, y)` in viewport pixel coordinates. Returns the chrome button id at that pixel (one of `min_btn.id()` / `max_btn.id()` / `close_btn.id()` / `app_icon_btn.id()`) or `HIT_NONE` for pixels outside any chrome button or outside the viewport entirely.
     ///
     /// **Rule 0 — WHY/PROOF/PREVENTS:** WHY: a negative `x` cast to `usize` wraps to a huge value; without the bound check, indexing `hit_test_map[idx]` panics. PROOF: the host receives cursor coords from winit which can land outside the window during drag-resize. PREVENTS: panic on out-of-window cursor.
