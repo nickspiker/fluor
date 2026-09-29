@@ -531,7 +531,7 @@ pub fn draw_app_icon(
     hit_test_map: Option<&mut [HitId]>,
     hit_id: HitId,
     width: usize,
-    _height: usize,
+    height: usize,
     cx: isize,
     cy: isize,
     radius: isize,
@@ -557,10 +557,11 @@ pub fn draw_app_icon(
     let r_bbox = r_ring; // the inward ramp reaches 0 at r_ring², so the disk never paints beyond r_ring
 
     let mut htm = hit_test_map;
-    let y0 = (cy - r_bbox) as usize;
-    let y1 = (cy + r_bbox + 1) as usize;
-    let x0 = (cx - r_bbox) as usize;
-    let x1 = (cx + r_bbox + 1) as usize;
+    // WHY/PROOF: the host can slide the orb partly or wholly off the buffer (photon's conversation blind); the bbox clamps to the buffer so no row or column wraps past it — an orb fully off-screen draws nothing.
+    let y0 = (cy - r_bbox).max(0) as usize;
+    let y1 = ((cy + r_bbox + 1).max(0) as usize).min(height);
+    let x0 = (cx - r_bbox).max(0) as usize;
+    let x1 = ((cx + r_bbox + 1).max(0) as usize).min(width);
 
     for y in y0..y1 {
         let dy = y as isize - cy;

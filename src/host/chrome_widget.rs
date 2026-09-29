@@ -172,6 +172,8 @@ pub struct DefaultChrome {
     pub hover_state: HitId,
     /// The orb's inset from the top-left corner on both axes, in pixels: None = the controls strip's height (desktop — the orb clears the strip's band); a phone sets its status-bar height here.
     pub orb_inset_px: Option<Coord>,
+    /// The orb's vertical slide from its rest place, pixels (negative = up) — see [`Self::set_orb_dy`].
+    pub orb_dy: Coord,
     /// DEVICE-GLASS CORNERS (photon on Android, Nick 2026-09-16): the physical display's corner radius in pixels, when the platform reports one. Set, it overrides the span-derived squircle sizes — the small (TR/BL) corners take the glass radius, the big (TL/BR) diagonal takes TWICE it, the same 2:1 the desktop window wears — and the perimeter draws EVEN in full-edge mode so the hairline can be lined up against the glass by eye. None = the desktop rule (span/4, span/2, no perimeter when full-edge).
     pub glass_radius_px: Option<Coord>,
     /// "Full edge" / maximized mode. When `true`, [`Self::rasterize_chrome`] skips [`chrome::draw_window_edges_and_mask`] entirely: no perimeter hairline, no corner cutout in `clip_mask`, no AA fringe — the chrome flows straight to the four screen edges. The OS surface is fullscreen anyway, the WM can't show a shadow against the screen border, and AA on a corner that's flush with the screen is wasted work. Buttons / title / app icon still rasterize as usual. Toggle via [`Self::set_full_edge`]; sync from [`super::app::Context::is_maximized`].
@@ -192,9 +194,12 @@ pub struct DefaultChrome {
 
 /// The app-icon orb's `(cx, cy, radius)` for a chrome `button_size`: diameter 9/4 of the unit (1.5× the 2026-07-17 badge, grown again 2026-09-13 — Nick: the orb itself 1.5× larger, the text beside it unchanged), centre a constant `button_size/2` in from the top-left corner so the tuck into the TL squircle survives the growth. The disk now stands 3/4 of a unit proud of the 2-unit strip; the title stays level with its centre.
 /// The orb's place: its radius is 9/8 of a button, and its centre sits `inset` in from the corner on both axes (Nick 2026-09-17, "the orb needs moved down and right in whatever height the controls / status bar is") — the controls strip's height on desktop, the status bar's on a phone, handed in by the host thru [`DefaultChrome::orb_inset_px`].
-fn orb_layout(button_size: usize, inset: isize) -> (isize, isize, isize) {
-    let orb_radius = (button_size as isize * 9) / 8;
-    let c = orb_radius + button_size as isize / 2 + inset;
+/// THE MAX RULE (Nick 2026-09-29): the centre sits at the orb's OWN offset — two thirds of the old desktop place (radius + half a button + the 2-button strip), "slightly higher and to the left" — or at the host's inset (a phone's status bar / side cutout) where that is further in; never the two added.
+fn orb_layout(button_size: usize, inset: Option<isize>) -> (isize, isize, isize) {
+    let b = button_size as isize;
+    let orb_radius = (b * 9) / 8;
+    let own = (orb_radius + b / 2 + 2 * b) * 2 / 3;
+    let c = own.max(inset.unwrap_or(0));
     (c, c, orb_radius)
 }
 
@@ -242,6 +247,7 @@ impl DefaultChrome {
             full_edge: false,
             glass_radius_px: None,
             orb_inset_px: None,
+            orb_dy: 0.0,
             viewport,
             layer_bg,
             layer_chrome,
@@ -276,15 +282,24 @@ impl DefaultChrome {
         }
         let span = self.viewport.effective_span();
         let button_size = crate::math::ceil(span / 32.0) as usize;
-        Some(orb_layout(button_size, self.orb_inset(button_size)))
+        let (cx, cy, r) = orb_layout(button_size, self.orb_inset(button_size));
+        Some((cx, cy + self.orb_dy as isize, r))
     }
 
-    /// The orb inset in pixels: the host's number when set, else the controls strip's height (2× a button).
-    fn orb_inset(&self, button_size: usize) -> isize {
-        match self.orb_inset_px {
-            Some(px) => px as isize,
-            None => (button_size * 2) as isize,
+    /// The host's orb inset in pixels, when set (the orb's own offset applies when it is not, or where it is further in — see `orb_layout`).
+    fn orb_inset(&self, _button_size: usize) -> Option<isize> {
+        self.orb_inset_px.map(|px| px as isize)
+    }
+
+    /// THE BLIND (photon's conversation top bar, Nick 2026-09-29): a vertical offset the host slides the orb by, in pixels — negative lifts it. 0 = at rest. The title stays put.
+    pub fn set_orb_dy(&mut self, dy: Coord) -> bool {
+        let dy = dy.round();
+        if self.orb_dy == dy {
+            return false;
         }
+        self.orb_dy = dy;
+        self.group.rpn.layers[self.layer_chrome].dirty = true;
+        true
     }
 
     /// Install (or clear) the orb inset — see [`Self::orb_inset_px`]. Returns whether it changed.
@@ -505,7 +520,7 @@ impl DefaultChrome {
                     buf_w,
                     buf_h,
                     orb_cx,
-                    orb_cy,
+                    orb_cy + self.orb_dy as isize,
                     orb_radius,
                     self.app_icon.as_ref(),
                     Some(orb_ring),
@@ -514,7 +529,7 @@ impl DefaultChrome {
                 );
                 if self.orb_pressed {
                     // Press glow — painted AFTER the orb+ring, so under()'s earliest-wins layering puts the halo BENEATH them: the opaque disk pixels early-out untouched and the bloom lands only in the transparent surround. Same pipeline as photon's text halos (disk coverage at the glow grey → soft h+v blurs → white-under), here with real under() because the chrome layer is still building.
-                    chrome::draw_orb_press_glow(chrome_buf, buf_w, buf_h, orb_cx, orb_cy, orb_radius);
+                    chrome::draw_orb_press_glow(chrome_buf, buf_w, buf_h, orb_cx, orb_cy + self.orb_dy as isize, orb_radius);
                 }
             }
             {
