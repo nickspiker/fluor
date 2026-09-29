@@ -170,8 +170,8 @@ pub struct DefaultChrome {
     pub orb_tint: chrome::OrbTint,
     /// Currently-hovered button id (HIT_NONE if none). Consumed by the host's overlay pass to derive the visible-RGB tint delta to apply at matching `hit_test_map` pixels in persistent_screen.
     pub hover_state: HitId,
-    /// The orb's inset from the top-left corner on both axes, in pixels: None = the controls strip's height (desktop — the orb clears the strip's band); a phone sets its status-bar height here.
-    pub orb_inset_px: Option<Coord>,
+    /// The host's bars the orb must clear, pixels `(top, left)`: a phone's status bar and any side cutout / nav bar; `(0, 0)` on desktop. The orb sits at its own offset or tangent to a bar, whichever is further in (`orb_layout`).
+    pub orb_inset_px: (Coord, Coord),
     /// The orb's vertical slide from its rest place, pixels (negative = up) — see [`Self::set_orb_dy`].
     pub orb_dy: Coord,
     /// DEVICE-GLASS CORNERS (photon on Android, Nick 2026-09-16): the physical display's corner radius in pixels, when the platform reports one. Set, it overrides the span-derived squircle sizes — the small (TR/BL) corners take the glass radius, the big (TL/BR) diagonal takes TWICE it, the same 2:1 the desktop window wears — and the perimeter draws EVEN in full-edge mode so the hairline can be lined up against the glass by eye. None = the desktop rule (span/4, span/2, no perimeter when full-edge).
@@ -194,13 +194,13 @@ pub struct DefaultChrome {
 
 /// The app-icon orb's `(cx, cy, radius)` for a chrome `button_size`: diameter 9/4 of the unit (1.5× the 2026-07-17 badge, grown again 2026-09-13 — Nick: the orb itself 1.5× larger, the text beside it unchanged), centre a constant `button_size/2` in from the top-left corner so the tuck into the TL squircle survives the growth. The disk now stands 3/4 of a unit proud of the 2-unit strip; the title stays level with its centre.
 /// The orb's place: its radius is 9/8 of a button, and its centre sits `inset` in from the corner on both axes (Nick 2026-09-17, "the orb needs moved down and right in whatever height the controls / status bar is") — the controls strip's height on desktop, the status bar's on a phone, handed in by the host thru [`DefaultChrome::orb_inset_px`].
-/// THE MAX RULE (Nick 2026-09-29): the centre sits at the orb's OWN offset — two thirds of the old desktop place (radius + half a button + the 2-button strip), "slightly higher and to the left" — or at the host's inset (a phone's status bar / side cutout) where that is further in; never the two added.
-fn orb_layout(button_size: usize, inset: Option<isize>) -> (isize, isize, isize) {
+/// THE MAX RULE (Nick 2026-09-29): on each axis the centre sits at the orb's OWN offset — two thirds of the old desktop place (radius + half a button + the 2-button strip), "slightly higher and to the left" — or TANGENT to the host's bar on that side (a phone's status bar above, a side cutout / nav bar to the left: the bar's extent plus the radius), whichever is further in; never the orb's offset added to the bar. As the zoom grows the orb's own offset wins; below that it rests against the bar.
+fn orb_layout(button_size: usize, inset_top: isize, inset_left: isize) -> (isize, isize, isize) {
     let b = button_size as isize;
     let orb_radius = (b * 9) / 8;
     let own = (orb_radius + b / 2 + 2 * b) * 2 / 3;
-    let c = own.max(inset.unwrap_or(0));
-    (c, c, orb_radius)
+    let tangent = |inset: isize| if inset > 0 { inset + orb_radius } else { 0 };
+    (own.max(tangent(inset_left)), own.max(tangent(inset_top)), orb_radius)
 }
 
 impl DefaultChrome {
@@ -246,7 +246,7 @@ impl DefaultChrome {
             hover_state: HIT_NONE,
             full_edge: false,
             glass_radius_px: None,
-            orb_inset_px: None,
+            orb_inset_px: (0.0, 0.0),
             orb_dy: 0.0,
             viewport,
             layer_bg,
@@ -282,14 +282,10 @@ impl DefaultChrome {
         }
         let span = self.viewport.effective_span();
         let button_size = crate::math::ceil(span / 32.0) as usize;
-        let (cx, cy, r) = orb_layout(button_size, self.orb_inset(button_size));
+        let (cx, cy, r) = orb_layout(button_size, self.orb_inset_px.0 as isize, self.orb_inset_px.1 as isize);
         Some((cx, cy + self.orb_dy as isize, r))
     }
 
-    /// The host's orb inset in pixels, when set (the orb's own offset applies when it is not, or where it is further in — see `orb_layout`).
-    fn orb_inset(&self, _button_size: usize) -> Option<isize> {
-        self.orb_inset_px.map(|px| px as isize)
-    }
 
     /// THE BLIND (photon's conversation top bar, Nick 2026-09-29): a vertical offset the host slides the orb by, in pixels — negative lifts it. 0 = at rest. The title stays put.
     pub fn set_orb_dy(&mut self, dy: Coord) -> bool {
@@ -302,8 +298,9 @@ impl DefaultChrome {
         true
     }
 
-    /// Install (or clear) the orb inset — see [`Self::orb_inset_px`]. Returns whether it changed.
-    pub fn set_orb_inset(&mut self, px: Option<Coord>) -> bool {
+    /// Install the host's bars the orb must clear: `top` (a phone's status bar) and `left` (a side cutout or nav bar), pixels, 0 = none — see [`Self::orb_inset_px`]. Returns whether it changed.
+    pub fn set_orb_insets(&mut self, top: Coord, left: Coord) -> bool {
+        let px = (top.max(0.0), left.max(0.0));
         if self.orb_inset_px == px {
             return false;
         }
@@ -435,8 +432,8 @@ impl DefaultChrome {
         let span = self.viewport.effective_span();
         // Span-relative: button height is span/32, where span is the harmonic mean of viewport dims times zoom. Strip layout bails downstream if the result is too small to render glyphs.
         let button_size = crate::math::ceil(span / 32.0) as usize;
-        // The orb inset is read HERE, before the chrome buffer is borrowed: `orb_inset` borrows all of self and the buffer borrow stays live to the end of the pass (E0502 on every target at a4a3090). All three are pure reads, so taking them ahead of the size guard below changes nothing.
-        let orb_inset = self.orb_inset(button_size);
+        // The orb insets are read HERE, before the chrome buffer is borrowed: reading self the buffer borrow stays live to the end of the pass (E0502 on every target at a4a3090). All three are pure reads, so taking them ahead of the size guard below changes nothing.
+        let orb_inset = (self.orb_inset_px.0 as isize, self.orb_inset_px.1 as isize);
 
         let chrome_buf = &mut self.group.rpn.layers[self.layer_chrome].pixels;
         // α + darkness: transparent init (α=0, dark=0) so the bg shows thru everywhere except the hairline + AA pixels.
@@ -462,7 +459,7 @@ impl DefaultChrome {
             || matches!(self.orb_tint, chrome::OrbTint::Custom { .. });
         // Geometry lives in `orb_layout` (one source for this pass and `orb_geometry()`); the title-margin math below tracks the orb's actual right edge automatically.
         let (orb_cx, orb_cy, orb_radius) = if orb_present {
-            orb_layout(button_size, orb_inset)
+            orb_layout(button_size, orb_inset.0, orb_inset.1)
         } else {
             (0, 0, 0)
         };
@@ -473,8 +470,9 @@ impl DefaultChrome {
             0
         };
         // Title row: level with the orb when one is present, else the original top-band centre.
+        // Level with the orb wherever it sits — including the host's slide (photon's conversation blind carries the name up with the avatar).
         let title_y_center = if orb_present {
-            orb_cy as Coord
+            (orb_cy + self.orb_dy as isize) as Coord
         } else {
             button_size as Coord * 0.5
         };
