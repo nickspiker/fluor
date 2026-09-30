@@ -200,9 +200,9 @@ fn orb_layout(button_size: usize, inset_top: isize, inset_left: isize) -> (isize
     let orb_radius = (b * 9) / 8;
     let own = (orb_radius + b / 2 + 2 * b) * 2 / 3;
     let tangent = |inset: isize| if inset > 0 { inset + orb_radius } else { 0 };
-    // y: its top edge tangent to the bar's bottom, or level with x — whichever is further down (Nick 2026-09-29).
-    let cx = own.max(tangent(inset_left));
-    (cx, cx.max(tangent(inset_top)), orb_radius)
+    // x and y are ONE number (Nick 2026-09-29): the largest of the orb's own offset and its tangent to either bar — the orb stays on the corner's diagonal.
+    let c = own.max(tangent(inset_left)).max(tangent(inset_top));
+    (c, c, orb_radius)
 }
 
 impl DefaultChrome {
