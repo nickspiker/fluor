@@ -256,9 +256,9 @@ impl<A: FluorApp> AndroidShell<A> {
         self.poll_keyboard()
     }
 
-    /// The scroll-vs-tap slop in pixels: a quarter of the effective span (≈ the width of a finger's wobble at any zoom), floored at 8 px.
+    /// The scroll-vs-tap slop in pixels: a sixty-fourth of the effective span (≈ the width of a finger's wobble at any zoom — the same notch the zoom feed uses), floored at 8 px. It was a QUARTER of the span (photon field report 2026-10-01, "after a scroll on the contact screen it triggers a select"): on a phone that is a few hundred pixels, so every scroll shorter than a third of the screen released as a tap on whatever row the finger stopped over.
     fn touch_slop(&self) -> Coord {
-        (self.viewport.effective_span() * 0.25).max(8.0)
+        (self.viewport.effective_span() / 64.0).max(8.0)
     }
 
     /// Hit id under the finger right now, from the app's [`FluorApp::hit_test_map`] at the surface-local cursor (Android's surface IS the window, so cursor coords need no origin offset). `HIT_NONE` when there is no map or the point is out of bounds. Feeds the [`crate::host::pointer::PointerArbiter`].
