@@ -14,9 +14,9 @@ use crate::coord::{Coord, RuVec2};
 /// The photon zoom step curve — asymmetric BY DESIGN (confirmed by Nick, 2026-07-12; the trio 31/32/33 is the spec, born in photon commit 529fbeb): each in-step multiplies by `32/31` (≈ +3.23%), each out-step by `32/33` (≈ −3.03%). The in/out ratios are deliberately incommensurate, so combinations of notches form a DENSE set — any zoom value is reachable by mixing ins and outs instead of being locked to a single ratio's lattice; the ≈0.1% in/out round-trip drift is the price and it's imperceptible. The ONE curve for every zoomable in the ecosystem: the host's RU zoom consumes it via [`Viewport::adjust_zoom`], and apps consume it directly for their own zoom targets (opsin's image wheel) so all wheels speak the same steps. Do NOT "fix" this into reciprocal steps — that trades reachability for a lattice.
 pub fn zoom_step_factor(steps: f32) -> f32 {
     if steps.is_sign_negative() {
-        (33f32 / 32.).powf(steps)
+        crate::math::powf(33f32 / 32., steps)
     } else {
-        (31f32 / 32.).powf(-steps)
+        crate::math::powf(31f32 / 32., -steps)
     }
 }
 

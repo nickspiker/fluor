@@ -7,10 +7,12 @@
 //! When rayon is on, rows run on different worker threads and the closure must be safe to call from multiple threads concurrently — that's `Send + Sync`. Rasterizer closures are tiny captures of small `f32` / `u32` / packed-pixel parameters with no interior mutability, so the bound is satisfied trivially. We require it unconditionally (even in sequential builds) so the call-site code is identical across feature combos — no `#[cfg]` per call.
 
 /// Runtime override: when set, [`par_rows`] and [`par_chunks`] run sequentially even with the `rayon` feature enabled. Used by hosts that write into device-coherent memory (e.g. Android's `ANativeWindow_lock` buffer) where worker-thread writes need a single-thread ordering guarantee before `unlockAndPost` hands the buffer to the compositor.
+#[cfg(any(feature = "rayon", feature = "host-android"))]
 pub static FORCE_SEQUENTIAL: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 #[inline]
+#[cfg(feature = "rayon")]
 fn force_sequential() -> bool {
     FORCE_SEQUENTIAL.load(core::sync::atomic::Ordering::Relaxed)
 }

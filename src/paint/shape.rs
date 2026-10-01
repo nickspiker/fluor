@@ -109,10 +109,10 @@ pub fn draw_image(
     let hh = dst_h * 0.5;
     let left = cx - hw;
     let top = cy - hh;
-    let x_min = left.floor() as i32;
-    let x_max = (cx + hw).ceil() as i32;
-    let y_min = top.floor() as i32;
-    let y_max = (cy + hh).ceil() as i32;
+    let x_min = crate::math::floor(left) as i32;
+    let x_max = crate::math::ceil(cx + hw) as i32;
+    let y_min = crate::math::floor(top) as i32;
+    let y_max = crate::math::ceil(cy + hh) as i32;
     let Some((x_start, y_start, x_end, y_end)) =
         Clip::intersect_bbox(clip, width, height, x_min, x_max, y_min, y_max)
     else {

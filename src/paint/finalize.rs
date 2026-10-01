@@ -18,14 +18,14 @@ use super::{
 /// Debug toggles: * `DEBUG_SHOW_ALPHA` (`[]a`): replace each pixel with `(final_α, final_α, final_α, 0xFF)` — grayscale α visualization, opaque so the OS shows it.
 /// * `DEBUG_SKIP_PREMULT` (`[]p`): skip the Linux RGB×α step.
 pub fn finalize_for_os(pixels: &mut [u32], clip_mask: &[u8]) {
-    let alpha_mode = DEBUG_SHOW_ALPHA.load(std::sync::atomic::Ordering::Relaxed);
+    let alpha_mode = DEBUG_SHOW_ALPHA.load(core::sync::atomic::Ordering::Relaxed);
     let n = pixels.len().min(clip_mask.len());
     if n == 0 {
         return;
     }
 
     // Debug-visualization paths stay scalar — they're rare (toggle-only) and not worth SIMD-izing. Hitmask piggybacks on FORCE_OPAQUE here too.
-    let hitmask = DEBUG_SHOW_HITMASK.load(std::sync::atomic::Ordering::Relaxed);
+    let hitmask = DEBUG_SHOW_HITMASK.load(core::sync::atomic::Ordering::Relaxed);
     let effective_alpha_mode = if hitmask {
         DEBUG_SHOW_ALPHA_FORCE_OPAQUE
     } else {
@@ -39,7 +39,7 @@ pub fn finalize_for_os(pixels: &mut [u32], clip_mask: &[u8]) {
     }
 
     // Premultiply RGB by final_α before handing to the OS compositor. Required on both Linux (X11 composite assumes premultiplied) and macOS (Metal PostMultiplied in practice needs it for clean AA edges — without it, edge pixels with fractional α show harsh checkerboard artifacts).
-    let skip_premult = DEBUG_SKIP_PREMULT.load(std::sync::atomic::Ordering::Relaxed);
+    let skip_premult = DEBUG_SKIP_PREMULT.load(core::sync::atomic::Ordering::Relaxed);
 
     let pixels = &mut pixels[..n];
     let clip = &clip_mask[..n];
@@ -47,7 +47,7 @@ pub fn finalize_for_os(pixels: &mut [u32], clip_mask: &[u8]) {
     // Chunk size of 4096 pixels (16 KiB of u32). Large enough to amortize Rayon's ~1 µs task-dispatch overhead against ~10 µs of SIMD work per chunk; small enough that a typical 8-core system pulls hundreds of tasks from a 4K (8M pixel) finalize and load-balances cleanly. On non-Rayon builds, this is just a sequential walk in 4096-pixel windows.
     const CHUNK: usize = 4096;
 
-    let opaque = crate::paint::OPAQUE_BACKDROP.load(std::sync::atomic::Ordering::Relaxed);
+    let opaque = crate::paint::OPAQUE_BACKDROP.load(core::sync::atomic::Ordering::Relaxed);
     crate::par::par_chunks(pixels, CHUNK, |off, chunk| {
         let clip_chunk = &clip[off..off + chunk.len()];
         finalize_chunk_dispatch(chunk, clip_chunk, skip_premult);
@@ -268,7 +268,7 @@ pub fn finalize_into_screen(
     damage_clip: crate::canvas::PixelRect,
     full_repaint: bool,
 ) {
-    let alpha_mode = DEBUG_SHOW_ALPHA.load(std::sync::atomic::Ordering::Relaxed);
+    let alpha_mode = DEBUG_SHOW_ALPHA.load(core::sync::atomic::Ordering::Relaxed);
     if scr_w == 0 || damage_clip.is_empty() {
         return;
     }
@@ -291,7 +291,7 @@ pub fn finalize_into_screen(
     let dst_x_min = (rect_x + sx_min as i32) as usize;
     let row_len = sx_max - sx_min;
 
-    let hitmask = DEBUG_SHOW_HITMASK.load(std::sync::atomic::Ordering::Relaxed);
+    let hitmask = DEBUG_SHOW_HITMASK.load(core::sync::atomic::Ordering::Relaxed);
     let effective_alpha_mode = if hitmask {
         DEBUG_SHOW_ALPHA_FORCE_OPAQUE
     } else {
@@ -317,10 +317,10 @@ pub fn finalize_into_screen(
         return;
     }
 
-    let skip_premult = DEBUG_SKIP_PREMULT.load(std::sync::atomic::Ordering::Relaxed);
-    let opaque = crate::paint::OPAQUE_BACKDROP.load(std::sync::atomic::Ordering::Relaxed);
+    let skip_premult = DEBUG_SKIP_PREMULT.load(core::sync::atomic::Ordering::Relaxed);
+    let opaque = crate::paint::OPAQUE_BACKDROP.load(core::sync::atomic::Ordering::Relaxed);
 
-    let tint_scan = DEBUG_SHOW_OPAQUE_SCAN.load(std::sync::atomic::Ordering::Relaxed);
+    let tint_scan = DEBUG_SHOW_OPAQUE_SCAN.load(core::sync::atomic::Ordering::Relaxed);
     if full_repaint {
         crate::par::par_rows(screen, scr_w, dst_y_min, dst_y_max, |dst_y, screen_row| {
             let sy = (dst_y as i32 - rect_y) as usize;

@@ -7,12 +7,17 @@
 /// Display colour-space matrix slot.
 ///
 /// On Android, photon's Activity queries `display.preferredWideGamutColorSpace` and pushes the panel's RGB→CIE-XYZ-D50 3x3 matrix here thru a JNI shim. Consumers (chromatic_wave, future LMS-based painters) read it via [`display_rgb_to_xyz`] and compose with their own LMS→XYZ matrix to land samples in the actual device's primaries instead of falling thru a hardcoded REC2020 approximation. `None` until the JNI shim fires, and on desktop builds; consumers fall back to whatever default they want in that case.
+///
+/// `std` only (the slot is a `Mutex`, and the only writer is a JNI shim): a no_std build has no display query to feed it, so the slot and its accessors don't exist there rather than silently reading `None`.
+#[cfg(feature = "std")]
 static DISPLAY_RGB_TO_XYZ: std::sync::Mutex<Option<[f32; 9]>> = std::sync::Mutex::new(None);
 
-/// Display chromaticity primaries (R, G, B as 1931-xy pairs — 6 floats: Rx Ry Gx Gy Bx By). Companion to [`display_rgb_to_xyz`]; useful when a consumer wants to do its own gamut mapping rather than going thru XYZ.
+/// Display chromaticity primaries (R, G, B as 1931-xy pairs — 6 floats: Rx Ry Gx Gy Bx By). Companion to [`display_rgb_to_xyz`]; useful when a consumer wants to do its own gamut mapping rather than going thru XYZ. `std` only, like [`DISPLAY_RGB_TO_XYZ`].
+#[cfg(feature = "std")]
 static DISPLAY_PRIMARIES: std::sync::Mutex<Option<[f32; 6]>> = std::sync::Mutex::new(None);
 
 /// Push the device's display colour-space data. Called from the JNI shim on Android after the Activity's display is available. Idempotent — safe to call multiple times (e.g. on display reconfiguration).
+#[cfg(feature = "std")]
 pub fn set_display_color_space(rgb_to_xyz: [f32; 9], primaries: [f32; 6]) {
     if let Ok(mut g) = DISPLAY_RGB_TO_XYZ.lock() {
         *g = Some(rgb_to_xyz);
@@ -23,11 +28,13 @@ pub fn set_display_color_space(rgb_to_xyz: [f32; 9], primaries: [f32; 6]) {
 }
 
 /// Read the device's display RGB→XYZ matrix if available. Consumers fall back to a hardcoded approximation (REC2020 in chromatic_wave's case) when this returns `None`.
+#[cfg(feature = "std")]
 pub fn display_rgb_to_xyz() -> Option<[f32; 9]> {
     DISPLAY_RGB_TO_XYZ.lock().ok().and_then(|g| *g)
 }
 
 /// Read the device's display chromaticity primaries `[Rx, Ry, Gx, Gy, Bx, By]` if available.
+#[cfg(feature = "std")]
 pub fn display_primaries() -> Option<[f32; 6]> {
     DISPLAY_PRIMARIES.lock().ok().and_then(|g| *g)
 }

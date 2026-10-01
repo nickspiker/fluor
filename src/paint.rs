@@ -7,6 +7,7 @@
 //! Every blending primitive accepts an optional [`Clip`] (defaults to full buffer when `None`) and an optional [`AlphaMask`] (full-frame, multiplies into per-pixel alpha for soft clipping — rounded textboxes, squircle pane corners, scroll fades). The clip is resolved once at entry into `(x_min, y_min, x_max, y_max)` loop bounds, so the inner loops carry **zero per-pixel bounds checks** — the math at the entry is the proof. AlphaMask dimensions must equal the buffer's `(buf_w, buf_h)`; mismatches panic per AGENT.md "fail loud."
 
 use crate::canvas::Canvas;
+#[cfg(feature = "text")]
 use crate::text::TextStyle;
 use crate::coord::Coord;
 
@@ -925,48 +926,48 @@ fn background_row(
 }
 
 /// Debug toggle that lets the `[]p` chord skip the boundary premultiply at runtime — A/B the Linux premult fix without recompiling. Stays `false` by default.
-pub static DEBUG_SKIP_PREMULT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static DEBUG_SKIP_PREMULT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Debug cycle bound to the `[]a` chord. Three states (rotate each press): `0` = off (normal boundary conversion), `1` = α-as-grayscale (replace each pixel with `(final_α, final_α, final_α, 0xFF)` — inspect alpha distribution), `2` = force-opaque (force every pixel's α to 255 and pass the visible RGB thru unmodified — inspect what the kernel produced BEFORE the clip mask + premultiply trimmed it).
-pub static DEBUG_SHOW_ALPHA: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+pub static DEBUG_SHOW_ALPHA: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 pub const DEBUG_SHOW_ALPHA_OFF: u8 = 0;
 pub const DEBUG_SHOW_ALPHA_GRAYSCALE: u8 = 1;
 pub const DEBUG_SHOW_ALPHA_FORCE_OPAQUE: u8 = 2;
 
 /// Debug toggle bound to the `[]h` chord. When set, `finalize_into_screen` routes thru the FORCE_OPAQUE debug branch (XOR darkness → visible RGB, ignore clip_mask trim, force α=0xFF, skip premult) so the per-id colours the consumer paints into scratch land in `persistent_screen` exactly as written — no AA edges, no corner cutouts, no shadow boost on the perimeter. The host additionally skips `paint_shadow` while this is on so the band outside the window doesn't disturb the hit-id view at the chrome edge.
-pub static DEBUG_SHOW_HITMASK: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static DEBUG_SHOW_HITMASK: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Debug toggle bound to the `[]d` chord (Decay). When set, the host saturating-subtracts 1 from every persistent_screen pixel's RGB at the top of each frame (before finalize) and self-requests a continuous redraw chain. Fresh pixels written by finalize / overlay land at full brightness; pixels that aren't repainted fade visibly toward black. Used to verify the incremental left/right opaque-scan finalize is actually copying the regions it should — anything that doesn't get touched on a given frame visibly decays.
-pub static DEBUG_SHOW_FADE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static DEBUG_SHOW_FADE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Debug toggle bound to the `[]b` chord. When set, the **incremental** finalize path saturating-adds 16 to the blue byte of every pixel inside the per-row `[l, r)` opaque-scan range, AFTER the chunk dispatch writes the post-XOR visible-RGB pixel. Makes exactly the pixels the incremental scan touches each frame glow blue — full_repaint frames are deliberately NOT tinted because a uniform interior wash on every focus change / resize / drag release would drown out the actual diagnostic signal (which is "what does the incremental scan land on?"). Pairs naturally with `DEBUG_SHOW_FADE` (the blue stack reaches equilibrium where incremental finalize hits often, decays elsewhere).
-pub static DEBUG_SHOW_OPAQUE_SCAN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static DEBUG_SHOW_OPAQUE_SCAN: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// OPAQUE BACKDROP (Nick 2026-09-09: "on fullscreen/android, blank with no border… whatever the buffer colour is, black"). When set, finalize hands the OS an α=255 frame: the premultiplied RGB it already computed IS the colour composited over black, so every partly-transparent pixel — the background field, the AA rims, anything the app left thin — lands on black instead of whatever the compositor keeps behind the surface. Flipped by the chrome's full-edge mode (maximized / Android), where there is no desktop to see thru to. Not a debug toggle.
-pub static OPAQUE_BACKDROP: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static OPAQUE_BACKDROP: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Debug toggle that suppresses chrome layer rasterization (perimeter hairline + future controls + title) so consumers can see the background / panes / textbox underneath without chrome on top. Bound to the `[]c` chord. The clip_mask is still carved at the boundary, so the window-shape trim remains visible. Stays `false` by default.
-pub static DEBUG_SKIP_CHROME: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static DEBUG_SKIP_CHROME: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Debug toggle that suppresses ONLY the controls strip (curves + hairlines + glyphs + dividers + strip-bg fill) while keeping the window perimeter intact. Bound to the `[]l` chord (controLs). Useful for isolating perimeter rendering from controls rendering. Stays `false` by default.
-pub static DEBUG_SKIP_CONTROLS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static DEBUG_SKIP_CONTROLS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Debug toggle that overlays a one-line diagnostic strip across the bottom of the window showing live render-pipeline stats: composite-FPS (= `1.0 / composite_time`, NOT the vsync-capped frame rate) and the cumulative frame counter. Bound to the `[]f` chord. The composite-FPS is the actual headroom — a 144 Hz display showing "1240 FPS" means each composite took ~0.8 ms, leaving 6.1 ms of slack against vsync. `false` by default. Counter bumped by primitives that perform genuine *rasterize* work (geometric paint, glyph shaping, etc.) — NOT by blits/copies/tint applications. The host reads-and-resets this with `.swap(0, ...)` after `app.render` to decide whether to call `DebugStats::record_rasterize` or only `record_present`. Lets the F (frame) counter climb on hover-only frames while R (rasterize) stays put.
-pub static RASTERIZE_OPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static RASTERIZE_OPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-pub static DEBUG_SHOW_FPS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static DEBUG_SHOW_FPS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Debug toggle that overlays a 1-px magenta hairline around the damage rect the host repaints this frame. Bound to the `[]w` chord ("Where"). Drawn directly into the platform back buffer AFTER `persistent_screen` has been copied in, BEFORE `present()`. The outline never enters `persistent_screen`, never flows thru finalize, and never survives more than one frame — so toggling it on/off needs no full-repaint promotion and there is no stale-bbox state to carry between frames. `false` by default.
-pub static DEBUG_SHOW_DAMAGE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static DEBUG_SHOW_DAMAGE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Stamp a 1-pixel magenta hairline around `bbox` directly into the screen-sized, visible-RGB back buffer. `bbox` is window-local; `offset_x` / `offset_y` are the window's top-left in screen space. Pure overwrite — no blending, no `under` path, no damage tracking. Caller invokes between `copy_from_slice(&persistent_screen)` and `buffer.present()` so the magenta lives for exactly one frame.
 pub fn stamp_damage_outline_visible(

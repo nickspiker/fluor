@@ -19,6 +19,7 @@ pub fn sin_cos(x: f32) -> (f32, f32) {
     (libm::sinf(x), libm::cosf(x))
 }
 #[inline]
+#[cfg(feature = "text")]
 pub fn atan2(y: f32, x: f32) -> f32 {
     libm::atan2f(y, x)
 }
