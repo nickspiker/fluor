@@ -604,6 +604,22 @@ impl Button {
         } else {
             theme::LABEL_COLOUR
         };
+        // THE HIT STAMP RIDES THE PAINT DECISION (photon 2026-10-01): a pixel that is already opaque when this pill arrives belongs to whatever painted first — the chrome's strip or orb, since fluor is front to back — and the under-blend would skip it, so the stamp skips it too. One decision per pixel, taken BEFORE this pill's own paint makes the pixel opaque. Bbox, not silhouette: the whole pill is clickable (the two-tone pass only covers the edge band), and the corners outside the silhouette are inside the pill's slot anyway. A disabled pill passes hit_map = None and stamps nothing.
+        if let Some(hm) = hit_map {
+            let x1 = (x0 + w).clamp(0, buf_w as isize);
+            let y1 = (y0 + h).clamp(0, buf_h as isize);
+            let sx = x0.max(0);
+            let sy = y0.max(0);
+            for py in sy..y1 {
+                let row = py as usize * buf_w;
+                for px in sx..x1 {
+                    let i = row + px as usize;
+                    if canvas.pixels[i] < 0xFF00_0000 {
+                        hm[i] = hit_id;
+                    }
+                }
+            }
+        }
         // Label first (topmost under-blend), centred in the SLOT (not the grown pill) so it stays put.
         text.draw_text_left(
             canvas,
@@ -643,19 +659,6 @@ impl Button {
             None,
             0,
         );
-        // Stamp the whole pill bbox so the entire pill is clickable (the two-tone pass only stamps the edge band). Bbox over-stamp — corners outside the silhouette claim a few extra pixels inside the pill anyway. A disabled pill passes hit_map = None and stamps nothing.
-        if let Some(hm) = hit_map {
-            let x1 = (x0 + w).clamp(0, buf_w as isize);
-            let y1 = (y0 + h).clamp(0, buf_h as isize);
-            let sx = x0.max(0);
-            let sy = y0.max(0);
-            for py in sy..y1 {
-                let row = py as usize * buf_w;
-                for px in sx..x1 {
-                    hm[row + px as usize] = hit_id;
-                }
-            }
-        }
     }
 
     /// Stamp this button's `hit_id` into `hit_map` at every pixel its pill (fill + two-tone stroke) touches — the true squircle silhouette, not a bbox rectangle.
