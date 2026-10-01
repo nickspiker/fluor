@@ -579,6 +579,19 @@ pub trait FluorApp {
         None
     }
 
+    /// Does the host keep its built-in zoom chords — Ctrl/Cmd + `=` `+` `-` `0` and Ctrl/Cmd +
+    /// scroll? Default yes, which is right for an app whose content fluor itself scales.
+    ///
+    /// Return `false` when the app must see every chord the user types. A remote-desktop viewer is
+    /// the clear case: it forwards keys to another machine, so a swallowed Ctrl+`-` is a keystroke
+    /// the remote never receives — the user presses "zoom out" in the guest's editor and nothing
+    /// happens anywhere, because the host quietly zoomed its own window instead. Intercepting
+    /// input on behalf of an app that wants none of it is the host overstepping; this lets the app
+    /// say so. Everything else (window chrome, the title bar, non-chord keys) is unaffected.
+    fn builtin_zoom_chords(&self) -> bool {
+        true
+    }
+
     /// Cursor icon at `(x, y)` in viewport pixel coords. Called whenever the cursor moves. Returns a fluor-native [`crate::event::CursorIcon`]; the host translates to its platform's cursor type before calling `set_cursor` on the OS window.
     fn cursor_for(&self, x: Coord, y: Coord, ctx: &Context) -> FCursorIcon;
 
@@ -3367,7 +3380,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 && key_event.state == ElementState::Pressed =>
             {
                 // Ctrl/Cmd + =/+/-/0 → zoom. Match `logical_key.to_text()` (the produced character) rather than `physical_key` so non-US layouts (Colemak/Dvorak/etc.) work — the user pressing the key labelled `=` should zoom in regardless of which physical-position that key occupies. `+` covers Shift+= and the numpad `+`; `=` covers the plain key on US. `-` covers minus and the numpad `-`. `0` covers digit and numpad 0.
-                if let Some(text) = key_event.logical_key.to_text() {
+                if let Some(text) = key_event.logical_key.to_text().filter(|_| self.app.builtin_zoom_chords()) {
                     match text {
                         "=" | "+" => {
                             self.apply_zoom_change(Some(1.0));
@@ -3387,7 +3400,8 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 self.dispatch_event(event);
             }
             WindowEvent::MouseWheel { delta, .. }
-                if self.modifiers.control_key() || self.modifiers.super_key() =>
+                if (self.modifiers.control_key() || self.modifiers.super_key())
+                    && self.app.builtin_zoom_chords() =>
             {
                 // Ctrl/Cmd + scroll → zoom. 1 step per scroll notch (LineDelta). Trackpad PixelDelta accumulates many small events; a step's worth of travel is span/(1<<6) — ≈21 px on a 1920×1080 window (the legacy photon "20 px" notch feel), derived from the display instead of hardcoded (no fixed pixels). Bare span, not effective_span: feed sensitivity must not compound with the ru being adjusted. Direction-independent — the dense-reachability design lives in `zoom_step_factor`'s in/out ratios, not the feed (the old 31/32-px split was fixed pixels AND redundant asymmetry).
                 let steps: f32 = match delta {
