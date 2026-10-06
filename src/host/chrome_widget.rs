@@ -333,6 +333,55 @@ impl DefaultChrome {
         paint(&mut canvas);
     }
 
+    /// SCROLL AS A MEMMOVE for the background layer (photon 2026-10-06, Nick: "how do we make it so it's just a mem move like we do with moving the window"): the layer's `rect` translates by `dy` in place (rows memmoved, exactly [`crate::paint::scroll_copy_rect`]) and ONLY `band` — the rows the shift exposed — is cleared and handed to `paint` to re-raster, with the layer left CLEAN. The full-layer noise re-raster that every scroll frame used to pay is gone; the caller's closure must confine itself to `band` (pass it as the clip to every paint call).
+    /// A layer that is already dirty is left to [`Self::rasterize_bg`] — it is about to re-raster whole anyway.
+    pub fn scroll_bg(
+        &mut self,
+        rect: crate::canvas::PixelRect,
+        dy: i32,
+        band: crate::canvas::PixelRect,
+        damage: &mut crate::canvas::Damage,
+        paint: impl FnOnce(&mut crate::canvas::Canvas),
+    ) {
+        let (w, h) = self.dims();
+        let layer = &mut self.group.rpn.layers[self.layer_bg];
+        if layer.dirty {
+            return;
+        }
+        crate::paint::scroll_copy_rect(&mut layer.pixels, w, h, rect.x0, rect.y0, rect.x1, rect.y1, dy);
+        let (bx0, bx1) = (band.x0.min(w), band.x1.min(w));
+        for y in band.y0.min(h)..band.y1.min(h) {
+            layer.pixels[y * w + bx0..y * w + bx1].fill(0);
+        }
+        let mut canvas = crate::canvas::Canvas::new(&mut layer.pixels, w, h, damage);
+        paint(&mut canvas);
+    }
+
+    /// The same shift for the per-pixel hit map: a scrolled pane's hit zones travel with its pixels, so the rows inside `rect` memmove by `dy` and only the exposed band waits for the pane's own re-stamp. Without this a memmoved frame would leave every hit zone one shift behind the pixels.
+    pub fn scroll_hit_map(&mut self, rect: crate::canvas::PixelRect, dy: i32) {
+        let (w, h) = self.dims();
+        let (x0, x1, y0, y1) = (rect.x0.min(w), rect.x1.min(w), rect.y0.min(h), rect.y1.min(h));
+        if dy == 0 || x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let n = dy.unsigned_abs() as usize;
+        if n >= y1 - y0 {
+            return;
+        }
+        let span = x1 - x0;
+        if dy > 0 {
+            for dst in (y0 + n..y1).rev() {
+                let s = (dst - n) * w + x0;
+                self.hit_test_map.copy_within(s..s + span, dst * w + x0);
+            }
+        } else {
+            for dst in y0..y1 - n {
+                let s = (dst + n) * w + x0;
+                self.hit_test_map.copy_within(s..s + span, dst * w + x0);
+            }
+        }
+    }
+
     /// Paint the window-perimeter hairline DIRECTLY into the consumer's `target` buffer and (re)carve the window-shape `clip_mask` — the first writer of the frame, run BEFORE the consumer paints any content into `target`.
     ///
     /// **Why this is split out of [`rasterize_chrome`]:** fluor is under-blend only ("topmost paints first wins"). The chrome group composites UNDER `target` at [`flatten_into`](Self::flatten_into) time (`target.under(chrome)`), so any content the consumer draws directly into `target` ALWAYS wins over chrome at shared edge pixels — burying the perimeter hairline wherever full-bleed content reaches the window edge. Painting the hairline into `target` first makes it the top of the under-chain at those edge pixels: content then composes UNDER it and the hairline survives. Buttons / orb / controls-strip / title stay in the chrome group (they never sit at the window edge, so no content conflicts there) and keep compositing under content as before.

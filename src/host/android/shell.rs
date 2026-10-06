@@ -137,6 +137,12 @@ impl<A: FluorApp> AndroidShell<A> {
                 .damage_rect(self.viewport)
                 .unwrap_or(viewport_rect);
             if !damage_clip.is_empty() {
+                // SCROLL AS A MEMMOVE (photon 2026-10-06): the app's rigid-shift hint moves the scratch rows BEFORE the damage clear (the clear would otherwise zero the memmove's source band) — the same step the desktop host takes in `render_frame`; Android has no persistent screen, so scratch is the only buffer to shift and the present finalizes it whole or by damage as it always did.
+                if damage_clip != viewport_rect {
+                    if let Some((rect, dy)) = self.app.scroll_hint(self.viewport) {
+                        crate::paint::scroll_copy_rect(&mut self.scratch, win_w, win_h, rect.x0, rect.y0, rect.x1, rect.y1, dy);
+                    }
+                }
                 clear_scratch_rect(&mut self.scratch, win_w, damage_clip);
                 self.pending_damage.clear();
                 self.with_context_render(damage_clip, |app, scratch, ctx| {

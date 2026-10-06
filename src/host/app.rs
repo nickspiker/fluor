@@ -2091,6 +2091,10 @@ impl<A: FluorApp> DesktopShell<A> {
         } else {
             self.app.scroll_hint(self.viewport)
         };
+        // The SCRATCH shifts too, BEFORE the damage clear below: scratch persists across frames and later incremental finalizes read any part of it, so it must stay current everywhere — and the memmove's source rows include the band the clear is about to zero (photon 2026-10-06, scroll as a memmove).
+        if let Some((rect, dy)) = scroll_hint {
+            crate::paint::scroll_copy_rect(&mut self.scratch, win_w, win_h, rect.x0, rect.y0, rect.x1, rect.y1, dy);
+        }
 
         clear_scratch_rect(&mut self.scratch, win_w, damage_clip);
 
