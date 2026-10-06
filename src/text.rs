@@ -297,6 +297,12 @@ impl TextRenderer {
         transform: Option<Transform>,
         shear: f32,
     ) -> f32 {
+        // Clip cull BEFORE shaping (photon 2026-10-06, scroll as a memmove): shaping is the cost of a text draw, and a clip that excludes the whole line box — an empty clip, or one whose rows lie entirely above or below `y ± 1.2·size` (y is the box centre; the margin covers ascender/descender overhang) — means nothing would land anyway. Returns 0.0: a caller laying out BY the returned width is laying out inside a culled band, where nothing paints either.
+        if let Some(c) = clip {
+            if c.x_end <= c.x_start || c.y_end <= c.y_start || y + size * 1.2 < c.y_start as f32 || y - size * 1.2 > c.y_end as f32 {
+                return 0.0;
+            }
+        }
         let buf_w = canvas.width;
         let buf_h = canvas.height;
         let attrs = Attrs::new()
@@ -364,6 +370,12 @@ impl TextRenderer {
         transform: Option<Transform>,
         shear: f32,
     ) -> f32 {
+        // Clip cull BEFORE shaping (photon 2026-10-06, scroll as a memmove): shaping is the cost of a text draw, and a clip that excludes the whole line box — an empty clip, or one whose rows lie entirely above or below `y ± 1.2·size` (y is the box centre; the margin covers ascender/descender overhang) — means nothing would land anyway. Returns 0.0: a caller laying out BY the returned width is laying out inside a culled band, where nothing paints either.
+        if let Some(c) = clip {
+            if c.x_end <= c.x_start || c.y_end <= c.y_start || y + size * 1.2 < c.y_start as f32 || y - size * 1.2 > c.y_end as f32 {
+                return 0.0;
+            }
+        }
         let buf_w = canvas.width;
         let buf_h = canvas.height;
         let attrs = Attrs::new()
@@ -428,6 +440,12 @@ impl TextRenderer {
         transform: Option<Transform>,
         shear: f32,
     ) -> f32 {
+        // Clip cull BEFORE shaping (photon 2026-10-06, scroll as a memmove): shaping is the cost of a text draw, and a clip that excludes the whole line box — an empty clip, or one whose rows lie entirely above or below `y ± 1.2·size` (y is the box centre; the margin covers ascender/descender overhang) — means nothing would land anyway. Returns 0.0: a caller laying out BY the returned width is laying out inside a culled band, where nothing paints either.
+        if let Some(c) = clip {
+            if c.x_end <= c.x_start || c.y_end <= c.y_start || y + size * 1.2 < c.y_start as f32 || y - size * 1.2 > c.y_end as f32 {
+                return 0.0;
+            }
+        }
         let buf_w = canvas.width;
         let buf_h = canvas.height;
         let attrs = Attrs::new()
