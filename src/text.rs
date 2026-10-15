@@ -1,4 +1,4 @@
-//! Text rendering — verbatim port of photon's [text_rasterizing.rs](/mnt/Harbor/Code/photon/src/ui/text_rasterizing.rs). Built on cosmic-text + swash. Bundles Open Sans Regular + Bold (OFL-licensed) so the default fluor build renders text out of the box; consumers can load additional fonts via the `font_system_mut()` accessor.
+//! Text rendering — verbatim port of photon's [text_rasterizing.rs](/mnt/Harbor/Code/photon/src/ui/text_rasterizing.rs). Built on cosmic-text + swash. Bundles Open Sans as one variable face, every weight 300..800 real (OFL-licensed) so the default fluor build renders text out of the box; consumers can load additional fonts via the `font_system_mut()` accessor.
 //!
 //! Photon's full version bundles Oxanium and Josefin Slab too; those are dropped here to keep the v0 crate small (~260 KB instead of ~2 MB). They'll be added back when a consumer needs them.
 
@@ -93,6 +93,8 @@ pub struct TextRenderer {
     scale_context: ScaleContext,
     /// Cache for transform-rasterized glyph images. Identity transforms use cosmic-text's own cache; only non-identity rasterizations land here.
     transform_cache: TransformGlyphCache,
+    /// OPTICAL WEIGHT (Nick 2026-10-14, with variable fonts): see [`TextRenderer::set_optical_weight`]. Off by default.
+    optical: bool,
 }
 
 /// How text draws — everything beyond "which glyphs, where". REQUIRED values (size, colour) live in [`TextStyle::new`]; every OPTION defaults to none and is added by a chainable builder. Fields are PRIVATE on purpose: no struct literals means adding the next option (kerning, vertical shear, …) can never break a call site — the forward-compat contract this API was rebuilt for (2026-07-17).
@@ -219,11 +221,8 @@ impl TextRenderer {
         // Build the FontSystem from an EXPLICIT db + our BundledFallback — NOT `FontSystem::new()`, whose `PlatformFallback` diverges per-OS (see BundledFallback). Locale is fixed too: cosmic-text only uses it to pick han-unification CJK order, which our bundled set doesn't cover, so a constant keeps rendering identical regardless of the host's `LANG`.
         let mut db = Database::new();
 
-        // Open Sans Regular + Bold — the primary Latin family. Photon bundles a much larger family set; v0 fluor keeps the crate tiny.
-        db.load_font_data(
-            include_bytes!("../assets/Open_Sans/static/OpenSans-Regular.ttf").to_vec(),
-        );
-        db.load_font_data(include_bytes!("../assets/Open_Sans/static/OpenSans-Bold.ttf").to_vec());
+        // Open Sans, VARIABLE (wght 300..800, wdth 75..100) — the primary Latin family, every weight a real one (Nick 2026-10-14, "get it all variable"). It replaced the static Regular + Bold, between which every 500 and 600 a consumer asked for used to snap to 400 or 700.
+        db.load_font_data(include_bytes!("../assets/Open_Sans/OpenSans-VariableFont_wdth,wght.ttf").to_vec());
         // Noto Sans Symbols 2 — the deterministic MONOCHROME symbol fallback. Covers hearts ♥♡, stars, checks, weather, geometric shapes, arrows, dingbats, box-drawing, and math that Open Sans lacks. Swash rasterizes these as a coverage Mask (tinted with the style colour like any glyph).
         db.load_font_data(
             include_bytes!("../assets/Noto_Sans_Symbols2/NotoSansSymbols2-Regular.ttf").to_vec(),
@@ -247,7 +246,22 @@ impl TextRenderer {
             scale_context: ScaleContext::new(),
             // Cap at 1024 glyph-images. At ~256 visible glyphs × 4 active rotation bins it never trips; bigger workloads tail-evict the coldest entries first.
             transform_cache: TransformGlyphCache::new(1024),
+            optical: false,
         }
+    }
+
+    /// OPTICAL WEIGHT (Nick 2026-10-14, with variable fonts): the weight a style asks for is the weight at 16 px; smaller text draws heavier and larger text lighter, so a 9 px label and a 40 px name read as the same weight — a thin stem under a pixel wide renders as grey, a heavy stem at display size reads as shouting. 4 weight units per pixel away from 16, at most +60 (small) and −40 (large), within 100..900. A variable face draws the result exactly; a static face snaps it to its nearest cut. Off by default, so a consumer opts in.
+    pub fn set_optical_weight(&mut self, on: bool) {
+        self.optical = on;
+    }
+
+    /// The weight actually drawn for a style weight at `size` px (see [`set_optical_weight`](Self::set_optical_weight)). Measuring and drawing both go through it, so a measured width is the drawn width.
+    pub fn optical_weight(&self, weight: u16, size: f32) -> u16 {
+        if !self.optical || !size.is_finite() {
+            return weight;
+        }
+        let d = ((16.0 - size) * 4.0).clamp(-40.0, 60.0);
+        (weight as f32 + d).round().clamp(100.0, 900.0) as u16
     }
 
     /// Mutable access to the underlying `FontSystem` so consumers can load additional fonts via `text.font_system_mut().db_mut().load_font_data(...)`.
@@ -309,7 +323,7 @@ impl TextRenderer {
         let buf_h = canvas.height;
         let attrs = Attrs::new()
             .family(Family::Name(font))
-            .weight(Weight(weight));
+            .weight(Weight(self.optical_weight(weight, size)));
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(None, None);
@@ -382,7 +396,7 @@ impl TextRenderer {
         let buf_h = canvas.height;
         let attrs = Attrs::new()
             .family(Family::Name(font))
-            .weight(Weight(weight));
+            .weight(Weight(self.optical_weight(weight, size)));
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(None, None);
@@ -452,7 +466,7 @@ impl TextRenderer {
         let buf_h = canvas.height;
         let attrs = Attrs::new()
             .family(Family::Name(font))
-            .weight(Weight(weight));
+            .weight(Weight(self.optical_weight(weight, size)));
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(None, None);
@@ -513,7 +527,7 @@ impl TextRenderer {
     ) -> f32 {
         let attrs = Attrs::new()
             .family(Family::Name(font))
-            .weight(Weight(weight));
+            .weight(Weight(self.optical_weight(weight, size)));
 
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
@@ -571,7 +585,7 @@ impl TextRenderer {
     ) -> f32 {
         let attrs = Attrs::new()
             .family(Family::Name(font))
-            .weight(Weight(weight));
+            .weight(Weight(self.optical_weight(weight, size)));
 
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
@@ -623,7 +637,7 @@ impl TextRenderer {
     ) -> f32 {
         let attrs = Attrs::new()
             .family(Family::Name(font))
-            .weight(Weight(weight));
+            .weight(Weight(self.optical_weight(weight, size)));
 
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
@@ -1043,7 +1057,7 @@ impl TextRenderer {
     ) -> f32 {
         let attrs = Attrs::new()
             .family(Family::Name(font))
-            .weight(Weight(weight));
+            .weight(Weight(self.optical_weight(weight, size)));
 
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
@@ -1092,7 +1106,7 @@ impl TextRenderer {
     ) -> f32 {
         let attrs = Attrs::new()
             .family(Family::Name(font))
-            .weight(Weight(weight));
+            .weight(Weight(self.optical_weight(weight, size)));
 
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
@@ -1141,7 +1155,7 @@ impl TextRenderer {
     ) -> f32 {
         let attrs = Attrs::new()
             .family(Family::Name(font))
-            .weight(Weight(weight));
+            .weight(Weight(self.optical_weight(weight, size)));
 
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
@@ -1390,7 +1404,7 @@ impl TextRenderer {
 
         let attrs = Attrs::new()
             .family(Family::Name(font))
-            .weight(Weight(weight));
+            .weight(Weight(self.optical_weight(weight, size)));
 
         let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(size, size));
         buffer.set_size(Some(10000.0), Some(size * 2.0));
@@ -1429,7 +1443,7 @@ impl TextRenderer {
         }
         let attrs = Attrs::new()
             .family(Family::Name(font))
-            .weight(Weight(weight));
+            .weight(Weight(self.optical_weight(weight, size)));
         let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(size, size));
         buffer.set_size(Some(10000.0), Some(size * 2.0));
         set_text_vs(&mut buffer, text, &attrs);
@@ -1473,7 +1487,7 @@ impl TextRenderer {
     ) -> f32 {
         let attrs = Attrs::new()
             .family(Family::Name(font))
-            .weight(Weight(weight));
+            .weight(Weight(self.optical_weight(weight, size)));
 
         let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(size, size));
         buffer.set_size(Some(size * 2.0), Some(size * 2.0));
@@ -1631,7 +1645,7 @@ impl TextRenderer {
     ) -> f32 {
         let attrs = Attrs::new()
             .family(Family::Name(font))
-            .weight(Weight(weight));
+            .weight(Weight(self.optical_weight(weight, size)));
 
         let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(size, size));
         buffer.set_size(Some(size * 2.0), Some(size * 2.0));
