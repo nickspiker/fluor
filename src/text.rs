@@ -44,6 +44,8 @@ fn damage_text_bbox(
 #[derive(Copy, Clone, PartialEq, Eq)]
 struct TransformGlyphKey {
     font_id: cosmic_text::fontdb::ID,
+    /// The weight the glyph is drawn at: one variable font draws every weight, so the weight is part of the glyph's identity.
+    weight: u16,
     glyph_id: u16,
     size_bits: u32,
     a_bits: u32,
@@ -184,9 +186,9 @@ impl Fallback for BundledFallback {
 /// U+FE0F after a base character forces the colour-emoji face for that character; U+FE0E forces the monochrome symbol face; a bare character follows the fallback chain (colour first — see BundledFallback).
 /// Why here and not in the font: cosmic-text's fallback triggers per MISSING glyph, not per selector. A selector the winning font doesn't map is just a default-ignorable zero-width glyph, so `☎\u{FE0E}` would still land on whichever face the chain reached first. Splitting the pair into its own span with an explicit family is the only lever that actually chooses the face.
 /// The selector stays in the span's text: the face it routes to treats it as default-ignorable, so it draws nothing and costs no advance.
-fn set_text_vs(buffer: &mut Buffer, fs: &mut FontSystem, text: &str, attrs: &Attrs) {
+fn set_text_vs(buffer: &mut Buffer, text: &str, attrs: &Attrs) {
     if !text.contains(['\u{FE0E}', '\u{FE0F}']) {
-        buffer.set_text(fs, text, attrs, Shaping::Advanced);
+        buffer.set_text(text, attrs, Shaping::Advanced, None);
         return;
     }
     let mut spans: Vec<(&str, Attrs)> = Vec::new();
@@ -209,7 +211,7 @@ fn set_text_vs(buffer: &mut Buffer, fs: &mut FontSystem, text: &str, attrs: &Att
     if plain_start < text.len() {
         spans.push((&text[plain_start..], attrs.clone()));
     }
-    buffer.set_rich_text(fs, spans, attrs, Shaping::Advanced, None);
+    buffer.set_rich_text(spans, attrs, Shaping::Advanced, None);
 }
 
 impl TextRenderer {
@@ -310,8 +312,8 @@ impl TextRenderer {
             .weight(Weight(weight));
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
-        buffer.set_size(&mut self.font_system, None, None);
-        set_text_vs(&mut buffer, &mut self.font_system, text, &attrs);
+        buffer.set_size(None, None);
+        set_text_vs(&mut buffer, text, &attrs);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -383,8 +385,8 @@ impl TextRenderer {
             .weight(Weight(weight));
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
-        buffer.set_size(&mut self.font_system, None, None);
-        set_text_vs(&mut buffer, &mut self.font_system, text, &attrs);
+        buffer.set_size(None, None);
+        set_text_vs(&mut buffer, text, &attrs);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -453,8 +455,8 @@ impl TextRenderer {
             .weight(Weight(weight));
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
-        buffer.set_size(&mut self.font_system, None, None);
-        set_text_vs(&mut buffer, &mut self.font_system, text, &attrs);
+        buffer.set_size(None, None);
+        set_text_vs(&mut buffer, text, &attrs);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -516,8 +518,8 @@ impl TextRenderer {
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 
-        buffer.set_size(&mut self.font_system, None, None);
-        set_text_vs(&mut buffer, &mut self.font_system, text, &attrs);
+        buffer.set_size(None, None);
+        set_text_vs(&mut buffer, text, &attrs);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -574,8 +576,8 @@ impl TextRenderer {
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 
-        buffer.set_size(&mut self.font_system, None, None);
-        set_text_vs(&mut buffer, &mut self.font_system, text, &attrs);
+        buffer.set_size(None, None);
+        set_text_vs(&mut buffer, text, &attrs);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -626,8 +628,8 @@ impl TextRenderer {
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 
-        buffer.set_size(&mut self.font_system, None, None);
-        set_text_vs(&mut buffer, &mut self.font_system, text, &attrs);
+        buffer.set_size(None, None);
+        set_text_vs(&mut buffer, text, &attrs);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -773,6 +775,7 @@ impl TextRenderer {
                                 .expect("path_transform set implies contour_transform set");
                             let key = TransformGlyphKey {
                                 font_id: glyph.font_id,
+                                weight: glyph.font_weight.0,
                                 glyph_id: glyph.glyph_id,
                                 size_bits: glyph.font_size.to_bits(),
                                 a_bits: t.a.to_bits(),
@@ -781,16 +784,19 @@ impl TextRenderer {
                                 d_bits: t.d.to_bits(),
                             };
                             if self.transform_cache.lookup(key).is_none() {
-                                let Some(font) = self.font_system.get_font(glyph.font_id) else {
+                                let Some(font) = self.font_system.get_font(glyph.font_id, glyph.font_weight) else {
                                     continue;
                                 };
                                 let image = {
                                     let swash_font = font.as_swash();
-                                    let mut scaler = self
-                                        .scale_context
-                                        .builder(swash_font)
-                                        .size(glyph.font_size)
-                                        .build();
+                                    let mut scaler = self.scale_context.builder(swash_font).size(glyph.font_size);
+                                    // A variable font drawn at the glyph's weight on its wght axis, as cosmic-text's own cache draws the upright glyphs (Nick 2026-10-14: variable weights in the render, no split fonts).
+                                    let wght = swash::Tag::from_be_bytes(*b"wght");
+                                    if let Some(axis) = swash_font.variations().find_by_tag(wght) {
+                                        let w = f32::from(glyph.font_weight.0).clamp(axis.min_value(), axis.max_value());
+                                        scaler = scaler.normalized_coords(swash_font.variations().normalized_coords([(wght, w)]));
+                                    }
+                                    let mut scaler = scaler.build();
                                     // Request the colour-bitmap and colour-outline sources ALONGSIDE the outline so a rotated colour emoji still produces a `Content::Color` image (swash picks the first source the face supports; Open Sans/Symbols glyphs fall thru to Outline as before). The swash transform rotates the colour strike in place, so rotated emoji show in true colour rather than being skipped.
                                     let Some(img) = Render::new(&[
                                         Source::ColorBitmap(swash::scale::StrikeWith::BestFit),
@@ -1042,8 +1048,8 @@ impl TextRenderer {
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 
-        buffer.set_size(&mut self.font_system, None, None);
-        set_text_vs(&mut buffer, &mut self.font_system, text, &attrs);
+        buffer.set_size(None, None);
+        set_text_vs(&mut buffer, text, &attrs);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -1091,8 +1097,8 @@ impl TextRenderer {
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 
-        buffer.set_size(&mut self.font_system, None, None);
-        set_text_vs(&mut buffer, &mut self.font_system, text, &attrs);
+        buffer.set_size(None, None);
+        set_text_vs(&mut buffer, text, &attrs);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -1140,8 +1146,8 @@ impl TextRenderer {
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 
-        buffer.set_size(&mut self.font_system, None, None);
-        set_text_vs(&mut buffer, &mut self.font_system, text, &attrs);
+        buffer.set_size(None, None);
+        set_text_vs(&mut buffer, text, &attrs);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -1387,8 +1393,10 @@ impl TextRenderer {
             .weight(Weight(weight));
 
         let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(size, size));
-        buffer.set_size(&mut self.font_system, Some(10000.0), Some(size * 2.0));
-        set_text_vs(&mut buffer, &mut self.font_system, text, &attrs);
+        buffer.set_size(Some(10000.0), Some(size * 2.0));
+        set_text_vs(&mut buffer, text, &attrs);
+        // cosmic-text 0.19 shapes on demand: lay the text out before reading its runs.
+        buffer.shape_until_scroll(&mut self.font_system, false);
 
         // Sum each glyph's ADVANCE (glyph.w), don't take max(glyph.x + glyph.w). A trailing space has zero visual extent, so cosmic-text gives it glyph.x = glyph.w = 0 when it's the last (or only)
         // glyph in the run — max(x+w) then returns 0, so a lone " " measures 0 and words that end in a space collapse into the next (text looks truncated / spaces vanish). Summing advances counts the space's advance regardless of position, matching `measure_text_widths_per_char` below.
@@ -1423,8 +1431,10 @@ impl TextRenderer {
             .family(Family::Name(font))
             .weight(Weight(weight));
         let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(size, size));
-        buffer.set_size(&mut self.font_system, Some(10000.0), Some(size * 2.0));
-        set_text_vs(&mut buffer, &mut self.font_system, text, &attrs);
+        buffer.set_size(Some(10000.0), Some(size * 2.0));
+        set_text_vs(&mut buffer, text, &attrs);
+        // cosmic-text 0.19 shapes on demand: lay the text out before reading its runs.
+        buffer.shape_until_scroll(&mut self.font_system, false);
         for run in buffer.layout_runs() {
             for glyph in run.glyphs {
                 // Binary search for the largest byte_idx <= glyph.start: that's the char whose UTF-8 encoding starts at or before this glyph's source byte.
@@ -1466,10 +1476,12 @@ impl TextRenderer {
             .weight(Weight(weight));
 
         let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(size, size));
-        buffer.set_size(&mut self.font_system, Some(size * 2.0), Some(size * 2.0));
+        buffer.set_size(Some(size * 2.0), Some(size * 2.0));
 
         let text = ch.to_string();
-        buffer.set_text(&mut self.font_system, &text, &attrs, Shaping::Advanced);
+        buffer.set_text(&text, &attrs, Shaping::Advanced, None);
+        // cosmic-text 0.19 shapes on demand: lay the text out before reading its runs.
+        buffer.shape_until_scroll(&mut self.font_system, false);
 
         let mut char_width: f32 = 0.0;
 
@@ -1622,10 +1634,12 @@ impl TextRenderer {
             .weight(Weight(weight));
 
         let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(size, size));
-        buffer.set_size(&mut self.font_system, Some(size * 2.0), Some(size * 2.0));
+        buffer.set_size(Some(size * 2.0), Some(size * 2.0));
 
         let text = ch.to_string();
-        buffer.set_text(&mut self.font_system, &text, &attrs, Shaping::Advanced);
+        buffer.set_text(&text, &attrs, Shaping::Advanced, None);
+        // cosmic-text 0.19 shapes on demand: lay the text out before reading its runs.
+        buffer.shape_until_scroll(&mut self.font_system, false);
 
         let mut char_width: f32 = 0.0;
 

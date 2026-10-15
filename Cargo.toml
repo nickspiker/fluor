@@ -61,7 +61,7 @@ rayon = ["std", "dep:rayon"]
 
 [dependencies]
 # vsf decodes the canonical image format used by `host::icon` (orb / app-icon decode). Default features (std + registry) match fluor's host environment. Optional behind `icon` — headless consumers (toka's wasm renderer) don't decode app icons, and rav1d can't build for wasm32.
-vsf = { version = "0.9.3", path = "../vsf", optional = true }
+vsf = { version = "0.10", path = "../vsf", optional = true }
 
 # rav1d decodes AV1 OBU bitstreams for icons over `vsfimg`'s UNCOMPRESSED_MAX_DIM. `bitdepth_8` keeps the build slim — fluor's icon path is u8 RGB only. Optional behind `icon` (see vsf note).
 rav1d = { version = "1.1", default-features = false, features = ["bitdepth_8"], optional = true }
@@ -76,7 +76,7 @@ rayon = { version = "1", optional = true }
 # winit + softbuffer are cross-platform (incl. Redox/Orbital), so they stay top-level under the host-winit feature. wgpu + pollster (macOS GPU present) and arboard (clipboard, non-Redox) are declared in the per-target blocks below instead — keeps them off the Redox dep graph.
 winit = { version = "0.30", optional = true }
 softbuffer = { version = "0.4", optional = true }
-cosmic-text = { version = "0.14", optional = true }
+cosmic-text = { version = "0.19", optional = true }
 # swash is pulled in transitively by cosmic-text but we use it directly for transform-aware
 # glyph rasterization (rotated/skewed text). Pinning the same version cosmic-text uses keeps
 # FontRef + ScaleContext interop trivial.
