@@ -3389,6 +3389,10 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                         window.set_cursor_visible(true);
                         window.set_cursor(winit_compat::to_winit_cursor(icon));
                         self.hide_os_cursor(false);
+                        #[cfg(target_os = "macos")]
+                        if !window.has_focus() {
+                            set_unfocused_cursor(icon);
+                        }
                     }
                     self.apply_response(response);
                 }
@@ -3823,4 +3827,23 @@ impl<A: FluorApp + 'static> DesktopShell<A> {
             self.apply_response(response);
         }
     }
+}
+
+/// macOS: the pointer's shape while our window is NOT key (Nick 2026-10-15: "none of the cursor changes happen if it's not raised except for the resize edges").
+/// winit sets the cursor thru a cursor rect, and AppKit consults cursor rects only on the key window — so over a background window the hand and the I-beam never showed, while the resize arrows (drawn by the window server) did.
+/// Setting the NSCursor directly on each move works whichever app is active; the next move over another app's window is that app's to set.
+/// The diagonal resize shapes have no public NSCursor, and the edge bands get the window server's arrows anyway, so those stay with winit.
+#[cfg(target_os = "macos")]
+fn set_unfocused_cursor(icon: FCursorIcon) {
+    use objc2_app_kit::NSCursor;
+    #[allow(deprecated)]
+    let cursor = match icon {
+        FCursorIcon::Pointer => NSCursor::pointingHandCursor(),
+        FCursorIcon::Text => NSCursor::IBeamCursor(),
+        FCursorIcon::NsResize => NSCursor::resizeUpDownCursor(),
+        FCursorIcon::EwResize => NSCursor::resizeLeftRightCursor(),
+        FCursorIcon::Default => NSCursor::arrowCursor(),
+        FCursorIcon::NwseResize | FCursorIcon::NeswResize | FCursorIcon::Hidden => return,
+    };
+    cursor.set();
 }
