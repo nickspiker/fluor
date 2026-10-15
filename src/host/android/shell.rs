@@ -49,6 +49,8 @@ pub struct AndroidShell<A: FluorApp> {
     pointer: crate::host::pointer::PointerArbiter,
     /// A finger is currently down (between ACTION_DOWN and ACTION_UP/CANCEL). Gates touch-drag → scroll: a MOVE while down emits a synthetic `MouseWheel` so the app's existing wheel handling scrolls (contacts, conversation, settings) — desktop has a wheel, touch didn't.
     touch_down: bool,
+    /// The app's folded focus as the Activity reports it ([`on_focus`](Self::on_focus)); starts true (the shell is built for a resumed, visible Activity).
+    focused: bool,
     touch_last_x: Coord,
     /// The finger's y at the last touch event, for the per-move scroll delta.
     touch_last_y: Coord,
@@ -85,6 +87,7 @@ impl<A: FluorApp> AndroidShell<A> {
             pending_damage: Damage::new(),
             pointer: crate::host::pointer::PointerArbiter::new(),
             touch_down: false,
+            focused: true,
             touch_last_x: 0.0,
             touch_last_y: 0.0,
             touch_travel: 0.0,
@@ -325,6 +328,17 @@ impl<A: FluorApp> AndroidShell<A> {
         let handled = matches!(self.dispatch(&ev), EventResponse::Handled);
         self.window.mark_dirty();
         handled
+    }
+
+    /// APP FOCUS from the Activity (Nick 2026-10-15: "should be the same on all platforms. screen off should be treated as defocus"): Kotlin folds resumed ∧ window-focused ∧ display-on and reports the result on every change. Delivered exactly as the desktop host delivers a window's focus — the `Focused` event thru `on_event`, then `on_focus_changed` — so an app's focus edges (saving work, sleeping the caret, telling its other devices) run on Android the same as everywhere. Repeats are dropped: only an edge reaches the app.
+    pub fn on_focus(&mut self, focused: bool) {
+        if self.focused == focused {
+            return;
+        }
+        self.focused = focused;
+        let _ = self.dispatch(&FEvent::Focused(focused));
+        self.app.on_focus_changed(focused);
+        self.window.mark_dirty();
     }
 
     /// Text input from `nativeOnTextInput` (Java `String` committed by the soft IME). Builds an `Event::Ime(Commit(text))` and dispatches.

@@ -865,6 +865,8 @@ struct DesktopShell<A: FluorApp> {
 
     /// Tracks `WindowEvent::Focused` folded over every surface (any() of `MonitorSurface::focused`) so the drop shadow can dim when the window is inactive — focused windows cast a stronger shadow (`SHADOW_SEED_FOCUSED`), unfocused ones use a quarter-strength shadow (`SHADOW_SEED_UNFOCUSED`).
     is_focused: bool,
+    /// The display is dark (macOS: asleep, or the session is not the active one — host/macos_screen.rs). Folded into `is_focused`: screen off reads as the app losing focus (Nick 2026-10-15).
+    display_asleep: bool,
 
     /// Live render-pipeline counters. Updated every `render_frame` call (composite-time EMA + frame counter); rendered to a bottom-of-window debug strip when [`paint::DEBUG_SHOW_FPS`] is set via the `[]f` chord.
     debug_stats: crate::paint::DebugStats,
@@ -951,6 +953,7 @@ impl<A: FluorApp> DesktopShell<A> {
                 h: 1,
             },
             is_focused: true,
+            display_asleep: false,
             debug_stats: crate::paint::DebugStats::default(),
             pending_damage: crate::canvas::Damage::new(),
             last_strip_active: false,
@@ -2956,6 +2959,9 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
         // Watch app activation so a Dock click can reach the window layer at all — see macos_reopen.
         #[cfg(target_os = "macos")]
         super::macos_reopen::install();
+        // Screen sleep / session switch → the app's focus (see macos_screen).
+        #[cfg(target_os = "macos")]
+        super::macos_screen::install();
         // Teach the same delegate to answer applicationDockMenu:. Wired before the menu spec is read
         // (below) — it simply answers null until `install_dock_menu` publishes one.
         #[cfg(target_os = "macos")]
@@ -3135,6 +3141,19 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
         #[cfg(target_os = "linux")]
         if x11_atomic::screen_changed() {
             self.rebuild_span(event_loop);
+        }
+        // The display went dark or came back (macos_screen): fold it into the app's focus and deliver the edge exactly as a window's focus change is delivered — the raw Focused event, then on_focus_changed.
+        #[cfg(target_os = "macos")]
+        if let Some(asleep) = super::macos_screen::take_change() {
+            self.display_asleep = asleep;
+            let was = self.is_focused;
+            self.is_focused = self.surfaces.iter().any(|s| s.focused) && !asleep;
+            log::info!("FLUOR-FOCUS: display {} — app focus {}", if asleep { "asleep" } else { "awake" }, self.is_focused);
+            if self.is_focused != was {
+                self.dispatch_event(WindowEvent::Focused(self.is_focused));
+                self.app.on_focus_changed(self.is_focused);
+                self.pending_full_repaint = true;
+            }
         }
         // Dock icon clicked. macOS asks the APPLICATION delegate, never the window, which is why this cannot be handled in `window_event` and why it was silently dropped before (see macos_reopen).
         #[cfg(target_os = "macos")]
@@ -3431,7 +3450,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 // Per-surface focus, folded into the shell-level flag — the app is focused when ANY of its surfaces is.
                 self.surfaces[si].focused = focused;
                 let was_focused = self.is_focused;
-                self.is_focused = self.surfaces.iter().any(|s| s.focused);
+                self.is_focused = self.surfaces.iter().any(|s| s.focused) && !self.display_asleep;
                 // The app hears the FOLDED edge only — per-surface flicker while focus hops between spans is not a focus change.
                 if self.is_focused != was_focused {
                     self.app.on_focus_changed(self.is_focused);

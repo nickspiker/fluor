@@ -57,6 +57,10 @@ pub(crate) mod macos_hittest;
 #[cfg(all(feature = "host-winit", target_os = "macos"))]
 pub(crate) mod macos_reopen;
 
+/// macOS display sleep / session switch → the app's focus (screen off reads as defocus).
+#[cfg(all(feature = "host-winit", target_os = "macos"))]
+pub(crate) mod macos_screen;
+
 /// macOS presentation options: cover the system menu bar for apps that fill the screen.
 #[cfg(all(feature = "host-winit", target_os = "macos"))]
 pub(crate) mod macos_presentation;
