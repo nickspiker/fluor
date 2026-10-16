@@ -95,6 +95,15 @@ pub struct TextRenderer {
     transform_cache: TransformGlyphCache,
     /// OPTICAL WEIGHT (Nick 2026-10-14, with variable fonts): see [`TextRenderer::set_optical_weight`]. Off by default.
     optical: bool,
+    /// Font packs ([`crate::packs`]), as bits by index: looked for in the db, loaded (there, bundled or fetched), wanted by text drawn without them, and offered to the app.
+    packs_checked: u64,
+    packs_loaded: u64,
+    packs_wanted: u64,
+    packs_offered: u64,
+    /// The regional face for Han text with no kana or Hangul to say otherwise.
+    han: crate::packs::Han,
+    /// Bumped whenever a face is added, so whatever measured text before (a label's advances) measures again.
+    fonts_version: u64,
 }
 
 /// How text draws — everything beyond "which glyphs, where". REQUIRED values (size, colour) live in [`TextStyle::new`]; every OPTION defaults to none and is added by a chainable builder. Fields are PRIVATE on purpose: no struct literals means adding the next option (kerning, vertical shear, …) can never break a call site — the forward-compat contract this API was rebuilt for (2026-07-17).
@@ -171,6 +180,7 @@ impl Fallback for BundledFallback {
     }
     fn script_fallback(&self, script: Script, _locale: &str) -> &[&'static str] {
         // Per-script bundled faces, tried right after the primary font and before the common chain. Still hardcoded, still bundle-only. CJK is deliberately absent (Nick 2026-09-08: skipped for now — a pan-CJK face is 10–20 MB and roughly doubles the binary; revisit when it earns its place).
+        // A script's family whether bundled by the app or loaded from a font pack later ([`crate::packs`], Nick 2026-10-16): a family not in the db is skipped, so naming it before it arrives costs nothing.
         match script {
             Script::Arabic => &["Noto Sans Arabic"],
             Script::Devanagari => &["Noto Sans Devanagari"],
@@ -178,6 +188,30 @@ impl Fallback for BundledFallback {
             Script::Armenian => &["Noto Sans Armenian"],
             Script::Georgian => &["Noto Sans Georgian"],
             Script::Runic => &["Noto Sans Runic"],
+            Script::Hebrew => &["Noto Sans Hebrew"],
+            Script::Syriac => &["Noto Sans Syriac"],
+            Script::Thaana => &["Noto Sans Thaana"],
+            Script::Bengali => &["Noto Sans Bengali"],
+            Script::Gurmukhi => &["Noto Sans Gurmukhi"],
+            Script::Gujarati => &["Noto Sans Gujarati"],
+            Script::Oriya => &["Noto Sans Oriya"],
+            Script::Tamil => &["Noto Sans Tamil"],
+            Script::Telugu => &["Noto Sans Telugu"],
+            Script::Kannada => &["Noto Sans Kannada"],
+            Script::Malayalam => &["Noto Sans Malayalam"],
+            Script::Sinhala => &["Noto Sans Sinhala"],
+            Script::Lao => &["Noto Sans Lao"],
+            Script::Tibetan => &["Noto Serif Tibetan"],
+            Script::Myanmar => &["Noto Sans Myanmar"],
+            Script::Ethiopic => &["Noto Sans Ethiopic"],
+            Script::Cherokee => &["Noto Sans Cherokee"],
+            Script::Canadian_Aboriginal => &["Noto Sans Canadian Aboriginal"],
+            Script::Khmer => &["Noto Sans Khmer"],
+            Script::Mongolian => &["Noto Sans Mongolian"],
+            Script::Tifinagh => &["Noto Sans Tifinagh"],
+            Script::Han | Script::Bopomofo => &["Noto Sans SC", "Noto Sans TC", "Noto Sans HK", "Noto Sans JP", "Noto Sans KR"],
+            Script::Hiragana | Script::Katakana => &["Noto Sans JP"],
+            Script::Hangul => &["Noto Sans KR"],
             _ => &[],
         }
     }
@@ -188,31 +222,38 @@ impl Fallback for BundledFallback {
 /// U+FE0F after a base character forces the colour-emoji face for that character; U+FE0E forces the monochrome symbol face; a bare character follows the fallback chain (colour first — see BundledFallback).
 /// Why here and not in the font: cosmic-text's fallback triggers per MISSING glyph, not per selector. A selector the winning font doesn't map is just a default-ignorable zero-width glyph, so `☎\u{FE0E}` would still land on whichever face the chain reached first. Splitting the pair into its own span with an explicit family is the only lever that actually chooses the face.
 /// The selector stays in the span's text: the face it routes to treats it as default-ignorable, so it draws nothing and costs no advance.
-fn set_text_vs(buffer: &mut Buffer, text: &str, attrs: &Attrs) {
-    if !text.contains(['\u{FE0E}', '\u{FE0F}']) {
+fn set_text_vs<'a>(buffer: &mut Buffer, text: &'a str, attrs: &Attrs<'a>, cjk: Option<&'static str>) {
+    if cjk.is_none() && !text.contains(['\u{FE0E}', '\u{FE0F}']) {
         buffer.set_text(text, attrs, Shaping::Advanced, None);
         return;
     }
+    // Each character's family override: a variation-selector pair its emoji or symbol face, a CJK character the text's regional face (Nick 2026-10-16: Japanese forms for Japanese names), the rest none. Runs of one override become one span.
     let mut spans: Vec<(&str, Attrs)> = Vec::new();
-    let mut plain_start = 0usize;
+    let span = |spans: &mut Vec<(&'a str, Attrs<'a>)>, part: &'a str, family: Option<&'static str>| {
+        if !part.is_empty() {
+            spans.push((part, match family {
+                Some(f) => attrs.clone().family(Family::Name(f)),
+                None => attrs.clone(),
+            }));
+        }
+    };
+    let (mut run_start, mut run_family) = (0usize, None::<&'static str>);
     let mut it = text.char_indices().peekable();
     while let Some((i, c)) = it.next() {
-        let Some(&(_, vs)) = it.peek() else { break };
-        if vs != '\u{FE0E}' && vs != '\u{FE0F}' {
-            continue;
+        let family = match it.peek() {
+            Some(&(_, vs)) if vs == '\u{FE0F}' || vs == '\u{FE0E}' => {
+                it.next();
+                Some(if vs == '\u{FE0F}' { "Noto Color Emoji" } else { "Noto Sans Symbols 2" })
+            }
+            _ if crate::packs::is_cjk(c) => cjk,
+            _ => None,
+        };
+        if family != run_family {
+            span(&mut spans, &text[run_start..i], run_family);
+            (run_start, run_family) = (i, family);
         }
-        let end = i + c.len_utf8() + vs.len_utf8();
-        if plain_start < i {
-            spans.push((&text[plain_start..i], attrs.clone()));
-        }
-        let family = if vs == '\u{FE0F}' { "Noto Color Emoji" } else { "Noto Sans Symbols 2" };
-        spans.push((&text[i..end], attrs.clone().family(Family::Name(family))));
-        it.next();
-        plain_start = end;
     }
-    if plain_start < text.len() {
-        spans.push((&text[plain_start..], attrs.clone()));
-    }
+    span(&mut spans, &text[run_start..], run_family);
     buffer.set_rich_text(spans, attrs, Shaping::Advanced, None);
 }
 
@@ -247,7 +288,106 @@ impl TextRenderer {
             // Cap at 1024 glyph-images. At ~256 visible glyphs × 4 active rotation bins it never trips; bigger workloads tail-evict the coldest entries first.
             transform_cache: TransformGlyphCache::new(1024),
             optical: false,
+            packs_checked: 0,
+            packs_loaded: 0,
+            packs_wanted: 0,
+            packs_offered: 0,
+            han: crate::packs::Han::Simplified,
+            fonts_version: 0,
         }
+    }
+
+    /// The packs this text needs, noted as wanted where none is loaded; returns the CJK face its CJK runs draw in (kana means Japanese, Hangul Korean, Han alone the renderer's default), if it has any.
+    fn note_packs(&mut self, text: &str) -> Option<&'static str> {
+        use crate::packs::{Han, Need, PACKS, need};
+        if text.is_ascii() {
+            return None;
+        }
+        let (mut kana, mut hangul, mut shared) = (false, false, false);
+        for c in text.chars() {
+            match need(c) {
+                Some(Need::Script(i)) => self.need_pack(i),
+                Some(Need::Kana) => kana = true,
+                Some(Need::Hangul) => hangul = true,
+                Some(Need::Shared) => shared = true,
+                None => {}
+            }
+        }
+        if !(kana || hangul || shared) {
+            return None;
+        }
+        let region = if kana { Han::Japanese } else if hangul { Han::Korean } else { self.han };
+        let i = region.pack();
+        self.need_pack(i);
+        Some(PACKS[i].family)
+    }
+
+    /// One pack noted as needed: looked for in the db the first time (a face an app bundled counts as loaded), wanted if absent.
+    fn need_pack(&mut self, i: usize) {
+        let bit = 1u64 << i;
+        if self.packs_loaded & bit != 0 {
+            return;
+        }
+        if self.packs_checked & bit == 0 {
+            self.packs_checked |= bit;
+            let family = crate::packs::PACKS[i].family;
+            if self.font_system.db().faces().any(|f| f.families.iter().any(|(n, _)| n == family)) {
+                self.packs_loaded |= bit;
+                return;
+            }
+        }
+        self.packs_wanted |= bit;
+    }
+
+    /// Packs text has needed since the last call and none is loaded for, each offered once: the app fetches them and hands each to [`TextRenderer::load_pack`] (or [`TextRenderer::add_pack_face`] for a face it checked itself).
+    pub fn wanted_packs(&mut self) -> Vec<&'static crate::packs::Pack> {
+        let new = self.packs_wanted & !self.packs_loaded & !self.packs_offered;
+        self.packs_offered |= new;
+        (0..crate::packs::PACKS.len()).filter(|i| new & (1u64 << i) != 0).map(|i| &crate::packs::PACKS[i]).collect()
+    }
+
+    /// Offer a pack again (its fetch failed): the next text needing it brings it back through [`TextRenderer::wanted_packs`].
+    pub fn offer_again(&mut self, id: &str) {
+        if let Some(i) = crate::packs::index(id) {
+            self.packs_offered &= !(1u64 << i);
+        }
+    }
+
+    /// The regional face for Han text with no kana or Hangul in it (Simplified Chinese until set).
+    pub fn set_han(&mut self, region: crate::packs::Han) {
+        self.han = region;
+    }
+
+    /// Bumped whenever a face is added: anything that measured text before measures again.
+    pub fn fonts_version(&self) -> u64 {
+        self.fonts_version
+    }
+
+    /// A pack's face added, checked by the caller already: it must declare the pack's family. The next frame draws that script.
+    pub fn add_pack_face(&mut self, id: &str, face: Vec<u8>) -> Result<(), String> {
+        let i = crate::packs::index(id).ok_or_else(|| format!("unknown font pack {id}"))?;
+        let family = crate::packs::PACKS[i].family;
+        let ids = self.font_system.db_mut().load_font_source(cosmic_text::fontdb::Source::Binary(std::sync::Arc::new(face)));
+        let db = self.font_system.db();
+        if !ids.iter().any(|id| db.face(*id).is_some_and(|f| f.families.iter().any(|(n, _)| n == family))) {
+            for id in ids {
+                self.font_system.db_mut().remove_face(id);
+            }
+            return Err(format!("font pack {id}: the face is not {family}"));
+        }
+        self.packs_loaded |= 1u64 << i;
+        self.packs_checked |= 1u64 << i;
+        self.fonts_version += 1;
+        Ok(())
+    }
+
+    /// A signed pack document checked against the author's key and its face added ([`crate::packs::read`]); returns the pack.
+    #[cfg(feature = "packs")]
+    pub fn load_pack(&mut self, doc: &[u8], author: [u8; 32]) -> Result<&'static crate::packs::Pack, String> {
+        let (i, face) = crate::packs::read(doc, author)?;
+        let pack = &crate::packs::PACKS[i];
+        self.add_pack_face(pack.id, face)?;
+        Ok(pack)
     }
 
     /// OPTICAL WEIGHT (Nick 2026-10-14, with variable fonts): the weight a style asks for is the weight at 16 px; smaller text draws heavier and larger text lighter, so a 9 px label and a 40 px name read as the same weight — a thin stem under a pixel wide renders as grey, a heavy stem at display size reads as shouting. 4 weight units per pixel away from 16, at most +60 (small) and −40 (large), within 100..900. A variable face draws the result exactly; a static face snaps it to its nearest cut. Off by default, so a consumer opts in.
@@ -327,7 +467,8 @@ impl TextRenderer {
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(None, None);
-        set_text_vs(&mut buffer, text, &attrs);
+        let cjk = self.note_packs(text);
+        set_text_vs(&mut buffer, text, &attrs, cjk);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -400,7 +541,8 @@ impl TextRenderer {
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(None, None);
-        set_text_vs(&mut buffer, text, &attrs);
+        let cjk = self.note_packs(text);
+        set_text_vs(&mut buffer, text, &attrs, cjk);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -470,7 +612,8 @@ impl TextRenderer {
         let metrics = Metrics::relative(size, 1.2);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(None, None);
-        set_text_vs(&mut buffer, text, &attrs);
+        let cjk = self.note_packs(text);
+        set_text_vs(&mut buffer, text, &attrs, cjk);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -533,7 +676,8 @@ impl TextRenderer {
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 
         buffer.set_size(None, None);
-        set_text_vs(&mut buffer, text, &attrs);
+        let cjk = self.note_packs(text);
+        set_text_vs(&mut buffer, text, &attrs, cjk);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -591,7 +735,8 @@ impl TextRenderer {
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 
         buffer.set_size(None, None);
-        set_text_vs(&mut buffer, text, &attrs);
+        let cjk = self.note_packs(text);
+        set_text_vs(&mut buffer, text, &attrs, cjk);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -643,7 +788,8 @@ impl TextRenderer {
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 
         buffer.set_size(None, None);
-        set_text_vs(&mut buffer, text, &attrs);
+        let cjk = self.note_packs(text);
+        set_text_vs(&mut buffer, text, &attrs, cjk);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -1063,7 +1209,8 @@ impl TextRenderer {
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 
         buffer.set_size(None, None);
-        set_text_vs(&mut buffer, text, &attrs);
+        let cjk = self.note_packs(text);
+        set_text_vs(&mut buffer, text, &attrs, cjk);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -1112,7 +1259,8 @@ impl TextRenderer {
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 
         buffer.set_size(None, None);
-        set_text_vs(&mut buffer, text, &attrs);
+        let cjk = self.note_packs(text);
+        set_text_vs(&mut buffer, text, &attrs, cjk);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -1161,7 +1309,8 @@ impl TextRenderer {
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 
         buffer.set_size(None, None);
-        set_text_vs(&mut buffer, text, &attrs);
+        let cjk = self.note_packs(text);
+        set_text_vs(&mut buffer, text, &attrs, cjk);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         if let Some(run) = buffer.layout_runs().next() {
@@ -1408,7 +1557,8 @@ impl TextRenderer {
 
         let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(size, size));
         buffer.set_size(Some(10000.0), Some(size * 2.0));
-        set_text_vs(&mut buffer, text, &attrs);
+        let cjk = self.note_packs(text);
+        set_text_vs(&mut buffer, text, &attrs, cjk);
         // cosmic-text 0.19 shapes on demand: lay the text out before reading its runs.
         buffer.shape_until_scroll(&mut self.font_system, false);
 
@@ -1446,7 +1596,8 @@ impl TextRenderer {
             .weight(Weight(self.optical_weight(weight, size)));
         let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(size, size));
         buffer.set_size(Some(10000.0), Some(size * 2.0));
-        set_text_vs(&mut buffer, text, &attrs);
+        let cjk = self.note_packs(text);
+        set_text_vs(&mut buffer, text, &attrs, cjk);
         // cosmic-text 0.19 shapes on demand: lay the text out before reading its runs.
         buffer.shape_until_scroll(&mut self.font_system, false);
         for run in buffer.layout_runs() {

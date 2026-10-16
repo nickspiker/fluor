@@ -45,6 +45,10 @@ host-bare = []
 # build for wasm32, so headless consumers (toka's browser renderer) leave this off. Implied by
 # every real host feature; only paint/text/canvas consumers skip it.
 icon = ["dep:rav1d", "dep:vsf"]
+# packs — font packs (Nick 2026-10-16): faces the binary does not carry, fetched by the app as signed VSF documents the first time text needs one; this checks the author's signature (vsf crypto-verify) and loads them. The table and the need tracking are in `text` itself.
+packs = ["text", "dep:vsf", "vsf/crypto-verify", "vsf/text-encode"]
+# packs-publish — writing and signing pack documents (the publishing tool's side).
+packs-publish = ["packs", "vsf/crypto", "dep:ed25519-dalek"]
 # Android backend — ANativeWindow surface + JNI entry points + Choreographer-driven render scheduling. Enabled by the consumer's Android target block (e.g. photon's `[target.'cfg(target_os = "android")'.dependencies]`). text stays required because the chrome paints title glyphs; ndk + ndk-sys + jni + log are the NDK bindings the surface and JNI shims wrap.
 #
 # winit is intentionally NOT in this feature set — `FluorApp::set_event_proxy` takes a fluor-native `Arc<dyn WakeSender<Self::UserEvent>>` so the trait shape is platform-uniform without dragging winit's data types onto Android. Eliminates the `android-activity` compile-glue dep + the `android_main` linker shim that came along when winit was present on Android.
@@ -62,6 +66,7 @@ rayon = ["std", "dep:rayon"]
 [dependencies]
 # vsf decodes the canonical image format used by `host::icon` (orb / app-icon decode). Default features (std + registry) match fluor's host environment. Optional behind `icon` — headless consumers (toka's wasm renderer) don't decode app icons, and rav1d can't build for wasm32.
 vsf = { version = "0.11", path = "../vsf", optional = true }
+ed25519-dalek = { version = "2", optional = true }
 
 # rav1d decodes AV1 OBU bitstreams for icons over `vsfimg`'s UNCOMPRESSED_MAX_DIM. `bitdepth_8` keeps the build slim — fluor's icon path is u8 RGB only. Optional behind `icon` (see vsf note).
 rav1d = { version = "1.1", default-features = false, features = ["bitdepth_8"], optional = true }

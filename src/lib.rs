@@ -28,6 +28,8 @@ pub mod theme;
 
 #[cfg(feature = "text")]
 pub mod text;
+#[cfg(feature = "text")]
+pub mod packs;
 
 // Widgets (Textbox, Button) speak fluor-native event types ([`crate::event`]) and so compile on every host with `text` enabled. Whichever host is driving (host-winit on desktop, host-android on Android) translates platform input to fluor events at the boundary.
 #[cfg(feature = "text")]
