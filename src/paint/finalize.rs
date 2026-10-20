@@ -1,4 +1,4 @@
-//! OS-boundary finalize step — folds darkness→visible XOR, clip-mask α multiply, and (Linux-only) RGB premultiplication into one pass per pixel. Two entry points: [`finalize_for_os`] (in-place) and [`finalize_into_screen`] (read scratch, write to screen sub-rect, used by the fullscreen-compositor architecture). The shared `_chunk_dispatch` / `_chunk_simd` / `_chunk_scalar` family applies the same math via either SIMD lanes (8 px / iter) or scalar; both paths produce bit-identical output.
+//! OS-boundary finalize step — folds darkness→visible XOR, clip-mask α multiply, and RGB premultiplication (every platform: X11 compositing, Core Animation, Android and Windows ULW_ALPHA all take premultiplied pixels, so no presenter premultiplies again) into one pass per pixel. Two entry points: [`finalize_for_os`] (in-place) and [`finalize_into_screen`] (read scratch, write to screen sub-rect, used by the fullscreen-compositor architecture). The shared `_chunk_dispatch` / `_chunk_simd` / `_chunk_scalar` family applies the same math via either SIMD lanes (8 px / iter) or scalar; both paths produce bit-identical output.
 //!
 //! Also home to [`shift_screen_wrap`], the in-place 2-D wrap-shift used by the drag-to-move fast path. Lives here because it operates on the same post-finalize screen buffer.
 
@@ -7,7 +7,7 @@ use super::{
     DEBUG_SHOW_HITMASK, DEBUG_SHOW_OPAQUE_SCAN, DEBUG_SKIP_PREMULT,
 };
 
-/// Boundary step that finalizes the present buffer for the OS in a **single pass** per pixel — folds the darkness→visible flip, the window-shape clip-mask multiply, the Linux RGB premultiply, and the pack into one go. Walks `pixels` and `clip_mask` in lockstep; both slices must be the same length.
+/// Boundary step that finalizes the present buffer for the OS in a **single pass** per pixel — folds the darkness→visible flip, the window-shape clip-mask multiply, the RGB premultiply (every platform), and the pack into one go. Walks `pixels` and `clip_mask` in lockstep; both slices must be the same length.
 ///
 /// Per pixel:
 /// 1. `v = pixel ^ 0x00FFFFFF` — single XOR flips RGB darkness to visible (255 − dark). α stays as α (already opacity-direction in storage).
@@ -16,7 +16,7 @@ use super::{
 /// 4. Pack back into `0xααRRGGBB`.
 ///
 /// Debug toggles: * `DEBUG_SHOW_ALPHA` (`[]a`): replace each pixel with `(final_α, final_α, final_α, 0xFF)` — grayscale α visualization, opaque so the OS shows it.
-/// * `DEBUG_SKIP_PREMULT` (`[]p`): skip the Linux RGB×α step.
+/// * `DEBUG_SKIP_PREMULT` (`[]p`): skip the RGB×α step (debug only: every presenter expects premultiplied pixels).
 pub fn finalize_for_os(pixels: &mut [u32], clip_mask: &[u8]) {
     let alpha_mode = DEBUG_SHOW_ALPHA.load(core::sync::atomic::Ordering::Relaxed);
     let n = pixels.len().min(clip_mask.len());
@@ -38,7 +38,7 @@ pub fn finalize_for_os(pixels: &mut [u32], clip_mask: &[u8]) {
         return;
     }
 
-    // Premultiply RGB by final_α before handing to the OS compositor. Required on both Linux (X11 composite assumes premultiplied) and macOS (Metal PostMultiplied in practice needs it for clean AA edges — without it, edge pixels with fractional α show harsh checkerboard artifacts).
+    // Premultiply RGB by final_α before handing to the OS compositor, the one premultiply on every platform: X11 composite assumes premultiplied; Core Animation composites premultiplied whatever wgpu's PostMultiplied label says (it only clears the layer's `opaque` flag); Android's surface and Windows' ULW_ALPHA take it as-is. Each channel lands ≤ α ((c·α) >> 8), which ULW_ALPHA requires.
     let skip_premult = DEBUG_SKIP_PREMULT.load(core::sync::atomic::Ordering::Relaxed);
 
     let pixels = &mut pixels[..n];
@@ -251,7 +251,7 @@ pub fn scroll_copy_rect(
     }
 }
 
-/// Combined finalize + blit: same per-pixel math as [`finalize_for_os`] (XOR darkness→visible, multiply clip_mask into α, Linux RGB×α premultiply) but reads from a `(win_w × win_h)` scratch buffer and writes into a `(scr_w × scr_h)` screen buffer at the offset `(rect_x, rect_y)`. Used by the fullscreen-compositor host path: the consumer renders into the scratch (window-space, contiguous), this function reads scratch + clip_mask once per pixel and writes the OS-ready ARGB into the screen buffer's sub-rect. The scratch buffer is **not mutated** — its α + darkness convention is preserved so a future incremental-rendering path can reuse it across frames without forcing a full re-render.
+/// Combined finalize + blit: same per-pixel math as [`finalize_for_os`] (XOR darkness→visible, multiply clip_mask into α, RGB×α premultiply) but reads from a `(win_w × win_h)` scratch buffer and writes into a `(scr_w × scr_h)` screen buffer at the offset `(rect_x, rect_y)`. Used by the fullscreen-compositor host path: the consumer renders into the scratch (window-space, contiguous), this function reads scratch + clip_mask once per pixel and writes the OS-ready ARGB into the screen buffer's sub-rect. The scratch buffer is **not mutated** — its α + darkness convention is preserved so a future incremental-rendering path can reuse it across frames without forcing a full re-render.
 ///
 /// Pre-conditions: `rect_x + win_w ≤ scr_w` and `rect_y + win_h ≤ scr_h` (rect fits inside the screen). Caller is responsible for clearing the destination region (typically the whole screen buffer cleared to `0` so pixels outside `rect` stay α=0 and the OS compositor shows whatever's behind us).
 ///
@@ -482,6 +482,27 @@ fn finalize_into_scalar_debug(
                 screen[dst_idx] = 0xFF000000 | (final_a << 16) | (final_a << 8) | final_a;
             } else {
                 screen[dst_idx] = 0xFF000000 | (v & 0x00FFFFFF);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod premultiply_contract_tests {
+    /// Every presenter takes finalize's output as premultiplied and none premultiplies again; Windows' ULW_ALPHA also requires every channel ≤ α. Exhaustive over α, channel and clip coverage.
+    #[test]
+    fn finalized_channels_never_exceed_alpha() {
+        for clip in [255u8, 200, 128, 1] {
+            for a in 0..=255u32 {
+                let mut px: Vec<u32> = (0..=255u32).map(|dark| (a << 24) | (dark << 16) | (dark << 8) | dark).collect();
+                let mask = vec![clip; px.len()];
+                super::finalize_for_os(&mut px, &mask);
+                for p in px {
+                    let fa = p >> 24;
+                    for sh in [16, 8, 0] {
+                        assert!((p >> sh) & 0xFF <= fa, "α {a}, clip {clip}: channel {} > α {fa}", (p >> sh) & 0xFF);
+                    }
+                }
             }
         }
     }

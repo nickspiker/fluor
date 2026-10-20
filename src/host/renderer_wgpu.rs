@@ -90,7 +90,7 @@ impl Renderer {
             .find(|f| *f == wgpu::TextureFormat::Bgra8Unorm)
             .expect("wgpu: surface does not support Bgra8Unorm — fluor's pixel convention requires it for zero-conversion upload");
 
-        // Lock the alpha mode. PostMultiplied means the OS compositor performs the premultiply at present time, so we can hand it our straight-alpha pixels directly. Without it, we'd need to premultiply at upload — and we currently don't.
+        // Lock the alpha mode. On Metal, wgpu's PostMultiplied only clears the layer's `opaque` flag (wgpu-hal metal/surface.rs; Metal offers no PreMultiplied mode); Core Animation itself always composites premultiplied pixels, which is what `paint::finalize_into_screen` hands over — premultiplied once, on every platform. The name says straight alpha; the compositor does not.
         let alpha_mode = caps.alpha_modes.iter().copied()
             .find(|m| *m == wgpu::CompositeAlphaMode::PostMultiplied)
             .expect("wgpu: surface does not support PostMultiplied alpha — fluor's convention requires it (straight-alpha internal pixels)");

@@ -58,8 +58,7 @@ pub fn make_layered(window: &Arc<Window>) {
 
 /// Present `persistent_screen` (fluor's owned `0xAARRGGBB`-per-pixel screen buffer, `screen_w × screen_h`) to the layered window via `UpdateLayeredWindow`.
 ///
-/// `UpdateLayeredWindow` requires a 32-bit top-down DIB in **premultiplied BGRA**. fluor's buffer is `0xAARRGGBB` (the same packing softbuffer/wgpu consume) NOT premultiplied, so we convert per-pixel into a freshly-created DIB section, then blit. The whole screen-sized surface is updated each frame;
-/// the cost is one screen-sized copy+premultiply, matching the existing `persistent_screen → back buffer` copy the softbuffer path already pays.
+/// `UpdateLayeredWindow` requires a 32-bit top-down DIB in **premultiplied BGRA**, which is exactly what `persistent_screen` already holds: `paint::finalize_into_screen` premultiplies RGB by α on every platform (each channel ≤ α, as ULW_ALPHA requires), and `0xAARRGGBB` little-endian is B,G,R,A in memory, the DIB's byte order. So the present is one straight copy into a freshly-created DIB section, then the blit. (Until 2026-10-20 this premultiplied a second time, darkening every partly transparent pixel — AA edges, glows, shadows — by its own α once more.)
 pub fn present(window: &Arc<Window>, persistent_screen: &[u32], screen_w: u32, screen_h: u32) {
     let Some(hwnd) = hwnd(window) else { return };
     let w = screen_w as i32;
@@ -102,21 +101,9 @@ pub fn present(window: &Arc<Window>, persistent_screen: &[u32], screen_w: u32, s
                 }
             };
 
-        // Convert 0xAARRGGBB (straight alpha) → premultiplied BGRA, straight into the DIB.
-        let dst = std::slice::from_raw_parts_mut(bits as *mut u32, (w * h) as usize);
-        for (d, &src) in dst.iter_mut().zip(persistent_screen.iter()) {
-            let a = (src >> 24) & 0xFF;
-            let r = (src >> 16) & 0xFF;
-            let g = (src >> 8) & 0xFF;
-            let b = src & 0xFF;
-            // Premultiply each channel by alpha (UpdateLayeredWindow with ULW_ALPHA expects it), and pack BGRA (DIB byte order is B,G,R,A in memory = 0xAARRGGBB little-endian — same as src once premultiplied, so we repack with the premultiplied channels).
-            // Floor `>> 8` with the `a + (a >> 7)` weight bump instead of `/ 255`: α=255 passes the channel thru exactly, α=0 floors to 0, interior within 1 LSB — and premul ≤ α holds for every (channel, α) pair (verified exhaustively), which ULW_ALPHA requires. Three divisions per pixel per present was the most expensive `/ 255` in the tree.
-            let ae = a + (a >> 7);
-            let pr = ((r * ae) >> 8) & 0xFF;
-            let pg = ((g * ae) >> 8) & 0xFF;
-            let pb = ((b * ae) >> 8) & 0xFF;
-            *d = (a << 24) | (pr << 16) | (pg << 8) | pb;
-        }
+        // Already premultiplied BGRA (see the doc above): copy as-is.
+        let n = (w * h) as usize;
+        std::slice::from_raw_parts_mut(bits as *mut u32, n).copy_from_slice(&persistent_screen[..n]);
 
         let old: HGDIOBJ = SelectObject(mem_dc, dib);
 
