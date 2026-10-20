@@ -14,12 +14,13 @@ use crate::paint::{self, HitId};
 use crate::region::Region;
 
 /// Opaque darkness-convention colours, lumis palette: white(left)/black(right), grey pair when disabled.
-const LEFT_FILL: u32 = 0xFF00_0000; // white (zero darkness)
+/// White is diffuse white ([`crate::theme::WHITE`]), never darkness 0 (the top `g2t` code, a glow on HDR); the greys are the γ2 90 and 60 they always were, brought into the `g2t` buffer thru the palette path.
+const LEFT_FILL: u32 = crate::theme::WHITE;
 const RIGHT_FILL: u32 = 0xFFFF_FFFF; // black (full darkness)
-const LEFT_DISABLED: u32 = 0xFF00_0000 | (0x00FF_FFFF ^ 0x005A_5A5A); // 90-grey
-const RIGHT_DISABLED: u32 = 0xFF00_0000 | (0x00FF_FFFF ^ 0x003C_3C3C); // 60-grey
-const HANDLE_FILL: u32 = 0xFF00_0000; // white
-const HANDLE_DISABLED: u32 = 0xFF00_0000 | (0x00FF_FFFF ^ 0x005A_5A5A);
+const LEFT_DISABLED: u32 = crate::theme::dark(crate::theme::fmt(crate::theme::vsf(crate::theme::from_gamma2(0x5A_5A_5A)))); // 90-grey
+const RIGHT_DISABLED: u32 = crate::theme::dark(crate::theme::fmt(crate::theme::vsf(crate::theme::from_gamma2(0x3C_3C_3C)))); // 60-grey
+const HANDLE_FILL: u32 = crate::theme::WHITE;
+const HANDLE_DISABLED: u32 = LEFT_DISABLED;
 
 pub struct Slider {
     /// Allocated at construction; stamped into the host hit map across the whole grab band.

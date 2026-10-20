@@ -210,6 +210,15 @@ const fn to_working(r: i64, g: i64, b: i64) -> (i64, i64, i64) {
     ((m[0] * r + m[3] * g + m[6] * b) >> 16, (m[1] * r + m[4] * g + m[7] * b) >> 16, (m[2] * r + m[5] * g + m[8] * b) >> 16)
 }
 
+/// Diffuse white in the buffer, stored (α 0xFF + darkness): authored `g2t` 0xC2C2C2 thru [`vsf`].
+/// Darkness 0 is NOT white since the buffer went `g2t`: it is the top code, 9.7× white, which an SDR screen clips to white but an HDR surface shows as a glow — anything meant as white light uses this, and anything meant to glow above white is chosen on purpose.
+pub const WHITE: u32 = dark(fmt(vsf(0x00_C2_C2_C2)));
+
+/// White light at opacity `alpha` (0..=255): [`WHITE`]'s darkness under that α byte, for watermarks, hints and glows.
+pub const fn white_at(alpha: u32) -> u32 {
+    ((alpha & 0xFF) << 24) | (WHITE & 0x00FF_FFFF)
+}
+
 /// Variant of [`dark`] that leaves α=0 instead of setting it to 0xFF. Used for colour constants where the α-byte is filled in per-pixel at the use site (the textbox glow function).
 const fn dark_rgb_only(trgb: u32) -> u32 {
     trgb ^ 0x00FFFFFF
@@ -278,8 +287,8 @@ pub const TITLE_TEXT: u32 = dark(fmt(vsf(0x00_C2_8E_00)));
 #[cfg(feature = "amber")]
 pub const TITLE_TEXT_UNFOCUSED: u32 = dark(fmt(vsf(0x00_7E_55_00)));
 
-// Hint / placeholder text — pure white at 1/4 opacity (α=64), stored directly in α+darkness format (the version watermark is the same treatment at 1/8). Glyph coverage multiplies into this α, so every hint reads as faint light over the dark background rather than flat ink — the eye reads real content first, the hint only on attention. One colour for every hint, by design.
-pub const HINT_COLOUR: u32 = 0x40_00_00_00;
+// Hint / placeholder text — diffuse white ([`WHITE`], never darkness 0) at 1/4 opacity (α=64) (the version watermark is the same treatment at 1/8). Glyph coverage multiplies into this α, so every hint reads as faint light over the dark background rather than flat ink — the eye reads real content first, the hint only on attention. One colour for every hint, by design.
+pub const HINT_COLOUR: u32 = white_at(0x40);
 
 // Orb image desaturation factor applied when an unfocused window uses `OrbTint::FollowFocus`. `0 = full colour`, `255 = fully grey`. 128 = 50% lerp toward mid-grey — visibly quieted without losing app recognition. `Custom` orb tints ignore this (apps use the orb as a status indicator and want it stable).
 pub const ORB_DARKEN_UNFOCUSED: u8 = 128;
@@ -319,6 +328,18 @@ pub const GLOW_DARK: u32 = dark_rgb_only(fmt(vsf(0x00_00_00_00)));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// White is diffuse white, never darkness 0: every channel of [`WHITE`] sits near code 194 (the matrix may lift one a little — VSF white is about 1.12× a D65 display's red), far below the top code a bare darkness 0 meant; [`white_at`] carries the same darkness under any α, and the hint uses it.
+    #[test]
+    fn white_is_diffuse_white_not_the_top_code() {
+        for shift in [16, 8, 0] {
+            let code = 255 - ((WHITE >> shift) & 0xFF);
+            assert!((185..=205).contains(&code), "white's buffer code {code} on channel >>{shift}");
+        }
+        assert_eq!(WHITE >> 24, 0xFF);
+        assert_eq!(white_at(0x40), 0x4000_0000 | (WHITE & 0x00FF_FFFF));
+        assert_eq!(HINT_COLOUR, white_at(0x40));
+    }
 
     #[test]
     fn g2t_table_is_vsfs_decoder() {

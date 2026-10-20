@@ -521,8 +521,8 @@ pub fn draw_orb_press_glow(
             continue;
         }
         let idx = i + band_top * width;
-        // White light: darkness = 0, α = blurred coverage. under() on the already-opaque disk pixels no-ops — the orb art protects itself.
-        pixels[idx] = pixels[idx].under((grey as u32) << 24, BlendMode::Normal);
+        // White light: diffuse white (theme::WHITE, not darkness 0, which is a 9.7× glow on HDR), α = blurred coverage. under() on the already-opaque disk pixels no-ops — the orb art protects itself.
+        pixels[idx] = pixels[idx].under(crate::theme::white_at(grey as u32), BlendMode::Normal);
     }
 }
 

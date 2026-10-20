@@ -1197,9 +1197,11 @@ pub fn draw_blinkey_tinted(canvas: &mut Canvas, bx: usize, by: usize, height: us
             let (kr, kg, kb) = (k * tint.0 as u32 / 255, k * tint.1 as u32 / 255, k * tint.2 as u32 / 255);
             let p = &mut pixels[(idx as isize + dx as isize) as usize];
             let a = *p & 0xFF00_0000;
-            let r = ((*p >> 16) & 0xFF).saturating_sub(kr);
-            let g = ((*p >> 8) & 0xFF).saturating_sub(kg);
-            let b = (*p & 0xFF).saturating_sub(kb);
+            // Brightening stops at diffuse white (theme::WHITE), never darkness 0: past white is a 9.7× glow on an HDR surface, and SDR clipped it to white anyway. A pixel already brighter than white keeps its own light.
+            let lift = |d: u32, k: u32, shift: u32| d.saturating_sub(k).max(d.min((crate::theme::WHITE >> shift) & 0xFF));
+            let r = lift((*p >> 16) & 0xFF, kr, 16);
+            let g = lift((*p >> 8) & 0xFF, kg, 8);
+            let b = lift(*p & 0xFF, kb, 0);
             *p = a | (r << 16) | (g << 8) | b;
         }
     }
