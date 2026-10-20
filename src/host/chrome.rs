@@ -24,7 +24,7 @@ pub use crate::paint::{HIT_NONE, HitId};
 pub enum OrbTint {
     /// Default — ring colour equals the active perimeter colour and the orb image desaturates to 50 % grey when the window is unfocused. Window-state-as-orb-state, no app intervention.
     FollowFocus,
-    /// App-driven override. `ring` paints the AA ring (already darkness-packed, e.g. a `theme::*` constant or `dark(fmt(0x00_FF_FF_FF))`). `brighten = true` applies photon's 3/2 lift to the icon image (online/active state), `false` leaves it as decoded.
+    /// App-driven override. `ring` paints the AA ring (already darkness-packed, e.g. a `theme::*` constant or `dark(fmt(0x00_FF_FF_FF))`). `brighten = true` lifts the icon image (online/active state: light × 9/4 up to white, chrome::BRIGHTEN_DARK), `false` leaves it as decoded.
     Custom { ring: u32, brighten: bool },
 }
 
@@ -640,18 +640,36 @@ fn sample_icon(
     modulate_icon_pixel(raw, darken, brighten)
 }
 
-/// Apply photon-style brighten (visible_RGB × 3/2 saturating) and a linear-blend-toward-mid-grey darken in one pass. α byte is preserved (always opaque for icon pixels).
-///
-/// In α + darkness terms: brighten visible_R = `min(255, vR × 3/2)` becomes `dR_new = dR.saturating_sub((255 − dR) / 2)`. saturating_sub kept because brightening already-dark pixels (`dR < 85`) would wrap u32 below zero without it — clamping at 0 is the correct "can't brighten past full visible" outcome.
+/// The orb's online BRIGHTEN as a darkness→darkness table: photon's "visible × 3/2" was a γ2 lift, i.e. light × 9/4, clipped at white. On the `g2t` buffer it is done in light — decode, × 9/4, stop at diffuse white (194), take VSF's bucket — because the old code-space `saturating_sub` drove near-white icon pixels to darkness 0, the top code: 9.7× white, which an HDR surface shows as a glow and asks the display for (2026-10-20, the orb's bright centre on a Pixel 8 Pro). A pixel already brighter than white keeps its own light.
+const BRIGHTEN_DARK: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut d = 0;
+    while d < 256 {
+        let code = 255 - d;
+        let lifted = (crate::theme::G2T_LIGHT_Q16[code] as u64 * 9 / 4) as u32;
+        let mut c = crate::theme::g2t_code(if lifted > 65536 { 65536 } else { lifted });
+        if c > 194 {
+            c = 194;
+        }
+        if (code as u32) > c {
+            c = code as u32;
+        }
+        t[d] = (255 - c) as u8;
+        d += 1;
+    }
+    t
+};
+
+/// Apply photon-style brighten (light × 9/4 up to white, [`BRIGHTEN_DARK`]) and a linear-blend-toward-mid-grey darken in one pass. α byte is preserved (always opaque for icon pixels).
 fn modulate_icon_pixel(pixel: u32, darken: u8, brighten: bool) -> u32 {
     let mut dr = (pixel >> 16) & 0xFF;
     let mut dg = (pixel >> 8) & 0xFF;
     let mut db = pixel & 0xFF;
 
     if brighten {
-        dr = dr.saturating_sub((255 - dr) / 2);
-        dg = dg.saturating_sub((255 - dg) / 2);
-        db = db.saturating_sub((255 - db) / 2);
+        dr = BRIGHTEN_DARK[dr as usize] as u32;
+        dg = BRIGHTEN_DARK[dg as usize] as u32;
+        db = BRIGHTEN_DARK[db as usize] as u32;
     }
 
     if darken > 0 {
@@ -1204,5 +1222,23 @@ mod tests {
             0,
             "bottom edge painted at right end (big)"
         );
+    }
+}
+
+#[cfg(test)]
+mod brighten_tests {
+    /// The orb's brighten lifts light, never past white: black stays black, white stays white, a mid grey brightens, and nothing reaches the top code a code-space lift used to (darkness 0 = 9.7× white).
+    #[test]
+    fn brighten_lifts_light_up_to_white_and_no_further() {
+        let t = super::BRIGHTEN_DARK;
+        assert_eq!(t[255], 255, "black");
+        assert_eq!(t[255 - 194], 255 - 194, "white stays white");
+        assert!(t[255 - 120] < 255 - 120, "a mid grey brightens");
+        for d in 0..256usize {
+            let code = 255 - d;
+            let out = 255 - t[d] as usize;
+            assert!(out >= code, "never darker");
+            assert!(out <= 194.max(code), "never past white unless it already was: code {code} → {out}");
+        }
     }
 }

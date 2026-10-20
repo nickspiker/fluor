@@ -17,13 +17,13 @@ fn force_sequential() -> bool {
     FORCE_SEQUENTIAL.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Iterate `pixels` row-by-row over `row_start..row_end`, calling `f(row_index, &mut row_slice)` for each row. Each `row_slice` is exactly `width` `u32`s. With `rayon` enabled and [`FORCE_SEQUENTIAL`] clear, rows are dispatched in parallel; otherwise sequentially.
+/// Iterate `pixels` row-by-row over `row_start..row_end`, calling `f(row_index, &mut row_slice)` for each row. Each `row_slice` is exactly `width` elements (`u32` pixels, or the F16 surface's `u64`). With `rayon` enabled and [`FORCE_SEQUENTIAL`] clear, rows are dispatched in parallel; otherwise sequentially.
 ///
 /// Pre-conditions: `pixels.len() >= row_end * width` and `row_start <= row_end`. No internal clamping — the caller (a clipped rasterizer or a boundary pass) is responsible for shaping the range to fit the buffer.
 #[inline]
-pub fn par_rows<F>(pixels: &mut [u32], width: usize, row_start: usize, row_end: usize, f: F)
+pub fn par_rows<T: Send, F>(pixels: &mut [T], width: usize, row_start: usize, row_end: usize, f: F)
 where
-    F: Fn(usize, &mut [u32]) + Send + Sync,
+    F: Fn(usize, &mut [T]) + Send + Sync,
 {
     if row_start >= row_end || width == 0 {
         return;

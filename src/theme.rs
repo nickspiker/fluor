@@ -159,6 +159,118 @@ pub const DARK_TO_SDR: [u8; 256] = {
     t
 };
 
+/// Where the display map's roll-off starts, as a fraction of the display's peak, when content is brighter than the display can show — vsf's `colour::display::DISPLAY_KNEE` (a test holds the copy to it).
+pub const DISPLAY_KNEE: f32 = 0.75;
+
+/// vsf's `colour::display::display_light`, copied (fluor carries no runtime vsf on every target; `tests::display_light_is_vsfs` holds it to the original): scene light `l` (diffuse white 1) on a display whose peak is `headroom` × white, for content whose brightest light is `content_peak` → display light as a fraction of the display's peak.
+/// Linear while the content fits; past the knee an extended-Reinhard shoulder that reaches exactly 1 at `content_peak`, so nothing clips and nothing brighter than the content is assumed.
+pub fn display_light(l: f32, headroom: f32, content_peak: f32) -> f32 {
+    if !(l > 0.) {
+        return 0.;
+    }
+    let h = if headroom > 1. { headroom } else { 1. };
+    if !(content_peak > h) {
+        return (l / h).min(1.);
+    }
+    let k = DISPLAY_KNEE * h;
+    if l <= k {
+        return l / h;
+    }
+    let r = h - k;
+    let u = (l - k) / r;
+    let top = (content_peak - k) / r;
+    let s = u * (1. + u / (top * top)) / (1. + u);
+    ((k + r * s) / h).min(1.)
+}
+
+/// Q16 light (65536 = 1.0) → IEEE half bits, integer only: normals from 2⁻¹⁴ up, subnormals below, truncating like VSF's bucket rule; past half's range saturates at the largest finite half.
+pub const fn q16_to_half(v: u32) -> u16 {
+    if v == 0 {
+        return 0;
+    }
+    let top = 31 - v.leading_zeros(); // bit index of the leading 1: the value is 2^(top − 16)
+    if top < 2 {
+        return (v << 8) as u16; // subnormal: value / 2⁻²⁴ = v × 2⁸
+    }
+    let exp = top - 1; // (top − 16) + 15
+    if exp >= 31 {
+        return 0x7BFF;
+    }
+    let mant = ((v << (31 - top)) >> 21) & 0x3FF;
+    ((exp << 10) | mant) as u16
+}
+
+/// The extended-range finalize table (HDR plan, Android first): for every stored DARKNESS byte, the light the surface gets in its own linear extended range (1.0 = SDR white), as half bits for the opaque fast path and as Q16 for partly-covered pixels (premultiplied by α in integers, then packed).
+/// Built for the headroom the display GRANTED and the frame's brightest light; rebuilt only when either changes. 512 + 1024 bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HdrTable {
+    pub half: [u16; 256],
+    pub q16: [u32; 256],
+    pub headroom_q16: u32,
+    pub peak_code: u8,
+}
+
+impl HdrTable {
+    /// `headroom` = what the display grants now (×white, ≥ 1); `peak_code` = the brightest `g2t` code in the frame.
+    pub fn new(headroom: f32, peak_code: u8) -> Self {
+        let h = if headroom > 1. { headroom } else { 1. };
+        let peak = G2T_LIGHT_Q16[peak_code as usize] as f32 / 65536.;
+        let mut half = [0u16; 256];
+        let mut q16 = [0u32; 256];
+        for d in 0..256 {
+            let l = G2T_LIGHT_Q16[255 - d] as f32 / 65536.;
+            let out = display_light(l, h, peak) * h;
+            let q = (out * 65536. + 0.5) as u32;
+            q16[d] = q;
+            half[d] = q16_to_half(q);
+        }
+        HdrTable { half, q16, headroom_q16: (h * 65536. + 0.5) as u32, peak_code }
+    }
+
+    /// The light (×white) the buffer's brightest value reaches with this table: what the surface reports as its current ratio.
+    pub fn buffer_ratio(&self) -> f32 {
+        let top = self.q16.iter().copied().max().unwrap_or(65536);
+        (top.max(65536)) as f32 / 65536.
+    }
+}
+
+/// The 10-BIT extended-brightness table (HDR plan, Android: RGBA_1010102, BT.2020, γ2.2, extended range — the format the Pixel's display processor composites itself, where F16 forced a GPU pass into an 8-bit sRGB target).
+/// On that surface 1023 is SDR white × the DECLARED ratio (SurfaceFlinger: layerBrightnessNits = sdrWhitePointNits × currentHdrSdrRatio), so every stored DARKNESS byte maps to (light ÷ declared)^(1/2.2) × 1023, clipped at the top. Declared 1 is a plain SDR surface (white near 1015); declared 9.7 still leaves SDR white about 360 codes, more than the `g2t` buffer's 194 below white.
+/// Rebuilt only when the declared ratio changes (an SDR frame never does).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hdr10Table {
+    pub code: [u16; 256],
+    pub declared_q16: u32,
+}
+
+impl Hdr10Table {
+    pub fn new(declared: f32) -> Self {
+        let d = if declared > 1. { declared } else { 1. };
+        let mut code = [0u16; 256];
+        for dark in 0..256 {
+            let l = G2T_LIGHT_Q16[255 - dark] as f32 / 65536.;
+            let v = (l / d).min(1.);
+            code[dark] = (v.powf(1. / 2.2) * 1023. + 0.5) as u16;
+        }
+        Hdr10Table { code, declared_q16: (d * 65536. + 0.5) as u32 }
+    }
+
+    pub fn declared(&self) -> f32 {
+        self.declared_q16 as f32 / 65536.
+    }
+}
+
+/// α (0..=255) → half bits of α / 255: the F16 surface's alpha channel and the opaque α (255 → 1.0).
+pub const ALPHA_HALF: [u16; 256] = {
+    let mut t = [0u16; 256];
+    let mut a = 0;
+    while a < 256 {
+        t[a] = q16_to_half(((a as u32) * 65536 + 127) / 255);
+        a += 1;
+    }
+    t
+};
+
 /// A stored α + darkness pixel → visible SDR display RGB (γ2, white at 255), α passing thru: finalize's per-pixel colour step.
 #[inline(always)]
 pub const fn to_sdr_visible(px: u32) -> u32 {
@@ -328,6 +440,72 @@ pub const GLOW_DARK: u32 = dark_rgb_only(fmt(vsf(0x00_00_00_00)));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The integer half pack agrees with IEEE half at the landmarks and with a float reference (truncating) everywhere a Q16 light lands.
+    #[test]
+    fn q16_to_half_is_ieee_half() {
+        assert_eq!(q16_to_half(0), 0);
+        assert_eq!(q16_to_half(65536), 0x3C00, "1.0");
+        assert_eq!(q16_to_half(131072), 0x4000, "2.0");
+        assert_eq!(q16_to_half(32768), 0x3800, "0.5");
+        assert_eq!(q16_to_half(4), 0x0400, "2⁻¹⁴, the smallest normal");
+        assert_eq!(q16_to_half(1), 0x0100, "2⁻¹⁶, subnormal");
+        for v in [3u32, 5, 100, 4095, 65535, 65537, 98304, 637212, 1 << 30] {
+            let f = v as f32 / 65536.;
+            let b = f.to_bits();
+            let want = ((((b >> 23) & 0xFF) as i32 - 112) as u32) << 10 | ((b >> 13) & 0x3FF);
+            if v >= 4 && v < (1 << 31) / 2 {
+                assert_eq!(q16_to_half(v) as u32, want, "{v}");
+            }
+        }
+        assert_eq!(ALPHA_HALF[255], 0x3C00);
+        assert_eq!(ALPHA_HALF[0], 0);
+    }
+
+    /// fluor's copy of the display map is vsf's.
+    #[test]
+    fn display_light_is_vsfs() {
+        assert_eq!(DISPLAY_KNEE, vsf::colour::display::DISPLAY_KNEE);
+        for &(h, p) in &[(1.0f32, 1.0f32), (1.0, 9.7), (2.0, 2.0), (2.0, 9.7), (1.65, 4.0), (8.0, 2.0)] {
+            for i in 0..=200 {
+                let l = i as f32 * 0.05;
+                assert_eq!(display_light(l, h, p), vsf::colour::display::display_light(l, h, p), "l={l} h={h} p={p}");
+            }
+        }
+    }
+
+    /// The extended-range table: on an SDR grant white stays white and nothing passes 1; with 2× granted and content peaking at 2×, the map is plain linear, so white is 1 and code 227 (2×) is 2; content brighter than the grant rolls off into exactly the grant.
+    #[test]
+    fn hdr_table_maps_light_into_the_granted_headroom() {
+        let light = |t: &HdrTable, code: usize| t.q16[255 - code] as f32 / 65536.;
+        let sdr = HdrTable::new(1.0, 194);
+        assert!((light(&sdr, 194) - 0.982).abs() < 0.01, "{}", light(&sdr, 194));
+        assert!(sdr.q16.iter().all(|&q| q <= 65536));
+        let fits = HdrTable::new(2.0, 227);
+        assert!((light(&fits, 194) - 0.982).abs() < 0.01);
+        assert!((light(&fits, 227) - 1.978).abs() < 0.02, "{}", light(&fits, 227));
+        let tall = HdrTable::new(2.0, 255);
+        assert!((light(&tall, 255) - 2.0).abs() < 1e-3, "the content's peak lands on the grant");
+        assert!(tall.q16.windows(2).all(|w| w[0] >= w[1]), "monotone (darkness up = light down)");
+        assert_eq!(tall.half[255 - 194], q16_to_half(tall.q16[255 - 194]));
+    }
+
+    /// The 10-bit table: declared 1 is a plain SDR surface (white near the top, the top code clipped to 1023); declared 2 puts white at 2^(−1/2.2) of the range and code 227 (2×) at the top; every declaration is monotone and SDR white keeps far more than 194 codes.
+    #[test]
+    fn hdr10_table_spans_the_declared_ratio() {
+        let code = |t: &Hdr10Table, c: usize| t.code[255 - c] as i32;
+        let sdr = Hdr10Table::new(1.0);
+        assert!((code(&sdr, 194) - 1015).abs() <= 2, "{}", code(&sdr, 194));
+        assert_eq!(code(&sdr, 255), 1023);
+        let two = Hdr10Table::new(2.0);
+        assert!((code(&two, 194) - 741).abs() <= 3, "{}", code(&two, 194));
+        assert!(code(&two, 227) >= 1018);
+        let tall = Hdr10Table::new(9.72);
+        assert!(code(&tall, 194) > 340, "{}", code(&tall, 194));
+        for t in [&sdr, &two, &tall] {
+            assert!(t.code.windows(2).all(|w| w[0] >= w[1]));
+        }
+    }
 
     /// White is diffuse white, never darkness 0: every channel of [`WHITE`] sits near code 194 (the matrix may lift one a little — VSF white is about 1.12× a D65 display's red), far below the top code a bare darkness 0 meant; [`white_at`] carries the same darkness under any α, and the hint uses it.
     #[test]
