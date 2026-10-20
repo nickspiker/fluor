@@ -13,6 +13,7 @@
 //! Status: Phase 2.3 — events.rs + window.rs + shell.rs all wired. `AndroidShell` is the entry point; consumers' JNI thin-shims construct one in `nativeInit` and call its `draw` / `resize` / `on_touch` / `on_text_input` / `on_key_event` / `on_back_pressed` / `on_scale` methods from the matching `nativeXxx` JNI entry points.
 
 pub mod events;
+pub mod hdr_probe;
 pub mod shell;
 pub mod surface;
 pub mod window;

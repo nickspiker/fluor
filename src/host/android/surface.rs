@@ -159,6 +159,8 @@ impl Surface {
                 self.dataspace_set = true;
             }
 
+            // DEV PROBE (HDR plan, open test 2): a no-op unless a development build armed it; runs once.
+            super::hdr_probe::run_once(window.ptr().as_ptr());
             let mut android_buffer: ANativeWindow_Buffer = core::mem::zeroed();
             if ANativeWindow_lock(
                 window.ptr().as_ptr(),
