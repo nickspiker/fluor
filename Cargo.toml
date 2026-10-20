@@ -65,7 +65,7 @@ rayon = ["std", "dep:rayon"]
 
 [dependencies]
 # vsf decodes the canonical image format used by `host::icon` (orb / app-icon decode). Default features (std + registry) match fluor's host environment. Optional behind `icon` — headless consumers (toka's wasm renderer) don't decode app icons, and rav1d can't build for wasm32.
-vsf = { version = "0.11", path = "../vsf", optional = true }
+vsf = { version = "0.10", path = "../vsf", optional = true }
 ed25519-dalek = { version = "2", optional = true }
 
 # rav1d decodes AV1 OBU bitstreams for icons over `vsfimg`'s UNCOMPRESSED_MAX_DIM. `bitdepth_8` keeps the build slim — fluor's icon path is u8 RGB only. Optional behind `icon` (see vsf note).
