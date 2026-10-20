@@ -59,57 +59,98 @@ pub const fn dark(trgb: u32) -> u32 {
     (trgb ^ 0x00FFFFFF) | 0xFF000000
 }
 
-/// Compile-time VSF-RGB → display conversion — the whole palette is AUTHORED in VSF RGB and lands on the platform's surface correctly (Nick 2026-09-12: the buttons were raw eyeballed hex, never converted, "wretchedly bad" on a wide-gamut panel).
-/// macOS: identity — the surface is ICC-tagged VSF RGB (renderer_wgpu), the OS compositor does the conversion, so the authored value IS the buffer value (matches photon's `to_display`).
-/// Everywhere else: γ2-decode (x²) → VSF_RGB2REC2020 in Q16 fixed point → γ2-encode via const integer sqrt — the same math photon's `to_display` runs in f32 at runtime, done once at compile time (vsf's matrix constants, column-major, transcribed below; fluor deliberately has no vsf dep).
-#[cfg(target_os = "macos")]
+/// Light held by each 8-bit `g2t` code (VSF RGB with headroom, vsf `colour.md`: linear = atanh(code / 256)², ×256 bucket bottom), Q16: diffuse white = 65536. Code 194 is diffuse white's bucket (0.982 up to 1.0006, the code VSF's encoder gives 1.0), 255 is 9.7× white. Generated from vsf's own decoder; `tests::g2t_table_is_vsfs_decoder` holds it to that.
+pub const G2T_LIGHT_Q16: [u32; 256] = [
+    0, 1, 4, 9, 16, 25, 36, 49, 64, 81, 100, 121, 144, 169, 196, 226,
+    257, 290, 325, 362, 402, 443, 486, 532, 579, 629, 681, 734, 790, 848, 908, 971,
+    1035, 1101, 1170, 1240, 1313, 1388, 1466, 1545, 1627, 1710, 1796, 1885, 1975, 2068, 2163, 2260,
+    2359, 2461, 2565, 2672, 2781, 2892, 3006, 3122, 3240, 3361, 3484, 3610, 3738, 3868, 4001, 4137,
+    4275, 4416, 4559, 4705, 4854, 5005, 5159, 5316, 5475, 5637, 5802, 5970, 6140, 6313, 6490, 6669,
+    6851, 7036, 7223, 7414, 7608, 7805, 8006, 8209, 8415, 8625, 8838, 9054, 9274, 9496, 9723, 9952,
+    10185, 10422, 10662, 10906, 11153, 11404, 11659, 11918, 12180, 12447, 12717, 12991, 13269, 13552, 13838, 14129,
+    14424, 14723, 15026, 15335, 15647, 15964, 16286, 16612, 16944, 17280, 17621, 17967, 18318, 18674, 19036, 19402,
+    19775, 20152, 20536, 20925, 21320, 21720, 22127, 22540, 22959, 23384, 23816, 24255, 24700, 25152, 25610, 26076,
+    26549, 27030, 27518, 28013, 28517, 29028, 29547, 30075, 30611, 31156, 31709, 32272, 32844, 33425, 34016, 34617,
+    35228, 35849, 36481, 37124, 37777, 38442, 39119, 39808, 40508, 41222, 41948, 42687, 43440, 44207, 44988, 45784,
+    46595, 47422, 48264, 49123, 49999, 50892, 51803, 52733, 53682, 54651, 55640, 56649, 57681, 58735, 59812, 60913,
+    62039, 63191, 64369, 65575, 66809, 68074, 69369, 70696, 72057, 73452, 74884, 76353, 77862, 79412, 81005, 82642,
+    84327, 86061, 87847, 89687, 91584, 93540, 95560, 97647, 99803, 102034, 104344, 106737, 109219, 111795, 114471, 117255,
+    120153, 123173, 126326, 129620, 133068, 136681, 140474, 144462, 148664, 153099, 157792, 162769, 168060, 173703, 179740, 186220,
+    193205, 200766, 208993, 217996, 227912, 238921, 251251, 265216, 281241, 299939, 322228, 349566, 384469, 431821, 503081, 637212,
+];
+
+/// The `g2t` code for a light (Q16, diffuse white = 65536) by VSF's rule: the bucket it falls in, i.e. the largest code whose bucket bottom is at or below it (×2ⁿ truncation, the same answer as `vsf::colour::convert::delinearize_gamma2tanh_bits_f32`). Binary search over [`G2T_LIGHT_Q16`]; light past the top code's lands on 255.
+pub const fn g2t_code(light_q16: u32) -> u32 {
+    let (mut lo, mut hi) = (0usize, 255usize);
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        if G2T_LIGHT_Q16[mid] <= light_q16 {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo as u32
+}
+
+/// `vsf::colour::VSF_RGB2REC2020`, column-major, Q16, colorimetric (no chromatic adaptation since vsf 02076e6): out_row = m[row]·R + m[3+row]·G + m[6+row]·B. fluor deliberately has no runtime vsf dependency; `tests::rec2020_matrix_is_vsfs` holds this copy to vsf's.
+pub const VSF_RGB2REC2020_Q16: [i64; 9] = [
+    79325,
+    -3661,
+    24,
+    -9351,
+    72777,
+    671,
+    3466,
+    -5762,
+    61068,
+];
+
+/// Round-to-nearest integer sqrt over 0..=65025: the γ2 encode ((255x)² folds back to 255x exactly).
+const fn isqrt_round(v: i64) -> u32 {
+    let mut lo: i64 = 0;
+    let mut hi: i64 = 256;
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if mid * mid <= v {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo < 255 && (lo + 1) * (lo + 1) - v < v - lo * lo {
+        (lo + 1) as u32
+    } else {
+        lo as u32
+    }
+}
+
+/// Light (Q16) → the buffer's code: γ2 over 0..=255 with 255 = white, nearest, clipped at black and white. The buffer is γ2 until it becomes `g2t` (the HDR plan's P2), when this becomes [`g2t_code`] and the clip at white goes.
+pub const fn buffer_code(light_q16: i64) -> u32 {
+    let l = if light_q16 < 0 { 0 } else if light_q16 > 65536 { 65536 } else { light_q16 };
+    isqrt_round((l * 65025) >> 16)
+}
+
+/// Compile-time authored colour → buffer value. The whole palette is AUTHORED in VSF RGB `g2t` (Nick 2026-10-20: UI colours are VSF RGB g2t, an HDR stack) and lands on the platform's surface correctly: each code decodes to light ([`G2T_LIGHT_Q16`]), takes the working primaries, and encodes into the buffer ([`buffer_code`]). Integer only: Q16 multiplies and shifts, no floats.
+/// macOS: no matrix, because the surface is ICC-tagged VSF RGB (renderer_wgpu) and the OS compositor converts.
+/// Everywhere else: VSF RGB → Rec.2020 by [`VSF_RGB2REC2020_Q16`], the primaries the surface is tagged (or assumed) with.
 pub const fn vsf(trgb: u32) -> u32 {
-    trgb
+    let r = G2T_LIGHT_Q16[((trgb >> 16) & 0xFF) as usize] as i64;
+    let g = G2T_LIGHT_Q16[((trgb >> 8) & 0xFF) as usize] as i64;
+    let b = G2T_LIGHT_Q16[(trgb & 0xFF) as usize] as i64;
+    let (lr, lg, lb) = to_working(r, g, b);
+    (trgb & 0xFF00_0000) | (buffer_code(lr) << 16) | (buffer_code(lg) << 8) | buffer_code(lb)
+}
+
+#[cfg(target_os = "macos")]
+const fn to_working(r: i64, g: i64, b: i64) -> (i64, i64, i64) {
+    (r, g, b)
 }
 
 #[cfg(not(target_os = "macos"))]
-pub const fn vsf(trgb: u32) -> u32 {
-    // vsf::colour::VSF_RGB2REC2020, column-major, Q16: out_row = m[0+row]·R + m[3+row]·G + m[6+row]·B (apply_matrix_3x3_f32's convention).
-    const Q: f64 = 65536.0;
-    const M: [i64; 9] = [
-        (1.205_768_5 * Q) as i64,
-        (-0.065_750_4 * Q) as i64,
-        (0.001_773_122_6 * Q) as i64,
-        (-0.120_429_486 * Q) as i64,
-        (1.061_958_3 * Q) as i64,
-        (0.027_606_096 * Q) as i64,
-        (0.022_573_812 * Q) as i64,
-        (-0.030_623_026 * Q) as i64,
-        (0.887_765_8 * Q) as i64,
-    ];
-    // Round-to-nearest integer sqrt over 0..=65025 — the γ2 encode ((255x)² folds back to 255x exactly).
-    const fn isqrt_round(v: i64) -> u32 {
-        let mut lo: i64 = 0;
-        let mut hi: i64 = 256;
-        while lo + 1 < hi {
-            let mid = (lo + hi) / 2;
-            if mid * mid <= v {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        if lo < 255 && (lo + 1) * (lo + 1) - v < v - lo * lo {
-            (lo + 1) as u32
-        } else {
-            lo as u32
-        }
-    }
-    let r = ((trgb >> 16) & 0xFF) as i64;
-    let g = ((trgb >> 8) & 0xFF) as i64;
-    let b = (trgb & 0xFF) as i64;
-    let (lr, lg, lb) = (r * r, g * g, b * b);
-    const fn ch(m0: i64, m1: i64, m2: i64, lr: i64, lg: i64, lb: i64) -> u32 {
-        let v = (m0 * lr + m1 * lg + m2 * lb) >> 16;
-        let v = if v < 0 { 0 } else if v > 65025 { 65025 } else { v };
-        isqrt_round(v)
-    }
-    (trgb & 0xFF00_0000) | (ch(M[0], M[3], M[6], lr, lg, lb) << 16) | (ch(M[1], M[4], M[7], lr, lg, lb) << 8) | ch(M[2], M[5], M[8], lr, lg, lb)
+const fn to_working(r: i64, g: i64, b: i64) -> (i64, i64, i64) {
+    let m = VSF_RGB2REC2020_Q16;
+    ((m[0] * r + m[3] * g + m[6] * b) >> 16, (m[1] * r + m[4] * g + m[7] * b) >> 16, (m[2] * r + m[5] * g + m[8] * b) >> 16)
 }
 
 /// Variant of [`dark`] that leaves α=0 instead of setting it to 0xFF. Used for colour constants where the α-byte is filled in per-pixel at the use site (the textbox glow function).
@@ -118,7 +159,7 @@ const fn dark_rgb_only(trgb: u32) -> u32 {
 }
 
 // Background texture (organic noise, scrollable). Three NOISE-MATH constants: an additive BASE colour, and two bit-MASKS the noise function ANDs random bits into (`rng & BG_MASK`, `>>8 & BG_SPECKLE`) — the masks carve variance into the channels, they are NOT colours, so a colour-space matrix on them is meaningless and they stay as-authored. Only BG_BASE is a real colour.
-// COLOUR DOCTRINE: every literal in this file is AUTHORED VSF RGB and goes thru [`vsf`] — a compile-time bake (identity on macOS's ICC-tagged surface, the γ2/matrix/γ2 conversion everywhere else), so the noise still never takes a runtime matrix and each platform gets the right buffer value instead of one shared compromise.
+// COLOUR DOCTRINE: every literal in this file is AUTHORED VSF RGB `g2t` (diffuse white = 0xC2) and goes thru [`vsf`] — a compile-time bake (identity on macOS's ICC-tagged surface, the γ2/matrix/γ2 conversion everywhere else), so the noise still never takes a runtime matrix and each platform gets the right buffer value instead of one shared compromise.
 // The noise function does its math then flips the result to stored darkness at the store site (`result ^ 0x00FFFFFF`) — so these are NOT wrapped with `dark()`.
 #[cfg(not(feature = "amber"))]
 pub const BG_BASE: u32 = fmt(vsf(0x00_0C_14_0E));
@@ -137,38 +178,38 @@ pub const BG_SPECKLE: u32 = fmt(0x00_7F_50_00);
 // Window edges (focused). Saturated warm top/left + saturated cool bottom/right give the chrome its 3D bevel cue. Brighter than the unfocused variants below — an active window earns the eye's attention.
 // amber (dev builds): the perimeter hairline IS the debug badge — full #FFA000 on the light edge; a darker orange shadow edge keeps the bevel cue.
 #[cfg(not(feature = "amber"))]
-pub const WINDOW_LIGHT_EDGE: u32 = dark(fmt(vsf(0x00_5C_4F_35)));
+pub const WINDOW_LIGHT_EDGE: u32 = dark(fmt(vsf(0x00_58_4C_34)));
 #[cfg(not(feature = "amber"))]
-pub const WINDOW_SHADOW_EDGE: u32 = dark(fmt(vsf(0x00_29_3A_4A)));
+pub const WINDOW_SHADOW_EDGE: u32 = dark(fmt(vsf(0x00_28_39_48)));
 #[cfg(feature = "amber")]
-pub const WINDOW_LIGHT_EDGE: u32 = dark(fmt(vsf(0x00_FF_A0_00)));
+pub const WINDOW_LIGHT_EDGE: u32 = dark(fmt(vsf(0x00_C2_8E_00)));
 #[cfg(feature = "amber")]
-pub const WINDOW_SHADOW_EDGE: u32 = dark(fmt(vsf(0x00_80_50_00)));
+pub const WINDOW_SHADOW_EDGE: u32 = dark(fmt(vsf(0x00_76_4D_00)));
 
 // Window edges (unfocused). Desaturated (channels pulled toward grey, keeping a slight warm vs cool hint so the bevel survives) and darker than the focused variants. Reads as "this window is quiet, but I can still see it's a window."
 #[cfg(not(feature = "amber"))]
-pub const WINDOW_LIGHT_EDGE_UNFOCUSED: u32 = dark(fmt(vsf(0x00_36_34_30)));
+pub const WINDOW_LIGHT_EDGE_UNFOCUSED: u32 = dark(fmt(vsf(0x00_35_33_2F)));
 #[cfg(not(feature = "amber"))]
-pub const WINDOW_SHADOW_EDGE_UNFOCUSED: u32 = dark(fmt(vsf(0x00_2A_2D_32)));
+pub const WINDOW_SHADOW_EDGE_UNFOCUSED: u32 = dark(fmt(vsf(0x00_29_2C_31)));
 #[cfg(feature = "amber")]
-pub const WINDOW_LIGHT_EDGE_UNFOCUSED: u32 = dark(fmt(vsf(0x00_8A_58_00)));
+pub const WINDOW_LIGHT_EDGE_UNFOCUSED: u32 = dark(fmt(vsf(0x00_7E_55_00)));
 #[cfg(feature = "amber")]
-pub const WINDOW_SHADOW_EDGE_UNFOCUSED: u32 = dark(fmt(vsf(0x00_45_2C_00)));
+pub const WINDOW_SHADOW_EDGE_UNFOCUSED: u32 = dark(fmt(vsf(0x00_43_2B_00)));
 
 // Controls strip background. The strip stays functional/clickable even when the window is unfocused, so the bg is focus-invariant. Strip hairlines + BL curve are NOT constants here — they now follow the focus-driven edge palette (vertical dividers + bottom hairline = `WINDOW_LIGHT_EDGE[_UNFOCUSED]`; BL squircle = `WINDOW_SHADOW_EDGE[_UNFOCUSED]`) so the strip's framing dims with the rest of the window.
-pub const WINDOW_CONTROLS_BG: u32 = dark(fmt(vsf(0x00_1E_1E_1E)));
+pub const WINDOW_CONTROLS_BG: u32 = dark(fmt(vsf(0x00_1D_1D_1D)));
 
 // Window-control hover TARGET colours: close = red, maximize = green, minimize = blue.
 // `dark(fmt(rgb))` stores visible RGB → darkness; the migration previously carried the legacy DARKNESS-encoded values (0x21FDF9 etc.) and wrapped them in dark() again, double-inverting to cyan/magenta/yellow.
 // These are the plain visible primaries so ChromeButton::tint_delta's `wrap_sub_rgb(target, WINDOW_CONTROLS_BG)` lands the control at the right hue.
-pub const CLOSE_HOVER: u32 = dark(fmt(vsf(0x00_DE_02_06)));
-pub const MAXIMIZE_HOVER: u32 = dark(fmt(vsf(0x00_03_78_03)));
-pub const MINIMIZE_HOVER: u32 = dark(fmt(vsf(0x00_08_05_DA)));
+pub const CLOSE_HOVER: u32 = dark(fmt(vsf(0x00_B3_02_06)));
+pub const MAXIMIZE_HOVER: u32 = dark(fmt(vsf(0x00_03_70_03)));
+pub const MINIMIZE_HOVER: u32 = dark(fmt(vsf(0x00_08_05_B1)));
 
 // Generic UI text. `TEXT_COLOUR` is the focused title + primary body text (brighter than the previous 0xD0 for a stronger active-window contrast). `TEXT_COLOUR_UNFOCUSED` dims for inactive-window titles (between `LABEL_COLOUR` and the focused value — readable but obviously quiet). `LABEL_COLOUR` stays as the secondary/labels grey used everywhere else.
-pub const TEXT_COLOUR: u32 = dark(fmt(vsf(0x00_E8_E8_E8)));
-pub const TEXT_COLOUR_UNFOCUSED: u32 = dark(fmt(vsf(0x00_6A_6A_6A)));
-pub const LABEL_COLOUR: u32 = dark(fmt(vsf(0x00_80_80_80)));
+pub const TEXT_COLOUR: u32 = dark(fmt(vsf(0x00_B8_B8_B8)));
+pub const TEXT_COLOUR_UNFOCUSED: u32 = dark(fmt(vsf(0x00_64_64_64)));
+pub const LABEL_COLOUR: u32 = dark(fmt(vsf(0x00_76_76_76)));
 
 // Title-bar text — normally just TEXT_COLOUR[_UNFOCUSED]; a named constant so the amber dev theme can badge the TITLE orange without touching body text everywhere.
 #[cfg(not(feature = "amber"))]
@@ -176,9 +217,9 @@ pub const TITLE_TEXT: u32 = TEXT_COLOUR;
 #[cfg(not(feature = "amber"))]
 pub const TITLE_TEXT_UNFOCUSED: u32 = TEXT_COLOUR_UNFOCUSED;
 #[cfg(feature = "amber")]
-pub const TITLE_TEXT: u32 = dark(fmt(vsf(0x00_FF_A0_00)));
+pub const TITLE_TEXT: u32 = dark(fmt(vsf(0x00_C2_8E_00)));
 #[cfg(feature = "amber")]
-pub const TITLE_TEXT_UNFOCUSED: u32 = dark(fmt(vsf(0x00_8A_58_00)));
+pub const TITLE_TEXT_UNFOCUSED: u32 = dark(fmt(vsf(0x00_7E_55_00)));
 
 // Hint / placeholder text — pure white at 1/4 opacity (α=64), stored directly in α+darkness format (the version watermark is the same treatment at 1/8). Glyph coverage multiplies into this α, so every hint reads as faint light over the dark background rather than flat ink — the eye reads real content first, the hint only on attention. One colour for every hint, by design.
 pub const HINT_COLOUR: u32 = 0x40_00_00_00;
@@ -187,33 +228,123 @@ pub const HINT_COLOUR: u32 = 0x40_00_00_00;
 pub const ORB_DARKEN_UNFOCUSED: u8 = 128;
 
 // Window control glyph colours (drawn on top of WINDOW_CONTROLS_BG).
-pub const CLOSE_GLYPH: u32 = dark(fmt(vsf(0x00_80_20_20)));
-pub const MAXIMIZE_GLYPH: u32 = dark(fmt(vsf(0x00_48_6B_3A)));
-pub const MAXIMIZE_GLYPH_INTERIOR: u32 = dark(fmt(vsf(0x00_28_2D_2E)));
-pub const MINIMIZE_GLYPH: u32 = dark(fmt(vsf(0x00_33_30_C7)));
+pub const CLOSE_GLYPH: u32 = dark(fmt(vsf(0x00_76_1F_1F)));
+pub const MAXIMIZE_GLYPH: u32 = dark(fmt(vsf(0x00_46_65_39)));
+pub const MAXIMIZE_GLYPH_INTERIOR: u32 = dark(fmt(vsf(0x00_27_2C_2D)));
+pub const MINIMIZE_GLYPH: u32 = dark(fmt(vsf(0x00_32_2F_A7)));
 
 // Textbox.
 pub const TEXTBOX_FILL: u32 = dark(fmt(vsf(0x00_06_08_09)));
 pub const TEXTBOX_HOVER: u32 = dark(fmt(vsf(0x00_12_16_18)));
 pub const TEXTBOX_ACTIVE: u32 = dark(fmt(vsf(0x00_00_00_00)));
-pub const TEXTBOX_LIGHT_EDGE: u32 = dark(fmt(vsf(0x00_44_41_37)));
-pub const TEXTBOX_SHADOW_EDGE: u32 = dark(fmt(vsf(0x00_2B_34_37)));
-pub const TEXTBOX_TEXT: u32 = dark(fmt(vsf(0x00_E0_E0_DC)));
-pub const TEXTBOX_SELECTION_BG: u32 = dark(fmt(vsf(0x00_3A_5A_8C)));
+pub const TEXTBOX_LIGHT_EDGE: u32 = dark(fmt(vsf(0x00_42_3F_36)));
+pub const TEXTBOX_SHADOW_EDGE: u32 = dark(fmt(vsf(0x00_2A_33_36)));
+pub const TEXTBOX_TEXT: u32 = dark(fmt(vsf(0x00_B4_B4_B2)));
+pub const TEXTBOX_SELECTION_BG: u32 = dark(fmt(vsf(0x00_39_56_7F)));
 
 // Button. Distinct from textbox FILL so the eye reads "this is an action surface, not a typing surface" at a glance — slate-grey-blue, noticeably lighter than TEXTBOX_FILL's near-black. Hover lightens further toward a more saturated blue; active (pressed) drops back near TEXTBOX_FILL for the "pressed in" effect that conventionally inverts the normal raised-button shading.
-pub const BUTTON_FILL: u32 = dark(fmt(vsf(0x00_1A_22_4E)));
-pub const BUTTON_HOVER: u32 = dark(fmt(vsf(0x00_28_34_71)));
-pub const BUTTON_ACTIVE: u32 = dark(fmt(vsf(0x00_0C_10_32)));
+pub const BUTTON_FILL: u32 = dark(fmt(vsf(0x00_1A_21_4B)));
+pub const BUTTON_HOVER: u32 = dark(fmt(vsf(0x00_27_33_6A)));
+pub const BUTTON_ACTIVE: u32 = dark(fmt(vsf(0x00_0C_10_31)));
 // Held: a finger/button is DOWN on this control and a release here will fire it (press-hold-release — see host::pointer). A brighter, more-saturated azure than HOVER so touch-down visibly LIGHTS UP the control (distinct from ACTIVE's darker "pressed-in" focus reading); slides back to FILL if the pointer drags off before release. Also the fill used for photon's non-widget stamped elements (pills, contact/nav rows, orb) while held.
-pub const BUTTON_HELD: u32 = dark(fmt(vsf(0x00_3C_4C_A8)));
+pub const BUTTON_HELD: u32 = dark(fmt(vsf(0x00_3B_4A_93)));
 
 // Cursor (blinkey).
 pub const CURSOR_BRIGHTNESS: f32 = 100.0;
 
 // Textbox glow colours (RGB only — α-byte is set per-pixel by the glow function).
-pub const GLOW_DEFAULT: u32 = dark_rgb_only(fmt(vsf(0x00_FF_FF_FF)));
-pub const GLOW_SUCCESS: u32 = dark_rgb_only(fmt(vsf(0x00_40_FF_40)));
-pub const GLOW_ERROR: u32 = dark_rgb_only(fmt(vsf(0x00_FF_60_60)));
+pub const GLOW_DEFAULT: u32 = dark_rgb_only(fmt(vsf(0x00_C2_C2_C2)));
+pub const GLOW_SUCCESS: u32 = dark_rgb_only(fmt(vsf(0x00_3E_C2_3E)));
+pub const GLOW_ERROR: u32 = dark_rgb_only(fmt(vsf(0x00_C2_5C_5C)));
 /// Black halo — the rays add darkness instead of brightness, drawing the surrounding pixels toward 0. Used by [`crate::widgets::Button`] so its focus motif reads as a "deepening shadow / pressing into the surface" rather than the textbox glow's "lit-from-within" feel. Distinct visual vocabulary at the same pixel cost.
 pub const GLOW_DARK: u32 = dark_rgb_only(fmt(vsf(0x00_00_00_00)));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn g2t_table_is_vsfs_decoder() {
+        for c in 0..256u32 {
+            let want = vsf::colour::convert::linearize_gamma2tanh_bits_f32(c, 8) as f64 * 65536.0;
+            let got = G2T_LIGHT_Q16[c as usize] as f64;
+            assert!((got - want).abs() <= 1.0 + want * 1e-6, "code {c}: {got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn rec2020_matrix_is_vsfs() {
+        for (i, v) in vsf::colour::VSF_RGB2REC2020.iter().enumerate() {
+            assert_eq!(VSF_RGB2REC2020_Q16[i], (*v as f64 * 65536.0).round() as i64, "element {i}");
+        }
+    }
+
+    #[test]
+    fn g2t_code_inverts_the_table() {
+        for c in 0..256u32 {
+            assert_eq!(g2t_code(G2T_LIGHT_Q16[c as usize]), c);
+        }
+        assert_eq!(g2t_code(65536), 194, "diffuse white, as VSF's encoder puts it");
+        for l in [0u32, 1000, 30000, 65536, 300000, 600000] {
+            assert_eq!(g2t_code(l), vsf::colour::convert::delinearize_gamma2tanh_bits_f32(l as f32 / 65536.0, 8), "light {l}");
+        }
+        assert_eq!(g2t_code(u32::MAX), 255);
+    }
+
+    /// The palette moved from γ2 to `g2t` authoring with its light kept: each pair is (the γ2 value it had, the `g2t` value it has now), and the old pipeline (γ2 decode ÷255, the same matrix, γ2 encode) and the new one land within 3 codes. Not 0: `g2t` spends 194 codes below white where γ2 spent 255, so near white one `g2t` step is about 2.4 γ2 codes, and VSF's rule takes the bucket below.
+    #[test]
+    fn the_g2t_palette_keeps_the_gamma2_palettes_light() {
+        const PAIRS: &[(u32, u32)] = &[
+            (0x0C140E, 0x0C140E),
+            (0x140D00, 0x140D00),
+            (0x5C4F35, 0x584C34),
+            (0x293A4A, 0x283948),
+            (0xFFA000, 0xC28E00),
+            (0x805000, 0x764D00),
+            (0x363430, 0x35332F),
+            (0x2A2D32, 0x292C31),
+            (0x8A5800, 0x7E5500),
+            (0x452C00, 0x432B00),
+            (0x1E1E1E, 0x1D1D1D),
+            (0xDE0206, 0xB30206),
+            (0x037803, 0x037003),
+            (0x0805DA, 0x0805B1),
+            (0xE8E8E8, 0xB8B8B8),
+            (0x6A6A6A, 0x646464),
+            (0x808080, 0x767676),
+            (0xFFA000, 0xC28E00),
+            (0x8A5800, 0x7E5500),
+            (0x802020, 0x761F1F),
+            (0x486B3A, 0x466539),
+            (0x282D2E, 0x272C2D),
+            (0x3330C7, 0x322FA7),
+            (0x060809, 0x060809),
+            (0x121618, 0x121618),
+            (0x000000, 0x000000),
+            (0x444137, 0x423F36),
+            (0x2B3437, 0x2A3336),
+            (0xE0E0DC, 0xB4B4B2),
+            (0x3A5A8C, 0x39567F),
+            (0x1A224E, 0x1A214B),
+            (0x283471, 0x27336A),
+            (0x0C1032, 0x0C1031),
+            (0x3C4CA8, 0x3B4A93),
+            (0xFFFFFF, 0xC2C2C2),
+            (0x40FF40, 0x3EC23E),
+            (0xFF6060, 0xC25C5C),
+            (0x000000, 0x000000),
+        ];
+        let old = |hex: u32| {
+            let ch = |c: u32| ((c * c) as i64 * 65536) / 65025;
+            let (r, g, b) = to_working(ch((hex >> 16) & 0xFF), ch((hex >> 8) & 0xFF), ch(hex & 0xFF));
+            [buffer_code(r), buffer_code(g), buffer_code(b)]
+        };
+        for &(was, now) in PAIRS {
+            let (o, n) = (old(was), vsf(now));
+            let n = [(n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF];
+            for i in 0..3 {
+                assert!(o[i].abs_diff(n[i]) <= 3, "{was:06X} → {now:06X}: channel {i} {} vs {}", o[i], n[i]);
+            }
+        }
+    }
+}
