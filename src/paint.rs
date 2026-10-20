@@ -422,7 +422,7 @@ pub fn apply_overlay(
                     continue;
                 }
                 let raw = scratch[map_idx];
-                let visible = raw ^ 0x00FF_FFFF;
+                let visible = crate::theme::to_sdr_visible(raw);
                 let (r, g, b) = if sqrt {
                     // Per-pixel gamma lift: v' = sqrt(v/255)·255 per channel. See the doc note above.
                     (

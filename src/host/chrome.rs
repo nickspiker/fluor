@@ -630,7 +630,8 @@ fn sample_icon(
         let sx = ((2 * (dx + radius) + 1) * img.width as isize / denom) as usize;
         let sy = ((2 * (dy + radius) + 1) * img.height as isize / denom) as usize;
         // The Icon pixel contract is PLATFORM-NEUTRAL packed order (R@16 G@8 B@0 darkness); the platform channel pass happens HERE at the blit — identity on desktop, R↔B on Android — so every icon source (brand orb, dev gradient, avatar swap-in) renders true without each producer remembering `fmt`. (Skipping it was the Android "red-blue swapped orb", 2026-07-17.) The fallback ring colour below is NOT wrapped: it arrives from the host already platform-ordered.
-        crate::theme::fmt(img.pixels[sy * img.width as usize + sx])
+        // Icon pixels stay γ2 (the OS taskbar/tray read them as-is, `Icon::to_rgba_circular`); the `g2t` buffer takes the same light's code.
+        crate::theme::darkness_from_gamma2(crate::theme::fmt(img.pixels[sy * img.width as usize + sx]))
     } else if fallback_ring != 0 {
         0xFF000000 | (fallback_ring & 0x00FFFFFF)
     } else {

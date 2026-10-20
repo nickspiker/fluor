@@ -10,7 +10,7 @@ use super::{
 /// Boundary step that finalizes the present buffer for the OS in a **single pass** per pixel — folds the darkness→visible flip, the window-shape clip-mask multiply, the RGB premultiply (every platform), and the pack into one go. Walks `pixels` and `clip_mask` in lockstep; both slices must be the same length.
 ///
 /// Per pixel:
-/// 1. `v = pixel ^ 0x00FFFFFF` — single XOR flips RGB darkness to visible (255 − dark). α stays as α (already opacity-direction in storage).
+/// 1. `v = theme::to_sdr_visible(pixel)` — one table lookup per channel flips the stored darkness and maps the buffer's `g2t` code to the surface's display code (γ2, light above white clipped to white on SDR). α stays as α (already opacity-direction in storage).
 /// 2. `final_α = (α × clip_mask_α) >> 8` — multiply with the window-shape clip; trims to the window's actual shape while preserving any partial α the under-chain produced.
 /// 3. Premultiply RGB by `final_α / 256`. Required on all platforms for clean AA edges.
 /// 4. Pack back into `0xααRRGGBB`.
@@ -79,13 +79,13 @@ fn finalize_chunk_simd(chunk: &mut [u32], clip: &[u8], skip_premult: bool) {
     use crate::simd::{LANES, u32x8};
     let n = chunk.len();
     let mask_ff = u32x8::splat(0xFF);
-    let xor_flip = u32x8::splat(0x00FFFFFF);
     let const_256 = u32x8::splat(256);
 
     let mut i = 0;
     while i + LANES <= n {
-        let raw: [u32; 8] = chunk[i..i + LANES].try_into().unwrap();
-        let v = u32x8::from(raw) ^ xor_flip;
+        // The colour step is a table lookup per channel (`theme::to_sdr_visible`: flip + `g2t` → SDR display), done lane by lane before the SIMD premultiply.
+        let raw: [u32; 8] = core::array::from_fn(|k| crate::theme::to_sdr_visible(chunk[i + k]));
+        let v = u32x8::from(raw);
         let m = u32x8::from([
             clip[i] as u32,
             clip[i + 1] as u32,
@@ -107,7 +107,7 @@ fn finalize_chunk_simd(chunk: &mut [u32], clip: &[u8], skip_premult: bool) {
         i += LANES;
     }
     while i < n {
-        let v = chunk[i] ^ 0x00FFFFFF;
+        let v = crate::theme::to_sdr_visible(chunk[i]);
         let m = clip[i] as u32;
         let inner_a = (v >> 24) & 0xFF;
         let final_a = (inner_a * m) >> 8;
@@ -124,7 +124,7 @@ fn finalize_chunk_simd(chunk: &mut [u32], clip: &[u8], skip_premult: bool) {
 #[cfg(not(feature = "simd"))]
 fn finalize_chunk_scalar(chunk: &mut [u32], clip: &[u8], skip_premult: bool) {
     for i in 0..chunk.len() {
-        let v = chunk[i] ^ 0x00FFFFFF;
+        let v = crate::theme::to_sdr_visible(chunk[i]);
         let m = clip[i] as u32;
         let inner_a = (v >> 24) & 0xFF;
         let final_a = (inner_a * m) >> 8;
@@ -139,7 +139,7 @@ fn finalize_chunk_scalar(chunk: &mut [u32], clip: &[u8], skip_premult: bool) {
 /// Debug-visualization fallback: GRAYSCALE replaces each pixel with `(final_α, final_α, final_α, 0xFF)`; FORCE_OPAQUE keeps the kernel's visible RGB exactly and sets α=255 (lets you see what the kernel produced BEFORE the clip mask + premult trimmed it). Both stay scalar — they're debug-toggle paths, not on the hot path.
 fn finalize_scalar_debug_inplace(pixels: &mut [u32], clip_mask: &[u8], alpha_mode: u8) {
     for i in 0..pixels.len() {
-        let v = pixels[i] ^ 0x00FFFFFF;
+        let v = crate::theme::to_sdr_visible(pixels[i]);
         let m = clip_mask[i] as u32;
         let inner_a = (v >> 24) & 0xFF;
         let final_a = (inner_a * m) >> 8;
@@ -391,13 +391,12 @@ fn finalize_into_chunk_simd(src: &[u32], clip: &[u8], dst: &mut [u32], skip_prem
     use crate::simd::{LANES, u32x8};
     let n = src.len();
     let mask_ff = u32x8::splat(0xFF);
-    let xor_flip = u32x8::splat(0x00FFFFFF);
     let const_256 = u32x8::splat(256);
 
     let mut i = 0;
     while i + LANES <= n {
-        let raw: [u32; 8] = src[i..i + LANES].try_into().unwrap();
-        let v = u32x8::from(raw) ^ xor_flip;
+        let raw: [u32; 8] = core::array::from_fn(|k| crate::theme::to_sdr_visible(src[i + k]));
+        let v = u32x8::from(raw);
         let m = u32x8::from([
             clip[i] as u32,
             clip[i + 1] as u32,
@@ -419,7 +418,7 @@ fn finalize_into_chunk_simd(src: &[u32], clip: &[u8], dst: &mut [u32], skip_prem
         i += LANES;
     }
     while i < n {
-        let v = src[i] ^ 0x00FFFFFF;
+        let v = crate::theme::to_sdr_visible(src[i]);
         let m = clip[i] as u32;
         let inner_a = (v >> 24) & 0xFF;
         let final_a = (inner_a * m) >> 8;
@@ -436,7 +435,7 @@ fn finalize_into_chunk_simd(src: &[u32], clip: &[u8], dst: &mut [u32], skip_prem
 #[cfg(not(feature = "simd"))]
 fn finalize_into_chunk_scalar(src: &[u32], clip: &[u8], dst: &mut [u32], skip_premult: bool) {
     for i in 0..src.len() {
-        let v = src[i] ^ 0x00FFFFFF;
+        let v = crate::theme::to_sdr_visible(src[i]);
         let m = clip[i] as u32;
         let inner_a = (v >> 24) & 0xFF;
         let final_a = (inner_a * m) >> 8;
@@ -474,7 +473,7 @@ fn finalize_into_scalar_debug(
                 break;
             }
             let dst_idx = dst_row + (rect_x + sx as i32) as usize;
-            let v = scratch[scratch_idx] ^ 0x00FFFFFF;
+            let v = crate::theme::to_sdr_visible(scratch[scratch_idx]);
             let m = clip_mask[scratch_idx] as u32;
             let inner_a = (v >> 24) & 0xFF;
             let final_a = (inner_a * m) >> 8;

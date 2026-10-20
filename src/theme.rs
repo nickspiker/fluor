@@ -125,10 +125,67 @@ const fn isqrt_round(v: i64) -> u32 {
     }
 }
 
-/// Light (Q16) → the buffer's code: γ2 over 0..=255 with 255 = white, nearest, clipped at black and white. The buffer is γ2 until it becomes `g2t` (the HDR plan's P2), when this becomes [`g2t_code`] and the clip at white goes.
-pub const fn buffer_code(light_q16: i64) -> u32 {
+/// Light (Q16) → γ2 over 0..=255 with 255 = white, nearest, clipped at black and white: an SDR display code.
+pub const fn gamma2_code(light_q16: i64) -> u32 {
     let l = if light_q16 < 0 { 0 } else if light_q16 > 65536 { 65536 } else { light_q16 };
     isqrt_round((l * 65025) >> 16)
+}
+
+/// Light (Q16) → the buffer's code: `g2t` by VSF's rule ([`g2t_code`]), light above white kept up to the top code's 9.7×, below black clipped. The buffer has been `g2t` since 2026-10-20; the screen gets it thru [`G2T_TO_SDR`] (or, later, an HDR surface's table) in finalize.
+pub const fn buffer_code(light_q16: i64) -> u32 {
+    let l = if light_q16 < 0 { 0 } else if light_q16 > u32::MAX as i64 { u32::MAX as i64 } else { light_q16 };
+    g2t_code(l as u32)
+}
+
+/// The final step for an SDR surface: each `g2t` code → the γ2 display code of its light, clipped at white. One table, 256 bytes, applied per channel in `paint::finalize`; codes above white (195..=255) all show as white until an HDR surface has room for them.
+pub const G2T_TO_SDR: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut c = 0;
+    while c < 256 {
+        t[c] = gamma2_code(G2T_LIGHT_Q16[c] as i64) as u8;
+        c += 1;
+    }
+    t
+};
+
+/// [`G2T_TO_SDR`] indexed by the stored DARKNESS byte (255 − code), so finalize's flip and the display map are one lookup.
+pub const DARK_TO_SDR: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut d = 0;
+    while d < 256 {
+        t[d] = G2T_TO_SDR[255 - d];
+        d += 1;
+    }
+    t
+};
+
+/// A stored α + darkness pixel → visible SDR display RGB (γ2, white at 255), α passing thru: finalize's per-pixel colour step.
+#[inline(always)]
+pub const fn to_sdr_visible(px: u32) -> u32 {
+    (px & 0xFF00_0000) | ((DARK_TO_SDR[((px >> 16) & 0xFF) as usize] as u32) << 16) | ((DARK_TO_SDR[((px >> 8) & 0xFF) as usize] as u32) << 8) | DARK_TO_SDR[(px & 0xFF) as usize] as u32
+}
+
+/// γ2 code (÷255, white at 255) → the `g2t` code of the same light by VSF's rule: for pixels that arrive γ2-encoded (decoded images, avatars, emoji bitmaps, video frames, hand-written darkness constants) on their way into the `g2t` buffer.
+pub const GAMMA2_TO_G2T: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut c = 0;
+    while c < 256 {
+        t[c] = g2t_code(((c * c * 65536 + 65025 / 2) / 65025) as u32) as u8;
+        c += 1;
+    }
+    t
+};
+
+/// Visible γ2 RGB → visible `g2t` RGB, per channel by [`GAMMA2_TO_G2T`], α passing thru.
+#[inline(always)]
+pub const fn from_gamma2(visible: u32) -> u32 {
+    (visible & 0xFF00_0000) | ((GAMMA2_TO_G2T[((visible >> 16) & 0xFF) as usize] as u32) << 16) | ((GAMMA2_TO_G2T[((visible >> 8) & 0xFF) as usize] as u32) << 8) | GAMMA2_TO_G2T[(visible & 0xFF) as usize] as u32
+}
+
+/// A darkness value written for a γ2 buffer → the same light's darkness in the `g2t` buffer, α passing thru.
+#[inline(always)]
+pub const fn darkness_from_gamma2(dark: u32) -> u32 {
+    from_gamma2(dark ^ 0x00FF_FFFF) ^ 0x00FF_FFFF
 }
 
 /// Compile-time authored colour → buffer value. The whole palette is AUTHORED in VSF RGB `g2t` (Nick 2026-10-20: UI colours are VSF RGB g2t, an HDR stack) and lands on the platform's surface correctly: each code decodes to light ([`G2T_LIGHT_Q16`]), takes the working primaries, and encodes into the buffer ([`buffer_code`]). Integer only: Q16 multiplies and shifts, no floats.
@@ -279,6 +336,19 @@ mod tests {
         }
     }
 
+    /// An SDR screen sees what it saw before: every γ2 code taken into the buffer and back out thru the final table lands within 3 codes (2.4 γ2 codes per `g2t` step near white), white and black exactly; above white clips to white.
+    #[test]
+    fn gamma2_round_trips_thru_the_buffer_and_the_sdr_table() {
+        for c in 0..256u32 {
+            let back = G2T_TO_SDR[GAMMA2_TO_G2T[c as usize] as usize] as u32;
+            assert!(back.abs_diff(c) <= 3, "γ2 {c} → g2t {} → SDR {back}", GAMMA2_TO_G2T[c as usize]);
+        }
+        assert_eq!(GAMMA2_TO_G2T[255], 194);
+        assert_eq!(G2T_TO_SDR[194], 253, "white's bucket decodes at its bottom, 0.982 of white (VSF's rule)");
+        assert_eq!((G2T_TO_SDR[0], G2T_TO_SDR[255]), (0, 255));
+        assert_eq!(to_sdr_visible(0x80_00_00_00), 0x80_FF_FF_FF, "darkness 0 is peak, and peak shows as white on SDR");
+    }
+
     #[test]
     fn g2t_code_inverts_the_table() {
         for c in 0..256u32 {
@@ -291,7 +361,7 @@ mod tests {
         assert_eq!(g2t_code(u32::MAX), 255);
     }
 
-    /// The palette moved from γ2 to `g2t` authoring with its light kept: each pair is (the γ2 value it had, the `g2t` value it has now), and the old pipeline (γ2 decode ÷255, the same matrix, γ2 encode) and the new one land within 3 codes. Not 0: `g2t` spends 194 codes below white where γ2 spent 255, so near white one `g2t` step is about 2.4 γ2 codes, and VSF's rule takes the bucket below.
+    /// The palette moved from γ2 to `g2t` authoring with its light kept: each pair is (the γ2 value it had, the `g2t` value it has now), and what the old pipeline (γ2 decode ÷255, the same matrix, γ2 encode) put on an SDR screen and what the new one does (`g2t` buffer thru [`G2T_TO_SDR`]) land within 5 codes. Not 0: `g2t` spends 194 codes below white where γ2 spent 255, so near white one `g2t` step is about 2.4 γ2 codes, and VSF's rule decodes at the bucket's bottom twice here: the authored colour, then the buffer code after the matrix.
     #[test]
     fn the_g2t_palette_keeps_the_gamma2_palettes_light() {
         const PAIRS: &[(u32, u32)] = &[
@@ -337,13 +407,13 @@ mod tests {
         let old = |hex: u32| {
             let ch = |c: u32| ((c * c) as i64 * 65536) / 65025;
             let (r, g, b) = to_working(ch((hex >> 16) & 0xFF), ch((hex >> 8) & 0xFF), ch(hex & 0xFF));
-            [buffer_code(r), buffer_code(g), buffer_code(b)]
+            [gamma2_code(r), gamma2_code(g), gamma2_code(b)]
         };
         for &(was, now) in PAIRS {
             let (o, n) = (old(was), vsf(now));
-            let n = [(n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF];
+            let n = [G2T_TO_SDR[((n >> 16) & 0xFF) as usize] as u32, G2T_TO_SDR[((n >> 8) & 0xFF) as usize] as u32, G2T_TO_SDR[(n & 0xFF) as usize] as u32];
             for i in 0..3 {
-                assert!(o[i].abs_diff(n[i]) <= 3, "{was:06X} → {now:06X}: channel {i} {} vs {}", o[i], n[i]);
+                assert!(o[i].abs_diff(n[i]) <= 5, "{was:06X} → {now:06X}: channel {i} {} vs {}", o[i], n[i]);
             }
         }
     }

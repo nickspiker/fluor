@@ -2377,7 +2377,7 @@ impl<A: FluorApp> DesktopShell<A> {
                         continue;
                     }
                     let scr_x = scr_x as usize;
-                    let v = self.strip_buf[sb_row + x] ^ 0x00FF_FFFF;
+                    let v = crate::theme::to_sdr_visible(self.strip_buf[sb_row + x]);
                     ps[ps_row + scr_x] = 0xFF00_0000 | (v & 0x00FF_FFFF);
                 }
             }
