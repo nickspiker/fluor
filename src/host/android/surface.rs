@@ -76,6 +76,10 @@ pub struct Surface {
     dataspace_set: bool,
     /// Consecutive clean presents that found their buffer already current. At three, every buffer in the queue carries the content — until the next dirty frame there is nothing to lock or post (2026-09-10: an idle phone spent 1.3 ms of every vsync in lock + unlockAndPost for a frame it never changed).
     clean_streak: u8,
+    /// The extended-range surface (super::hdr_surface) when the app enabled it and this Android supports it; frames go there instead of the 8-bit window.
+    hdr: Option<super::hdr_surface::HdrSurface>,
+    /// It was tried and refused: this process stays on the 8-bit path rather than retrying every frame.
+    hdr_refused: bool,
 }
 
 impl Surface {
@@ -86,6 +90,8 @@ impl Surface {
             content_version: 1,
             dataspace_set: false,
             clean_streak: 0,
+            hdr: None,
+            hdr_refused: false,
         }
     }
 
@@ -123,6 +129,18 @@ impl Surface {
         damage_clip: PixelRect,
         dirty: bool,
     ) -> bool {
+        // EXTENDED RANGE first (super::hdr_surface): our own F16 child of this window, rebuilt when the window or its size changes; refused once, never retried.
+        if !self.hdr_refused && super::hdr_surface::enabled() {
+            let w = window.ptr().as_ptr();
+            if !self.hdr.as_ref().is_some_and(|h| h.fits(w, win_w, win_h)) {
+                self.hdr = None;
+                self.hdr = super::hdr_surface::HdrSurface::new(w, win_w, win_h);
+                self.hdr_refused = self.hdr.is_none();
+            }
+            if let Some(h) = self.hdr.as_mut() {
+                return h.present(scratch, clip_mask, dirty).wrote;
+            }
+        }
         if dirty {
             self.clean_streak = 0;
         } else if self.clean_streak >= 3 {
@@ -159,8 +177,6 @@ impl Surface {
                 self.dataspace_set = true;
             }
 
-            // DEV PROBE (HDR plan, open test 2): a no-op unless a development build armed it; runs once.
-            super::hdr_probe::run_once(window.ptr().as_ptr());
             let mut android_buffer: ANativeWindow_Buffer = core::mem::zeroed();
             if ANativeWindow_lock(
                 window.ptr().as_ptr(),

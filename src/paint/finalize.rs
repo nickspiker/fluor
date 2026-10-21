@@ -447,6 +447,105 @@ fn finalize_into_chunk_scalar(src: &[u32], clip: &[u8], dst: &mut [u32], skip_pr
     }
 }
 
+/// The EXTENDED-RANGE finalize (HDR plan, Android first): the whole window from `scratch` (α + darkness, the `g2t` buffer) into an RGBA F16 surface whose dataspace is linear extended (1.0 = SDR white), `dst_stride` pixels per row.
+/// Per pixel: final α = α × clip / 255; an opaque pixel takes three half lookups in `table` (the darkness flip, the display map and the half pack in one read each); a partly-covered one is premultiplied in Q16 integers from `table.q16` and packed ([`crate::theme::q16_to_half`]); α is written as half, or 1.0 over black when [`crate::paint::OPAQUE_BACKDROP`] is set, like the 8-bit path.
+/// Channels go in the order they are stored — byte 0 to the first half — which is R, G, B on Android, where theme::fmt already put R in the low byte.
+/// Returns the frame's brightest `g2t` code (255 − the smallest darkness under any visible pixel): the light the next frame asks the display for.
+pub fn finalize_into_f16(
+    scratch: &[u32],
+    clip_mask: &[u8],
+    win_w: usize,
+    win_h: usize,
+    dst: &mut [u64],
+    dst_stride: usize,
+    table: &crate::theme::HdrTable,
+) -> u8 {
+    if dst_stride == 0 || win_w == 0 {
+        return 0;
+    }
+    let rows = win_h.min(dst.len() / dst_stride);
+    let w = win_w.min(dst_stride);
+    let opaque = crate::paint::OPAQUE_BACKDROP.load(core::sync::atomic::Ordering::Relaxed);
+    let min_dark = core::sync::atomic::AtomicU32::new(255);
+    crate::par::par_rows(dst, dst_stride, 0, rows, |y, row| {
+        let off = y * win_w;
+        let m = finalize_f16_row(&scratch[off..off + w], &clip_mask[off..off + w], &mut row[..w], table, opaque);
+        min_dark.fetch_min(m, core::sync::atomic::Ordering::Relaxed);
+    });
+    255 - min_dark.into_inner() as u8
+}
+
+/// The 10-BIT extended-brightness finalize (HDR plan, Android: RGBA_1010102, BT.2020, γ2.2, extended range): the whole window from `scratch` into a 2:10:10:10 surface, `dst_stride` pixels per row, R in the low bits.
+/// Per pixel: final α = α × clip / 255; each channel one read of `table` (darkness flip + light ÷ declared ratio + γ2.2 in one); premultiplied ON CODES like the 8-bit path (Nick: blending stays on codes); α as 2 bits, or opaque when [`crate::paint::OPAQUE_BACKDROP`] is set.
+/// Channels go in stored order — byte 0 to bits 0–9 — which is R, G, B on Android. Returns the frame's brightest `g2t` code, as [`finalize_into_f16`] does.
+pub fn finalize_into_1010102(
+    scratch: &[u32],
+    clip_mask: &[u8],
+    win_w: usize,
+    win_h: usize,
+    dst: &mut [u32],
+    dst_stride: usize,
+    table: &crate::theme::Hdr10Table,
+) -> u8 {
+    if dst_stride == 0 || win_w == 0 {
+        return 0;
+    }
+    let rows = win_h.min(dst.len() / dst_stride);
+    let w = win_w.min(dst_stride);
+    let opaque = crate::paint::OPAQUE_BACKDROP.load(core::sync::atomic::Ordering::Relaxed);
+    let min_dark = core::sync::atomic::AtomicU32::new(255);
+    crate::par::par_rows(dst, dst_stride, 0, rows, |y, row| {
+        let off = y * win_w;
+        let src = &scratch[off..off + w];
+        let clip = &clip_mask[off..off + w];
+        let mut m = 255u32;
+        for (i, out) in row[..w].iter_mut().enumerate() {
+            let px = src[i];
+            let a = (((px >> 24) & 0xFF) * clip[i] as u32 + 127) / 255;
+            if a == 0 {
+                *out = if opaque { 3 << 30 } else { 0 };
+                continue;
+            }
+            let (d0, d1, d2) = ((px & 0xFF) as usize, ((px >> 8) & 0xFF) as usize, ((px >> 16) & 0xFF) as usize);
+            m = m.min(d0 as u32).min(d1 as u32).min(d2 as u32);
+            let ch = |d: usize| {
+                let c = table.code[d] as u32;
+                if a == 255 { c } else { (c * a + 127) / 255 }
+            };
+            let a2 = if opaque { 3 } else { (a * 3 + 127) / 255 };
+            *out = ch(d0) | ch(d1) << 10 | ch(d2) << 20 | a2 << 30;
+        }
+        min_dark.fetch_min(m, core::sync::atomic::Ordering::Relaxed);
+    });
+    255 - min_dark.into_inner() as u8
+}
+
+/// One row of [`finalize_into_f16`]; returns the row's smallest darkness under a visible pixel.
+#[inline]
+fn finalize_f16_row(src: &[u32], clip: &[u8], dst: &mut [u64], t: &crate::theme::HdrTable, opaque: bool) -> u32 {
+    let one = crate::theme::ALPHA_HALF[255] as u64;
+    let mut min_dark = 255u32;
+    for i in 0..src.len() {
+        let px = src[i];
+        let a = (((px >> 24) & 0xFF) * clip[i] as u32 + 127) / 255;
+        if a == 0 {
+            dst[i] = if opaque { one << 48 } else { 0 };
+            continue;
+        }
+        let (d0, d1, d2) = ((px & 0xFF) as usize, ((px >> 8) & 0xFF) as usize, ((px >> 16) & 0xFF) as usize);
+        min_dark = min_dark.min(d0 as u32).min(d1 as u32).min(d2 as u32);
+        let (h0, h1, h2) = if a == 255 {
+            (t.half[d0], t.half[d1], t.half[d2])
+        } else {
+            let pm = |d: usize| crate::theme::q16_to_half(((t.q16[d] as u64 * a as u64 + 127) / 255) as u32);
+            (pm(d0), pm(d1), pm(d2))
+        };
+        let alpha = if opaque { one } else { crate::theme::ALPHA_HALF[a as usize] as u64 };
+        dst[i] = h0 as u64 | (h1 as u64) << 16 | (h2 as u64) << 32 | alpha << 48;
+    }
+    min_dark
+}
+
 /// Debug-visualization fallback for [`finalize_into_screen`]: GRAYSCALE / FORCE_OPAQUE paths stay scalar (debug-toggle, off the hot path). Sequential — Rayon adds no value here.
 #[allow(clippy::too_many_arguments)]
 fn finalize_into_scalar_debug(
@@ -504,5 +603,60 @@ mod premultiply_contract_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod extended_range_tests {
+    use crate::theme::{q16_to_half, HdrTable, ALPHA_HALF, WHITE};
+
+    /// The F16 finalize: an opaque pixel is its three table halves with α 1; a half-covered one is premultiplied (≤ its opaque light, α ½); a transparent one is zero; the stride gap is left alone; the returned peak is the brightest code under a visible pixel.
+    #[test]
+    fn f16_finalize_maps_premultiplies_and_reports_the_peak() {
+        let t = HdrTable::new(2.0, 227);
+        let glow = 0xFF00_0000 | ((255 - 227) << 16) | ((255 - 227) << 8) | (255 - 227); // code 227 = 2× white
+        let scratch = [WHITE, glow, WHITE & 0x00FF_FFFF | 0x8000_0000, 0x0000_0000];
+        let clip = [255u8; 4];
+        let mut dst = [0xDEAD_BEEFu64; 5];
+        let was = crate::paint::OPAQUE_BACKDROP.swap(false, core::sync::atomic::Ordering::Relaxed);
+        let peak = super::finalize_into_f16(&scratch, &clip, 4, 1, &mut dst, 5, &t);
+        crate::paint::OPAQUE_BACKDROP.store(was, core::sync::atomic::Ordering::Relaxed);
+        let ch = |p: u64, i: u32| ((p >> (16 * i)) & 0xFFFF) as u16;
+        let d0 = (WHITE & 0xFF) as usize;
+        assert_eq!(ch(dst[0], 0), t.half[d0]);
+        assert_eq!(ch(dst[0], 3), ALPHA_HALF[255]);
+        assert_eq!(ch(dst[1], 0), t.half[255 - 227]);
+        assert!(ch(dst[2], 0) < t.half[d0] && ch(dst[2], 0) > 0, "premultiplied below the opaque light");
+        assert_eq!(ch(dst[2], 3), ALPHA_HALF[128]);
+        assert_eq!(dst[3], 0);
+        assert_eq!(dst[4], 0xDEAD_BEEF, "the stride gap is not written");
+        assert_eq!(peak, 227);
+        assert_eq!(t.half[255 - 227], q16_to_half(t.q16[255 - 227]));
+    }
+}
+
+#[cfg(test)]
+mod ten_bit_tests {
+    use crate::theme::{Hdr10Table, WHITE};
+
+    /// The 10-bit finalize: an opaque pixel is its three table codes with α 3, a half-covered one is premultiplied on codes, a transparent one is zero, the stride gap is untouched, and the peak is the brightest visible code.
+    #[test]
+    fn ten_bit_finalize_packs_premultiplies_and_reports_the_peak() {
+        let t = Hdr10Table::new(2.0);
+        let glow = 0xFF00_0000 | ((255 - 227) << 16) | ((255 - 227) << 8) | (255 - 227);
+        let scratch = [WHITE, glow, WHITE & 0x00FF_FFFF | 0x8000_0000, 0];
+        let mut dst = [0xDEAD_BEEFu32; 5];
+        let was = crate::paint::OPAQUE_BACKDROP.swap(false, core::sync::atomic::Ordering::Relaxed);
+        let peak = super::finalize_into_1010102(&scratch, &[255; 4], 4, 1, &mut dst, 5, &t);
+        crate::paint::OPAQUE_BACKDROP.store(was, core::sync::atomic::Ordering::Relaxed);
+        let ch = |p: u32, i: u32| (p >> (10 * i)) & 0x3FF;
+        let w = t.code[(WHITE & 0xFF) as usize] as u32;
+        assert_eq!((ch(dst[0], 0), dst[0] >> 30), (w, 3));
+        assert_eq!(ch(dst[1], 0), t.code[255 - 227] as u32);
+        assert_eq!(ch(dst[2], 0), (w * 128 + 127) / 255);
+        assert_eq!(dst[2] >> 30, 2);
+        assert_eq!(dst[3], 0);
+        assert_eq!(dst[4], 0xDEAD_BEEF);
+        assert_eq!(peak, 227);
     }
 }
