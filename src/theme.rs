@@ -250,7 +250,7 @@ impl Hdr10Table {
         for dark in 0..256 {
             let l = G2T_LIGHT_Q16[255 - dark] as f32 / 65536.;
             let v = (l / d).min(1.);
-            code[dark] = (v.powf(1. / 2.2) * 1023. + 0.5) as u16;
+            code[dark] = (libm::powf(v, 1. / 2.2) * 1023. + 0.5) as u16;
         }
         Hdr10Table { code, declared_q16: (d * 65536. + 0.5) as u32 }
     }
