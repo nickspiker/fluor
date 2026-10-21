@@ -9,7 +9,7 @@
 //!
 //! Coordinate convention: origin is at viewport center, +x right, +y down. The y-down choice is deliberate — text engines, image scanline order, and pixel storage are all y-down, so +y down means zero flip points below the layout layer.
 
-use crate::coord::{Coord, RuVec2};
+use crate::coord::{Coord};
 
 /// The photon zoom step curve — asymmetric BY DESIGN (confirmed by Nick, 2026-07-12; the trio 31/32/33 is the spec, born in photon commit 529fbeb): each in-step multiplies by `32/31` (≈ +3.23%), each out-step by `32/33` (≈ −3.03%). The in/out ratios are deliberately incommensurate, so combinations of notches form a DENSE set — any zoom value is reachable by mixing ins and outs instead of being locked to a single ratio's lattice; the ≈0.1% in/out round-trip drift is the price and it's imperceptible. The ONE curve for every zoomable in the ecosystem: the host's RU zoom consumes it via [`Viewport::adjust_zoom`], and apps consume it directly for their own zoom targets (opsin's image wheel) so all wheels speak the same steps. Do NOT "fix" this into reciprocal steps — that trades reachability for a lattice.
 pub fn zoom_step_factor(steps: f32) -> f32 {
@@ -79,22 +79,6 @@ impl Viewport {
     #[inline]
     pub fn ru_to_px_d(&self, d_ru: Coord) -> isize {
         (d_ru * self.span * self.ru) as isize
-    }
-
-    /// Convert an `RuVec2` point to a `(px_x, px_y)` integer pixel coordinate pair.
-    #[inline]
-    pub fn ru_to_px(&self, p: RuVec2) -> (isize, isize) {
-        (self.ru_to_px_x(p.x), self.ru_to_px_y(p.y))
-    }
-
-    /// Convert a pixel coordinate (top-left origin) to an `RuVec2` (center-origin). Inverse of [`ru_to_px`](Self::ru_to_px) up to integer rounding.
-    #[inline]
-    pub fn px_to_ru(&self, px: i32, py: i32) -> RuVec2 {
-        let span_ru = self.span * self.ru;
-        RuVec2 {
-            x: (px as Coord - self.half_w) / span_ru,
-            y: (py as Coord - self.half_h) / span_ru,
-        }
     }
 
     /// Pixel size of 1 RU under the current zoom (`span * ru`). Use this everywhere "scale by viewport" math used to use bare `span` — chrome button size, glyph font size, widget hairlines, anything the user-facing zoom should affect. Bare `span` is the unzoomed pixel harmonic mean and only matters for OS-edge-adjacent things (e.g. WM resize-border hit zones).
