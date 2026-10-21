@@ -131,11 +131,6 @@ proptest = "1.5"
 # Tests hold fluor's copied colour constants (theme.rs: the g2t table, VSF_RGB2REC2020) to vsf's own, so a matrix change there fails here instead of drifting.
 vsf = { version = "0.10", path = "../vsf" }
 
-# Auto-discovered examples inherit NO feature requirements, so a default-feature `cargo test`/`cargo build --examples` tries to compile winit examples in the headless config and dies on the host-winit gates. Name the requirement explicitly.
-[[example]]
-name = "panes"
-required-features = ["host-winit"]
-
 [profile.dev]
 opt-level = 2
 overflow-checks = false
