@@ -633,10 +633,15 @@ pub trait FluorApp {
         false
     }
 
-    /// The window is being closed — by the OS (`WindowEvent::CloseRequested`: Alt-F4, taskbar close) or by the app's own chrome close button ([`EventResponse::Close`]). Return `true` to stay RESIDENT: the host hides the window (`set_visible(false)`) and the process keeps running — network, timers, everything — until an [`EventResponse::ShowWindow`] surfaces it again. Return `false` (the default) for the normal exit. The app is the policy owner: track your own hidden state here (the host won't call anything else).
+    /// The window is being closed — by the OS (`WindowEvent::CloseRequested`: Alt-F4, taskbar close) or by the app's own chrome close button ([`EventResponse::Close`]). Return `true` to stay RESIDENT: the host hides the window (`set_visible(false)`) and the process keeps running — network, timers, everything — until an [`EventResponse::ShowWindow`] surfaces it again. Return `false` (the default) for the normal exit. The app is the policy owner: track your own hidden state here, and its end in [`Self::on_window_shown`].
     fn on_close_requested(&mut self) -> bool {
         false
     }
+
+    /// The host just made the window visible again: an [`EventResponse::ShowWindow`] or [`EventResponse::Raise`], or a macOS Dock click (which reaches the application, never the app's event handlers).
+    /// The counterpart of the hide that [`Self::on_close_requested`] asked for — fires on every such surfacing, hidden before or not, so an app's visible flag can simply follow it.
+    /// Default: ignored.
+    fn on_window_shown(&mut self) {}
 
     /// Initial visible-window size when the app first opens, given the monitor dimensions in pixels. Default returns half the monitor in each axis (the conventional "open at a reasonable fraction of the display, centred" desktop convention) — apps with strong aspect-ratio opinions (Photon's portrait launch window, fixed-aspect editors) override. Return `(width, height)`; the host clamps each to ≥ 1 and centres the window on the monitor.
     fn initial_size(&self, monitor: (u32, u32)) -> (u32, u32) {
@@ -2571,6 +2576,7 @@ impl<A: FluorApp> DesktopShell<A> {
                     // This is why "Show" from the tray menu did nothing after a minimize.
                     s.window.set_minimized(false);
                 }
+                self.app.on_window_shown();
                 // Muffin (and X11 WMs generally) DENY focus_window from a background app as focus stealing, so the un-hidden window surfaced BEHIND the stack ("shows very briefly, goes behind" — field, 2026-08-16). A window-LEVEL pulse raises unconditionally — restack requests are not focus requests — then drops back to normal; focus_window afterwards has a fighting chance, and the worst case is raised-but-unfocused instead of buried.
                 window.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
                 window.set_window_level(winit::window::WindowLevel::Normal);
@@ -2614,6 +2620,7 @@ impl<A: FluorApp> DesktopShell<A> {
                     s.window.set_visible(true);
                     s.window.set_minimized(false);
                 }
+                self.app.on_window_shown();
                 window.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
                 window.set_window_level(winit::window::WindowLevel::Normal);
                 window.focus_window();
@@ -3163,6 +3170,8 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 s.window.set_minimized(false);
                 s.window.set_visible(true);
             }
+            // Tell the app before the focus edge lands, so a resident app's hidden flag is already cleared when it judges whether anyone is looking.
+            self.app.on_window_shown();
             if let Some(window) = self.home_window() {
                 window.focus_window();
                 window.request_redraw();
@@ -3260,6 +3269,10 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
             let now = Instant::now();
             let when = if when <= now { now + MIN_WAKE } else { when };
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(when));
+        } else {
+            // Nothing scheduled: sleep until an event.
+            // winit's control flow is STICKY — without this the last WaitUntil stays armed, and once its instant passes every loop wakes at once and re-arms the same past instant (macOS: the waker's 0.1 µs repeating timer fires back to back), a hard spin the floor above never sees.
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
         }
     }
 
