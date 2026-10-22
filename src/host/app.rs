@@ -209,6 +209,26 @@ mod x11_atomic {
         ok
     }
 
+    /// The active monitors as RandR reports them right now (`RRGetMonitors`), primary first, as `(x, y, w, h)`.
+    /// Asked on fluor's own connection, the one that just saw the change: winit caches its monitor list and drops the cache only when ITS connection processes the same event, so reading winit here could return the old layout and the rebuild would wrongly decide nothing moved.
+    /// None off X11, without RandR 1.5, or with no active monitor; the caller falls back to winit's list.
+    pub fn monitor_layout() -> Option<Vec<(i32, i32, u32, u32)>> {
+        use x11rb::protocol::randr::ConnectionExt as _;
+        let conn = conn()?;
+        let root = conn.setup().roots.first()?.root;
+        let reply = conn.randr_get_monitors(root, true).ok()?.reply().ok()?;
+        let mut mons: Vec<(bool, (i32, i32, u32, u32))> = reply
+            .monitors
+            .iter()
+            .filter(|m| m.width > 0 && m.height > 0)
+            .map(|m| (m.primary, (m.x as i32, m.y as i32, m.width as u32, m.height as u32)))
+            .collect();
+        // Stable: the primary first, the rest in the server's order — the same ordering rule `resumed` applies to winit's list.
+        mons.sort_by_key(|(primary, _)| !*primary);
+        let out: Vec<(i32, i32, u32, u32)> = mons.into_iter().map(|(_, r)| r).collect();
+        (!out.is_empty()).then_some(out)
+    }
+
     /// Drain queued X events and report whether any RandR layout change arrived. NON-BLOCKING: it
     /// empties a queue that is already there rather than asking the server anything, so calling it
     /// once per event-loop cycle costs nothing while the layout is quiet — no timer, no polling.
@@ -882,6 +902,10 @@ struct DesktopShell<A: FluorApp> {
     last_strip_active: bool,
     /// Set by any event that destroys the chrome perimeter + shadow band content in the surfaces' `persistent_screen` buffers: drag release, resize, zoom, focus change. Consumed once per `render_frame` to switch from incremental mode to full-repaint mode (wipe the involved surfaces' buffers, finalize copies every pixel, paint_shadow runs once into the fresh band). Replaces every prior geometric-equality check on `damage_clip`.
     pending_full_repaint: bool,
+    /// Linux: a size the window manager imposed on the spanning surface that we already pushed back on once (see handle_surface_resized); cleared by every layout rebuild.
+    /// The same size imposed a second time is adopted, so a WM that insists can never start a resize loop.
+    #[cfg(target_os = "linux")]
+    span_pushed_back: Option<(u32, u32)>,
     /// macOS: whether WE hid the OS pointer with `NSCursor.hide` (counted, so it must be balanced by exactly one `unhide`). winit's `set_cursor_visible(false)` is a cursor RECT with an invisible cursor, which AppKit only honours on a key window whose rects it consults — on this click-thru, multi-surface compositor the arrow simply stayed (field 2026-09-20: "a normal teeny tiny one" beside the painted shape). Hiding the pointer process-wide is what a viewer painting the host's cursor actually wants, and it is undone the moment the app asks for any other icon or the pointer leaves.
     #[cfg(target_os = "macos")]
     os_cursor_hidden: bool,
@@ -963,6 +987,8 @@ impl<A: FluorApp> DesktopShell<A> {
             pending_damage: crate::canvas::Damage::new(),
             last_strip_active: false,
             pending_full_repaint: true,
+            #[cfg(target_os = "linux")]
+            span_pushed_back: None,
             #[cfg(target_os = "macos")]
             os_cursor_hidden: false,
             wake_pump: 0,
@@ -1265,20 +1291,30 @@ impl<A: FluorApp> DesktopShell<A> {
     /// desktop when the screen shrank. No-op when nothing actually moved.
     #[cfg(target_os = "linux")]
     fn rebuild_span(&mut self, event_loop: &ActiveEventLoop) {
-        // PRIMARY FIRST, same ordering rule as `resumed`.
-        let mut mons: Vec<winit::monitor::MonitorHandle> = Vec::new();
-        if let Some(p) = event_loop.primary_monitor() {
-            mons.push(p);
-        }
-        for m in event_loop.available_monitors() {
-            if !mons.iter().any(|q| *q == m) {
-                mons.push(m);
+        // THE LAYOUT FROM THE SERVER, NOT A CACHE (Nick 2026-10-22: after a monitor plug, an unplug or a resolution change, Photon painted the whole screen black or would not appear until relaunched).
+        // winit's list could still be the old one here (see x11_atomic::monitor_layout), the rebuild then saw "nothing moved", and the change was never looked at again.
+        let new_mons: Vec<MonitorRect> = match x11_atomic::monitor_layout() {
+            Some(layout) => layout
+                .into_iter()
+                .map(|(x, y, w, h)| MonitorRect { origin: (x, y), size: (w, h), work_area: monitor_work_area((x, y), (w, h)) })
+                .collect(),
+            None => {
+                // PRIMARY FIRST, same ordering rule as `resumed`.
+                let mut mons: Vec<winit::monitor::MonitorHandle> = Vec::new();
+                if let Some(p) = event_loop.primary_monitor() {
+                    mons.push(p);
+                }
+                for m in event_loop.available_monitors() {
+                    if !mons.iter().any(|q| *q == m) {
+                        mons.push(m);
+                    }
+                }
+                mons.iter().map(monitor_rect_of).collect()
             }
-        }
-        if mons.is_empty() {
+        };
+        if new_mons.is_empty() {
             return;
         }
-        let new_mons: Vec<MonitorRect> = mons.iter().map(monitor_rect_of).collect();
         let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
         for m in &new_mons {
             x0 = x0.min(m.origin.0);
@@ -1313,6 +1349,7 @@ impl<A: FluorApp> DesktopShell<A> {
             size
         );
         self.monitors = new_mons;
+        self.span_pushed_back = None;
         if let Some(s) = self.surfaces.first_mut() {
             s.origin = origin;
             s.size = size;
@@ -1792,6 +1829,27 @@ impl<A: FluorApp> DesktopShell<A> {
             && size.height == self.surfaces[si].size.1
             && self.surfaces[si].surface_ready
         {
+            return;
+        }
+        // Linux's one spanning surface is sized by fluor alone (the app's window is drawn inside it), so any other size is the window manager's doing: a screen that shrank makes it constrain the now-oversized surface to the monitor.
+        // Exactly monitor-sized and undecorated, Muffin promotes it to legacy FULLSCREEN, which unredirects it past the compositor and turns every transparent pixel black — the whole-screen black Nick saw after a monitor or resolution change (2026-10-22; the same promotion the one-row undersize exists for).
+        // Put our size back once; the same imposed size a second time is adopted below, so an insistent WM cannot start a loop.
+        #[cfg(target_os = "linux")]
+        if si == 0 && self.surfaces[0].surface_ready && self.span_pushed_back != Some((size.width, size.height)) {
+            let want = self.surfaces[0].size;
+            let origin = self.surfaces[0].origin;
+            log::info!(
+                "FLUOR-MON: the window manager resized the spanning surface to {}x{} (ours is {}x{} at {:?}) — putting it back",
+                size.width,
+                size.height,
+                want.0,
+                want.1,
+                origin
+            );
+            self.span_pushed_back = Some((size.width, size.height));
+            let w = self.surfaces[0].window.clone();
+            w.set_outer_position(winit::dpi::PhysicalPosition::new(origin.0, origin.1));
+            let _ = w.request_inner_size(winit::dpi::PhysicalSize::new(want.0, want.1));
             return;
         }
         // Convert the OS physical size to desktop units — points on macOS (physical ÷ scale is exact: winit derives physical FROM the point layout, so the division inverts it), physical px everywhere else.
