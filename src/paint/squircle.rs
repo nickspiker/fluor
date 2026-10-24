@@ -6,9 +6,13 @@ use super::HitId;
 use crate::canvas::Canvas;
 use crate::pixel::{Blend, BlendMode};
 
-/// THE ONE CORNER POWER (Nick 2026-10-23: "I like the offset diagonals and I like the window edges but I do not like the button power. Let's make the power the same"): the desktop window perimeter's superellipse exponent, shared by every button, checkbox, dropdown and textbox, so each surface carries the same smooth corner.
-/// The offset diagonals (TL+BR big, TR+BL small, `asymmetric_radii`) stay per element; only the power is common. The phone's glass corners fit their own power to the glass (`glass_corner_params`), and glyph strokes keep theirs.
-pub const SHAPE_POWER: i32 = 24;
+/// THE WIDGET CORNER POWER (Nick 2026-10-23/24): the textbox's smooth squircle, shared by every button, checkbox, dropdown and textbox so each carries the same corner — the buttons' old 1.75 pulled theirs toward a diamond.
+/// NOT the window's power: the desktop perimeter keeps its own `WINDOW_POWER`, which only reads smooth at a window-sized radius — at a widget's radius it draws a square (v125 shipped that for a day: "They are all squares now").
+/// The offset diagonals (TL+BR big, TR+BL small, `asymmetric_radii`) stay per element; the phone's glass corners fit their own power to the glass (`glass_corner_params`), and glyph strokes keep theirs.
+pub const SHAPE_POWER: i32 = 3;
+
+/// The desktop window perimeter's superellipse exponent — smooth at its span/4 and span/2 radii, far too square for anything widget-sized (see [`SHAPE_POWER`]).
+pub const WINDOW_POWER: i32 = 24;
 
 /// Hard-pixel squircle pill with AA on both the X-axis curve (sides) and Y-axis curve (cap tops/bottoms). Photon's avatar-ring strategy in one call — render twice with different sizes/colours to get a stroke ring.
 ///
