@@ -977,7 +977,7 @@ impl MultiTextbox {
         }
         let cw = pill_w as usize;
         let ch = pill_h as usize;
-        let squirdleyness = 3;
+        let squirdleyness = paint::SHAPE_POWER;
         let stroke_px = (self.stroke_ru * self.font_size) as isize + 1;
         // Corners come from the TEXT height, never the box height: a multi-line box keeps the corner its one-line self had instead of growing half-height caps. Asymmetric like the window perimeter — TL+BR deep, TR+BL half as deep (Nick 2026-09-09).
         let r_big = (self.font_size * 0.95).min(pill_h as f32 * 0.5).min(pill_w as f32 * 0.5);

@@ -6,6 +6,10 @@ use super::HitId;
 use crate::canvas::Canvas;
 use crate::pixel::{Blend, BlendMode};
 
+/// THE ONE CORNER POWER (Nick 2026-10-23: "I like the offset diagonals and I like the window edges but I do not like the button power. Let's make the power the same"): the desktop window perimeter's superellipse exponent, shared by every button, checkbox, dropdown and textbox, so each surface carries the same smooth corner.
+/// The offset diagonals (TL+BR big, TR+BL small, `asymmetric_radii`) stay per element; only the power is common. The phone's glass corners fit their own power to the glass (`glass_corner_params`), and glyph strokes keep theirs.
+pub const SHAPE_POWER: i32 = 24;
+
 /// Hard-pixel squircle pill with AA on both the X-axis curve (sides) and Y-axis curve (cap tops/bottoms). Photon's avatar-ring strategy in one call — render twice with different sizes/colours to get a stroke ring.
 ///
 /// Photon-faithful: precompute squircle crossings once (`(inset_px, l_aa, h_aa)` per pixel-row offset into the cap), then walk pure integer indices per corner. Each crossing produces BOTH a vertical-edge AA pixel and a horizontal-edge AA pixel via the squircle's diagonal symmetry — no separate per-col walk needed.
@@ -628,7 +632,7 @@ pub fn draw_squircle_rrect(
     draw_squircle_rrect_kernel(canvas, x, y, w, h, radii, &curve, &|_, _| (rgb, solid), None, 0);
 }
 
-/// Fractional-exponent variant of [`draw_squircle_rrect`] (the button family's 1.75).
+/// Fractional-exponent variant of [`draw_squircle_rrect`], for in-between shapes (the widget family now shares the integer [`SHAPE_POWER`]).
 pub fn draw_squircle_rrect_f(
     canvas: &mut Canvas,
     x: isize,

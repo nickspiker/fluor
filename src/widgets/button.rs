@@ -366,7 +366,7 @@ impl Button {
         let cw = pill_w as usize;
         let ch = pill_h as usize;
         // Fractional squirdleyness — slots between an ellipse (2) and a diamond (1). `1.5` reads as a noticeably-rounder, slightly-faceted pill: distinctly more curved than the textbox's `3.0` "slightly squared" but not as soft as a full ellipse. Routes thru paint's `_f` (powf) variant; the textbox / chrome keep the integer (powi) fast path. Adjustable per-instance via this constant; future API could expose it as a Button field if more shapes are desired.
-        let squirdleyness = 1.75;
+        let squirdleyness = paint::SHAPE_POWER as f32;
         // The `+ 1` idiom every other widget uses (textbox.rs): a 1 px floor on the ring. Without it the ring truncates to 0 below a 32 px font, the inner fill (painted first, so on top under under-blend) covers the whole pill, and the two-tone edge vanishes — the contact-screen action pills lost their hairline while Send kept its (2026-09-10).
         let stroke_px = (self.stroke_ru * self.font_size) as isize + 1;
 
@@ -540,7 +540,7 @@ impl Button {
         self.last_painted_hovered = self.hovered;
     }
 
-    /// Immediate-mode pill draw (no retained cache): THE canonical Button look — squircle fill + two-tone raised edge + centred label, fit to `rect`, hit-stamped — for a host with MANY one-off action pills where a persistent Button per pill isn't worth the click-counter state (photon's settings panel). Visually indistinguishable from a retained Button because it draws with the same primitives, the same `1.75` squirdleyness, the same two-tone edge, and the same no-floor `1/32·font_size` stroke.
+    /// Immediate-mode pill draw (no retained cache): THE canonical Button look — squircle fill + two-tone raised edge + centred label, fit to `rect`, hit-stamped — for a host with MANY one-off action pills where a persistent Button per pill isn't worth the click-counter state (photon's settings panel). Visually indistinguishable from a retained Button because it draws with the same primitives, the same shared `SHAPE_POWER`, the same two-tone edge, and the same no-floor `1/32·font_size` stroke.
     /// State fill mirrors [`Self::effective_fill`] precedence (pressed > hover > idle) using the same brightness factors, so an immediate pill hovers and presses identically to a retained one — this is the hover the hand-rolled pills never had. `fill = None` uses the theme navy; `Some((idle, held))` overrides for a ramp (Security's green→red destructiveness). Disabled dims the label to the theme grey; pass `hit_map = None` for a disabled pill so it stamps nothing and a dead tap dispatches nowhere.
     /// Fit-to-slot: the font shrinks so a label never overruns its slot (pills sharing a row don't collide), scaling all the way down; the pill grows only when the label needs more than `rect.w` (never shrinks the pill).
     #[allow(clippy::too_many_arguments)]
@@ -642,7 +642,7 @@ impl Button {
                 inner_h,
                 state_fill,
                 paint::asymmetric_radii((h as f32 * 0.5 - stroke as f32).max(1.0)),
-                1.75,
+                paint::SHAPE_POWER as f32,
             );
         }
         // Two-tone raised edge — shadow top/left, light bottom/right (protrudes toward the viewer).
@@ -655,7 +655,7 @@ impl Button {
             theme::TEXTBOX_SHADOW_EDGE,
             theme::TEXTBOX_LIGHT_EDGE,
             paint::asymmetric_radii(h as f32 * 0.5),
-            1.75,
+            paint::SHAPE_POWER as f32,
             None,
             0,
         );

@@ -467,7 +467,7 @@ impl Dropdown {
             return;
         }
         let stroke_px = (self.stroke_ru * self.font_size) as isize + 1;
-        let squirdleyness = 3.0;
+        let squirdleyness = paint::SHAPE_POWER as f32;
         let pad = self.popup_padding();
         let row_h = self.row_height();
 
@@ -555,7 +555,7 @@ impl Dropdown {
         }
         let cw = pill_w as usize;
         let ch = pill_h as usize;
-        let squirdleyness = 1.75;
+        let squirdleyness = paint::SHAPE_POWER as f32;
         let stroke_px = (self.stroke_ru * self.font_size) as isize + 1;
 
         if self.cache_disabled != !self.enabled {

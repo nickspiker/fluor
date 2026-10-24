@@ -891,7 +891,7 @@ impl Textbox {
         }
         let cw = pill_w as usize;
         let ch = pill_h as usize;
-        let squirdleyness = 3;
+        let squirdleyness = paint::SHAPE_POWER;
         let stroke_px = (self.stroke_ru * self.font_size) as isize + 1;
 
         // --- Pill cache rasterize (squircle fill + AA edges), only when geometry / zoom changed ---

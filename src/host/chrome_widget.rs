@@ -416,7 +416,7 @@ impl DefaultChrome {
             Some(g) if g > 0.0 => glass_corner_params(g, vp_w as Coord, vp_h as Coord),
             _ => {
                 let span = self.viewport.effective_span();
-                (span / 4.0, span / 2.0, 24)
+                (span / 4.0, span / 2.0, crate::paint::SHAPE_POWER)
             }
         };
         let (start, crossings) = compute_squircle_crossings(r_small, exponent);

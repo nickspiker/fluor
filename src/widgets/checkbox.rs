@@ -229,7 +229,7 @@ impl Checkbox {
                 inner,
                 fill,
                 paint::asymmetric_radii((big - stroke as f32).max(1.0)),
-                2.5,
+                paint::SHAPE_POWER as f32,
             );
         }
         paint::draw_squircle_rrect_two_tone_f(
@@ -241,7 +241,7 @@ impl Checkbox {
             theme::TEXTBOX_SHADOW_EDGE,
             theme::TEXTBOX_LIGHT_EDGE,
             paint::asymmetric_radii(big),
-            2.5,
+            paint::SHAPE_POWER as f32,
             None,
             0,
         );
