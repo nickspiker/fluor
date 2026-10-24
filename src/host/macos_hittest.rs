@@ -23,6 +23,8 @@ pub(super) struct HittestMonitor {
     /// The home window to wake on the entry edge — armed by the host when it flips hittest off (the home can change across monitors, so it is re-armed every time). `try_lock` in the callback: a contended lock just defers the wake to the next global move, it never blocks the run loop.
     wake: Arc<Mutex<Option<Arc<Window>>>>,
     _monitor: *mut objc2::runtime::AnyObject,
+    /// The LOCAL twin of `_monitor` (null when AppKit refused it): the same entry check for moves delivered to this app.
+    _local: *mut objc2::runtime::AnyObject,
 }
 
 unsafe impl Send for HittestMonitor {}
@@ -56,7 +58,8 @@ impl HittestMonitor {
             | NSEventMask::LeftMouseDragged
             | NSEventMask::RightMouseDragged;
 
-        let block = block2::RcBlock::new(move |_event: std::ptr::NonNull<NSEvent>| {
+        // THE ENTRY CHECK, shared by both monitors below.
+        let on_move = std::rc::Rc::new(move || {
             let loc: NSPoint = NSEvent::mouseLocation();
             // NSEvent mouseLocation: bottom-left origin. Flip Y to top-left.
             let screen_h = sh2.load(Ordering::Relaxed) as f64;
@@ -80,8 +83,22 @@ impl HittestMonitor {
             }
         });
 
+        // GLOBAL: moves AppKit delivers to OTHER apps — the click-thru window over another app's window, with another app in front.
+        let global_move = on_move.clone();
+        let block = block2::RcBlock::new(move |_event: std::ptr::NonNull<NSEvent>| global_move());
         let monitor: Option<Retained<AnyObject>> =
             NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &block);
+
+        // LOCAL: moves delivered to US — Photon is the active app and its window is click-thru (Nick 2026-10-23: "clicks don't always register until I drag").
+        // A global monitor never sees an event bound for its own app, so with Photon in front the re-entry was missed and the window stayed click-thru until a drag, whose events reach the app behind, woke it.
+        // The event goes on unchanged.
+        let local_move = on_move.clone();
+        let local_block = block2::RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| -> *mut NSEvent {
+            local_move();
+            event.as_ptr()
+        });
+        let local: Option<Retained<AnyObject>> =
+            unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &local_block) };
 
         monitor.map(|m| {
             let raw = Retained::into_raw(m);
@@ -94,6 +111,7 @@ impl HittestMonitor {
                 screen_h: sh,
                 wake,
                 _monitor: raw as *mut AnyObject,
+                _local: local.map_or(std::ptr::null_mut(), |l| Retained::into_raw(l) as *mut AnyObject),
             }
         })
     }
@@ -122,11 +140,13 @@ impl HittestMonitor {
 
 impl Drop for HittestMonitor {
     fn drop(&mut self) {
-        if !self._monitor.is_null() {
-            use objc2_app_kit::NSEvent;
-            unsafe {
-                let obj = objc2::rc::Retained::from_raw(self._monitor).unwrap();
-                NSEvent::removeMonitor(&obj);
+        use objc2_app_kit::NSEvent;
+        for raw in [self._monitor, self._local] {
+            if !raw.is_null() {
+                unsafe {
+                    let obj = objc2::rc::Retained::from_raw(raw).unwrap();
+                    NSEvent::removeMonitor(&obj);
+                }
             }
         }
     }
