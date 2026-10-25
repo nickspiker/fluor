@@ -373,6 +373,80 @@ pub fn draw_circle(
     });
 }
 
+/// A RING split into `colours.len()` equal segments, anti-aliased: centre `(cx, cy)`, mid radius `r`, stroke `stroke` pixels, segment 0 starting at 12 o'clock and running clockwise.
+/// Each segment takes its own colour (α + darkness packed; α = 0 draws nothing there); `gap` pixels of arc separate neighbours, none when there is only one segment, so one segment is a whole ring.
+/// The same count at any size: one member or a thousand share one drawing.
+pub fn draw_ring_segments(
+    canvas: &mut Canvas,
+    cx: Coord,
+    cy: Coord,
+    r: Coord,
+    stroke: Coord,
+    gap: Coord,
+    colours: &[u32],
+    clip: Option<Clip>,
+) {
+    let width = canvas.width;
+    let height = canvas.height;
+    let n = colours.len();
+    if n == 0 || r <= 0.0 || stroke <= 0.0 || width == 0 || height == 0 {
+        return;
+    }
+    let half = stroke * 0.5;
+    let r_out = r + half + 1.0;
+    let x_min = (cx - r_out) as i32;
+    let x_max = (cx + r_out + 1.0) as i32;
+    let y_min = (cy - r_out) as i32;
+    let y_max = (cy + r_out + 1.0) as i32;
+    let Some((x_start, y_start, x_end, y_end)) =
+        Clip::intersect_bbox(clip, width, height, x_min, x_max, y_min, y_max)
+    else {
+        return;
+    };
+    canvas.damage.add_bounds(x_start, y_start, x_end, y_end);
+    let pixels: &mut [u32] = canvas.pixels;
+    let tau = core::f32::consts::TAU;
+    let seg = tau / n as Coord;
+    // The gap, as arc length at the mid radius, split evenly to both sides of every boundary.
+    let half_gap = if n > 1 { gap * 0.5 } else { 0.0 };
+
+    crate::par::par_rows(pixels, width, y_start, y_end, |py, row| {
+        let dy = (py as Coord + 0.5) - cy;
+        for px in x_start..x_end {
+            let dx = (px as Coord + 0.5) - cx;
+            let dist = libm::sqrtf(dx * dx + dy * dy);
+            // Radial coverage: a one-pixel ramp at each edge of the stroke.
+            let radial = (half + 0.5 - (dist - r).abs()).clamp(0.0, 1.0);
+            if radial <= 0.0 {
+                continue;
+            }
+            // Clockwise from 12 o'clock (screen y grows downward).
+            let mut a = libm::atan2f(dx, -dy);
+            if a < 0.0 {
+                a += tau;
+            }
+            let i = ((a / seg) as usize).min(n - 1);
+            let colour = colours[i];
+            let colour_alpha = ((colour >> 24) & 0xFF) as Coord;
+            if colour_alpha <= 0.0 {
+                continue;
+            }
+            // Angular coverage: the arc distance to the nearer boundary of this segment, less the half gap, as a one-pixel ramp.
+            let angular = if n > 1 {
+                let into = a - i as Coord * seg;
+                let edge = into.min(seg - into) * r;
+                (edge - half_gap + 0.5).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let na = (colour_alpha * radial * angular) as u32;
+            if na > 0 {
+                row[px] = row[px].under((na << 24) | (colour & 0x00FFFFFF), BlendMode::Normal);
+            }
+        }
+    });
+}
+
 /// Filled axis-aligned ellipse, anti-aliased. Centered at `(cx, cy)` with fractional radii `(rx, ry)`. Colour is α + darkness packed.
 ///
 /// Per-pixel implicit form `f = (dx/rx)² + (dy/ry)² − 1` plus its gradient-magnitude-squared `|∇f|² = 4·((dx/rx²)² + (dy/ry²)²)`. AA via fused reciprocal-sqrt.
