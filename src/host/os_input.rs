@@ -137,6 +137,7 @@ mod linux {
 
     /// Parse XSettings property bytes and return the int value for `name`. Returns `None` on truncation, unknown byte-order, mismatched type, or name-not-found. Truncation is treated as silent failure (don't pretend to honor a setting we couldn't read).
     fn parse_xsettings_int(data: &[u8], name: &str) -> Option<u32> {
+        // WHY/PROOF: the XSettings property bytes come from another X client and can be any length — a short property would make data[0] and the n_settings read index past the end.
         if data.len() < 12 {
             return None;
         }
@@ -146,6 +147,7 @@ mod linux {
             _ => return None,
         };
         let read_u16 = |off: usize| -> Option<u16> {
+            // WHY/PROOF: off is driven by name and string lengths read out of the foreign XSettings bytes — a lying length would slice past the end and panic.
             let s = data.get(off..off + 2)?;
             Some(if big_endian {
                 u16::from_be_bytes([s[0], s[1]])
@@ -154,6 +156,7 @@ mod linux {
             })
         };
         let read_u32 = |off: usize| -> Option<u32> {
+            // WHY/PROOF: off is driven by lengths read out of the foreign XSettings bytes — a lying length would slice past the end and panic.
             let s = data.get(off..off + 4)?;
             Some(if big_endian {
                 u32::from_be_bytes([s[0], s[1], s[2], s[3]])
@@ -166,9 +169,11 @@ mod linux {
         let mut off = 12;
         for _ in 0..n_settings {
             // Per-setting header: type(1) + unused(1) + name_len(2)
+            // WHY/PROOF: n_settings and every offset come from the foreign XSettings bytes — a truncated property would index past the end and panic.
             let ty = *data.get(off)?;
             let name_len = read_u16(off + 2)? as usize;
             off += 4;
+            // WHY/PROOF: name_len is read from the foreign XSettings bytes — a lying length would slice past the end and panic.
             let raw_name = data.get(off..off + name_len)?;
             let setting_name = core::str::from_utf8(raw_name).ok()?;
             // Names are padded to a 4-byte boundary.

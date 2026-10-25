@@ -16,6 +16,7 @@ pub use crate::paint::HIT_NONE;
 
 /// Allocate the next dense hit ID. Threaded thru widget constructors at app startup — `let mut counter: HitId = HIT_NONE; let id = next_id(&mut counter);`. Increments first, returns the post-increment value, so the first call yields `1` (never `HIT_NONE`). 65 535-call ceiling at the [`HitId`] type's `u16` width; panics on overflow because exceeding 65 535 interactive zones in one app is a design error, not something to silently wrap and corrupt dispatch.
 pub fn next_id(counter: &mut HitId) -> HitId {
+    // WHY/PROOF: not a dodge but a loud failure — plain `+ 1` would wrap to HIT_NONE silently in release and hand two widgets the same dispatch id.
     *counter = counter
         .checked_add(1)
         .expect("HitId allocator overflowed u16 — more than 65 535 widgets registered, which is almost certainly a leak in the allocation pattern, not a real need");
@@ -173,6 +174,7 @@ pub fn linear_tab_next(
 pub fn build_overlay_deltas(root: &mut dyn Container, count: usize) -> alloc::vec::Vec<u32> {
     let mut t = alloc::vec![0u32; count];
     root.visit(&mut |w| {
+        // WHY/PROOF: count is the app's registry size, which can lag a widget built since — t[id] would panic.
         let id = w.id() as usize;
         if id < t.len() {
             if let Some(h) = w.hover() {
@@ -193,6 +195,7 @@ pub fn build_overlay_bboxes(
 ) -> alloc::vec::Vec<Option<PixelRect>> {
     let mut t = alloc::vec![None; count];
     root.visit(&mut |w| {
+        // WHY/PROOF: count is the app's registry size, which can lag a widget built since — t[id] would panic.
         let id = w.id() as usize;
         if id < t.len() {
             if let Some(h) = w.hover() {

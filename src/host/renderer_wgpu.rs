@@ -98,6 +98,7 @@ impl Renderer {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::COPY_DST,
             format: surface_format,
+            // WHY/PROOF: width and height are the OS window's size, which is 0 while minimized — wgpu panics configuring a zero-sized surface.
             width: width.max(1),
             height: height.max(1),
             present_mode: wgpu::PresentMode::Fifo,

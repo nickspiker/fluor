@@ -71,10 +71,11 @@ fn draw_squircle_pill_with_crossings(
     }
     // Damage = pill bbox clipped to buffer. Helpers use the same range internally for their per-row clips.
     {
+        // WHY/PROOF: the pill is placed by the caller's layout and straddles the buffer edge whenever it scrolls past one — a negative start would wrap to a huge usize; the far edges are past 0 by the overlap early-out above.
         let dx0 = pill_x.max(0) as usize;
         let dy0 = pill_y.max(0) as usize;
-        let dx1 = (pill_x + pill_w).min(buf_w_i).max(0) as usize;
-        let dy1 = (pill_y + pill_h).min(buf_h_i).max(0) as usize;
+        let dx1 = (pill_x + pill_w).min(buf_w_i) as usize;
+        let dy1 = (pill_y + pill_h).min(buf_h_i) as usize;
         canvas.damage.add_bounds(dx0, dy0, dx1, dy1);
     }
 
@@ -112,6 +113,7 @@ fn draw_squircle_pill_with_crossings(
     let center_x_start = pill_x + radius;
     let center_x_end = pill_x + pill_w - radius;
     if center_x_start < center_x_end {
+        // WHY/PROOF: the centre rectangle follows the caller-placed pill past the buffer edge — the max(0) / min(buf) keep the fill inside the buffer.
         let cy_start = pill_y.max(0) as usize;
         let cy_end = (pill_y + pill_h).min(buf_h_i).max(0) as usize;
         let cx_start = center_x_start.max(0) as usize;
@@ -195,10 +197,11 @@ fn draw_squircle_pill_two_tone_with_crossings(
         return;
     }
     {
+        // WHY/PROOF: the pill is placed by the caller's layout and straddles the buffer edge whenever it scrolls past one — a negative start would wrap to a huge usize; the far edges are past 0 by the overlap early-out above.
         let dx0 = pill_x.max(0) as usize;
         let dy0 = pill_y.max(0) as usize;
-        let dx1 = (pill_x + pill_w).min(buf_w_i).max(0) as usize;
-        let dy1 = (pill_y + pill_h).min(buf_h_i).max(0) as usize;
+        let dx1 = (pill_x + pill_w).min(buf_w_i) as usize;
+        let dy1 = (pill_y + pill_h).min(buf_h_i) as usize;
         canvas.damage.add_bounds(dx0, dy0, dx1, dy1);
     }
 
@@ -280,6 +283,7 @@ fn draw_squircle_pill_two_tone_with_crossings(
                 } else {
                     (v_aa_col + 1, diag_col + 1)
                 };
+                // WHY/PROOF: the run's ends follow the caller-placed pill past the buffer edge — negative would wrap the index, past the edge would write outside the row.
                 let fs = fx_start.max(0) as usize;
                 let fe = fx_end.max(0).min(buf_w_i) as usize;
                 let dy = v_row - pill_y;
@@ -316,6 +320,7 @@ fn draw_squircle_pill_two_tone_with_crossings(
                 } else {
                     (h_aa_row + 1, diag_row + 1)
                 };
+                // WHY/PROOF: the run's ends follow the caller-placed pill past the buffer edge — negative would wrap the index, past the edge would write outside the row.
                 let fs = fy_start.max(0) as usize;
                 let fe = fy_end.max(0).min(buf_h_i) as usize;
                 let dx = h_col - pill_x;
@@ -334,6 +339,7 @@ fn draw_squircle_pill_two_tone_with_crossings(
     let center_x_start = pill_x + radius;
     let center_x_end = pill_x + pill_w - radius;
     if center_x_start < center_x_end {
+        // WHY/PROOF: the centre rectangle follows the caller-placed pill past the buffer edge — the max(0) / min(buf) keep the fill inside the buffer.
         let cy_start = pill_y.max(0) as usize;
         let cy_end = (pill_y + pill_h).min(buf_h_i).max(0) as usize;
         let cx_start = center_x_start.max(0) as usize;
@@ -501,6 +507,7 @@ fn draw_squircle_pill_clipped(
                 } else {
                     (v_aa_col + 1, diag_col + 1)
                 };
+                // WHY/PROOF: the run's ends follow the caller-placed pill past the buffer edge — negative would wrap the index, past the edge would write outside the row.
                 let fs = fx_start.max(0) as usize;
                 let fe = fx_end.max(0).min(buf_w_i) as usize;
                 for fx in fs..fe {
@@ -531,6 +538,7 @@ fn draw_squircle_pill_clipped(
                 } else {
                     (h_aa_row + 1, diag_row + 1)
                 };
+                // WHY/PROOF: the run's ends follow the caller-placed pill past the buffer edge — negative would wrap the index, past the edge would write outside the row.
                 let fs = fy_start.max(0) as usize;
                 let fe = fy_end.max(0).min(buf_h_i) as usize;
                 for fy in fs..fe {
@@ -601,14 +609,14 @@ fn write_aa(pixels: &mut [u32], idx: usize, colour_rgb: u32, h_aa: u32) {
     pixels[idx] = pixels[idx].under(new_pixel, BlendMode::Normal);
 }
 
-/// Photon's squircle inset formula — single row, parameterized by `squirdleyness`. Returns the curve's inset (distance from the bbox edge to the leftmost / rightmost inside pixel) for a row at `y_from_center` rows above or below the squircle's vertical center.
+/// Photon's squircle inset formula — single row, parameterized by `squirdleyness`. Returns the curve's inset (distance from the bbox edge to the leftmost / rightmost inside pixel) for a row at `y_from_center` rows above or below the squircle's vertical center. `y_from_center` must lie within `radius` of the centre: past it the curve has no inside pixel and the result is NaN.
 ///
 /// `squirdleyness = 2` → circle. `squirdleyness = 3` → photon's textbox pill default (slightly flatter than a circle). Higher = more rectangular. Both `draw_textbox_pill` (AA path) and the textbox widget's hard-pixel renderer route thru this so any tweak to the curve math flows thru both code paths.
 ///
 /// Identical to the per-iteration formula at photon's [`compositing.rs:4567-4570`](/mnt/Harbor/Code/photon/src/ui/compositing.rs).
 #[inline]
 pub fn squircle_inset(y_from_center: f32, radius: f32, squirdleyness: i32) -> f32 {
-    let y_norm = (y_from_center / radius).min(1.0);
+    let y_norm = y_from_center / radius;
     let x_norm = crate::math::powf(
         1.0 - crate::math::powi(y_norm, squirdleyness),
         1.0 / squirdleyness as f32,
@@ -677,7 +685,7 @@ pub fn draw_squircle_rrect_two_tone(
     let shadow_solid = (shadow & 0x00FF_FFFF) | 0xFF000000;
     let light_rgb = light & 0x00FF_FFFF;
     let shadow_rgb = shadow & 0x00FF_FFFF;
-    let (wf, hf) = (w.max(1) as f32, h.max(1) as f32);
+    let (wf, hf) = (w as f32, h as f32);
     let pick = move |dx: isize, dy: isize| -> (u32, u32) {
         // Anti-diagonal seam: dx/w + dy/h ≤ 1 is the light (top-left) side.
         if dx as f32 / wf + dy as f32 / hf <= 1.0 {
@@ -709,7 +717,7 @@ pub fn draw_squircle_rrect_two_tone_f(
     let shadow_solid = (shadow & 0x00FF_FFFF) | 0xFF000000;
     let light_rgb = light & 0x00FF_FFFF;
     let shadow_rgb = shadow & 0x00FF_FFFF;
-    let (wf, hf) = (w.max(1) as f32, h.max(1) as f32);
+    let (wf, hf) = (w as f32, h as f32);
     let pick = move |dx: isize, dy: isize| -> (u32, u32) {
         if dx as f32 / wf + dy as f32 / hf <= 1.0 {
             (light_rgb, light_solid)
@@ -746,14 +754,16 @@ fn draw_squircle_rrect_kernel(
         return;
     }
     {
+        // WHY/PROOF: the box is placed by the caller's layout and straddles the buffer edge whenever it scrolls past one — a negative start would wrap to a huge usize; the far edges are past 0 by the overlap early-out above.
         let dx0 = x.max(0) as usize;
         let dy0 = y.max(0) as usize;
-        let dx1 = (x + w).min(buf_w_i).max(0) as usize;
-        let dy1 = (y + h).min(buf_h_i).max(0) as usize;
+        let dx1 = (x + w).min(buf_w_i) as usize;
+        let dy1 = (y + h).min(buf_h_i) as usize;
         canvas.damage.add_bounds(dx0, dy0, dx1, dy1);
     }
     // Each radius clamps to half the box on both axes; the corner quadrant is radius × radius at its corner.
-    let cap = ((w / 2).min(h / 2)).max(0) as f32;
+    // WHY/PROOF: the radii are the caller's (photon sizes them off the text height), so a short box can be handed a radius past half its height — the corner quadrants would overlap and the solid run between them would start past its end.
+    let cap = (w / 2).min(h / 2) as f32;
     let r: [isize; 4] = [
         radii[0].clamp(0.0, cap) as isize,
         radii[1].clamp(0.0, cap) as isize,
@@ -787,6 +797,7 @@ fn draw_squircle_rrect_kernel(
                     write_aa(pixels, row_base + v_aa_col as usize, rgb, h_u32);
                 }
                 let (fx_start, fx_end) = if flip_x { (h_col, v_aa_col) } else { (v_aa_col + 1, h_col + 1) };
+                // WHY/PROOF: the run's ends follow the caller-placed pill past the buffer edge — negative would wrap the index, past the edge would write outside the row.
                 let fs = fx_start.max(0) as usize;
                 let fe = fx_end.max(0).min(buf_w_i) as usize;
                 for fx in fs..fe {
@@ -806,6 +817,7 @@ fn draw_squircle_rrect_kernel(
                     write_aa(pixels, h_aa_row as usize * buf_w + col_us, rgb, h_u32);
                 }
                 let (fy_start, fy_end) = if flip_y { (v_row, h_aa_row) } else { (h_aa_row + 1, v_row + 1) };
+                // WHY/PROOF: the run's ends follow the caller-placed pill past the buffer edge — negative would wrap the index, past the edge would write outside the row.
                 let fs = fy_start.max(0) as usize;
                 let fe = fy_end.max(0).min(buf_h_i) as usize;
                 for fy in fs..fe {
@@ -822,6 +834,7 @@ fn draw_squircle_rrect_kernel(
 
     // Everything outside the corner quadrants: per row, the solid run between the left corner's extent and the right corner's.
     let (r_tl, r_tr, r_br, r_bl) = (r[0], r[1], r[2], r[3]);
+    // WHY/PROOF: the box follows the caller's layout past the buffer edge — the row and column clips keep the solid runs inside the buffer.
     let ry0 = y.max(0);
     let ry1 = (y + h).min(buf_h_i);
     for fy in ry0..ry1 {

@@ -1,11 +1,17 @@
 //! AA shape rasterizers — axis-aligned rect, rotated rect, axis-aligned ellipse / circle, rotated ellipse — plus the per-row pixel-range solver and reciprocal-sqrt helper they share. Every entry point honours sub-pixel position + size, composes UNDER existing pixel content via the [`Blend::under`] kernel, and reports its bbox to the canvas damage accumulator.
 //!
-//! Conventions: colour is α + darkness packed (build with [`crate::paint::pack_argb`]); `Coord` is fluor's `f32` alias. AA coverage is the standard analytical approximation — `0.5 + signed_distance_inside` clamped to `[0, 1]`, multiplied across edges for rotated rects, or solved analytically via implicit-form math for ellipses (sqrt-and-divide fused into a single hardware reciprocal-sqrt where available).
+//! Conventions: colour is α + darkness packed (build with [`crate::paint::pack_argb`]); `Coord` is fluor's `f32` alias. AA coverage is the standard analytical approximation — `0.5 + signed_distance_inside` saturated to a byte by [`cov8`]'s cast, multiplied across edges for rotated rects, or solved analytically via implicit-form math for ellipses (sqrt-and-divide fused into a single hardware reciprocal-sqrt where available).
 
 use super::{Clip, under_chunk_const_dispatch};
 use crate::canvas::Canvas;
 use crate::coord::Coord;
 use crate::pixel::{Blend, BlendMode};
+
+/// A one-pixel edge ramp `v` (≤ 0 outside, ≥ 1 inside) as a coverage byte: the `as u8` cast saturates both ends, which is the whole clamp.
+#[inline]
+fn cov8(v: Coord) -> u32 {
+    (v * 255.0) as u8 as u32
+}
 
 /// Photon's `blend_rgb_only` helper: weighted RGB blend of two colours with explicit per-pixel weights. Verbatim port from [compositing.rs:5821](/mnt/Harbor/Code/photon/src/ui/compositing.rs#L5821). Used by `draw_window_controls` for AA squircle edges.
 pub fn blend_rgb_only(bg_colour: u32, fg_colour: u32, weight_bg: u8, weight_fg: u8) -> u32 {
@@ -27,9 +33,9 @@ pub fn blend_rgb_only(bg_colour: u32, fg_colour: u32, weight_bg: u8, weight_fg: 
 
 /// Filled rectangle, anti-aliased, axis-aligned. Centered at `(cx, cy)` with fractional dimensions `(rect_w, rect_h)` — sub-pixel position + size both honoured. Colour is α + darkness packed (build with [`crate::paint::pack_argb`]); the rect blends UNDER any existing pixel content in the buffer via [`Blend::under`].
 ///
-/// AA: each pixel's coverage = `clamp(0.5 + distance_inside, 0, 1)` against the nearest rect edge. Interior pixels saturate to coverage = 1.0 (full colour). Edge pixels get a fraction of the source α. Off-buffer pixels are clipped by the iteration bounds.
+/// AA: each pixel's coverage = `0.5 + distance_inside` against the nearest rect edge, saturated to a byte by [`cov8`]'s cast. Interior pixels saturate to coverage = 1.0 (full colour). Edge pixels get a fraction of the source α. Off-buffer pixels are clipped by the iteration bounds.
 ///
-/// Rule 0: iteration bounds clamp `x_min/y_min ≥ 0` and `x_max/y_max ≤ buffer dim` because the rect can be partially or fully off-screen (caller passes arbitrary cx/cy); without the clamps an i32→usize cast on negative values wraps to a huge number → OOB panic. Coverage clamps to `[0, 1]` because pixels inside the rect have unbounded `d_inside`; without the cap, the `α × coverage` multiply would exceed the 0..255 byte range.
+/// Rule 0: iteration bounds clamp `x_min/y_min ≥ 0` and `x_max/y_max ≤ buffer dim` because the rect can be partially or fully off-screen (caller passes arbitrary cx/cy); without the clamps an i32→usize cast on negative values wraps to a huge number → OOB panic. Coverage saturates at 255 (the `as u8` cast in [`cov8`]) because pixels inside the rect have unbounded `d_inside`; without the cap, the `α × coverage` multiply would exceed the 0..255 byte range.
 pub fn draw_rect(
     canvas: &mut Canvas,
     cx: Coord,
@@ -59,7 +65,7 @@ pub fn draw_rect(
     canvas.damage.add_bounds(x_start, y_start, x_end, y_end);
     let pixels: &mut [u32] = canvas.pixels;
 
-    let colour_alpha = ((colour >> 24) & 0xFF) as Coord;
+    let colour_a = (colour >> 24) & 0xFF;
     let colour_dark = colour & 0x00FFFFFF;
 
     crate::par::par_rows(pixels, width, y_start, y_end, |py, row| {
@@ -69,11 +75,11 @@ pub fn draw_rect(
             let dx_abs = ((px as Coord + 0.5) - cx).abs();
             let dx_inside = hw - dx_abs;
             let d_inside = dx_inside.min(dy_inside);
-            let coverage = (0.5 + d_inside).clamp(0.0, 1.0);
-            if coverage <= 0.0 {
+            let coverage = cov8(0.5 + d_inside);
+            if coverage == 0 {
                 continue;
             }
-            let new_alpha = (colour_alpha * coverage) as u32;
+            let new_alpha = colour_a * coverage / 255;
             if new_alpha == 0 {
                 continue;
             }
@@ -102,6 +108,7 @@ pub fn draw_image(
     if src_w == 0 || src_h == 0 || dst_w <= 0.0 || dst_h <= 0.0 || width == 0 || height == 0 {
         return;
     }
+    // WHY/PROOF: src and its dimensions come from a decoded image (an avatar off the wire) — a short buffer would index past its end.
     if src.len() < src_w * src_h {
         return;
     }
@@ -130,14 +137,16 @@ pub fn draw_image(
         if sy_f < 0.0 {
             return;
         }
-        let sy = (sy_f as i32).clamp(0, src_h_i - 1) as usize;
+        // sy_f ≥ 0 was just checked; the bbox rounds out to whole pixels, so the last row's centre can sample one past the source's bottom edge.
+        let sy = (sy_f as i32).min(src_h_i - 1) as usize;
         let src_row_base = sy * src_w;
         for px in x_start..x_end {
             let sx_f = ((px as Coord + 0.5) - left) * step_x;
             if sx_f < 0.0 {
                 continue;
             }
-            let sx = (sx_f as i32).clamp(0, src_w_i - 1) as usize;
+            // sx_f ≥ 0 was just checked; the rounded-out bbox's last column can sample one past the source's right edge.
+            let sx = (sx_f as i32).min(src_w_i - 1) as usize;
             let sp = src[src_row_base + sx];
             row[px] = row[px].under(sp, BlendMode::Normal);
         }
@@ -148,7 +157,7 @@ pub fn draw_image(
 ///
 /// Scanline + per-pixel edge AA. Per row we analytically solve the px range where each pixel's centre lies in the rect's local-coord interior (full coverage) vs the wider "any coverage" band (AA needed). The interior loop is a tight UNDER-blend with a precomputed `(α<<24)|RGB` value — no per-pixel rotation, no coverage math, no abs/clamp. Only the two AA strips at the row endpoints (and full-AA rows near top/bottom corners) pay for the 4-edge product coverage. Bounding box is the tight rotated extent `(hw|cos| + hh|sin|, hw|sin| + hh|cos|)`.
 ///
-/// Coverage at AA pixels: product of four `clamp(0.5 + signed_dist_inside, 0, 1)` terms, one per edge.
+/// Coverage at AA pixels: product of four [`cov8`]`(0.5 + signed_dist_inside)` bytes, one per edge.
 pub fn draw_rect_rotated(
     canvas: &mut crate::canvas::Canvas,
     cx: Coord,
@@ -184,7 +193,6 @@ pub fn draw_rect_rotated(
     canvas.damage.add_bounds(x_start, y_start, x_end, y_end);
     let pixels: &mut [u32] = canvas.pixels;
 
-    let colour_alpha = ((colour >> 24) & 0xFF) as Coord;
     let colour_dark = colour & 0x00FFFFFF;
     let full_alpha = (colour >> 24) & 0xFF;
     let full_top = (full_alpha << 24) | colour_dark;
@@ -230,12 +238,9 @@ pub fn draw_rect_rotated(
         let mut lx = lx0 + (outer_lo as Coord - x_start as Coord) * dlx;
         let mut ly = ly0 + (outer_lo as Coord - x_start as Coord) * dly;
         for px in outer_lo..inner_lo {
-            let cov_r = (0.5 + (hw - lx)).clamp(0.0, 1.0);
-            let cov_l = (0.5 + (lx + hw)).clamp(0.0, 1.0);
-            let cov_t = (0.5 + (hh - ly)).clamp(0.0, 1.0);
-            let cov_b = (0.5 + (ly + hh)).clamp(0.0, 1.0);
-            let coverage = cov_r * cov_l * cov_t * cov_b;
-            let na = (colour_alpha * coverage) as u32;
+            // Four coverage bytes multiply to at most 255⁴, which fits a u32; α × that needs u64.
+            let coverage = cov8(0.5 + (hw - lx)) * cov8(0.5 + (lx + hw)) * cov8(0.5 + (hh - ly)) * cov8(0.5 + (ly + hh));
+            let na = (full_alpha as u64 * coverage as u64 / 4_228_250_625) as u32;
             if na > 0 {
                 let rect_pixel = (na << 24) | colour_dark;
                 row[px] = row[px].under(rect_pixel, BlendMode::Normal);
@@ -249,12 +254,9 @@ pub fn draw_rect_rotated(
         let mut lx = lx0 + (inner_hi as Coord - x_start as Coord) * dlx;
         let mut ly = ly0 + (inner_hi as Coord - x_start as Coord) * dly;
         for px in inner_hi..outer_hi {
-            let cov_r = (0.5 + (hw - lx)).clamp(0.0, 1.0);
-            let cov_l = (0.5 + (lx + hw)).clamp(0.0, 1.0);
-            let cov_t = (0.5 + (hh - ly)).clamp(0.0, 1.0);
-            let cov_b = (0.5 + (ly + hh)).clamp(0.0, 1.0);
-            let coverage = cov_r * cov_l * cov_t * cov_b;
-            let na = (colour_alpha * coverage) as u32;
+            // Four coverage bytes multiply to at most 255⁴, which fits a u32; α × that needs u64.
+            let coverage = cov8(0.5 + (hw - lx)) * cov8(0.5 + (lx + hw)) * cov8(0.5 + (hh - ly)) * cov8(0.5 + (ly + hh));
+            let na = (full_alpha as u64 * coverage as u64 / 4_228_250_625) as u32;
             if na > 0 {
                 let rect_pixel = (na << 24) | colour_dark;
                 row[px] = row[px].under(rect_pixel, BlendMode::Normal);
@@ -288,6 +290,7 @@ fn px_range(
     let i_max = crate::math::floor(i_hi) as i64;
     let start_i = x_start as i64;
     let end_i = x_end as i64;
+    // WHY/PROOF: the solved range runs wherever the rotated edge crosses the row, past the clip on either side — the clamps keep the AA strips inside the row's clipped span.
     let lo_px = (start_i + i_min).clamp(start_i, end_i);
     let hi_px = (start_i + i_max + 1).clamp(start_i, end_i);
     if lo_px >= hi_px {
@@ -331,6 +334,7 @@ pub fn draw_circle(
     if r <= 0.0 || width == 0 || height == 0 {
         return;
     }
+    // WHY/PROOF: r is the caller's radius, and under half a pixel r − ½ goes negative — squared, it would claim a full-coverage interior the circle doesn't have.
     let r_in = (r - 0.5).max(0.0);
     let r_out = r + 0.5;
     let r_in2 = r_in * r_in;
@@ -416,8 +420,8 @@ pub fn draw_ring_segments(
             let dx = (px as Coord + 0.5) - cx;
             let dist = libm::sqrtf(dx * dx + dy * dy);
             // Radial coverage: a one-pixel ramp at each edge of the stroke.
-            let radial = (half + 0.5 - (dist - r).abs()).clamp(0.0, 1.0);
-            if radial <= 0.0 {
+            let radial = cov8(half + 0.5 - (dist - r).abs());
+            if radial == 0 {
                 continue;
             }
             // Clockwise from 12 o'clock (screen y grows downward).
@@ -425,21 +429,22 @@ pub fn draw_ring_segments(
             if a < 0.0 {
                 a += tau;
             }
+            // WHY/PROOF: atan2 of a hair-negative angle plus τ rounds to exactly τ in f32, and a / seg then lands on n — colours[n] would panic.
             let i = ((a / seg) as usize).min(n - 1);
             let colour = colours[i];
-            let colour_alpha = ((colour >> 24) & 0xFF) as Coord;
-            if colour_alpha <= 0.0 {
+            let colour_a = (colour >> 24) & 0xFF;
+            if colour_a == 0 {
                 continue;
             }
             // Angular coverage: the arc distance to the nearer boundary of this segment, less the half gap, as a one-pixel ramp.
             let angular = if n > 1 {
                 let into = a - i as Coord * seg;
                 let edge = into.min(seg - into) * r;
-                (edge - half_gap + 0.5).clamp(0.0, 1.0)
+                cov8(edge - half_gap + 0.5)
             } else {
-                1.0
+                255
             };
-            let na = (colour_alpha * radial * angular) as u32;
+            let na = colour_a * radial * angular / 65_025;
             if na > 0 {
                 row[px] = row[px].under((na << 24) | (colour & 0x00FFFFFF), BlendMode::Normal);
             }
@@ -498,7 +503,8 @@ pub fn draw_ellipse(
                 row[px] = row[px].under(full_pixel, BlendMode::Normal);
             } else if f < 0.0 || f_sq_4 < grad2 {
                 let inv_g = fast_inv_sqrt(grad2);
-                let coverage = (0.5 - f * inv_g).clamp(0.0, 1.0);
+                // In this branch |f · inv_g| < 0.5, so coverage already sits in [0, 1] (fast_inv_sqrt's ~12-bit error moves it by under 1/255, and the `as u32` cast floors any hair below 0).
+                let coverage = 0.5 - f * inv_g;
                 let na = (colour_alpha * coverage) as u32;
                 if na > 0 {
                     let ellipse_pixel = (na << 24) | colour_dark;
@@ -565,7 +571,8 @@ pub fn draw_ellipse_rotated(
                 row[px] = row[px].under(full_pixel, BlendMode::Normal);
             } else if f < 0. || f_sq_4 < grad2 {
                 let inv_g = fast_inv_sqrt(grad2);
-                let coverage = (0.5 - f * inv_g).clamp(0., 1.);
+                // In this branch |f · inv_g| < 0.5, so coverage already sits in [0, 1] (see draw_ellipse).
+                let coverage = 0.5 - f * inv_g;
                 let na = (colour_alpha * coverage) as u32;
                 if na > 0 {
                     let ellipse_pixel = (na << 24) | colour_dark;

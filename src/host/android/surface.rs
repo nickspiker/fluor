@@ -193,7 +193,7 @@ impl Surface {
             let dst_width = android_buffer.width as usize;
             let dst_pixels: &mut [u32] = core::slice::from_raw_parts_mut(
                 android_buffer.bits as *mut u32,
-                stride.saturating_mul(dst_height),
+                stride * dst_height,
             );
 
             if dirty {
@@ -203,6 +203,7 @@ impl Surface {
                 }
             }
 
+            // WHY/PROOF: dst_width is what ANativeWindow_lock reports, 0 on a buffer mid-teardown — dst_width − 1 would underflow usize (the `< stride` test below then fails the read).
             let magic_idx = dst_width.saturating_sub(1);
             let buffer_is_current = !is_samsung()
                 && magic_idx < stride
@@ -210,11 +211,13 @@ impl Surface {
 
             // A clean present counts toward the streak whether the buffer was already current or had to be refreshed: clean frames write identical content, so three of them leave every queue buffer equal either way. This is what makes the skip reach Samsung, where the magic-pixel cache is off and every idle frame was a full finalize + post (Emma's phone, 2026-09-10: 12–27 ms of present per idle frame).
             if !dirty {
-                self.clean_streak = self.clean_streak.saturating_add(1);
+                // The streak stops at 3: a clean frame at 3 returns before the lock above, so it never reaches here to pass it.
+                self.clean_streak += 1;
             }
             let wrote = if buffer_is_current {
                 false
             } else {
+                // WHY/PROOF: the locked buffer's size is the OS's and lags the window across a rotation or resize, and damage_clip is the app's — the finalize would index past the smaller of the two.
                 let copy_width = dst_width.min(win_w);
                 let copy_height = dst_height.min(win_h);
                 let clip = PixelRect::new(

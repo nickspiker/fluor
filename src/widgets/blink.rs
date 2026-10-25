@@ -119,10 +119,12 @@ mod tests {
     fn intervals_are_not_constant() {
         // xorshift32 should produce varied intervals across many advances.
         let mut t = BlinkTimer::new();
-        let mut intervals = std::collections::HashSet::new();
+        let mut intervals = Vec::new();
         for _ in 0..20 {
-            intervals.insert(t.advance().as_millis());
+            intervals.push(t.advance().as_millis());
         }
+        intervals.sort_unstable();
+        intervals.dedup();
         assert!(
             intervals.len() > 5,
             "xorshift32 should produce >5 distinct values in 20 draws"

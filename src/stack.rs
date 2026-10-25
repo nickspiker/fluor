@@ -120,9 +120,7 @@ impl StackCompositor {
 
     /// A layer was blitted on its own (not thru [`Self::evaluate`]): mark it clean, and drop the cached composite so a later `evaluate` recomputes rather than returning a composite that predates this layer's paint.
     pub fn settle_layer(&mut self, idx: usize) {
-        if let Some(l) = self.layers.get_mut(idx) {
-            l.dirty = false;
-        }
+        self.layers[idx].dirty = false;
         let old = core::mem::take(&mut self.composite);
         if !old.is_empty() {
             self.release_buf(old);
@@ -138,7 +136,7 @@ impl StackCompositor {
         }
 
         let any_dirty = self.program.iter().any(|op| match op {
-            Op::Push(idx) => self.layers.get(*idx).map_or(false, |l| l.dirty),
+            Op::Push(idx) => self.layers[*idx].dirty,
             _ => false,
         });
 

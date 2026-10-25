@@ -146,6 +146,7 @@ impl MultiTextbox {
     }
     /// The wrap width text lays out against.
     fn usable_w(&self) -> Coord {
+        // WHY/PROOF: width and right_inset are the app's — a wrap width under one glyph would put every char on its own line (or a negative width every char past it).
         (self.width - self.pad_x() * 2.0 - self.right_inset).max(self.font_size)
     }
     /// Total laid-out text height (all lines), independent of the box height.
@@ -160,6 +161,7 @@ impl MultiTextbox {
     /// Replace the styled ranges. Ranges are clamped to the text; an app-detected set that equals the current one is a no-op (no cache dirt).
     pub fn set_spans(&mut self, spans: Vec<Span>) {
         let n = self.chars.len();
+        // WHY/PROOF: the spans are the app's (a link detector run on older text), which can name chars past the end after an edit — a span past n would slice past chars when the line paints.
         let mut clean: Vec<Span> = spans.into_iter().map(|mut s| { s.start = s.start.min(n); s.end = s.end.clamp(s.start, n); s }).filter(|s| s.end > s.start).collect();
         clean.sort_by_key(|s| s.start);
         if clean != self.spans {
@@ -175,6 +177,7 @@ impl MultiTextbox {
     /// Tag a char range as a link with `dest` (the paste-onto-selection gesture): replaces any span it overlaps.
     pub fn tag_link(&mut self, start: usize, end: usize, dest: String, colour: u32) {
         let n = self.chars.len();
+        // WHY/PROOF: the range is the app's, possibly stale against the current text — the slice would panic past n.
         let (start, end) = (start.min(n), end.min(n));
         if end <= start {
             return;
@@ -205,7 +208,8 @@ impl MultiTextbox {
 
     /// `start..end` was deleted: spans after it slide back, spans overlapping it lose the overlap, emptied spans die.
     fn spans_on_delete(&mut self, start: usize, end: usize) {
-        let n = end.saturating_sub(start);
+        // Every caller passes start ≤ end (a cursor and the char after it, a clamped replace range, or a selection's lo / hi).
+        let n = end - start;
         if n > 0 {
             for s in self.spans.iter_mut() {
                 if s.start >= end {
@@ -273,6 +277,7 @@ impl MultiTextbox {
     /// Turn `start..end` into a tagged link whose VISIBLE text is `label` and whose destination is `dest` (the link button: "https://passless.org/photon/" shows as "passless.org/photon"). The label comes back selected in the link's colour: typing replaces it, whitespace / a right arrow / a click accept it, backspace on the selection reverts to the plain address. This is the ONLY way text becomes a link on its own — nothing is detected or coloured before the press.
     pub fn relabel_span(&mut self, start: usize, end: usize, label: &str, dest: String, colour: u32, text: &mut TextRenderer) {
         let n = self.chars.len();
+        // WHY/PROOF: the range is the app's, possibly stale against the current text — the slice would panic past n.
         let (start, end) = (start.min(n), end.min(n));
         if end <= start {
             return;
@@ -336,7 +341,7 @@ impl MultiTextbox {
                     _ => i,
                 };
                 self.line_starts.push(brk);
-                line_w = self.widths[brk..=i.saturating_sub(0)]
+                line_w = self.widths[brk..=i]
                     .iter()
                     .take(i - brk)
                     .sum::<Coord>()
@@ -372,6 +377,7 @@ impl MultiTextbox {
             self.pill_cache_dirty = true;
         }
         let min_h = self.row_h() + self.pad_y() * 2.0;
+        // WHY/PROOF: max_h is the caller's cap and can sit below one row — f32::clamp panics on min > max; the clamp itself is the grow-to-cap layout, not a guard.
         let new_h = self.content_h().clamp(min_h, max_h.max(min_h));
         if (self.height - new_h).abs() > 0.5 {
             self.height = new_h;
@@ -413,7 +419,7 @@ impl MultiTextbox {
     fn line_draw_range(&self, line: usize) -> (usize, usize) {
         let s = self.line_starts[line];
         let mut e = self.line_end(line);
-        if e > s && self.chars.get(e - 1) == Some(&'\n') {
+        if e > s && self.chars[e - 1] == '\n' {
             e -= 1;
         }
         (s, e)
@@ -452,6 +458,7 @@ impl MultiTextbox {
     }
     fn clamp_scroll(&mut self) {
         let max = (self.line_starts.len() as Coord * self.row_h() - self.inner_h()).max(0.0);
+        // WHY/PROOF: not a guard — the user's wheel and fling push scroll_y against these limits; max floors at 0 (content shorter than the box) so f32::clamp's min ≤ max holds.
         self.scroll_y = self.scroll_y.clamp(0.0, max);
     }
     /// Keep the caret's line inside the visible band.
@@ -609,6 +616,7 @@ impl MultiTextbox {
         text: &mut TextRenderer,
     ) {
         let n = self.chars.len();
+        // WHY/PROOF: replace_char_range is the IME's editor op, whose range can name chars past the end after a racing edit — drain would panic.
         let start = start.min(n);
         let end = end.clamp(start, n);
         self.chars.drain(start..end);
@@ -689,12 +697,14 @@ impl MultiTextbox {
     // ---- Caret movement ----
 
     pub fn cursor_left(&mut self) {
+        // WHY/PROOF: the user's Left arrow at the start of the text — the caret stays at 0 instead of wrapping to usize::MAX.
         self.cursor = self.cursor.saturating_sub(1);
         self.goal_x = None;
         self.ensure_cursor_visible();
         self.text_cache_dirty = true;
     }
     pub fn cursor_right(&mut self) {
+        // WHY/PROOF: the user's Right arrow at the end of the text — the caret stays at the end instead of passing it.
         self.cursor = (self.cursor + 1).min(self.chars.len());
         self.goal_x = None;
         self.ensure_cursor_visible();
@@ -748,7 +758,8 @@ impl MultiTextbox {
     pub fn cursor_index_from_xy(&self, x: Coord, y: Coord) -> usize {
         let (lx, ly) = self.to_local(x, y);
         let line_f = (ly - self.inner_top() + self.scroll_y) / self.row_h();
-        let line = (line_f.max(0.0) as usize).min(self.line_starts.len().saturating_sub(1));
+        // WHY/PROOF: the pointer's y can sit below the last line (or above the first; the f32 → usize cast floors that to 0) — line_starts[line] would panic.
+        let line = (line_f as usize).min(self.line_starts.len() - 1);
         self.index_at_line_x(line, lx - self.pad_x())
     }
     /// Press: place the caret, clear the anchor (drag extends from here).
@@ -771,6 +782,7 @@ impl MultiTextbox {
         if self.chars.is_empty() {
             return;
         }
+        // WHY/PROOF: the double-tap index is the app's (cursor_index_from_xy returns the end of the text past the last char) — chars[idx] would panic.
         let idx = idx.min(self.chars.len() - 1);
         let class = |c: char| -> u8 {
             if c.is_alphanumeric() || c == '_' {
@@ -984,10 +996,10 @@ impl MultiTextbox {
         let r_small = r_big * 0.5;
         let outer_radii: paint::CornerRadii = [r_big, r_small, r_big, r_small];
         let inner_radii: paint::CornerRadii = [
-            (r_big - stroke_px as f32).max(1.0),
-            (r_small - stroke_px as f32).max(1.0),
-            (r_big - stroke_px as f32).max(1.0),
-            (r_small - stroke_px as f32).max(1.0),
+            r_big - stroke_px as f32,
+            r_small - stroke_px as f32,
+            r_big - stroke_px as f32,
+            r_small - stroke_px as f32,
         ];
 
         if self.pill_cache_dirty {
@@ -998,8 +1010,8 @@ impl MultiTextbox {
             self.pill_cache_h = ch;
             let inner_x = stroke_px;
             let inner_y = stroke_px;
-            let inner_w = (pill_w - 2 * stroke_px).max(0);
-            let inner_h = (pill_h - 2 * stroke_px).max(0);
+            let inner_w = pill_w - 2 * stroke_px;
+            let inner_h = pill_h - 2 * stroke_px;
             let mut cache_damage = crate::canvas::Damage::new();
             {
                 let mut cache_canvas =
@@ -1023,7 +1035,7 @@ impl MultiTextbox {
                 self.inner_pill_mask[i] = ((self.pill_cache[i] >> 24) & 0xFF) as u8;
             }
             if self.right_inset > 0.0 {
-                let cut = (pill_w as Coord - self.right_inset).max(0.0) as usize;
+                let cut = (pill_w as Coord - self.right_inset) as usize;
                 for y in 0..ch {
                     for x in cut..cw {
                         self.inner_pill_mask[y * cw + x] = 0;
@@ -1066,9 +1078,9 @@ impl MultiTextbox {
 
             // Visible line band under the current scroll — everything else is culled.
             let first_line = ((self.scroll_y / row_h).floor() as usize)
-                .min(self.line_starts.len().saturating_sub(1));
+                .min(self.line_starts.len() - 1);
             let last_line = (((self.scroll_y + self.inner_h()) / row_h).ceil() as usize)
-                .min(self.line_starts.len().saturating_sub(1));
+                .min(self.line_starts.len() - 1);
 
             // Per-line draw work precomputed BEFORE the cache borrow (line text, y centre, selection rect) — the borrow of text_cache below can't coexist with &self reads.
             struct LineDraw {
@@ -1250,10 +1262,10 @@ impl Focus for MultiTextbox {
         MultiTextbox::set_focused(self, focused);
     }
     fn focus_bbox(&self) -> Option<PixelRect> {
-        let x0 = (self.center_x - self.width * 0.5).max(0.0) as usize;
-        let y0 = (self.center_y - self.height * 0.5).max(0.0) as usize;
-        let x1 = (self.center_x + self.width * 0.5).max(0.0) as usize;
-        let y1 = (self.center_y + self.height * 0.5).max(0.0) as usize;
+        let x0 = (self.center_x - self.width * 0.5) as usize;
+        let y0 = (self.center_y - self.height * 0.5) as usize;
+        let x1 = (self.center_x + self.width * 0.5) as usize;
+        let y1 = (self.center_y + self.height * 0.5) as usize;
         Some(PixelRect::new(x0, y0, x1, y1))
     }
 }

@@ -65,16 +65,15 @@ pub fn apply_textbox_glow_right(
     if pill_w <= 0 || pill_h <= 0 || seed == 0 || factor_256 == 0 || factor_256 >= 256 {
         return;
     }
-    let buf_w_i = buf_w as isize;
-    let buf_h_i = buf_h as isize;
+    // WHY/PROOF: the pill's position is the caller's layout, partly or wholly off the buffer whenever a widget scrolls past an edge — the max(0) and clip mins below keep every scan and ray inside the pixel buffer.
     let clip_rect = Clip::resolve(clip, buf_w, buf_h);
     let y0 = (pill_y.max(0) as usize).max(clip_rect.y_start);
-    let y1 = ((pill_y + pill_h).min(buf_h_i).max(0) as usize).min(clip_rect.y_end);
+    let y1 = ((pill_y + pill_h).max(0) as usize).min(clip_rect.y_end);
     if y0 >= y1 {
         return;
     }
     let scan_left = (pill_x.max(0) as usize).max(clip_rect.x_start);
-    let scan_right = ((pill_x + pill_w).min(buf_w_i).max(0) as usize).min(clip_rect.x_end);
+    let scan_right = ((pill_x + pill_w).max(0) as usize).min(clip_rect.x_end);
     if scan_left >= scan_right {
         return;
     }
@@ -82,13 +81,13 @@ pub fn apply_textbox_glow_right(
     let (alphas, alpha_len) = compute_alphas(seed, factor_256);
     {
         let dx0 = scan_left;
-        let dx1 = (scan_right + alpha_len).min(buf_w).min(clip_rect.x_end);
+        let dx1 = (scan_right + alpha_len).min(clip_rect.x_end);
         canvas.damage.add_bounds(dx0, y0, dx1, y1);
     }
 
     let glow_rgb = glow_colour & 0x00FF_FFFF;
     let pixels: &mut [u32] = canvas.pixels;
-    let ray_x_end = clip_rect.x_end.min(buf_w);
+    let ray_x_end = clip_rect.x_end;
 
     for y in y0..y1 {
         let row_base = y * buf_w;
@@ -132,23 +131,22 @@ pub fn apply_textbox_glow_left(
     if pill_w <= 0 || pill_h <= 0 || seed == 0 || factor_256 == 0 || factor_256 >= 256 {
         return;
     }
-    let buf_w_i = buf_w as isize;
-    let buf_h_i = buf_h as isize;
+    // WHY/PROOF: the pill's position is the caller's layout, partly or wholly off the buffer whenever a widget scrolls past an edge — the max(0) and clip mins below keep every scan and ray inside the pixel buffer.
     let clip_rect = Clip::resolve(clip, buf_w, buf_h);
     let y0 = (pill_y.max(0) as usize).max(clip_rect.y_start);
-    let y1 = ((pill_y + pill_h).min(buf_h_i).max(0) as usize).min(clip_rect.y_end);
+    let y1 = ((pill_y + pill_h).max(0) as usize).min(clip_rect.y_end);
     if y0 >= y1 {
         return;
     }
     let scan_left = (pill_x.max(0) as usize).max(clip_rect.x_start);
-    let scan_right = ((pill_x + pill_w).min(buf_w_i).max(0) as usize).min(clip_rect.x_end);
+    let scan_right = ((pill_x + pill_w).max(0) as usize).min(clip_rect.x_end);
     if scan_left >= scan_right {
         return;
     }
 
     let (alphas, alpha_len) = compute_alphas(seed, factor_256);
     {
-        let dx0 = scan_left.saturating_sub(alpha_len).max(clip_rect.x_start);
+        let dx0 = (scan_left as isize - alpha_len as isize).max(clip_rect.x_start as isize) as usize;
         let dx1 = scan_right;
         canvas.damage.add_bounds(dx0, y0, dx1, y1);
     }
@@ -207,23 +205,22 @@ pub fn apply_textbox_glow_top(
     if pill_w <= 0 || pill_h <= 0 || seed == 0 || factor_256 == 0 || factor_256 >= 256 {
         return;
     }
-    let buf_w_i = buf_w as isize;
-    let buf_h_i = buf_h as isize;
+    // WHY/PROOF: the pill's position is the caller's layout, partly or wholly off the buffer whenever a widget scrolls past an edge — the max(0) and clip mins below keep every scan and ray inside the pixel buffer.
     let clip_rect = Clip::resolve(clip, buf_w, buf_h);
     let x0 = (pill_x.max(0) as usize).max(clip_rect.x_start);
-    let x1 = ((pill_x + pill_w).min(buf_w_i).max(0) as usize).min(clip_rect.x_end);
+    let x1 = ((pill_x + pill_w).max(0) as usize).min(clip_rect.x_end);
     if x0 >= x1 {
         return;
     }
     let scan_top = (pill_y.max(0) as usize).max(clip_rect.y_start);
-    let scan_bot = ((pill_y + pill_h).min(buf_h_i).max(0) as usize).min(clip_rect.y_end);
+    let scan_bot = ((pill_y + pill_h).max(0) as usize).min(clip_rect.y_end);
     if scan_top >= scan_bot {
         return;
     }
 
     let (alphas, alpha_len) = compute_alphas(seed, factor_256);
     {
-        let dy0 = scan_top.saturating_sub(alpha_len).max(clip_rect.y_start);
+        let dy0 = (scan_top as isize - alpha_len as isize).max(clip_rect.y_start as isize) as usize;
         let dy1 = scan_bot;
         canvas.damage.add_bounds(x0, dy0, x1, dy1);
     }
@@ -279,16 +276,15 @@ pub fn apply_textbox_glow_bottom(
     if pill_w <= 0 || pill_h <= 0 || seed == 0 || factor_256 == 0 || factor_256 >= 256 {
         return;
     }
-    let buf_w_i = buf_w as isize;
-    let buf_h_i = buf_h as isize;
+    // WHY/PROOF: the pill's position is the caller's layout, partly or wholly off the buffer whenever a widget scrolls past an edge — the max(0) and clip mins below keep every scan and ray inside the pixel buffer.
     let clip_rect = Clip::resolve(clip, buf_w, buf_h);
     let x0 = (pill_x.max(0) as usize).max(clip_rect.x_start);
-    let x1 = ((pill_x + pill_w).min(buf_w_i).max(0) as usize).min(clip_rect.x_end);
+    let x1 = ((pill_x + pill_w).max(0) as usize).min(clip_rect.x_end);
     if x0 >= x1 {
         return;
     }
     let scan_top = (pill_y.max(0) as usize).max(clip_rect.y_start);
-    let scan_bot = ((pill_y + pill_h).min(buf_h_i).max(0) as usize).min(clip_rect.y_end);
+    let scan_bot = ((pill_y + pill_h).max(0) as usize).min(clip_rect.y_end);
     if scan_top >= scan_bot {
         return;
     }
@@ -296,13 +292,13 @@ pub fn apply_textbox_glow_bottom(
     let (alphas, alpha_len) = compute_alphas(seed, factor_256);
     {
         let dy0 = scan_top;
-        let dy1 = (scan_bot + alpha_len).min(buf_h).min(clip_rect.y_end);
+        let dy1 = (scan_bot + alpha_len).min(clip_rect.y_end);
         canvas.damage.add_bounds(x0, dy0, x1, dy1);
     }
 
     let glow_rgb = glow_colour & 0x00FF_FFFF;
     let pixels: &mut [u32] = canvas.pixels;
-    let ray_y_end = clip_rect.y_end.min(buf_h);
+    let ray_y_end = clip_rect.y_end;
 
     for x in x0..x1 {
         let mut opaque_y: Option<usize> = None;
@@ -357,6 +353,7 @@ pub fn apply_textbox_glow(
 
     let y_top = cy - box_height / 2;
     let y_bot = cy + box_height / 2;
+    // WHY/PROOF: a pill near the buffer's edge puts the blur padding past it — the saturating subs and buffer mins here (and the left blur's start below) keep the damage rect and the left ray inside the buffer.
     // Damage = glow halo bbox (box + lateral blur padding, vertical box + vertical blur).
     {
         let x0 = cx.saturating_sub(box_width / 2 + blur_h);
@@ -408,6 +405,7 @@ pub fn apply_textbox_glow(
             if bx > 0 && mask[idx] < mask[idx - 1] {
                 adder += (mask[idx - 1] - mask[idx]) as u32;
             }
+            // WHY/PROOF: not a guard but the ported glow's peak brightness (photon's legacy curve) — uncapped, a full 255 edge step leaves the adder near 239 and the halo about three times brighter; a smooth ceiling is the owner's call.
             adder = (adder * 15 >> 4).min(71);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
             if intensity > 0 {
@@ -427,6 +425,7 @@ pub fn apply_textbox_glow(
             if bx + 1 < buf_w && mask[idx] < mask[idx + 1] {
                 adder += (mask[idx + 1] - mask[idx]) as u32;
             }
+            // WHY/PROOF: the same peak-brightness ceiling as the right blur (a visible shape, not a guard).
             adder = (adder * 15 >> 4).min(71);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
             if intensity > 0 {
@@ -452,6 +451,7 @@ pub fn apply_textbox_glow(
                     adder += (mask[ia] - mask[idx]) as u32;
                 }
             }
+            // WHY/PROOF: not a guard but the ported glow's vertical peak brightness (photon's legacy curve) — uncapped, the top and bottom halo brighten several times over.
             adder = (adder * 3 >> 2).min(70);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
             if intensity > 0 {
@@ -480,6 +480,7 @@ pub fn apply_textbox_glow(
                     adder += (mask[ib] - mask[idx]) as u32;
                 }
             }
+            // WHY/PROOF: the same peak-brightness ceiling as the down blur (a visible shape, not a guard).
             adder = (adder * 3 >> 2).min(70);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
             if intensity > 0 {

@@ -208,6 +208,7 @@ impl HdrSurface {
     pub fn present(&mut self, scratch: &[u32], clip_mask: &[u8], dirty: bool) -> HdrPresent {
         let dirty = dirty || core::mem::take(&mut self.pending);
         // DECLARE what the buffer spans: the content's peak, but never more than the display grants (a declaration past the grant makes SurfaceFlinger dim the whole layer, white with it). An SDR frame declares 1 and its table never changes.
+        // WHY/PROOF: ASurfaceTransaction_setExtendedRangeBrightness rejects ratios below 1, and granted() is what the display reports (0 or below 1 on an SDR panel) — both floors keep the declaration legal.
         let light = |code: u8| (crate::theme::G2T_LIGHT_Q16[code as usize] as f32 / 65536.0).max(1.0);
         let declared = light(self.peak_code).min(granted().max(1.0));
         if (self.table.declared_q16 as i64 - (declared * 65536.0) as i64).abs() > 64 {

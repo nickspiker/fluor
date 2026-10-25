@@ -65,6 +65,7 @@ impl Slider {
             center_y,
             width,
             height,
+            // WHY/PROOF: the initial value is the app's (a restored setting) — a slider value outside 0..=1 would draw its fill past the band.
             value: value.clamp(0.0, 1.0),
             focused: false,
             hovered: false,
@@ -93,10 +94,11 @@ impl Slider {
 
     /// Set the value directly (clamped to `0..=1`). Bumps the change counter if it actually moved.
     pub fn set_value(&mut self, value: f32) {
+        // WHY/PROOF: a drag maps the cursor's x, which runs past either end of the band — unclamped, the value (and the fill) would leave 0..=1.
         let v = value.clamp(0.0, 1.0);
         if v != self.value {
             self.value = v;
-            self.change_counter = self.change_counter.wrapping_add(1);
+            self.change_counter += 1;
         }
     }
 
@@ -107,7 +109,7 @@ impl Slider {
             return;
         }
         let left = self.center_x - self.width * 0.5;
-        self.set_value(((x - left) / self.width.max(1e-6)) as f32);
+        self.set_value(((x - left) / self.width) as f32);
     }
 
     /// `true` if the value changed since the last call. Coalesces like [`super::Button::take_click`].
@@ -236,6 +238,7 @@ impl Slider {
         if let Some(map) = hit_map {
             let vw = canvas.width;
             let vh = canvas.height;
+            // WHY/PROOF: the band is placed by the app's layout and runs past the viewport when the slider scrolls past an edge — the stamp would index outside the hit map.
             let x0 = band_x.max(0) as usize;
             let y0 = band_y.max(0) as usize;
             let x1 = ((band_x + band_w).max(0) as usize).min(vw);
@@ -346,10 +349,10 @@ mod widget_impls {
         }
         fn focus_bbox(&self) -> Option<crate::canvas::PixelRect> {
             let r = self.bbox();
-            let x0 = r.x.max(0.0) as usize;
-            let y0 = r.y.max(0.0) as usize;
-            let x1 = (r.x + r.w).max(0.0) as usize;
-            let y1 = (r.y + r.h).max(0.0) as usize;
+            let x0 = r.x as usize;
+            let y0 = r.y as usize;
+            let x1 = (r.x + r.w) as usize;
+            let y1 = (r.y + r.h) as usize;
             Some(crate::canvas::PixelRect::new(x0, y0, x1, y1))
         }
     }

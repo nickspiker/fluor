@@ -179,6 +179,7 @@ impl Dropdown {
 
     /// Programmatic selection (no change-counter bump — that's for user actions).
     pub fn set_selected(&mut self, index: usize) {
+        // WHY/PROOF: the index is the app's (typically a restored setting), which can outlive a shorter option list — selected would index past the options when the pill paints.
         let index = index.min(self.options.len() - 1);
         if index != self.selected {
             self.selected = index;
@@ -253,13 +254,13 @@ impl Dropdown {
     }
 
     fn commit(&mut self, index: usize) {
-        let index = index.min(self.options.len() - 1);
+        // Every caller hands an index already in 0..n: a row's own index, the highlight (kept mod n) or selected ± 1 mod n.
         if index != self.selected {
             self.selected = index;
             self.text_cache_dirty = true;
         }
         // Commit always counts as a change event, even re-selecting the same option — apps that re-run an action on select can distinguish via selected() if they care.
-        self.change_counter = self.change_counter.wrapping_add(1);
+        self.change_counter += 1;
         self.close();
     }
 
@@ -383,6 +384,7 @@ impl Dropdown {
         let gap = self.height / 16.;
         let below_y = self.center_y + self.height * 0.5 + gap;
         let y = if below_y + h > viewport_h as Coord {
+            // WHY/PROOF: a dropdown on a window too short for its popup either way would flip the popup above the viewport's top edge, where none of it shows — the floor pins it to the visible top (layout, not memory).
             (self.center_y - self.height * 0.5 - gap - h).max(0.0)
         } else {
             below_y
@@ -491,6 +493,7 @@ impl Dropdown {
             text.draw_text_left(canvas, label, text_left, row_cy, &TextStyle::new(self.font_size, theme::TEXTBOX_TEXT).font(self.font), clip, None);
             // Stamp the row's hit band (interior of the popup only, clear of the AA edge).
             if let Some(map) = hit_map.as_deref_mut() {
+                // WHY/PROOF: the popup follows the app's layout past the viewport edge — a negative start would wrap the index and the far edges would stamp outside the hit map.
                 let x0 = (x + stroke_px).max(0) as usize;
                 let x1 = ((x + w - stroke_px).max(0) as usize).min(viewport_w);
                 let y0 = (row_top as isize).max(0) as usize;
@@ -512,10 +515,10 @@ impl Dropdown {
             canvas,
             x + stroke_px,
             y + stroke_px,
-            (w - 2 * stroke_px).max(0),
-            (h - 2 * stroke_px).max(0),
+            w - 2 * stroke_px,
+            h - 2 * stroke_px,
             theme::TEXTBOX_FILL,
-            paint::asymmetric_radii((popup_r - stroke_px as f32).max(1.0)),
+            paint::asymmetric_radii(popup_r - stroke_px as f32),
             squirdleyness,
         );
         paint::draw_squircle_rrect_two_tone_f(
@@ -574,8 +577,8 @@ impl Dropdown {
             {
                 let mut cache_canvas =
                     crate::canvas::Canvas::new(&mut self.pill_cache, cw, ch, &mut cache_damage);
-                let inner_w = (pill_w - 2 * stroke_px).max(0);
-                let inner_h = (pill_h - 2 * stroke_px).max(0);
+                let inner_w = pill_w - 2 * stroke_px;
+                let inner_h = pill_h - 2 * stroke_px;
                 if inner_w > 0 && inner_h > 0 {
                     // Asymmetric corners (TL+BR deep, TR+BL half) — the button family's split.
                     paint::draw_squircle_rrect_f(
@@ -585,7 +588,7 @@ impl Dropdown {
                         inner_w,
                         inner_h,
                         theme::BUTTON_FILL,
-                        paint::asymmetric_radii((pill_h as f32 * 0.5 - stroke_px as f32).max(1.0)),
+                        paint::asymmetric_radii(pill_h as f32 * 0.5 - stroke_px as f32),
                         squirdleyness,
                     );
                 }
@@ -720,7 +723,7 @@ impl Dropdown {
 fn glow_factor_256(font_size: f32, radius_scale: f32) -> u32 {
     let target_radius = font_size * radius_scale;
     let drop = (1240.0 / target_radius) as u32;
-    (256u32.saturating_sub(drop)).clamp(96, 254)
+    (256.0 - drop as f32) as u8 as u32
 }
 
 mod widget_impls {
@@ -829,10 +832,10 @@ mod widget_impls {
         fn focus_bbox(&self) -> Option<crate::canvas::PixelRect> {
             let r = self.bbox();
             Some(crate::canvas::PixelRect::new(
-                r.x.max(0.0) as usize,
-                r.y.max(0.0) as usize,
-                (r.x + r.w).max(0.0) as usize,
-                (r.y + r.h).max(0.0) as usize,
+                r.x as usize,
+                r.y as usize,
+                (r.x + r.w) as usize,
+                (r.y + r.h) as usize,
             ))
         }
     }

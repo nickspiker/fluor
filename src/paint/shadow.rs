@@ -26,6 +26,7 @@ pub fn paint_shadow(
     if rw <= 0 || rh <= 0 {
         return;
     }
+    // WHY/PROOF: window_rect is the OS window's place on the screen buffer, which goes negative or past the edge when the window is dragged partly off-screen — the rays below would index outside the screen without this clip.
     let x_chrome_left = rx.max(0) as usize;
     let y_chrome_top = ry.max(0) as usize;
     let x_chrome_end = ((rx + rw).max(0) as usize).min(scr_w);
@@ -93,8 +94,9 @@ pub fn paint_shadow(
             y -= 1;
         }
         cast_shadow_ray(screen, scr_w, scr_h, factor_256, shadow_seed, x, y);
-        let dx_left = right_col.saturating_sub(x);
-        let dy_up = bot_row.saturating_sub(y);
+        // x can walk past right_col on an opaque run, so dx_left is signed (negative never beats dy_up, as the old saturating 0 never did); y stays ≤ bot_row by the loop condition.
+        let dx_left = right_col as isize - x as isize;
+        let dy_up = (bot_row - y) as isize;
         if dx_left > dy_up {
             break;
         }
@@ -189,8 +191,9 @@ pub fn paint_shadow(
                 yg += 1;
             }
             cast_shadow_ray_ul(screen, scr_w, factor_256, tl_seed, xg, yg);
-            let dx_right = xg.saturating_sub(x_chrome_left);
-            let dy_down = yg.saturating_sub(y_chrome_top);
+            // xg can walk left of x_chrome_left on an opaque run, so dx_right is signed (negative never beats dy_down, as the old saturating 0 never did); yg stays ≥ y_chrome_top since it only steps down from above it.
+            let dx_right = xg as isize - x_chrome_left as isize;
+            let dy_down = (yg - y_chrome_top) as isize;
             if dx_right > dy_down {
                 break;
             }
@@ -239,7 +242,7 @@ pub fn paint_shadow(
     let _ = scr_h;
 }
 
-/// Cast one DR shadow ray. Flat loop, single zero check on shadow_alpha or screen edge. Per cell: * α > 0 (chrome AA) → under-blend black: α += shadow_alpha * (256 - α) >> 8; chrome RGB stays (shadow's premult RGB is 0 since visible black).
+/// Cast one DR shadow ray. Flat loop, single zero check on shadow_alpha or screen edge. With `shadow_seed ≤ 255` (an α byte; the host passes 0x80 or 0x40), `boost = shadow_alpha × (256 − a) >> 8 ≤ 255 − a`, so `a + boost ≤ 255` and needs no clamp. Per cell: * α > 0 (chrome AA) → under-blend black: α += shadow_alpha * (256 - α) >> 8; chrome RGB stays (shadow's premult RGB is 0 since visible black).
 ///   * α == 0 (transparent) → direct-assign black premult: (shadow_alpha << 24), RGB all zero.
 /// Decay shadow_alpha by factor_256 each step.
 fn cast_shadow_ray(
@@ -261,7 +264,7 @@ fn cast_shadow_ray(
         } else {
             let cover = 256 - a;
             let boost = (shadow_alpha * cover) >> 8;
-            let na = (a + boost).min(0xFF);
+            let na = a + boost;
             screen[idx] = (p & 0x00FFFFFF) | (na << 24);
         }
         shadow_alpha = (shadow_alpha * factor_256) >> 8;
@@ -292,7 +295,7 @@ fn cast_shadow_ray_ul(
         } else {
             let cover = 256 - a;
             let boost = (shadow_alpha * cover) >> 8;
-            let na = (a + boost).min(0xFF);
+            let na = a + boost;
             screen[idx] = (p & 0x00FFFFFF) | (na << 24);
         }
         shadow_alpha = (shadow_alpha * factor_256) >> 8;

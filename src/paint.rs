@@ -52,11 +52,12 @@ impl Clip {
         }
     }
 
-    /// Resolve an optional clip — `None` defaults to the full buffer. Used by every primitive at entry so the rest of the function reads from a single concrete `Clip`.
+    /// Resolve an optional clip — `None` defaults to the full buffer, and a given clip is cut to the buffer here, once, so no primitive needs its own `.min(buf_w)` / `.min(buf_h)`. Used by every primitive at entry so the rest of the function reads from a single concrete `Clip`.
     #[inline]
     pub fn resolve(opt: Option<Clip>, buf_w: usize, buf_h: usize) -> Self {
         match opt {
-            Some(c) => c,
+            // WHY/PROOF: a caller's clip is the app's damage rect, which can overhang the buffer (a widget straddling the window edge, a stale rect after a shrink) — every primitive indexes the buffer up to x_end and y_end.
+            Some(c) => Self { x_start: c.x_start.min(buf_w), y_start: c.y_start.min(buf_h), x_end: c.x_end.min(buf_w), y_end: c.y_end.min(buf_h) },
             None => Self::buffer(buf_w, buf_h),
         }
     }
@@ -73,10 +74,11 @@ impl Clip {
         y_max: i32,
     ) -> Option<(usize, usize, usize, usize)> {
         let c = Self::resolve(opt, buf_w, buf_h);
+        // WHY/PROOF: the bbox is the primitive's caller-placed geometry, negative or past the buffer whenever it straddles an edge — max(0) before the cast keeps a negative from wrapping to a huge usize, and the clip bounds keep the loops inside the buffer.
         let x_start = (x_min.max(0) as usize).max(c.x_start);
         let y_start = (y_min.max(0) as usize).max(c.y_start);
-        let x_end = (x_max.max(0) as usize).min(buf_w).min(c.x_end);
-        let y_end = (y_max.max(0) as usize).min(buf_h).min(c.y_end);
+        let x_end = (x_max.max(0) as usize).min(c.x_end);
+        let y_end = (y_max.max(0) as usize).min(c.y_end);
         if x_start >= x_end || y_start >= y_end {
             None
         } else {
@@ -289,8 +291,7 @@ pub fn wrap_add_rgb_where(pixels: &mut [u32], hit_map: &[HitId], target_id: HitI
     let dr = ((delta_rgb >> 16) & 0xFF) as u8;
     let dg = ((delta_rgb >> 8) & 0xFF) as u8;
     let db = (delta_rgb & 0xFF) as u8;
-    let n = pixels.len().min(hit_map.len());
-    for i in 0..n {
+    for i in 0..pixels.len() {
         if hit_map[i] == target_id {
             let p = pixels[i];
             let a = p & 0xFF00_0000;
@@ -360,6 +361,7 @@ pub fn apply_overlay(
     if !any_current && !any_last {
         return;
     }
+    // WHY/PROOF: win_w and win_h are the OS window's, 0 while minimized, and hit_test_map is the app's, resized on its own schedule after an OS resize — the scan would index past it.
     if scr_w == 0
         || win_w == 0
         || win_h == 0
@@ -371,6 +373,7 @@ pub fn apply_overlay(
     let table_len = deltas.len();
     let scr_h = persistent_screen.len() / scr_w;
     // The full on-screen window range — the fallback scan for an id with no bbox.
+    // WHY/PROOF: win_ox and win_oy are the OS window's place on the screen buffer, negative or past its edge while the window is dragged partly off-screen — the window rows and columns outside the screen would index past persistent_screen.
     let full_y_lo = ((-win_oy).max(0) as usize).min(win_h);
     let full_y_hi = win_h.min(((scr_h as i32) - win_oy).max(0) as usize);
     let full_x_lo = ((-win_ox).max(0) as usize).min(win_w);
@@ -398,6 +401,7 @@ pub fn apply_overlay(
         if delta != 0 {
             new_active[id] = true;
         }
+        // WHY/PROOF: bboxes is the app's table (overlay_bboxes), which may be shorter than the hit registry or carry rects past the on-screen window — get() falls back to the full window, and the clamps keep the scan inside both buffers.
         let (y0, y1, x0, x1) = match bboxes.get(id).copied().flatten() {
             Some(r) => (
                 r.y0.clamp(full_y_lo, full_y_hi),
@@ -449,7 +453,7 @@ pub fn apply_overlay(
 ///
 /// Use case: blit a cached widget layer (built by repeated `under()` from empty) onto a target buffer — every Stack layer, Group composite and chrome layer is one.
 pub fn flatten_premult(dst: &mut [u32], src: &[u32]) {
-    let n = dst.len().min(src.len());
+    let n = dst.len();
     if n == 0 {
         return;
     }
@@ -460,7 +464,7 @@ pub fn flatten_premult(dst: &mut [u32], src: &[u32]) {
 
 #[inline]
 fn flatten_premult_chunk(dst: &mut [u32], src: &[u32]) {
-    let n = dst.len().min(src.len());
+    let n = dst.len();
     for i in 0..n {
         let d = dst[i];
         if d >= 0xFF000000 {
@@ -522,25 +526,23 @@ pub fn unpack_argb(packed: u32) -> (u8, u8, u8, u8) {
     (r, g, b, a)
 }
 
-/// Scale a fluor internal pixel's VISIBLE brightness by `num/den`, clamping each channel to
-/// `[0, 255]` and preserving α. Derives a lighter/darker variant of a fill in the same hue — e.g. a custom-coloured button's hover/held fills off its resting fill, so any tint gets the same luminance ramp the `BUTTON_FILL/HOVER/HELD` constants encode (dark idle → ~1.5× hover → ~2.2×
-/// held) instead of a hand-picked pair per colour. `(num, den) = (1, 1)` is identity.
+/// Scale a fluor internal pixel's VISIBLE brightness by `num/den`, each channel saturating at 255 thru the float-to-u8 cast, preserving α. Derives a lighter/darker variant of a fill in the same hue — e.g. a custom-coloured button's hover/held fills off its resting fill, so any tint gets the same luminance ramp the `BUTTON_FILL/HOVER/HELD` constants encode (dark idle → ~1.5× hover → ~2.2× held) instead of a hand-picked pair per colour. `(num, den) = (1, 1)` is identity.
 #[inline]
 pub fn scale_brightness(packed: u32, num: u16, den: u16) -> u32 {
     let (r, g, b, a) = unpack_argb(packed);
-    let s = |c: u8| ((c as u32 * num as u32 / den.max(1) as u32).min(255)) as u8;
+    let s = |c: u8| (c as f64 * num as f64 / den as f64) as u8;
     pack_argb(s(r), s(g), s(b), a)
 }
 
 use crate::pixel::Blend;
 pub use crate::pixel::BlendMode;
 
-/// Flatten `src` underneath `dst` across the whole slice, pixel-by-pixel, via [`Blend::under`]. `dst` is the partial composite already accumulated above (its α-byte = accumulated opacity); `src` is the new layer going behind. Per-pixel early-out fires when `dst.α == 0xFF`. Both slices must be the same length.
+/// Flatten `src` underneath `dst` across the whole slice, pixel-by-pixel, via [`Blend::under`]. `dst` is the partial composite already accumulated above (its α-byte = accumulated opacity); `src` is the new layer going behind. Per-pixel early-out fires when `dst.α == 0xFF`. Both slices must be the same length (a shorter `src` panics: a size mismatch is a bug upstream, never something to paper over).
 ///
 /// For `BlendMode::Normal` (the 99% case) the kernel uses 8-wide SIMD + Rayon parallelism. Other modes fall back to scalar per-pixel with Rayon row-chunking still applied — the math just stays in the scalar [`Blend::under`] kernel.
 #[inline]
 pub fn flatten(dst: &mut [u32], src: &[u32], mode: BlendMode) {
-    let n = dst.len().min(src.len());
+    let n = dst.len();
     if n == 0 {
         return;
     }
@@ -803,8 +805,8 @@ pub fn background_noise_split(
     if buf_w < 2 || buf_h < 2 {
         return;
     }
-    // Texture origin: the left/right mirror axis + each half's inner edge. Clamped in-bounds. Default = buffer centre.
-    let split_x = split_x.unwrap_or(buf_w / 2).min(buf_w);
+    // Texture origin: the left/right mirror axis + each half's inner edge. Default = buffer centre; `background_row` clamps it into the paint range.
+    let split_x = split_x.unwrap_or(buf_w / 2);
     // Right half keeps `scroll_offset`; the left half tracks its own pane when given, else moves with the right (a single unified scroll → the two halves stay mirror-locked).
     let left_scroll = left_scroll.unwrap_or(scroll_offset);
     let clip = Clip::resolve(clip, buf_w, buf_h);
@@ -812,12 +814,13 @@ pub fn background_noise_split(
     let (row_start, row_end, x_start, x_end) = if fullscreen {
         (clip.y_start, clip.y_end, clip.x_start, clip.x_end)
     } else {
-        (
-            (clip.y_start + 1).min(clip.y_end),
-            clip.y_end.saturating_sub(1).max(clip.y_start),
-            (clip.x_start + 1).min(clip.x_end),
-            clip.x_end.saturating_sub(1).max(clip.x_start),
-        )
+        // The 1 px inset crosses itself on a clip under 3 px tall or wide (and would underflow at 0), so it runs signed and an empty result returns here.
+        let (ys, ye) = (clip.y_start as isize + 1, clip.y_end as isize - 1);
+        let (xs, xe) = (clip.x_start as isize + 1, clip.x_end as isize - 1);
+        if ys >= ye || xs >= xe {
+            return;
+        }
+        (ys as usize, ye as usize, xs as usize, xe as usize)
     };
     if row_start >= row_end || x_start >= x_end {
         return;
@@ -874,7 +877,8 @@ fn background_row(
                 .wrapping_sub(height as u64 / 2)
                 .wrapping_mul(0x9E37_79B9_4517_B397)
     };
-    // The mirror axis: both halves grow outward from here. Clamped into the paint range.
+    // The mirror axis: both halves grow outward from here, clamped into the paint range.
+    // WHY/PROOF: split_x is the app's pane split, which the damage clip can leave outside [x_start, x_end) — the halves would index the row outside the paint range.
     let origin = split_x.clamp(x_start, x_end);
 
     // Right half — origin to right edge, ADD step, scrolled by `right_scroll`. Noise composes UNDER existing content (topmost-first): an empty pixel gets the noise; a non-empty pixel (e.g. a topmost rect already painted) has the noise blended behind it.
@@ -905,8 +909,8 @@ fn background_row(
     let mut colour = rng.wrapping_add(shimmer as u64) as u32 & BG_MASK;
     let mut x_hi = origin;
     while x_hi > x_start {
-        let chunk_lo = x_hi.saturating_sub(CHUNK).max(x_start);
-        let chunk_len = x_hi - chunk_lo;
+        let chunk_len = (x_hi - x_start).min(CHUNK);
+        let chunk_lo = x_hi - chunk_len;
         for i in (0..chunk_len).rev() {
             rng ^= rng.rotate_left(13).wrapping_sub(12_345_678_942);
             let adder = rng as u32 & ones;
@@ -986,6 +990,7 @@ pub fn stamp_damage_outline_visible(
     let sy0_i = offset_y + bbox.y0 as i32;
     let sx1_i = offset_x + bbox.x1 as i32;
     let sy1_i = offset_y + bbox.y1 as i32;
+    // WHY/PROOF: offset_x and offset_y are the OS window's place on the screen, negative or past its edge while the window hangs off-screen — the outline would index outside the back buffer.
     let x0 = sx0_i.max(0) as usize;
     let y0 = sy0_i.max(0) as usize;
     let x1 = (sx1_i.max(0) as usize).min(scr_w);
@@ -1008,7 +1013,7 @@ pub fn stamp_damage_outline_visible(
     }
     // Left and right columns (interior rows only — corners are claimed by the top/bottom rows).
     let interior_y0 = y0 + 1;
-    let interior_y1 = y1.saturating_sub(1);
+    let interior_y1 = y1 - 1;
     if interior_y0 < interior_y1 {
         let right_col = x1 - 1;
         for py in interior_y0..interior_y1 {
@@ -1087,7 +1092,7 @@ impl DebugStats {
     /// Bump `frame_count` only — for frames that present without rasterizing (cursor blink off-frame, tint-diff-only hover update once dirty tracking lands). No stage timings updated; the strip continues to show whatever the last rasterize recorded. `damage_pct` updates every present so the live damage area shows even when no rasterize fired.
     #[inline]
     pub fn record_present(&mut self, damage_pct: f32) {
-        self.frame_count = self.frame_count.wrapping_add(1);
+        self.frame_count += 1;
         self.last_damage_pct = damage_pct;
     }
 
@@ -1098,7 +1103,7 @@ impl DebugStats {
         self.fill_secs = fill;
         self.finalize_secs = finalize;
         self.shadow_secs = shadow;
-        self.rasterize_count = self.rasterize_count.wrapping_add(1);
+        self.rasterize_count += 1;
         self.last_rasterize_pct = pct;
     }
 
@@ -1140,7 +1145,7 @@ pub fn draw_debug_strip(
     let shadow_ms = stats.shadow_secs * 1000.0;
     let total_ms = stats.total_secs() * 1000.0;
 
-    let damage_pct = (stats.last_damage_pct * 100.0).clamp(0.0, 100.0);
+    let damage_pct = stats.last_damage_pct * 100.0;
     let stats_line = alloc::format!(
         "app {app_ms:>6.3} ms  fill {fill_ms:>6.3} ms  fin {fin_ms:>6.3} ms  shdw {shadow_ms:>6.3} ms    tot {total_ms:>6.3} ms    F {:>7} R {:>7} ({damage_pct:>5.1}%)",
         stats.frame_count,
@@ -1192,13 +1197,13 @@ pub fn draw_blinkey_tinted(canvas: &mut Canvas, bx: usize, by: usize, height: us
         };
         let w = wave as u32;
         for dx in -7i32..=7 {
-            // The cursor is a BRIGHT wave. In the α + darkness convention (RGB bytes are darkness, `0 = white`), brightening means REDUCING darkness — a per-channel saturating subtract, NOT the add the visible-RGB original used. (Photon's buffer was visible-space, so it added; the port kept the `+=` which silently darkened the cursor into invisibility against a dark field.) α is preserved.
+            // The cursor is a BRIGHT wave. In the α + darkness convention (RGB bytes are darkness, `0 = white`), brightening means REDUCING darkness — a per-channel subtract (signed, floored by the white stop below), NOT the add the visible-RGB original used. (Photon's buffer was visible-space, so it added; the port kept the `+=` which silently darkened the cursor into invisibility against a dark field.) α is preserved.
             let k = w >> dx.unsigned_abs();
             let (kr, kg, kb) = (k * tint.0 as u32 / 255, k * tint.1 as u32 / 255, k * tint.2 as u32 / 255);
             let p = &mut pixels[(idx as isize + dx as isize) as usize];
             let a = *p & 0xFF00_0000;
             // Brightening stops at diffuse white (theme::WHITE), never darkness 0: past white is a 9.7× glow on an HDR surface, and SDR clipped it to white anyway. A pixel already brighter than white keeps its own light.
-            let lift = |d: u32, k: u32, shift: u32| d.saturating_sub(k).max(d.min((crate::theme::WHITE >> shift) & 0xFF));
+            let lift = |d: u32, k: u32, shift: u32| (d as i32 - k as i32).max(d.min((crate::theme::WHITE >> shift) & 0xFF) as i32) as u32;
             let r = lift((*p >> 16) & 0xFF, kr, 16);
             let g = lift((*p >> 8) & 0xFF, kg, 8);
             let b = lift(*p & 0xFF, kb, 0);
@@ -1339,6 +1344,7 @@ pub mod glyph {
         let cxi = x as i32;
         let cyi = y as i32;
         let height = (pixels.len() / width) as i32;
+        // WHY/PROOF: the button sits wherever the chrome strip lands on an OS-sized viewport, which on a tiny window pushes it past an edge — the quadrant loops would index outside the pixel buffer.
         let min_x = ((x as i32) - (r as i32)).max(0);
         let max_x = ((x as i32) + (r as i32)).min(width as i32);
         let min_y = ((y as i32) - (r as i32)).max(0);
@@ -1395,6 +1401,7 @@ pub mod glyph {
         let dy = y2 - y1;
         let len_sq = dx * dx + dy * dy;
         let t = ((px - x1) * dx + (py - y1) * dy) / len_sq;
+        // Not a guard: clamping t to the segment IS the capsule's geometry (closest point on a segment, round caps at both ends) — a smooth stand-in would bend the stroke's ends.
         let t_clamped = t.clamp(0.0, 1.0);
         let cx = x1 + t_clamped * dx;
         let cy = y1 + t_clamped * dy;
@@ -1441,16 +1448,11 @@ pub fn circle_filled(
     // Damage = bbox of the circle clipped to buffer + caller clip.
     {
         let c = Clip::resolve(clip, buf_w, buf_h);
-        let x0 = (cx - radius).max(c.x_start as isize).max(0) as usize;
-        let y0 = (cy - radius).max(c.y_start as isize).max(0) as usize;
-        let x1 = (cx + radius + 1)
-            .min(c.x_end as isize)
-            .min(buf_w as isize)
-            .max(0) as usize;
-        let y1 = (cy + radius + 1)
-            .min(c.y_end as isize)
-            .min(buf_h as isize)
-            .max(0) as usize;
+        // WHY/PROOF: the centre is the caller's layout position, off the buffer whenever the circle straddles an edge — a negative bound would wrap to a huge usize in the damage rect.
+        let x0 = (cx - radius).max(c.x_start as isize) as usize;
+        let y0 = (cy - radius).max(c.y_start as isize) as usize;
+        let x1 = (cx + radius + 1).min(c.x_end as isize).max(0) as usize;
+        let y1 = (cy + radius + 1).min(c.y_end as isize).max(0) as usize;
         canvas.damage.add_bounds(x0, y0, x1, y1);
     }
     let pixels: &mut [u32] = canvas.pixels;

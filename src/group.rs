@@ -160,9 +160,7 @@ impl Group {
         clip: Option<paint::Clip>,
     ) {
         let (region, blend) = (self.region, self.blend);
-        if let Some(layer) = self.rpn.layers.get(idx) {
-            blit_region(&layer.pixels, region, blend, target, target_w, target_h, clip);
-        }
+        blit_region(&self.rpn.layers[idx].pixels, region, blend, target, target_w, target_h, clip);
         self.rpn.settle_layer(idx);
     }
 }
@@ -187,6 +185,7 @@ fn blit_region(
     // Resolve external clip; intersect with target bounds. `None` → full target buffer.
     let clip_rect = paint::Clip::resolve(clip, target_w, target_h);
 
+    // WHY/PROOF: the region's origin is the caller's layout position, which sits partly or wholly off the target whenever content scrolls or a window shrinks — without these row and column clips the slices below would index outside the target buffer.
     for row in 0..gh {
         let ty = gy + row as isize;
         if ty < 0 || (ty as usize) >= target_h {

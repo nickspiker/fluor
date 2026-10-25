@@ -1,6 +1,6 @@
 //! Pill-shaped button widget. Visually a Textbox stripped of the editing apparatus: same squircle silhouette, same two-tone AA edge, same focus-glow, same hover tint via the host's overlay-deltas pipe; just a static centred label, no cursor / scroll / selection / keystroke routing. Adapted from `widgets::textbox` so the pill-cache + text-cache-clipped-by-`AlphaMask` pattern is identical and the two widgets read as a coherent family.
 //!
-//! **Action model.** Button doesn't carry a callback or an action enum — it owns a click counter. App polls [`Button::take_click`] each frame; `true` means the button fired since last poll. That's the smallest stateful API that decouples "the widget knows it was clicked" from "the app knows what to do about it" without dragging closures + lifetime juggling into the widget. For richer action dispatch (per-button intent codes, multi-target routing), the app builds a `HashMap<HitId, Action>` keyed by `button.hit_id()` and matches at the dispatch layer.
+//! **Action model.** Button doesn't carry a callback or an action enum — it owns a click counter. App polls [`Button::take_click`] each frame; `true` means the button fired since last poll. That's the smallest stateful API that decouples "the widget knows it was clicked" from "the app knows what to do about it" without dragging closures + lifetime juggling into the widget. For richer action dispatch (per-button intent codes, multi-target routing), the app keeps a `Vec<(HitId, Action)>` keyed by `button.hit_id()` (a linear scan over a handful of buttons) and matches at the dispatch layer.
 
 use crate::canvas::PixelRect;
 use crate::text::TextStyle;
@@ -289,7 +289,7 @@ impl Button {
 
     /// Mark the click counter advanced. Called from the Click trait impl; pub(crate) so internal consumers can fire it without going thru the trait if they need to (e.g. a hypothetical keyboard accelerator outside Key::on_key).
     pub(crate) fn fire(&mut self) {
-        self.click_counter = self.click_counter.wrapping_add(1);
+        self.click_counter += 1;
     }
 
     /// Symmetric inner padding inside the pill, in pixels. Same model as Textbox so a Button and Textbox at the same `font_size` have visually identical pill margins.
@@ -389,8 +389,8 @@ impl Button {
             self.pill_cache_h = ch;
             let inner_x = stroke_px;
             let inner_y = stroke_px;
-            let inner_w = (pill_w - 2 * stroke_px).max(0);
-            let inner_h = (pill_h - 2 * stroke_px).max(0);
+            let inner_w = pill_w - 2 * stroke_px;
+            let inner_h = pill_h - 2 * stroke_px;
             let mut cache_damage = crate::canvas::Damage::new();
             {
                 let mut cache_canvas =
@@ -404,7 +404,7 @@ impl Button {
                         inner_w,
                         inner_h,
                         pill_fill,
-                        paint::asymmetric_radii((pill_h as f32 * 0.5 - stroke_px as f32).max(1.0)),
+                        paint::asymmetric_radii(pill_h as f32 * 0.5 - stroke_px as f32),
                         squirdleyness,
                     );
                 }
@@ -583,7 +583,7 @@ impl Button {
         let max_w = rect.w * 0.96;
         if tw + font_size * 1.6 > max_w {
             let scaled = font_size * max_w / (tw + font_size * 1.6);
-            font_size = scaled.min(font_size);
+            font_size = scaled;
             tw = text.measure_text(label, &TextStyle::new(font_size, 0).font(font));
         }
         let need_w = tw + font_size * 1.6;
@@ -606,8 +606,9 @@ impl Button {
         };
         // THE HIT STAMP RIDES THE PAINT DECISION (photon 2026-10-01): a pixel that is already opaque when this pill arrives belongs to whatever painted first — the chrome's strip or orb, since fluor is front to back — and the under-blend would skip it, so the stamp skips it too. One decision per pixel, taken BEFORE this pill's own paint makes the pixel opaque. Bbox, not silhouette: the whole pill is clickable (the two-tone pass only covers the edge band), and the corners outside the silhouette are inside the pill's slot anyway. A disabled pill passes hit_map = None and stamps nothing.
         if let Some(hm) = hit_map {
-            let x1 = (x0 + w).clamp(0, buf_w as isize);
-            let y1 = (y0 + h).clamp(0, buf_h as isize);
+            // WHY/PROOF: the pill is placed by the app's layout and runs past the buffer when its row scrolls off an edge — the stamp would index outside the hit map; a far edge below 0 just empties the range.
+            let x1 = (x0 + w).min(buf_w as isize);
+            let y1 = (y0 + h).min(buf_h as isize);
             let sx = x0.max(0);
             let sy = y0.max(0);
             for py in sy..y1 {
@@ -630,8 +631,8 @@ impl Button {
             None,
             None,
         );
-        let inner_w = (w - 2 * stroke).max(0);
-        let inner_h = (h - 2 * stroke).max(0);
+        let inner_w = w - 2 * stroke;
+        let inner_h = h - 2 * stroke;
         if inner_w > 0 && inner_h > 0 {
             // Asymmetric corners (TL+BR deep, TR+BL half) — the same split the retained Button and the window perimeter carry.
             paint::draw_squircle_rrect_f(
@@ -641,7 +642,7 @@ impl Button {
                 inner_w,
                 inner_h,
                 state_fill,
-                paint::asymmetric_radii((h as f32 * 0.5 - stroke as f32).max(1.0)),
+                paint::asymmetric_radii(h as f32 * 0.5 - stroke as f32),
                 paint::SHAPE_POWER as f32,
             );
         }
@@ -669,9 +670,11 @@ impl Button {
         let pill_y = (self.center_y - self.height * 0.5) as isize;
         let cw = self.pill_cache_w;
         let ch = self.pill_cache_h;
-        if cw == 0 || ch == 0 || self.pill_cache.len() < cw * ch {
+        // The cache is resized to cw × ch in the same step that sets cw and ch; 0 means no paint has run yet.
+        if cw == 0 || ch == 0 {
             return;
         }
+        // WHY/PROOF: the pill follows the app's layout past the buffer edge when its row scrolls off — the row and column tests keep the stamp inside the hit map.
         for cy in 0..ch {
             let ty = pill_y + cy as isize;
             if ty < 0 || ty as usize >= buf_h {
@@ -692,11 +695,11 @@ impl Button {
     }
 }
 
-/// Same RU-invariant glow factor as Textbox's [`Textbox::glow_factor_256`]; duplicated here so Button doesn't pull a `pub(crate)` from Textbox just for one tiny formula. Returns a factor in `[96, 254]` where smaller = steeper decay = shorter visual reach; matches the chrome shadow's `factor_256` math so glows around buttons and textboxes share the same look.
+/// Same RU-invariant glow factor as Textbox's [`Textbox::glow_factor_256`]; duplicated here so Button doesn't pull a `pub(crate)` from Textbox just for one tiny formula. Returns a factor in `[0, 255]` (the `as u8` cast saturates both ends; 0 at a tiny font turns the glow off) where smaller = steeper decay = shorter visual reach; matches the chrome shadow's `factor_256` math so glows around buttons and textboxes share the same look.
 fn glow_factor_256(font_size: f32, radius_scale: f32) -> u32 {
     let target_radius = font_size * radius_scale;
     let drop = (1240.0 / target_radius) as u32;
-    (256u32.saturating_sub(drop)).clamp(96, 254)
+    (256.0 - drop as f32) as u8 as u32
 }
 
 mod widget_impls {
@@ -775,10 +778,10 @@ mod widget_impls {
         }
         fn focus_bbox(&self) -> Option<crate::canvas::PixelRect> {
             let r = self.bbox();
-            let x0 = r.x.max(0.0) as usize;
-            let y0 = r.y.max(0.0) as usize;
-            let x1 = (r.x + r.w).max(0.0) as usize;
-            let y1 = (r.y + r.h).max(0.0) as usize;
+            let x0 = r.x as usize;
+            let y0 = r.y as usize;
+            let x1 = (r.x + r.w) as usize;
+            let y1 = (r.y + r.h) as usize;
             Some(crate::canvas::PixelRect::new(x0, y0, x1, y1))
         }
     }

@@ -183,7 +183,7 @@ impl<A: FluorApp> AndroidShell<A> {
             let storm = st.2 as f32 / secs > 30.0;
             if (secs >= 5.0 && storm) || secs >= 30.0 {
                 {
-                    let n = st.1.max(1) as f32;
+                    let n = st.1 as f32;
                     log::info!(
                         "FLUOR: frames — {:.0} frames/s, {:.0} dirty/s; per frame tick {:.1} ms, render {:.1} ms, present {:.1} ms",
                         st.1 as f32 / secs,
@@ -265,9 +265,9 @@ impl<A: FluorApp> AndroidShell<A> {
         self.poll_keyboard()
     }
 
-    /// The scroll-vs-tap slop in pixels: a sixty-fourth of the effective span (≈ the width of a finger's wobble at any zoom — the same notch the zoom feed uses), floored at 8 px. It was a QUARTER of the span (photon field report 2026-10-01, "after a scroll on the contact screen it triggers a select"): on a phone that is a few hundred pixels, so every scroll shorter than a third of the screen released as a tap on whatever row the finger stopped over.
+    /// The scroll-vs-tap slop in pixels: a sixty-fourth of the effective span (≈ the width of a finger's wobble at any zoom — the same notch the zoom feed uses). It was a QUARTER of the span (photon field report 2026-10-01, "after a scroll on the contact screen it triggers a select"): on a phone that is a few hundred pixels, so every scroll shorter than a third of the screen released as a tap on whatever row the finger stopped over.
     fn touch_slop(&self) -> Coord {
-        (self.viewport.effective_span() / 64.0).max(8.0)
+        self.viewport.effective_span() / 64.0
     }
 
     /// Hit id under the finger right now, from the app's [`FluorApp::hit_test_map`] at the surface-local cursor (Android's surface IS the window, so cursor coords need no origin offset). `HIT_NONE` when there is no map or the point is out of bounds. Feeds the [`crate::host::pointer::PointerArbiter`].
@@ -471,6 +471,7 @@ fn clear_scratch_rect(scratch: &mut [u32], width: usize, rect: PixelRect) {
         return;
     }
     let x0 = rect.x0;
+    // WHY/PROOF: rect is the app's damage rect, which can overhang the surface (a widget past a just-rotated edge) — the clear would index past the row.
     let x1 = rect.x1.min(width);
     if x0 >= x1 {
         return;

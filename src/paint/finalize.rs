@@ -19,7 +19,8 @@ use super::{
 /// * `DEBUG_SKIP_PREMULT` (`[]p`): skip the RGB×α step (debug only: every presenter expects premultiplied pixels).
 pub fn finalize_for_os(pixels: &mut [u32], clip_mask: &[u8]) {
     let alpha_mode = DEBUG_SHOW_ALPHA.load(core::sync::atomic::Ordering::Relaxed);
-    let n = pixels.len().min(clip_mask.len());
+    // The clip mask is the window's own shape at the window's size: a shorter one is a sizing bug upstream and panics at the slice below.
+    let n = pixels.len();
     if n == 0 {
         return;
     }
@@ -219,6 +220,7 @@ pub fn scroll_copy_rect(
     y1: usize,
     dy: i32,
 ) {
+    // WHY/PROOF: the rect is the app's scroll hint, which can overhang the screen buffer (a pane taller than a shrunken window) — the row copies would index past the buffer.
     let x0 = x0.min(scr_w);
     let x1 = x1.min(scr_w);
     let y0 = y0.min(scr_h);
@@ -274,6 +276,7 @@ pub fn finalize_into_screen(
     }
     let scr_h = screen.len() / scr_w;
 
+    // WHY/PROOF: rect_x and rect_y are the OS window's place on the screen buffer, negative or past its edge while the window hangs off-screen, and damage_clip is the app's rect — without these the copy would index outside both buffers.
     let rect_sy_min = (-rect_y).max(0) as usize;
     let rect_sx_min = (-rect_x).max(0) as usize;
     let rect_sy_max = win_h.min(((scr_h as i32) - rect_y).max(0) as usize);
@@ -364,6 +367,7 @@ pub fn finalize_into_screen(
             }
             if tint_scan {
                 for px in dst_chunk.iter_mut() {
+                    // WHY/PROOF: not a guard — the debug tint's saturation is what lets repeated incremental hits pile up to full blue; wrapping would blink back to dark every 16 hits.
                     let b = ((*px & 0xFF) as u8).saturating_add(16) as u32;
                     *px = (*px & 0xFFFF_FF00) | b;
                 }
@@ -463,6 +467,7 @@ pub fn finalize_into_f16(
     if dst_stride == 0 || win_w == 0 {
         return 0;
     }
+    // WHY/PROOF: dst is the OS-allocated surface buffer, whose height and stride can lag the window size across a resize — the rows would index past it.
     let rows = win_h.min(dst.len() / dst_stride);
     let w = win_w.min(dst_stride);
     let opaque = crate::paint::OPAQUE_BACKDROP.load(core::sync::atomic::Ordering::Relaxed);
@@ -490,6 +495,7 @@ pub fn finalize_into_1010102(
     if dst_stride == 0 || win_w == 0 {
         return 0;
     }
+    // WHY/PROOF: dst is the OS-allocated surface buffer, whose height and stride can lag the window size across a resize — the rows would index past it.
     let rows = win_h.min(dst.len() / dst_stride);
     let w = win_w.min(dst_stride);
     let opaque = crate::paint::OPAQUE_BACKDROP.load(core::sync::atomic::Ordering::Relaxed);
@@ -567,10 +573,8 @@ fn finalize_into_scalar_debug(
         let dst_row = dst_y * scr_w;
         let src_row = sy * win_w;
         for sx in sx_min..sx_max {
+            // sy < sy_max ≤ win_h and sx < sx_max ≤ win_w (the caller's clip), so the index is inside the window-sized scratch and clip mask.
             let scratch_idx = src_row + sx;
-            if scratch_idx >= scratch.len() || scratch_idx >= clip_mask.len() {
-                break;
-            }
             let dst_idx = dst_row + (rect_x + sx as i32) as usize;
             let v = crate::theme::to_sdr_visible(scratch[scratch_idx]);
             let m = clip_mask[scratch_idx] as u32;

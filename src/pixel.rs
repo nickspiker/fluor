@@ -136,6 +136,7 @@ impl Blend for Argb8 {
                 0xFF - (((0xFF - td_b) * (0xFF - bd_b)) >> 8),
             ),
             BlendMode::Screen => ((td_r * bd_r) >> 8, (td_g * bd_g) >> 8, (td_b * bd_b) >> 8),
+            // WHY/PROOF: the saturation IS the Add and Subtract blend (light past white stays white, darkness past black stays black), not a guard — plain arithmetic would wrap a bright pair to a dark result and underflow u32 into the next lane.
             BlendMode::Add => (
                 (td_r + bd_r).saturating_sub(0xFF),
                 (td_g + bd_g).saturating_sub(0xFF),

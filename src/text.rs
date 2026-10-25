@@ -33,10 +33,11 @@ fn damage_text_bbox(
     let by = ty + text_height;
     let w = buf_w as f32;
     let h = buf_h as f32;
-    let x0 = lx.max(0.0).min(w) as usize;
-    let y0 = ty.max(0.0).min(h) as usize;
-    let x1 = rx.max(0.0).min(w) as usize;
-    let y1 = by.max(0.0).min(h) as usize;
+    // WHY/PROOF: the anchor is the caller's text position, past the buffer whenever the text scrolls off an edge — the min keeps the damage rect inside the buffer; a negative edge needs no floor, since the f32 → usize cast saturates it to 0.
+    let x0 = lx.min(w) as usize;
+    let y0 = ty.min(h) as usize;
+    let x1 = rx.min(w) as usize;
+    let y1 = by.min(h) as usize;
     damage.add_bounds(x0, y0, x1, y1);
 }
 
@@ -400,8 +401,10 @@ impl TextRenderer {
         if !self.optical || !size.is_finite() {
             return weight;
         }
-        let d = ((16.0 - size) * 4.0).clamp(-40.0, 60.0);
-        (weight as f32 + d).round().clamp(100.0, 900.0) as u16
+        // The size → weight lift is the old linear ramp `(16 − size) × 4` eased into its old limits (−40 and +60) by a tanh centred on their midpoint: C∞ where the clamp had kinks at 26 px and 1 px, and within about two weight units of the ramp across 12–20 px.
+        let d = 10.0 + 50.0 * libm::tanhf(((16.0 - size) * 4.0 - 10.0) / 50.0);
+        // The u16 cast saturates; a weight past 100..=900 is bounded by the variable font's own wght axis at the scaler (and matched to the nearest face otherwise).
+        (weight as f32 + d).round() as u16
     }
 
     /// Mutable access to the underlying `FontSystem` so consumers can load additional fonts via `text.font_system_mut().db_mut().load_font_data(...)`.
@@ -953,6 +956,7 @@ impl TextRenderer {
                                     // A variable font drawn at the glyph's weight on its wght axis, as cosmic-text's own cache draws the upright glyphs (Nick 2026-10-14: variable weights in the render, no split fonts).
                                     let wght = swash::Tag::from_be_bytes(*b"wght");
                                     if let Some(axis) = swash_font.variations().find_by_tag(wght) {
+                                        // WHY/PROOF: the axis range is read from the font file, and a weight past it is outside what the face defines — swash's variation coords would extrapolate the outline.
                                         let w = f32::from(glyph.font_weight.0).clamp(axis.min_value(), axis.max_value());
                                         scaler = scaler.normalized_coords(swash_font.variations().normalized_coords([(wght, w)]));
                                     }
@@ -1145,6 +1149,7 @@ impl TextRenderer {
                                 let final_x = (anchor_x + rot_x) as i32;
                                 let final_y = (anchor_y + rot_y) as i32;
                                 // Clip to the buffer: a glyph can land partly (or wholly) off-canvas — e.g. a mid-rotation sliver resize (observed 1440×202 on Android) put final_y negative, and the `as usize` cast wrapped it to ~2^64, indexing OOB (samsung panic, 2026-07-15). Skip the off-canvas pixels instead.
+                                // WHY/PROOF: final_x and final_y come from glyph positioning, negative or past the buffer whenever text runs off an edge — the cast to usize would wrap and the write would land outside the pixel buffer.
                                 if final_x < 0
                                     || final_y < 0
                                     || final_x >= width as i32
@@ -1376,6 +1381,7 @@ impl TextRenderer {
                                 let final_x = glyph_x as isize + cx as isize;
                                 let final_y = glyph_y as isize + cy as isize;
 
+                                // WHY/PROOF: final_x and final_y come from glyph positioning, negative or past the buffer whenever text runs off an edge — the cast to usize would wrap and the write would land outside the pixel buffer.
                                 if final_x < 0 || final_y < 0 || final_x >= width as isize {
                                     continue;
                                 }
@@ -1448,6 +1454,7 @@ impl TextRenderer {
                                 let final_x = glyph_x as isize + cx as isize;
                                 let final_y = glyph_y as isize + cy as isize;
 
+                                // WHY/PROOF: final_x and final_y come from glyph positioning, negative or past the buffer whenever text runs off an edge — the cast to usize would wrap and the write would land outside the pixel buffer.
                                 if final_x < 0 || final_y < 0 || final_x >= width as isize {
                                     continue;
                                 }
@@ -1519,6 +1526,7 @@ impl TextRenderer {
                                 let final_x = glyph_x as isize + cx as isize;
                                 let final_y = glyph_y as isize + cy as isize;
 
+                                // WHY/PROOF: final_x and final_y come from glyph positioning, negative or past the buffer whenever text runs off an edge — the cast to usize would wrap and the write would land outside the pixel buffer.
                                 if final_x < 0 || final_y < 0 || final_x >= width as isize {
                                     continue;
                                 }
@@ -1610,9 +1618,8 @@ impl TextRenderer {
                     Err(i) if i > 0 => byte_to_char[i - 1].1,
                     Err(_) => continue,
                 };
-                if char_idx < widths.len() {
-                    widths[char_idx] += glyph.w;
-                }
+                // char_idx comes from this string's own char_indices, so it is < char_count = widths.len().
+                widths[char_idx] += glyph.w;
             }
         }
         widths
@@ -1757,6 +1764,7 @@ impl TextRenderer {
         let mut x_offset = x_start;
         let chars: Vec<char> = text.chars().collect();
 
+        // WHY/PROOF: the char range is the caller's, which can run past the string — chars[i] would panic.
         for i in start_char_index..end_char_index.min(chars.len()) {
             let ch = chars[i];
             self.render_char_additive(
@@ -1838,6 +1846,7 @@ impl TextRenderer {
                             let final_x = glyph_x + cx as i32;
                             let final_y = glyph_y + cy as i32;
                             // WHY: Glyph can be partially off-screen when textbox is scrolled PROOF: final_x/final_y are i32, can be negative or exceed bounds PREVENTS: Index out of bounds panic on wrapped negative values
+                            // WHY/PROOF: final_x and final_y come from glyph positioning, negative or past the buffer whenever text runs off an edge — the cast to usize would wrap and the write would land outside the pixel buffer.
                             if final_x < 0
                                 || final_y < 0
                                 || final_x as usize >= width

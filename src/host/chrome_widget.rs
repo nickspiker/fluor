@@ -231,7 +231,7 @@ impl DefaultChrome {
             Op::Push(layer_bg),
             Op::Under(BlendMode::Normal),
         ]);
-        let map_len = (viewport.width_px as usize).saturating_mul(viewport.height_px as usize);
+        let map_len = viewport.width_px as usize * viewport.height_px as usize;
         let min_id = widget::next_id(hit_counter);
         let max_id = widget::next_id(hit_counter);
         let close_id = widget::next_id(hit_counter);
@@ -269,7 +269,7 @@ impl DefaultChrome {
             viewport.height_px as Coord,
         );
         self.group.resize(region);
-        let map_len = (viewport.width_px as usize).saturating_mul(viewport.height_px as usize);
+        let map_len = viewport.width_px as usize * viewport.height_px as usize;
         self.hit_test_map.resize(map_len, HIT_NONE);
         self.viewport = viewport;
     }
@@ -302,6 +302,7 @@ impl DefaultChrome {
 
     /// Install the host's bars the orb must clear: `top` (a phone's status bar) and `left` (a side cutout or nav bar), pixels, 0 = none — see [`Self::orb_inset_px`]. Returns whether it changed.
     pub fn set_orb_insets(&mut self, top: Coord, left: Coord) -> bool {
+        // WHY/PROOF: the insets are the OS's status bar / cutout extents as the host reads them, which can come back negative — the stored value must compare equal to "none".
         let px = (top.max(0.0), left.max(0.0));
         if self.orb_inset_px == px {
             return false;
@@ -349,6 +350,7 @@ impl DefaultChrome {
             return;
         }
         crate::paint::scroll_copy_rect(&mut layer.pixels, w, h, rect.x0, rect.y0, rect.x1, rect.y1, dy);
+        // WHY/PROOF: band is the app's exposed-band rect, which can overhang the layer (a pane past a shrunken window) — the fill would index past the layer.
         let (bx0, bx1) = (band.x0.min(w), band.x1.min(w));
         for y in band.y0.min(h)..band.y1.min(h) {
             layer.pixels[y * w + bx0..y * w + bx1].fill(0);
@@ -360,6 +362,7 @@ impl DefaultChrome {
     /// The same shift for the per-pixel hit map: a scrolled pane's hit zones travel with its pixels, so the rows inside `rect` memmove by `dy` and only the exposed band waits for the pane's own re-stamp. Without this a memmoved frame would leave every hit zone one shift behind the pixels.
     pub fn scroll_hit_map(&mut self, rect: crate::canvas::PixelRect, dy: i32) {
         let (w, h) = self.dims();
+        // WHY/PROOF: rect is the app's scroll hint, which can overhang the hit map — the row copies would index past it.
         let (x0, x1, y0, y1) = (rect.x0.min(w), rect.x1.min(w), rect.y0.min(h), rect.y1.min(h));
         if dy == 0 || x1 <= x0 || y1 <= y0 {
             return;
@@ -501,6 +504,7 @@ impl DefaultChrome {
 
         // Controls-strip layout. Computed early so the title text pass can clip against `strip_x` (title shouldn't paint over the buttons even at long titles or narrow windows). The strip lives in the top-right `ctl`-tall band, `strip_w` wide.
         let strip_w = ctl * 7 / 2;
+        // WHY/PROOF: buf_w is the OS window's width, which a user can drag narrower than the controls strip — buf_w − strip_w would underflow usize.
         let strip_x = buf_w.saturating_sub(strip_w);
 
         // App-icon orb layout: centered in the top-left `button_size`-tall band, mirroring the right-side controls strip. Diameter is half the band height so the orb reads as a tasteful badge rather than a full button. Title text shifts right by the orb's footprint when an icon is present. `draw_app_icon` has an `r < 2` early-return so degenerate sizes pass thru without drawing — no min-size guard needed here.
@@ -516,7 +520,8 @@ impl DefaultChrome {
         };
         // Title clears the orb's actual right edge. `draw_title_text`'s base left margin is `button_size/2`, so `left_extra` is the extra push needed to land the title just past `orb_cx + orb_radius` (plus a `button_size/4` gap). Tracks the orb wherever it sits, so moving the orb right keeps the title from sliding under it.
         let title_left_extra = if orb_present {
-            ((orb_cx + orb_radius) as usize + button_size / 4).saturating_sub(button_size / 2)
+            // orb_layout puts the centre at least 2.4 buttons in, so the orb's right edge is always past half a button.
+            (orb_cx + orb_radius) as usize + button_size / 4 - button_size / 2
         } else {
             0
         };

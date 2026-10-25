@@ -109,10 +109,11 @@ pub(crate) fn region_to_pixelrect(
     let vw = viewport_w as f32;
     let vh = viewport_h as f32;
     // Min edge floors, MAX edge CEILS. A damage rect must be a superset of the painted pixels: a region whose right/bottom edge lands on a fractional coordinate (glow reach, sub-pixel pill geometry after a zoom) paints INTO that boundary pixel, so truncating the max down leaves the last column/row unclaimed — a 1px stale sliver of pill edge or focus glow that the dirty-gated bg never repaints under (the contacts search box's "glow clips/lingers on deselect"). Ceil claims that pixel.
-    let x0 = region.x.max(0.0).min(vw).floor() as usize;
-    let y0 = region.y.max(0.0).min(vh).floor() as usize;
-    let x1 = (region.x + region.w).max(0.0).min(vw).ceil() as usize;
-    let y1 = (region.y + region.h).max(0.0).min(vh).ceil() as usize;
+    // WHY/PROOF: the region is the widget's layout, past the viewport whenever it scrolls off an edge — the min keeps the rect inside the buffers it clears; a negative edge needs no floor, since the f32 → usize cast saturates it to 0.
+    let x0 = region.x.min(vw).floor() as usize;
+    let y0 = region.y.min(vh).floor() as usize;
+    let x1 = (region.x + region.w).min(vw).ceil() as usize;
+    let y1 = (region.y + region.h).min(vh).ceil() as usize;
     PixelRect::new(x0, y0, x1, y1)
 }
 
@@ -137,15 +138,14 @@ pub(crate) fn blit_cache_to_target(
     if cache_w == 0 || cache_h == 0 {
         return;
     }
-    let target_w_i = target_w as isize;
-    let target_h_i = target_h as isize;
     let clip_rect = paint::Clip::resolve(clip, target_w, target_h);
 
-    // Damage = blit region ∩ target bounds ∩ clip.
-    let dx0 = (origin_x.max(0).min(target_w_i) as usize).max(clip_rect.x_start);
-    let dy0 = (origin_y.max(0).min(target_h_i) as usize).max(clip_rect.y_start);
-    let dx1 = ((origin_x + cache_w as isize).max(0).min(target_w_i) as usize).min(clip_rect.x_end);
-    let dy1 = ((origin_y + cache_h as isize).max(0).min(target_h_i) as usize).min(clip_rect.y_end);
+    // Damage = blit region ∩ clip (the resolved clip is already inside the target); a start past the target leaves dx0 ≥ dx1 and returns below.
+    // WHY/PROOF: the origin is the widget's layout position, negative or past the target whenever it scrolls off an edge — max(0) keeps the cast from wrapping to a huge usize.
+    let dx0 = (origin_x.max(0) as usize).max(clip_rect.x_start);
+    let dy0 = (origin_y.max(0) as usize).max(clip_rect.y_start);
+    let dx1 = ((origin_x + cache_w as isize).max(0) as usize).min(clip_rect.x_end);
+    let dy1 = ((origin_y + cache_h as isize).max(0) as usize).min(clip_rect.y_end);
     if dx0 >= dx1 || dy0 >= dy1 {
         return;
     }
@@ -153,26 +153,13 @@ pub(crate) fn blit_cache_to_target(
 
     let target = &mut *canvas.pixels;
     let mut hit_map = hit_map;
-    for cy in 0..cache_h {
-        let ty = origin_y + cy as isize;
-        if ty < 0 || ty >= target_h_i {
-            continue;
-        }
-        let ty = ty as usize;
-        if ty < clip_rect.y_start || ty >= clip_rect.y_end {
-            continue;
-        }
+    // Walk only the clipped range: [dx0, dx1) × [dy0, dy1) lies inside the target, the clip and the cache's footprint (dx0 ≥ origin_x, dx1 ≤ origin_x + cache_w), so no per-pixel bounds test.
+    for ty in dy0..dy1 {
+        let cy = (ty as isize - origin_y) as usize;
         let cache_row = cy * cache_w;
         let target_row = ty * target_w;
-        for cx in 0..cache_w {
-            let tx = origin_x + cx as isize;
-            if tx < 0 || tx >= target_w_i {
-                continue;
-            }
-            let tx = tx as usize;
-            if tx < clip_rect.x_start || tx >= clip_rect.x_end {
-                continue;
-            }
+        for tx in dx0..dx1 {
+            let cx = (tx as isize - origin_x) as usize;
             let cache_idx = cache_row + cx;
             let target_idx = target_row + tx;
 
@@ -315,9 +302,10 @@ impl Textbox {
                 // The previous painted rect is the BARE pill; if the box was glowing when it moved, its old halo reached `glow_pad` past that rect — inflate so the trail is fully cleared.
                 let prev_region = if moved && self.focused {
                     let (hp, vp) = self.glow_pad();
+                    // WHY/PROOF: the inflated halo runs past the viewport for a pill at its edge — the far edges stay inside the buffers the damage clears (the near edges saturate to 0 in the f32 → usize cast).
                     PixelRect::new(
-                        (prev.x0 as f32 - hp).max(0.0) as usize,
-                        (prev.y0 as f32 - vp).max(0.0) as usize,
+                        (prev.x0 as f32 - hp) as usize,
+                        (prev.y0 as f32 - vp) as usize,
                         (prev.x1 as f32 + hp).min(viewport_w as f32).ceil() as usize,
                         (prev.y1 as f32 + vp).min(viewport_h as f32).ceil() as usize,
                     )
@@ -431,6 +419,7 @@ impl Textbox {
             self.scroll_offset = 0.0;
         } else {
             let bound = (tw - uw) * 0.5;
+            // WHY/PROOF: not a guard — the bound IS the scroll limit the user's wheel and drag push against; without it the text scrolls out of the pill.
             self.scroll_offset = self.scroll_offset.clamp(-bound, bound);
         }
         if self.scroll_offset != before {
@@ -472,6 +461,7 @@ impl Textbox {
 
     /// Usable text area width (pill interior minus [`Self::padding`] on both sides, minus the [`right_inset`](Self::set_right_inset) button exclusion). What the scroll clamp uses as the "fit boundary": `text_width ≤ usable_width` ⇒ text fits and centres at `scroll_offset = 0`; otherwise it overflows and `scroll_offset` is bounded to `±(text_width − usable_width) / 2`.
     pub fn usable_width(&self) -> Coord {
+        // WHY/PROOF: width and right_inset are the app's, and a pill narrower than its padding plus the button exclusion would report a negative text area to the scroll bounds and the clip mask.
         (self.width - self.padding() * 2.0 - self.right_inset).max(0.0)
     }
 
@@ -482,6 +472,7 @@ impl Textbox {
 
     /// Exclude `inset` pixels at the pill's right edge from the text area (an overlaid button's footprint: its width + its inset from the pill edge). Text layout, scroll bounds, and the clip mask all respect it — typed text stops at the button instead of sliding under it. Invalidates the caches on change (the mask + text anchor both move).
     pub fn set_right_inset(&mut self, inset: Coord) {
+        // WHY/PROOF: the inset is the app's button footprint, which a layout can hand over negative — it would widen the text area past the pill.
         let inset = inset.max(0.0);
         if self.right_inset != inset {
             self.right_inset = inset;
@@ -628,6 +619,7 @@ impl Textbox {
     /// Replace the char range `[start, end)` with `s`, cursor landing after the insertion — the honest-IME editor op (voice dictation and predictive keyboards rewrite EARLIER words via setComposingRegion, which needs true range replacement, not backspace-replay at the cursor). Indices clamp to the text; start > end swaps.
     pub fn replace_char_range(&mut self, start: usize, end: usize, s: &str, text: &mut TextRenderer) {
         let n = self.chars.len();
+        // WHY/PROOF: the range comes from the OS IME (setComposingRegion and friends), which can name chars past the end after a racing edit — the slice would panic.
         let (mut a, mut b) = (start.min(n), end.min(n));
         if a > b {
             core::mem::swap(&mut a, &mut b);
@@ -763,6 +755,7 @@ impl Textbox {
         let tw = self.text_width();
         let uw = self.usable_width();
         let bound = if tw <= uw { 0.0 } else { (tw - uw) * 0.5 };
+        // The spring's rest point is the nearest scroll limit — the clamp defines the target, it guards nothing.
         let target = self.scroll_offset.clamp(-bound, bound);
         let over = self.scroll_offset - target;
         if over == 0.0 {
@@ -830,7 +823,7 @@ impl Textbox {
     fn glow_factor_256(font_size: f32, radius_scale: f32) -> u32 {
         let target_radius = font_size * radius_scale;
         let drop = (1240.0 / target_radius) as u32;
-        (256u32.saturating_sub(drop)).clamp(96, 254)
+        (256.0 - drop as f32) as u8 as u32
     }
 
     /// Larger bbox with the actual focus-glow ray reach added on every side. Horizontal sides use the 0x80 seed reach with the horizontal radius scale (`1.5`); vertical sides use the 0x40 seed reach with the vertical radius scale (`0.75`, half the horizontal so the top/bottom halo is more contained while keeping the same per-pixel intensity at the boundary). Both derived from the same `factor_256` math the render pass uses, so the bbox exactly contains what `apply_textbox_glow_{right,left,top,bottom}` will paint — no early cutoff, no over-clearing. Use this for the focus-on / focus-off transition (glow appearing / disappearing) — the only time we need to repaint the wider halo region. Keep off the per-keystroke hot path.
@@ -905,8 +898,8 @@ impl Textbox {
             // Paint into cache at LOCAL coords (origin = 0,0) so it's blit-translatable.
             let inner_x = stroke_px;
             let inner_y = stroke_px;
-            let inner_w = (pill_w - 2 * stroke_px).max(0);
-            let inner_h = (pill_h - 2 * stroke_px).max(0);
+            let inner_w = pill_w - 2 * stroke_px;
+            let inner_h = pill_h - 2 * stroke_px;
             let mut cache_damage = crate::canvas::Damage::new();
             // Inner squircle (the fill INSIDE the stroke). Scope so cache_canvas drops before the mask read.
             {
@@ -921,7 +914,7 @@ impl Textbox {
                         inner_w,
                         inner_h,
                         theme::TEXTBOX_FILL,
-                        paint::asymmetric_radii((pill_h as f32 * 0.5 - stroke_px as f32).max(1.0)),
+                        paint::asymmetric_radii(pill_h as f32 * 0.5 - stroke_px as f32),
                         squirdleyness,
                     );
                 }
@@ -934,7 +927,7 @@ impl Textbox {
             }
             // Button-exclusion hard cut: zero the mask columns under an overlaid button (right_inset from the pill's right edge) so overflowing text/selection can never paint beneath it. A vertical cut, no AA fade — the button's own opaque fill sits over the boundary, so the cut is never naked.
             if self.right_inset > 0.0 {
-                let cut = (pill_w as Coord - self.right_inset).max(0.0) as usize;
+                let cut = (pill_w as Coord - self.right_inset) as usize;
                 for y in 0..ch {
                     for x in cut..cw {
                         self.inner_pill_mask[y * cw + x] = 0;
@@ -1023,8 +1016,9 @@ impl Textbox {
                 match (first_visible, last_visible) {
                     (Some(fv), Some(lv)) if fv <= lv => {
                         let n = self.chars.len();
+                        // The pad stops at the string's ends (first_padded at 0, last_padded at n − 1, n ≥ 1 since fv exists) — past them the substring slice would panic.
                         let first_padded = fv.saturating_sub(PAD_CHARS);
-                        let last_padded = (lv + PAD_CHARS).min(n.saturating_sub(1));
+                        let last_padded = (lv + PAD_CHARS).min(n - 1);
                         // Left-anchor at the substring's first char position. Centre-anchoring with our cached `sub_width` was jerking when `first_padded`/`last_padded` shifted across char boundaries during scroll, because cosmic-text measures the substring's actual width (max_x − min_x of its glyphs) — which differs from our sum-of-widths by the substring's leading/trailing sidebearings, and those sidebearings change with the boundary chars. Left-anchoring uses only the LEFT position derived from our widths array, so each char lands where the corresponding char in the full string would land regardless of substring boundary.
                         let cum_to_first: Coord = self.widths[..first_padded].iter().sum();
                         let sub_left = local_text_left + cum_to_first;
@@ -1154,6 +1148,7 @@ impl Textbox {
             let blinkey_x = (blinkey_x_v - offset_x as isize) as usize;
             let blinkey_y = ((self.center_y - self.font_size * 0.5) - offset_y) as usize;
             let blinkey_h = self.font_size as usize;
+            // WHY/PROOF: the caret follows the scroll and the app's layout, so its 15-px smear can hang past the buffer's edge — the smear would index outside it.
             if blinkey_x >= 7 && blinkey_x + 7 < buf_w && blinkey_y + blinkey_h <= buf_h {
                 let half = blinkey_h / 2;
                 let top_bright = self.blinkey_wave_top;
@@ -1173,13 +1168,15 @@ impl Textbox {
                         if w == 0 {
                             continue;
                         }
-                        let w = w.min(255) as u8;
+                        // The wave peaks at (8/9)(16/9) × CURSOR_BRIGHTNESS (100) ≈ 158, so it already fits a byte.
+                        let w = w as u8;
                         let idx = (row_base as isize + blinkey_x as isize + dx as isize) as usize;
                         let p = pixels[idx];
                         let a = p & 0xFF00_0000;
                         let r = ((p >> 16) & 0xFF) as u8;
                         let g = ((p >> 8) & 0xFF) as u8;
                         let b = (p & 0xFF) as u8;
+                        // WHY/PROOF: not a guard — brightening a darkness byte stops at 0 (white); a plain subtract would wrap a near-white pixel to near-black.
                         let r = r.saturating_sub(w);
                         let g = g.saturating_sub(w);
                         let b = b.saturating_sub(w);
@@ -1338,10 +1335,10 @@ mod widget_impls {
         }
         fn focus_bbox(&self) -> Option<crate::canvas::PixelRect> {
             // Textbox's geometry is stored as floating-point center + size; converting to PixelRect (usize-bounded integer rect) is a Region-to-PixelRect cast, not the same as `bbox()` (which returns a Region for the focus-glow region API). Truncate toward zero to integer pixels and clamp negative sides to 0 — the focus-bbox is purely for spatial tab-order math, not damage rects, so single-pixel imprecision is fine.
-            let x0 = (self.center_x - self.width * 0.5).max(0.0) as usize;
-            let y0 = (self.center_y - self.height * 0.5).max(0.0) as usize;
-            let x1 = (self.center_x + self.width * 0.5).max(0.0) as usize;
-            let y1 = (self.center_y + self.height * 0.5).max(0.0) as usize;
+            let x0 = (self.center_x - self.width * 0.5) as usize;
+            let y0 = (self.center_y - self.height * 0.5) as usize;
+            let x1 = (self.center_x + self.width * 0.5) as usize;
+            let y1 = (self.center_y + self.height * 0.5) as usize;
             Some(crate::canvas::PixelRect::new(x0, y0, x1, y1))
         }
     }

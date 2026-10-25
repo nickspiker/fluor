@@ -83,6 +83,7 @@ mod x11_atomic {
         };
         // Empty rect → empty rectangle list → the whole window is mouse-transparent (used when the visible window doesn't intersect this surface at all).
         let rect = Rectangle {
+            // WHY/PROOF: the window rect is the OS window's, and XShape's rectangle carries i16 / u16 fields — an off-screen or giant window would wrap the cast into a wrong input region.
             x: x.max(0).min(i16::MAX as i32) as i16,
             y: y.max(0).min(i16::MAX as i32) as i16,
             width: w.min(u16::MAX as u32) as u16,
@@ -298,6 +299,7 @@ fn work_area_windows() -> Option<(i32, i32, u32, u32)> {
     if ok.is_err() {
         return None;
     }
+    // WHY/PROOF: the RECT is what Win32 reports, inverted on a minimized or mid-teardown window — the cast would wrap a negative extent to about 4 billion.
     let w = (r.right - r.left).max(0) as u32;
     let h = (r.bottom - r.top).max(0) as u32;
     if w == 0 || h == 0 {
@@ -339,8 +341,8 @@ fn work_area_macos(origin: (i32, i32), size: (u32, u32)) -> Option<(i32, i32, u3
         let vf = screen.visibleFrame();
         let wa_x = vf.origin.x.round() as i32;
         let wa_y = (primary_h - (vf.origin.y + vf.size.height)).round() as i32;
-        let wa_w = vf.size.width.round().max(0.0) as u32;
-        let wa_h = vf.size.height.round().max(0.0) as u32;
+        let wa_w = vf.size.width.round() as u32;
+        let wa_h = vf.size.height.round() as u32;
         if wa_w == 0 || wa_h == 0 {
             return None;
         }
@@ -379,14 +381,16 @@ fn monitor_rect_of(monitor: &winit::monitor::MonitorHandle) -> MonitorRect {
             ((monitor.position().y as f64) / scale).round() as i32,
         ),
         (
-            ((monitor.size().width.max(1) as f64) / scale).round().max(1.0) as u32,
-            ((monitor.size().height.max(1) as f64) / scale).round().max(1.0) as u32,
+            // WHY/PROOF: winit reports 0×0 for a monitor mid-unplug, and a fractional scale can round a 1-px side to 0 — a zero-sized surface panics the buffer setup.
+            ((monitor.size().width as f64) / scale).round().max(1.0) as u32,
+            ((monitor.size().height as f64) / scale).round().max(1.0) as u32,
         ),
     );
     #[cfg(not(target_os = "macos"))]
     let (origin, size) = {
         let _ = scale;
         (
+            // WHY/PROOF: winit reports 0×0 for a monitor mid-unplug — a zero-sized surface panics the buffer setup.
             (monitor.position().x, monitor.position().y),
             (monitor.size().width.max(1), monitor.size().height.max(1)),
         )
@@ -738,6 +742,7 @@ fn clear_scratch_rect(scratch: &mut [u32], win_w: usize, rect: crate::canvas::Pi
     if rect.is_empty() {
         return;
     }
+    // WHY/PROOF: win_w is the OS window's width, 0 while minimized, and rect is the app's damage rect, which can overhang the scratch — the division and the row fills would panic.
     let win_h = scratch.len() / win_w.max(1);
     let y0 = rect.y0.min(win_h);
     let y1 = rect.y1.min(win_h);
@@ -808,6 +813,7 @@ impl MonitorSurface {
     /// Backing-pixel dimensions of this surface's present buffers: desktop units × `pixel_ratio`, rounded. On X11/Windows `pixel_ratio` is 1.0 so this IS `size`; on macOS `size` is points and this is the Retina backing buffer. Rounding convention for ALL unit→backing conversions in this file: multiply by the ratio, then `.round()` (ties away from zero).
     fn backing(&self) -> (usize, usize) {
         (
+            // WHY/PROOF: size and pixel_ratio are the OS's, and a 0-px side (minimized, mid-unplug) would size a zero-length present buffer.
             ((self.size.0 as f64) * self.pixel_ratio).round().max(1.0) as usize,
             ((self.size.1 as f64) * self.pixel_ratio).round().max(1.0) as usize,
         )
@@ -840,6 +846,7 @@ struct RasterPass {
 struct DesktopShell<A: FluorApp> {
     app: A,
     /// Per-monitor OS surfaces. Phase A: exactly one entry (the primary monitor), created in `resumed`; empty until then.
+    // Empty until `resumed` creates the first OS window and shrinks on a monitor unplug, so every lookup by `home` or a surface index goes thru get() (WHY/PROOF: the OS decides when surfaces exist).
     surfaces: Vec<MonitorSurface>,
     /// Every connected monitor's geometry, PRIMARY FIRST. Distinct from `surfaces` because Linux
     /// runs a single desktop-spanning surface: this is the only place that still knows where one
@@ -1066,6 +1073,7 @@ impl<A: FluorApp> DesktopShell<A> {
     /// Build the pass-0 viewport for a window of `w × h` desktop units: identical dims on X11/Windows, points × `window_scale` on macOS (the app lays out span-relative, so the scaled dims carry the density and `ru` stays the user's zoom multiplier untouched).
     fn pass0_viewport(&self, w: u32, h: u32, ru: Coord) -> Viewport {
         let k = self.unit_to_px() as f64;
+        // WHY/PROOF: w and h are the OS window's, 0 while minimized — a 0-px viewport divides by zero in the effective span.
         let pw = (((w as f64) * k).round() as u32).max(1);
         let ph = (((h as f64) * k).round() as u32).max(1);
         Viewport::new(pw, ph).with_ru(ru)
@@ -1263,6 +1271,7 @@ impl<A: FluorApp> DesktopShell<A> {
             return r;
         };
         let (wx, wy, ww, wh) = s.work_area;
+        // WHY/PROOF: not a guard but this function's job — snap the user's or a restored rect into an OS work area, which reads 0 on a monitor mid-unplug.
         let w = r.w.min(ww.max(1));
         let h = r.h.min(wh.max(1));
         let x = r.x.max(wx).min(wx + ww as i32 - w as i32);
@@ -1284,6 +1293,7 @@ impl<A: FluorApp> DesktopShell<A> {
         } else {
             (m.origin.0, m.origin.1, m.size.0, m.size.1)
         };
+        // WHY/PROOF: not a guard but this function's job — snap the user's or a restored rect into an OS work area, which reads 0 on a monitor mid-unplug.
         let w = r.w.min(ww.max(1));
         let h = r.h.min(wh.max(1));
         let x = r.x.max(wx).min(wx + ww as i32 - w as i32);
@@ -1332,8 +1342,9 @@ impl<A: FluorApp> DesktopShell<A> {
         let origin = (x0, y0);
         // Same one-row undersize `create_monitor_surface` applies, for the same anti-fullscreen reason.
         let size = (
+            // WHY/PROOF: the union is of OS-reported monitors, degenerate when winit reports 0×0 ones — width at least 1, height one row shy but never below 1.
             (x1 - x0).max(1) as u32,
-            (((y1 - y0).max(1) as u32).saturating_sub(1)).max(1),
+            ((y1 - y0).max(2) - 1) as u32,
         );
 
         let same_monitors = self.monitors.len() == new_mons.len()
@@ -1395,6 +1406,7 @@ impl<A: FluorApp> DesktopShell<A> {
         #[cfg(not(target_os = "macos"))]
         {
             let r = hs / self.window_scale;
+            // WHY/PROOF: r is the ratio of two OS scale factors, and the rescaled side (and below, the position clamp into the OS work area) must stay on a real monitor and at least 1 px.
             let new_w = (((self.window_rect.w as f64) * r).round() as u32).max(1);
             let new_h = (((self.window_rect.h as f64) * r).round() as u32).max(1);
             self.window_rect.x += (self.window_rect.w as i32 - new_w as i32) / 2;
@@ -1495,6 +1507,7 @@ impl<A: FluorApp> DesktopShell<A> {
             // Pass geometry — see [`RasterPass`]: same dims + ru multiplier on X11/Windows, points × scale dims + bare user ru on macOS.
             #[cfg(target_os = "macos")]
             let (pw, ph, pru) = (
+                // WHY/PROOF: sc is an OS scale factor and the rect the OS window's — a 0-px pass viewport divides by zero in the effective span.
                 (((self.window_rect.w as f64) * sc).round() as u32).max(1),
                 (((self.window_rect.h as f64) * sc).round() as u32).max(1),
                 user_ru,
@@ -1689,8 +1702,9 @@ impl<A: FluorApp> DesktopShell<A> {
                 ((monitor.position().y as f64) / scale).round() as i32,
             ),
             (
-                ((monitor.size().width.max(1) as f64) / scale).round().max(1.0) as u32,
-                ((monitor.size().height.max(1) as f64) / scale).round().max(1.0) as u32,
+                // WHY/PROOF: winit reports 0×0 for a monitor mid-unplug, and a fractional scale can round a 1-px side to 0 — a zero-sized surface panics the buffer setup.
+                ((monitor.size().width as f64) / scale).round().max(1.0) as u32,
+                ((monitor.size().height as f64) / scale).round().max(1.0) as u32,
             ),
         );
         // `span` overrides the monitor rect when one surface must cover MORE than its monitor —
@@ -1699,6 +1713,7 @@ impl<A: FluorApp> DesktopShell<A> {
         let (origin, mut size) = match span {
             Some((o, sz)) => (o, sz),
             None => (
+                // WHY/PROOF: winit reports 0×0 for a monitor mid-unplug — a zero-sized surface panics the buffer setup.
                 (monitor.position().x, monitor.position().y),
                 (monitor.size().width.max(1), monitor.size().height.max(1)),
             ),
@@ -1706,7 +1721,8 @@ impl<A: FluorApp> DesktopShell<A> {
         // Linux/X11: undersize the surface by ONE pixel row. An undecorated window EXACTLY monitor-sized gets auto-promoted to legacy FULLSCREEN by Mutter-family WMs (Muffin 6.4 verified live 2026-07-25: _NET_WM_STATE grew FULLSCREEN unrequested) — fullscreen-layer stacking sits ABOVE the panel, burying the taskbar (the "black taskbar" lockup; _NET_WM_BYPASS_COMPOSITOR=2 and the unredirect gsetting were both red herrings). h−1 defeats the exact-size match; the missing row is imperceptible — maximize targets the work area, and the bottom row usually sits over the panel anyway.
         #[cfg(target_os = "linux")]
         {
-            size.1 = size.1.saturating_sub(1).max(1);
+            // WHY/PROOF: the size is the OS monitor's; one row shy, never below 1.
+            size.1 = size.1.max(2) - 1;
         }
         #[cfg(target_os = "macos")]
         let pixel_ratio = scale;
@@ -1768,6 +1784,7 @@ impl<A: FluorApp> DesktopShell<A> {
         #[cfg(target_os = "macos")]
         let renderer = Some(super::renderer_wgpu::Renderer::new(
             window.clone(),
+            // WHY/PROOF: the size is winit's, 0 on a minimized window — wgpu panics configuring a zero-sized surface.
             ((size.0 as f64) * scale).round().max(1.0) as u32,
             ((size.1 as f64) * scale).round().max(1.0) as u32,
         ));
@@ -1791,6 +1808,7 @@ impl<A: FluorApp> DesktopShell<A> {
         let surface = None;
 
         // Persistent buffer at backing pixels (== desktop units on X11/Windows, points × scale on macOS).
+        // WHY/PROOF: the size is the OS monitor's, 0 mid-unplug — the persistent buffer and its row math need at least one pixel.
         let bw = ((size.0 as f64) * pixel_ratio).round().max(1.0) as usize;
         let bh = ((size.1 as f64) * pixel_ratio).round().max(1.0) as usize;
         // Multi-monitor diagnostic (rides the consumer's log bridge into the pullable app log): the raw winit monitor geometry AND the derived desktop-unit rect. The macOS cross-monitor vanish investigation hinges on whether these origins land in ONE coherent point space when the two monitors carry different scales — a wrong origin makes involved() miss the second surface forever.
@@ -1862,6 +1880,7 @@ impl<A: FluorApp> DesktopShell<A> {
         // Convert the OS physical size to desktop units — points on macOS (physical ÷ scale is exact: winit derives physical FROM the point layout, so the division inverts it), physical px everywhere else.
         #[cfg(target_os = "macos")]
         let unit_size = {
+            // WHY/PROOF: pixel_ratio is the OS backing scale, which can read 0 before the first scale event — the division below would make an infinite size.
             let pr = self.surfaces[si].pixel_ratio.max(0.5);
             (
                 ((size.width as f64) / pr).round().max(1.0) as u32,
@@ -1960,6 +1979,7 @@ impl<A: FluorApp> DesktopShell<A> {
             } else {
                 (self.window_rect.w, self.window_rect.h)
             };
+            // WHY/PROOF: the wanted size is the app's or the user's last resize, and it must fit the OS monitor and keep at least 1 px.
             let (new_w, new_h) = (want_w.max(1).min(mw), want_h.max(1).min(mh));
             // FIRST placement centres on the monitor. LATER ones keep the user's placement and only
             // pull it back in bounds — re-centring on every surface resize would make the window
@@ -2303,6 +2323,7 @@ impl<A: FluorApp> DesktopShell<A> {
         // Scroll-copy: before finalize, memmove the rigidly-translated region of persistent_screen so only the exposed band (in `damage_clip`) needs finalizing. Gated on `!full_repaint` — a full repaint (frame-level, first_after_wake, or an extra pass) wipes and redraws the surface, so there's nothing to carry forward. The hint is in viewport pixels; translate the rect corners and the delta into this surface's BACKING pixels with the same `(rect_x, rect_y)` blit origin + `pr` scale finalize uses, so the copy lands exactly where the finalized pixels will.
         if !full_repaint {
             if let Some((rect, dy)) = scroll_hint {
+                // WHY/PROOF: rect_x and rect_y are the OS window's place on the surface, negative while the window hangs off its left or top edge — the casts would wrap.
                 let bx0 = (rect_x + (rect.x0 as f64 * pr).round() as i32).max(0) as usize;
                 let by0 = (rect_y + (rect.y0 as f64 * pr).round() as i32).max(0) as usize;
                 let bx1 = (rect_x + (rect.x1 as f64 * pr).round() as i32).max(0) as usize;
@@ -2327,6 +2348,7 @@ impl<A: FluorApp> DesktopShell<A> {
             const FADE_STEP: u8 = 4;
             for px in self.surfaces[si].persistent_screen.iter_mut() {
                 let a = *px & 0xFF00_0000;
+                // WHY/PROOF: not a guard — the debug fade's saturation is what parks untouched pixels at black; wrapping would flash them back to white.
                 let r = (((*px >> 16) & 0xFF) as u8).saturating_sub(FADE_STEP) as u32;
                 let g = (((*px >> 8) & 0xFF) as u8).saturating_sub(FADE_STEP) as u32;
                 let b = ((*px & 0xFF) as u8).saturating_sub(FADE_STEP) as u32;
@@ -2359,7 +2381,7 @@ impl<A: FluorApp> DesktopShell<A> {
             let span = src_vp.effective_span();
             let target_radius = span / 16.0;
             let drop = (1240.0 / target_radius) as u32;
-            let factor_256 = (256u32.saturating_sub(drop)).clamp(96, 254);
+            let factor_256 = (256.0 - drop as f32) as u8 as u32;
             let shadow_seed: u32 = if self.is_focused { 0x80 } else { 0x40 };
             // Shadow casts in surface-local BACKING pixels — the same translated blit origin finalize used, with the window footprint scaled by pixel_ratio.
             let rect_for_shadow = (rect_x, rect_y, px_w, px_h);
@@ -2409,9 +2431,10 @@ impl<A: FluorApp> DesktopShell<A> {
             let strip_h = crate::paint::DEBUG_STRIP_H;
             // Centre the strip in the bottom 1/12th of the window (mirrors the old computation; flush-bottom would collide with the squircle corner cutouts).
             let band_top = (win_h * 11) / 12;
+            // WHY/PROOF: win_h is the OS window's, and a window shorter than 12 strip heights leaves the band thinner than the strip — the subtraction would underflow usize.
             let strip_y_in_window = band_top + ((win_h - band_top).saturating_sub(strip_h)) / 2;
 
-            let strip_px = win_w.saturating_mul(strip_h);
+            let strip_px = win_w * strip_h;
             if self.strip_buf.len() != strip_px {
                 self.strip_buf = vec![0u32; strip_px];
             } else {
@@ -2433,6 +2456,7 @@ impl<A: FluorApp> DesktopShell<A> {
             // Clobber `strip_buf` rows into this surface's persistent_screen at the surface-local `(rect_x, rect_y + strip_y_in_window)`. Per-pixel: XOR α + darkness → visible RGB, force α=0xFF.
             let rect_y_top = rect_y + strip_y_in_window as i32;
             let ps = &mut self.surfaces[si].persistent_screen;
+            // WHY/PROOF: rect_x and rect_y are the OS window's place on the surface, off its edges while the window hangs past them — the row and column tests keep the strip inside persistent_screen.
             for y in 0..strip_h {
                 let scr_y = rect_y_top + y as i32;
                 if scr_y < 0 || (scr_y as usize) >= scr_h {
@@ -2884,6 +2908,7 @@ impl<A: FluorApp> DesktopShell<A> {
         let dx = (self.cursor_x as i32 - self.drag_start_cursor_screen_pos.0) as Coord;
         let dy = (self.cursor_y as i32 - self.drag_start_cursor_screen_pos.1) as Coord;
 
+        // WHY/PROOF: dx and dy are the user's drag, which can pull an edge past the opposite one — the min size keeps the window real and the squircle math from degenerating.
         // Min size keeps the squircle math from degenerating. 128 px matches the pre-pivot limit.
         let min_size: Coord = 128.0;
 
@@ -3098,6 +3123,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
                 x1 = x1.max(m.origin.0 + m.size.0 as i32);
                 y1 = y1.max(m.origin.1 + m.size.1 as i32);
             }
+            // WHY/PROOF: the union is of OS-reported monitors, degenerate when winit reports none or 0×0 ones — a zero-sized spanning surface panics the buffer setup.
             let span = ((x0, y0), ((x1 - x0).max(1) as u32, (y1 - y0).max(1) as u32));
             log::info!("FLUOR-MON: single spanning surface {span:?}");
             let primary = monitors.into_iter().next().expect("monitors is non-empty");
@@ -3150,6 +3176,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
         // Initial visible-window size: app-supplied (defaults to half the screen in each axis), clamped to the surface's work area and centred within it — the work area is already in GLOBAL desktop units, so the centering math places the window correctly even when the primary monitor isn't at (0, 0). Apps with aspect-ratio opinions override [`FluorApp::initial_size`].
         let (wa_x, wa_y, wa_w, wa_h) = self.surfaces[0].work_area;
         let (req_w, req_h) = self.app.initial_size((wa_w, wa_h));
+        // WHY/PROOF: the requested size is the app's, and it must fit the OS work area and keep at least 1 px.
         let initial_w = req_w.max(1).min(wa_w);
         let initial_h = req_h.max(1).min(wa_h);
         let win_x = wa_x + ((wa_w as i32) - (initial_w as i32)) / 2;

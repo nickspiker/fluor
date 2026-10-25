@@ -50,8 +50,8 @@ impl Icon {
             let x = (i as u32 % w) as f32;
             let y = (i as u32 / w) as f32;
             let d = ((x - cx) * (x - cx) + (y - cy) * (y - cy)).sqrt();
-            // Full inside, zero outside, linear ramp across the ~1.5px rim.
-            let cover = ((radius - d) / 1.5).clamp(0.0, 1.0);
+            // Full inside, zero outside, linear ramp across the ~1.5px rim; the ramp runs past 1 inside and below 0 outside, and the `as u8` cast saturates both ends (the stored icon is opaque, so 255 × cover ≥ 255 inside).
+            let cover = (radius - d) / 1.5;
             let a = (((visible >> 24) & 0xFF) as f32 * cover) as u8;
             rgba.push(((visible >> 16) & 0xFF) as u8);
             rgba.push(((visible >> 8) & 0xFF) as u8);
@@ -110,6 +110,7 @@ impl Icon {
             .ok_or(IconError::MissingImageSection)?;
 
         let mut p = img_field.offset_bytes;
+        // WHY/PROOF: the section offset is read from the icon file header — a corrupt or truncated file can point past the end, and data[p] would panic.
         if p >= data.len() {
             return Err(IconError::Parse(format!(
                 "image section offset {} beyond file length {}",
@@ -120,6 +121,7 @@ impl Icon {
         if data[p] == b'>' {
             p += 1;
         }
+        // WHY/PROOF: p may have stepped one past a `>` at the very end of a truncated file — data[p] would panic, and the error message reads the byte the same guarded way.
         if p >= data.len() || data[p] != b'[' {
             return Err(IconError::Parse(format!(
                 "expected '[' at section start, got byte {:02x}",
@@ -128,6 +130,7 @@ impl Icon {
         }
         p += 1;
 
+        // WHY/PROOF: a truncated file can end right after the `[` — data[p] would panic.
         if p < data.len() && data[p] != b'(' {
             let _name = parse(data, &mut p)
                 .map_err(|e| IconError::Parse(format!("section name: {:?}", e)))?;

@@ -143,7 +143,7 @@ impl Checkbox {
     /// Flip the state and bump the change counter — called from the Click / Key impls.
     fn toggle(&mut self) {
         self.checked = !self.checked;
-        self.change_counter = self.change_counter.wrapping_add(1);
+        self.change_counter += 1;
     }
 
     /// Set the state programmatically (mirroring a synced setting into the UI) WITHOUT bumping the change counter — a programmatic set must never re-fire `take_toggle` and echo back into the setting it came from.
@@ -218,7 +218,7 @@ impl Checkbox {
             self.empty_fill.unwrap_or(theme::TEXTBOX_FILL)
         };
         // Asymmetric corners like the textbox, button and window perimeter (Nick 2026-09-10): TL+BR at the box's deep radius, TR+BL at half — the inner fill's corners sit one stroke inside the outer ring's.
-        let inner = (side as isize - 2 * stroke).max(0);
+        let inner = side as isize - 2 * stroke;
         let big = side * 0.32;
         if inner > 0 {
             paint::draw_squircle_rrect_f(
@@ -228,7 +228,7 @@ impl Checkbox {
                 inner,
                 inner,
                 fill,
-                paint::asymmetric_radii((big - stroke as f32).max(1.0)),
+                paint::asymmetric_radii(big - stroke as f32),
                 paint::SHAPE_POWER as f32,
             );
         }
@@ -251,7 +251,7 @@ impl Checkbox {
             // Wrapped label, vertically centred on the widget: one line sits on center_y exactly as before; more lines stack around it.
             let lines = self.label_lines(text);
             let step = self.font_size * 1.25;
-            let first_y = self.center_y - step * (lines.len().saturating_sub(1) as Coord) * 0.5;
+            let first_y = self.center_y - step * (lines.len() as Coord - 1.0) * 0.5;
             for (i, line) in lines.iter().enumerate() {
                 text.draw_text_left(
                     canvas,
@@ -268,13 +268,14 @@ impl Checkbox {
         // Stamp the hit id over the whole widget rect (box + label) so the entire row is clickable.
         if let Some(map) = hit_map.as_deref_mut() {
             let rect = PixelRect::new(
-                (self.center_x - self.width * 0.5).max(0.0) as usize,
-                (self.center_y - self.height * 0.5).max(0.0) as usize,
-                (self.center_x + self.width * 0.5).max(0.0) as usize,
-                (self.center_y + self.height * 0.5).max(0.0) as usize,
+                (self.center_x - self.width * 0.5) as usize,
+                (self.center_y - self.height * 0.5) as usize,
+                (self.center_x + self.width * 0.5) as usize,
+                (self.center_y + self.height * 0.5) as usize,
             );
             let bw = canvas.width;
             let bh = canvas.height;
+            // WHY/PROOF: the widget rect is the app's layout, past the canvas when the row scrolls off an edge — the stamp would index outside the hit map.
             let x1 = rect.x1.min(bw);
             let y1 = rect.y1.min(bh);
             for y in rect.y0..y1 {
@@ -359,10 +360,10 @@ mod widget_impls {
         fn focus_bbox(&self) -> Option<crate::canvas::PixelRect> {
             let r = self.bbox();
             Some(crate::canvas::PixelRect::new(
-                r.x.max(0.0) as usize,
-                r.y.max(0.0) as usize,
-                (r.x + r.w).max(0.0) as usize,
-                (r.y + r.h).max(0.0) as usize,
+                r.x as usize,
+                r.y as usize,
+                (r.x + r.w) as usize,
+                (r.y + r.h) as usize,
             ))
         }
     }

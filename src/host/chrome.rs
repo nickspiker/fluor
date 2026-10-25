@@ -370,14 +370,15 @@ pub fn draw_title_text(
         // Fit n lines into the strip: line step 1.15·font, block ≤ 1.8·button_size.
         let fit = button_size as Coord * 1.8 / (lines.len() as Coord * 1.15);
         if fit < font_size {
-            font_size = fit.max(button_size as Coord * 0.35);
+            font_size = fit;
             lines = wrap(text_renderer, font_size);
         }
     }
-    let n = lines.len().max(1);
+    // A non-empty title splits into at least one line, so n ≥ 1.
+    let n = lines.len();
     let step = font_size * 1.15;
     let half_band = button_size as Coord;
-    let clip_y0 = (y_center - half_band).max(0.0) as usize;
+    let clip_y0 = (y_center - half_band) as usize; // f32 → usize saturates a negative to 0
     let clip_y1 = (y_center + half_band) as usize;
     let clip = Clip::new(left_margin, clip_y0, clip_x_end, clip_y1);
     for (k, line) in lines.iter().enumerate() {
@@ -411,6 +412,7 @@ pub fn draw_status_bar(
     // `band_h / 2` side padding clips long strings off the BL/BR curves.
     if !text.is_empty() {
         let side_margin = band_h / 2;
+        // WHY/PROOF: width is the OS window's, which can be dragged narrower than the side margin — width − side_margin would underflow usize.
         let clip_x_end = width.saturating_sub(side_margin);
         if side_margin < clip_x_end {
             let font_size = band_h as Coord * 0.55;
@@ -464,6 +466,7 @@ pub fn draw_orb_press_glow(
 ) {
     const GLOW_GREY: u8 = 0xB0;
     let r_out = radius * 2;
+    // WHY/PROOF: the host slides the orb partly or wholly off the buffer (photon's conversation blind) — the band and column clips keep every write inside it, and band_h saturates to 0 for an orb wholly below the buffer.
     let band_top = (cy - r_out).max(0) as usize;
     let band_bot = (((cy + r_out + 1).max(0)) as usize).min(height);
     let band_h = band_bot.saturating_sub(band_top);
@@ -706,8 +709,8 @@ fn strip_layout(
     }
     let strip_x = w - strip_w;
     let button_area_offset = button_size / 4;
-    // saturating_sub keeps button_size=0 from underflowing; all the `for ... in 0..button_size` loops fall thru naturally with empty range.
-    let last_row = button_size.saturating_sub(1);
+    // button_size = ceil(span / 32) ≥ 1 for any live viewport (the width/height < 2 bail above), so this never underflows.
+    let last_row = button_size - 1;
     Some((w, strip_w, strip_x, button_area_offset, last_row, h))
 }
 
@@ -976,17 +979,17 @@ pub fn draw_minimize_symbol(
             }
             let px = cx as isize + ww;
             let py = cy as isize + h + (r / 2) as isize;
+            // WHY/PROOF: the glyph sits wherever the controls strip lands on the OS-sized window, past an edge on a tiny one — the write would index outside the buffer.
             if px < 0 || py < 0 || (px as usize) >= width || (py as usize) >= height {
                 continue;
             }
             let idx = (py as usize) * width + (px as usize);
             let gradient = ((r4 - dist4) << 8) / (r3 << 2);
-            // AA via α-byte: opacity = gradient/256 (clamped to 255 = fully opaque).
-            let opacity = gradient.min(256) as u32;
-            if opacity == 0 {
+            // AA via α-byte: opacity = gradient/256, capped at 255 (fully opaque) — not a guard: the interior's gradient grows past 255 by construction and would carry out of the α byte.
+            let chrome_alpha = gradient.min(255) as u32;
+            if chrome_alpha == 0 {
                 continue;
             }
-            let chrome_alpha = opacity.min(255);
             let value = (stroke & 0x00FFFFFF) | (chrome_alpha << 24);
             pixels[idx] = pixels[idx].under(value, BlendMode::Normal);
         }
@@ -1014,8 +1017,9 @@ pub fn draw_maximize_symbol(
     let mut r_inner4 = r_inner * r_inner;
     r_inner4 *= r_inner4;
     let r_inner3 = r_inner * r_inner * r_inner;
-    let outer_thresh = (r3 << 2).max(1);
-    let inner_thresh = (r_inner3 << 2).max(1);
+    // r ≥ 1 and r_inner ≥ 1, so both thresholds are ≥ 4 — no zero divisor.
+    let outer_thresh = r3 << 2;
+    let inner_thresh = r_inner3 << 2;
     let stroke_rgb = (
         ((stroke >> 16) & 0xFF) as u32,
         ((stroke >> 8) & 0xFF) as u32,
@@ -1040,6 +1044,7 @@ pub fn draw_maximize_symbol(
             }
             let px = cx as isize + ww;
             let py = cy as isize + h;
+            // WHY/PROOF: the glyph sits wherever the controls strip lands on the OS-sized window, past an edge on a tiny one — the write would index outside the buffer.
             if px < 0 || py < 0 || (px as usize) >= width || (py as usize) >= height {
                 continue;
             }
@@ -1064,11 +1069,11 @@ pub fn draw_maximize_symbol(
                 let dist_from_outer = r4 - dist4;
                 if dist_from_outer <= outer_thresh {
                     let gradient = (dist_from_outer << 8) / outer_thresh;
-                    let opacity = gradient.min(256) as u32;
-                    if opacity == 0 {
+                    // Capped at 255 (fully opaque): gradient reaches 256 at the ring's inner edge of the ramp and would carry out of the α byte.
+                    let chrome_alpha = gradient.min(255) as u32;
+                    if chrome_alpha == 0 {
                         continue;
                     }
-                    let chrome_alpha = opacity.min(255);
                     (stroke & 0x00FFFFFF) | (chrome_alpha << 24)
                 } else {
                     stroke
@@ -1107,6 +1112,7 @@ pub fn draw_close_symbol(
     let denom = outer8 - inner8; // = 8·rad ≥ 8
 
     let r_i = r as isize;
+    // WHY/PROOF: the glyph sits wherever the controls strip lands on the OS-sized window, past an edge on a tiny one — a negative start would wrap the index.
     let x0 = (cxi - r_i).max(0) as usize;
     let x1 = ((cxi + r_i + 1).max(0) as usize).min(width);
     let y0 = (cyi - r_i).max(0) as usize;

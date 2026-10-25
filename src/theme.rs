@@ -230,6 +230,7 @@ impl HdrTable {
     /// The light (×white) the buffer's brightest value reaches with this table: what the surface reports as its current ratio.
     pub fn buffer_ratio(&self) -> f32 {
         let top = self.q16.iter().copied().max().unwrap_or(65536);
+        // WHY/PROOF: Android's extended-range brightness API rejects a buffer ratio below 1 (white) — a dark frame whose brightest code sits below white would otherwise report one.
         (top.max(65536)) as f32 / 65536.
     }
 }
@@ -249,6 +250,7 @@ impl Hdr10Table {
         let mut code = [0u16; 256];
         for dark in 0..256 {
             let l = G2T_LIGHT_Q16[255 - dark] as f32 / 65536.;
+            // WHY/PROOF: content past the declared ratio is brighter than the surface's top code — without the clip the code would exceed 1023 and carry into the neighbouring channel of the packed RGBA_1010102 word.
             let v = (l / d).min(1.);
             code[dark] = (libm::powf(v, 1. / 2.2) * 1023. + 0.5) as u16;
         }

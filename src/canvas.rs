@@ -32,11 +32,13 @@ impl PixelRect {
 
     #[inline]
     pub fn width(&self) -> usize {
+        // WHY/PROOF: an inverted rect (x0 > x1) is a legal empty value by this type's contract and apps build their own damage rects — plain subtraction would panic on one in debug and report a huge width in release.
         self.x1.saturating_sub(self.x0)
     }
 
     #[inline]
     pub fn height(&self) -> usize {
+        // WHY/PROOF: an inverted rect (y0 > y1) is a legal empty value by this type's contract — plain subtraction would underflow on one.
         self.y1.saturating_sub(self.y0)
     }
 
