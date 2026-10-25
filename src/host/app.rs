@@ -700,7 +700,14 @@ pub fn run_app<A: FluorApp + 'static>(app: A) -> Result<(), EventLoopError> {
 pub fn run_app_recoverable<A: FluorApp + 'static>(
     mut app: A,
 ) -> (A, Result<(), EventLoopError>) {
-    let event_loop = match EventLoop::<A::UserEvent>::with_user_event().build() {
+    let mut builder = EventLoop::<A::UserEvent>::with_user_event();
+    // X11 FIRST on Linux whenever an X display exists (XWayland on a Wayland desktop included): fluor composites into one transparent spanning surface, and only X11 gives it the click-thru input region (XShape) and a buffer that is always the last frame. Under native Wayland the whole spanning surface took the pointer and the drag shifted stale buffers (Emma's Arch laptop, 2026-10-25). Native Wayland remains the fallback when no X display is offered.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty()) {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        builder.with_x11();
+    }
+    let event_loop = match builder.build() {
         Ok(l) => l,
         Err(e) => return (app, Err(e)),
     };
@@ -2577,8 +2584,13 @@ impl<A: FluorApp> DesktopShell<A> {
             let Some(surface) = s.surface.as_mut() else {
                 return;
             };
+            // Shift OUR copy, then hand the platform the whole of it: the buffer softbuffer returns is only the last frame when its age is 1 (X11). On Wayland it rotates two or more buffers, and shifting a two-frames-old buffer by one frame's delta put the window at alternating positions every other frame (Emma's Arch laptop, 2026-10-25: "jitters while you drag, stops when you stop").
+            crate::paint::shift_screen_wrap(&mut s.persistent_screen, scr_w, scr_h, dxp, dyp);
             let mut buffer = surface.buffer_mut().expect("softbuffer buffer_mut");
-            crate::paint::shift_screen_wrap(&mut buffer, scr_w, scr_h, dxp, dyp);
+            if buffer.len() != s.persistent_screen.len() {
+                return;
+            }
+            buffer.copy_from_slice(&s.persistent_screen);
             buffer.present().expect("softbuffer buffer.present");
         }
         self.push_input_region(si);
