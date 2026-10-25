@@ -324,6 +324,23 @@ pub fn apply_textbox_glow_bottom(
     }
 }
 
+/// Where the glow's ceiling starts to bend: below it the adder passes untouched.
+const GLOW_KNEE: u32 = 48;
+/// What the glow's ceiling approaches and never passes.
+const GLOW_CEIL: u32 = 74;
+
+/// The glow's peak brightness as a smooth ceiling (Nick 2026-10-25) where the legacy curve had a hard min(71) and min(70).
+/// Identity up to the knee, then the hyperbola knee + e·span / (e + span) with e the excess and span = ceil − knee: slope 1 on both sides of the knee (C¹), approaching the ceiling asymptotically (the quotient rounds, so a full step peaks where the legacy cap did).
+/// A full 255 edge step lands where the hard caps sat: 239 → 71 across, 191 → 70 down and up.
+#[inline]
+fn glow_ceiling(x: u32) -> u32 {
+    if x <= GLOW_KNEE {
+        return x;
+    }
+    let (e, span) = (x - GLOW_KNEE, GLOW_CEIL - GLOW_KNEE);
+    GLOW_KNEE + (e * span + (e + span) / 2) / (e + span)
+}
+
 /// Paint a 4-directional blur glow around a textbox pill silhouette.
 ///
 /// Loop structure + adder/intensity math ported from photon's `apply_textbox_glow` (`compositing.rs:4479`). Pixel writes compose UNDER whatever's already in the buffer via [`Blend::under`] (Normal) — same kernel as every other fluor primitive. Caller paints squircle FIRST (topmost), then this; the squircle's opaque interior takes the under() early-out so glow stays outside the silhouette, AA-edge pixels (α<255) let glow bleed thru the soft transition.
@@ -405,8 +422,7 @@ pub fn apply_textbox_glow(
             if bx > 0 && mask[idx] < mask[idx - 1] {
                 adder += (mask[idx - 1] - mask[idx]) as u32;
             }
-            // WHY/PROOF: not a guard but the ported glow's peak brightness (photon's legacy curve) — uncapped, a full 255 edge step leaves the adder near 239 and the halo about three times brighter; a smooth ceiling is the owner's call.
-            adder = (adder * 15 >> 4).min(71);
+            adder = glow_ceiling(adder * 15 >> 4);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
             if intensity > 0 {
                 let new_pixel = (intensity << 24) | glow_rgb;
@@ -425,8 +441,7 @@ pub fn apply_textbox_glow(
             if bx + 1 < buf_w && mask[idx] < mask[idx + 1] {
                 adder += (mask[idx + 1] - mask[idx]) as u32;
             }
-            // WHY/PROOF: the same peak-brightness ceiling as the right blur (a visible shape, not a guard).
-            adder = (adder * 15 >> 4).min(71);
+            adder = glow_ceiling(adder * 15 >> 4);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
             if intensity > 0 {
                 let new_pixel = (intensity << 24) | glow_rgb;
@@ -451,8 +466,7 @@ pub fn apply_textbox_glow(
                     adder += (mask[ia] - mask[idx]) as u32;
                 }
             }
-            // WHY/PROOF: not a guard but the ported glow's vertical peak brightness (photon's legacy curve) — uncapped, the top and bottom halo brighten several times over.
-            adder = (adder * 3 >> 2).min(70);
+            adder = glow_ceiling(adder * 3 >> 2);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
             if intensity > 0 {
                 let new_pixel = (intensity << 24) | glow_rgb;
@@ -480,13 +494,31 @@ pub fn apply_textbox_glow(
                     adder += (mask[ib] - mask[idx]) as u32;
                 }
             }
-            // WHY/PROOF: the same peak-brightness ceiling as the down blur (a visible shape, not a guard).
-            adder = (adder * 3 >> 2).min(70);
+            adder = glow_ceiling(adder * 3 >> 2);
             let intensity = (adder * (255 - mask[idx]) as u32) >> 8;
             if intensity > 0 {
                 let new_pixel = (intensity << 24) | glow_rgb;
                 pixels[idx] = pixels[idx].under(new_pixel, BlendMode::Normal);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The smooth ceiling keeps the legacy peaks, rises monotonically and never passes its ceiling.
+    #[test]
+    fn glow_ceiling_keeps_the_legacy_peaks() {
+        assert_eq!(glow_ceiling(239), 71, "a full step across");
+        assert_eq!(glow_ceiling(191), 70, "a full step down or up");
+        assert_eq!(glow_ceiling(GLOW_KNEE), GLOW_KNEE);
+        let mut last = 0;
+        for x in 0..=4096u32 {
+            let y = glow_ceiling(x);
+            assert!(y >= last && y <= GLOW_CEIL, "x {x}: {y} after {last}");
+            last = y;
         }
     }
 }
