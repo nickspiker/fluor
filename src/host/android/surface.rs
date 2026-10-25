@@ -237,6 +237,7 @@ impl Surface {
                     0,
                     clip,
                     true,
+                    false,
                 );
                 if magic_idx < stride {
                     dst_pixels[magic_idx] = self.content_version;

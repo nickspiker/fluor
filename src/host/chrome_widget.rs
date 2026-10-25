@@ -830,6 +830,12 @@ impl DefaultChrome {
         }
     }
 
+    /// [`Self::damage_rect`] for an app that never flattens the bg layer — its picture goes under the chrome some other way (the GPU present's under layer): only the chrome layer's own repaint is damage, since the bg layer's dirty flag, never settled by a flatten, would otherwise make every frame a whole-window repaint.
+    pub fn chrome_damage_rect(&self) -> Option<crate::canvas::PixelRect> {
+        let (w, h) = self.dims();
+        self.group.rpn.layers[self.layer_chrome].dirty.then(|| crate::canvas::PixelRect::new(0, 0, w, h))
+    }
+
     /// Read-only accessor so the host overlay pass can walk the hit-test map without taking ownership.
     pub fn hit_test_map(&self) -> &[HitId] {
         &self.hit_test_map

@@ -349,7 +349,7 @@ pub fn apply_overlay(
     deltas: &[u32],
     bboxes: &[Option<crate::canvas::PixelRect>],
     last_active: &mut [bool],
-) {
+) -> Option<crate::canvas::PixelRect> {
     debug_assert_eq!(
         deltas.len(),
         last_active.len(),
@@ -359,7 +359,7 @@ pub fn apply_overlay(
     let any_current = deltas.iter().any(|&d| d != 0);
     let any_last = last_active.iter().any(|&a| a);
     if !any_current && !any_last {
-        return;
+        return None;
     }
     // WHY/PROOF: win_w and win_h are the OS window's, 0 while minimized, and hit_test_map is the app's, resized on its own schedule after an OS resize — the scan would index past it.
     if scr_w == 0
@@ -368,7 +368,7 @@ pub fn apply_overlay(
         || hit_test_map.len() < win_w * win_h
         || scratch.len() < win_w * win_h
     {
-        return;
+        return None;
     }
     let table_len = deltas.len();
     let scr_h = persistent_screen.len() / scr_w;
@@ -382,12 +382,14 @@ pub fn apply_overlay(
         for a in last_active.iter_mut() {
             *a = false;
         }
-        return;
+        return None;
     }
 
     // Snapshot prev → new. With u16 IDs the previous fixed `[bool; 256]` swap can't survive, but the table is bounded by registered widget count (~tens, not 65 k) so a per-frame Vec pair is cheap.
     let prev_active: alloc::vec::Vec<bool> = last_active.to_vec();
     let mut new_active = alloc::vec![false; table_len];
+    // The window pixels the scans covered, for a present that uploads only what changed.
+    let mut touched: Option<crate::canvas::PixelRect> = None;
 
     // Per-id BOUNDED scan: for each id that's tinted now OR was last frame, walk ONLY its bbox (clamped to the on-screen range; falling back to the full window if it has none), tinting the pixels where `hit_map == id`.
     // This makes hover cost O(hovered widget), not O(screen) — the whole point of the bbox table.
@@ -411,6 +413,12 @@ pub fn apply_overlay(
             ),
             None => (full_y_lo, full_y_hi, full_x_lo, full_x_hi),
         };
+        if y0 < y1 && x0 < x1 {
+            touched = Some(match touched {
+                Some(t) => crate::canvas::PixelRect::new(t.x0.min(x0), t.y0.min(y0), t.x1.max(x1), t.y1.max(y1)),
+                None => crate::canvas::PixelRect::new(x0, y0, x1, y1),
+            });
+        }
         let sqrt = delta & OVERLAY_SQRT_BRIGHTEN != 0;
         let dr = ((delta >> 16) & 0xFF) as u8;
         let dg = ((delta >> 8) & 0xFF) as u8;
@@ -447,6 +455,7 @@ pub fn apply_overlay(
         }
     }
     last_active.copy_from_slice(&new_active);
+    touched
 }
 
 /// Compose `src` underneath `dst` where `src` is in *pre-composed* α + darkness form (the result of a chain of `under()` writes starting from empty — so `src.dark` is already attenuated by `src.α`). Unlike [`flatten`] with `BlendMode::Normal`, this kernel scales src's contribution by `(256 − dst.α)` only, NOT by `(256 − dst.α) × src.α`, avoiding the second premult that would dim every AA pixel.

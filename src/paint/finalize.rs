@@ -255,6 +255,8 @@ pub fn scroll_copy_rect(
 
 /// Combined finalize + blit: same per-pixel math as [`finalize_for_os`] (XOR darkness→visible, multiply clip_mask into α, RGB×α premultiply) but reads from a `(win_w × win_h)` scratch buffer and writes into a `(scr_w × scr_h)` screen buffer at the offset `(rect_x, rect_y)`. Used by the fullscreen-compositor host path: the consumer renders into the scratch (window-space, contiguous), this function reads scratch + clip_mask once per pixel and writes the OS-ready ARGB into the screen buffer's sub-rect. The scratch buffer is **not mutated** — its α + darkness convention is preserved so a future incremental-rendering path can reuse it across frames without forcing a full re-render.
 ///
+/// `over`: the scratch goes over an under layer the GPU present lays beneath it — partly covering pixels are finalized as their own colour (see [`finalize_over_chunk`]), not as the pixel over white.
+///
 /// Pre-conditions: `rect_x + win_w ≤ scr_w` and `rect_y + win_h ≤ scr_h` (rect fits inside the screen). Caller is responsible for clearing the destination region (typically the whole screen buffer cleared to `0` so pixels outside `rect` stay α=0 and the OS compositor shows whatever's behind us).
 ///
 /// One pass over pixels — same cost per pixel as `finalize_for_os` plus one address calculation for the screen-buffer offset.
@@ -269,6 +271,7 @@ pub fn finalize_into_screen(
     rect_y: i32,
     damage_clip: crate::canvas::PixelRect,
     full_repaint: bool,
+    over: bool,
 ) {
     let alpha_mode = DEBUG_SHOW_ALPHA.load(core::sync::atomic::Ordering::Relaxed);
     if scr_w == 0 || damage_clip.is_empty() {
@@ -321,7 +324,8 @@ pub fn finalize_into_screen(
     }
 
     let skip_premult = DEBUG_SKIP_PREMULT.load(core::sync::atomic::Ordering::Relaxed);
-    let opaque = crate::paint::OPAQUE_BACKDROP.load(core::sync::atomic::Ordering::Relaxed);
+    // Over an under layer the layer is the backdrop: the chrome keeps its own α and the present fills the rest of the window from the layer.
+    let opaque = crate::paint::OPAQUE_BACKDROP.load(core::sync::atomic::Ordering::Relaxed) && !over;
 
     let tint_scan = DEBUG_SHOW_OPAQUE_SCAN.load(core::sync::atomic::Ordering::Relaxed);
     if full_repaint {
@@ -331,7 +335,11 @@ pub fn finalize_into_screen(
             let src_chunk = &scratch[scratch_off..scratch_off + row_len];
             let clip_chunk = &clip_mask[scratch_off..scratch_off + row_len];
             let dst_chunk = &mut screen_row[dst_x_min..dst_x_min + row_len];
-            finalize_into_chunk_dispatch(src_chunk, clip_chunk, dst_chunk, skip_premult);
+            if over {
+                finalize_over_chunk(src_chunk, clip_chunk, dst_chunk);
+            } else {
+                finalize_into_chunk_dispatch(src_chunk, clip_chunk, dst_chunk, skip_premult);
+            }
             if opaque {
                 for px in dst_chunk.iter_mut() {
                     *px |= 0xFF00_0000;
@@ -359,7 +367,11 @@ pub fn finalize_into_screen(
             let clip_chunk = &clip_row[l..l + len];
             let src_chunk = &src_row[l..l + len];
             let dst_chunk = &mut screen_row[dst_x_min + l..dst_x_min + l + len];
-            finalize_into_chunk_dispatch(src_chunk, clip_chunk, dst_chunk, skip_premult);
+            if over {
+                finalize_over_chunk(src_chunk, clip_chunk, dst_chunk);
+            } else {
+                finalize_into_chunk_dispatch(src_chunk, clip_chunk, dst_chunk, skip_premult);
+            }
             if opaque {
                 for px in dst_chunk.iter_mut() {
                     *px |= 0xFF00_0000;
@@ -373,6 +385,30 @@ pub fn finalize_into_screen(
                 }
             }
         });
+    }
+}
+
+/// Finalize for a scratch that goes OVER an under layer (the GPU present lays the app's own picture beneath the chrome, `host::gpu::UnderLayer`): the scratch's darkness is premultiplied by α (the under-chains build it so), so a partly covering pixel's own colour is its darkness ÷ α — that thru the display map, then premultiplied by α × clip, the way the present adds the layer's light under it.
+/// The plain finalize takes the darkness as it is, which is the pixel over WHITE: right for a window whose content is opaque, too light here, where the map shows thru the anti-aliased edges of the chrome's text and controls.
+/// An opaque or empty pixel comes out exactly as the plain finalize gives it.
+fn finalize_over_chunk(src: &[u32], clip: &[u8], dst: &mut [u32]) {
+    for i in 0..src.len() {
+        let p = src[i];
+        let a = p >> 24;
+        let v = if a == 0 || a == 255 {
+            crate::theme::to_sdr_visible(p)
+        } else {
+            let k = (255 << 16) / a;
+            // WHY/PROOF: an app may write straight darkness with partial α (pack_argb takes visible RGB and α apart), whose darkness exceeds α — un-premultiplying it would carry past the byte into the next channel.
+            let un = |d: u32| ((d * k + 32768) >> 16).min(255);
+            crate::theme::to_sdr_visible((a << 24) | (un((p >> 16) & 0xFF) << 16) | (un((p >> 8) & 0xFF) << 8) | un(p & 0xFF))
+        };
+        let m = clip[i] as u32;
+        let final_a = (a * m) >> 8;
+        let r = (((v >> 16) & 0xFF) * final_a) >> 8;
+        let g = (((v >> 8) & 0xFF) * final_a) >> 8;
+        let b = ((v & 0xFF) * final_a) >> 8;
+        dst[i] = (final_a << 24) | (r << 16) | (g << 8) | b;
     }
 }
 

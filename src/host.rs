@@ -41,9 +41,9 @@ pub mod widget;
 #[cfg(feature = "text")]
 pub mod pointer;
 
-/// macOS renderer — wgpu/Metal with PostMultiplied alpha for transparent corners.
-#[cfg(all(feature = "host-winit", target_os = "macos"))]
-pub mod renderer_wgpu;
+/// The GPU present: wgpu/Metal on macOS, wgpu/Vulkan on Linux with the `gpu` feature; an app's own GPU picture goes under the chrome on the surface.
+#[cfg(all(feature = "host-winit", fluor_gpu))]
+pub mod gpu;
 
 /// Winit ↔ fluor event translation helpers. Used by host-winit's `DesktopShell` to translate at the event-loop boundary, and by consumers that still receive winit-shaped events from `FluorApp::on_event` while the trait migration is in flight.
 #[cfg(feature = "host-winit")]

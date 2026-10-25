@@ -579,6 +579,22 @@ pub trait FluorApp {
     /// Per-frame paint into the host's CPU present buffer. Flatten owned Groups onto `target`. The damage clip computed pre-render is in `ctx.damage_clip`; thread it thru every flatten / blit / glow call to skip pixels outside the dirty region.
     fn render(&mut self, target: &mut [u32], ctx: &mut Context);
 
+    /// Draw on fluor's GPU (macOS always presents thru wgpu; Linux with fluor's `gpu` feature): `Some` asks for a device with these features and limits, made once, on the adapter that presents to the window, before [`Self::init`]. `None` (the default) keeps Linux on softbuffer and gives macOS a plain device.
+    #[cfg(fluor_gpu)]
+    fn gpu_request(&self, _adapter: &wgpu::Adapter) -> Option<super::gpu::GpuRequest> {
+        None
+    }
+
+    /// fluor's device is made (after [`Self::gpu_request`], before [`Self::init`]): the app keeps a clone to draw on it.
+    #[cfg(fluor_gpu)]
+    fn gpu_ready(&mut self, _gpu: &super::gpu::Gpu) {}
+
+    /// The app's picture under the chrome this frame, drawn on fluor's device and submitted by the end of [`Self::render`], the size of the pass-0 viewport: fluor's present lays it under the chrome inside the window's clip mask, so `render` paints only what goes over it (the scratch transparent elsewhere). Asked once per frame, right after the pass-0 render; the presents in between (the drag fast path, an OS expose) lay the last one under, at the window's place. Default: none.
+    #[cfg(fluor_gpu)]
+    fn under_layer(&mut self) -> Option<super::gpu::UnderLayer> {
+        None
+    }
+
     /// Per-hit-id overlay delta table for THIS frame. The host runs one walk over `hit_test_map()` after finalize+shadow; for each pixel `i`, if `current[id] != last_applied[id]`, it wrap-adds the prior delta back and wrap-subs the current delta in `persistent_screen` (visible-RGB space). Apps return a slice where entry `[id]` is the visible-RGB delta to apply to pixels marked with that hit id this frame (e.g. the hover tint when a button is hovered, zero otherwise). Length must equal `registry.next_id` (= 1 + number of registered hit zones); IDs past the slice are treated as zero-delta. Default impl: empty slice (no overlay tints, no allocations).
     ///
     /// Takes `&mut self` so apps can build the table by walking their [`crate::host::widget::Container`] (which threads `&mut dyn Widget` thru `visit`) — see [`crate::host::widget::build_overlay_deltas`] for the canonical one-liner implementation.
@@ -788,10 +804,10 @@ struct MonitorSurface {
     pixel_ratio: f64,
     /// This monitor's work area `(x, y, w, h)` in GLOBAL desktop units — the monitor minus panels/taskbars, via [`monitor_work_area`].
     work_area: (i32, i32, u32, u32),
-    /// wgpu renderer for this surface (macOS present path).
-    #[cfg(target_os = "macos")]
-    renderer: Option<super::renderer_wgpu::Renderer>,
-    /// softbuffer surface for this window (Linux/X11, Redox); `None` on Windows which presents via UpdateLayeredWindow directly.
+    /// The GPU present for this surface (macOS always; Linux with the `gpu` feature when the app asked for fluor's device — softbuffer otherwise).
+    #[cfg(fluor_gpu)]
+    presenter: Option<super::gpu::Presenter>,
+    /// softbuffer surface for this window (Linux/X11, Redox); `None` on Windows which presents via UpdateLayeredWindow directly, and on Linux when the GPU presents.
     #[cfg(not(target_os = "macos"))]
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
     /// Persistent surface-sized pixel buffer, owned by us. Survives across frames so post-finalize overlays (hover/focus tint diffs, blinkey) can mutate just a few pixels each frame without re-running finalize for the whole window. The platform's softbuffer / wgpu back buffer may rotate or arrive stale; we always memcpy this over it just before `present()` so the platform buffer's prior state doesn't matter. Resized when the surface size changes.
@@ -817,6 +833,15 @@ impl MonitorSurface {
             ((self.size.0 as f64) * self.pixel_ratio).round().max(1.0) as usize,
             ((self.size.1 as f64) * self.pixel_ratio).round().max(1.0) as usize,
         )
+    }
+
+    /// Part of the persistent buffer changed (backing pixels): the GPU present uploads it. Nothing to track for the CPU presents, which copy the buffer whole.
+    #[allow(unused_variables)]
+    fn mark(&mut self, x0: i32, y0: i32, x1: i32, y1: i32) {
+        #[cfg(fluor_gpu)]
+        if let Some(p) = self.presenter.as_mut() {
+            p.mark(x0, y0, x1, y1);
+        }
     }
 
     /// This monitor's rect in GLOBAL desktop units, in the tuple shape [`intersect_rect`] speaks.
@@ -947,6 +972,15 @@ struct DesktopShell<A: FluorApp> {
     hittest_off: bool,
     #[cfg(target_os = "macos")]
     hittest_monitor: Option<super::macos_hittest::HittestMonitor>,
+    /// fluor's GPU, made with the first surface (see [`FluorApp::gpu_request`]); `None` on Linux when the app did not ask or no adapter presents.
+    #[cfg(fluor_gpu)]
+    gpu: Option<super::gpu::Gpu>,
+    /// The device was tried for (made or not): Linux asks the app once.
+    #[cfg(fluor_gpu)]
+    gpu_tried: bool,
+    /// The app's layer from the last pass-0 render ([`FluorApp::under_layer`]).
+    #[cfg(fluor_gpu)]
+    under: Option<super::gpu::UnderLayer>,
 }
 
 #[cfg(feature = "host-winit")]
@@ -1016,6 +1050,12 @@ impl<A: FluorApp> DesktopShell<A> {
             hittest_off: false,
             #[cfg(target_os = "macos")]
             hittest_monitor: None,
+            #[cfg(fluor_gpu)]
+            gpu: None,
+            #[cfg(fluor_gpu)]
+            gpu_tried: false,
+            #[cfg(fluor_gpu)]
+            under: None,
         }
     }
 
@@ -1193,6 +1233,36 @@ impl<A: FluorApp> DesktopShell<A> {
         }
     }
 
+    /// Present surface `si` thru its GPU presenter: the app's layer under the chrome where the window is on this surface. `all` marks the whole buffer changed; `clip` uploads the window's clip mask (its shape was cut again: a full repaint).
+    #[cfg(fluor_gpu)]
+    fn gpu_present(&mut self, si: usize, all: bool, clip: bool) {
+        let layer = self.under.clone();
+        let (vw, vh) = (self.viewport.width_px, self.viewport.height_px);
+        let Some(gpu) = self.gpu.as_ref() else {
+            return;
+        };
+        let s = &mut self.surfaces[si];
+        let pr = s.pixel_ratio;
+        // The window on this surface in backing pixels, under the one unit→backing rounding convention (multiply, then `.round()`).
+        let rect = (
+            (((self.window_rect.x - s.origin.0) as f64) * pr).round() as i32,
+            (((self.window_rect.y - s.origin.1) as f64) * pr).round() as i32,
+            ((self.window_rect.w as f64) * pr).round() as i32,
+            ((self.window_rect.h as f64) * pr).round() as i32,
+        );
+        let dormant = s.dormant;
+        let Some(p) = s.presenter.as_mut() else {
+            return;
+        };
+        if all {
+            p.mark_all();
+        }
+        if layer.is_some() && (clip || !p.has_clip(vw, vh)) {
+            p.set_clip(gpu, &self.clip_mask, vw, vh);
+        }
+        p.present(gpu, &s.persistent_screen, if dormant { None } else { layer.as_ref() }, rect);
+    }
+
     /// Push surface `si`'s persistent buffer to the OS as-is — no finalize, no overlay, no outline. Serves non-home `RedrawRequested` (OS expose), the dormant first present (all-zero buffer = fully transparent, so a fresh window never flashes back-buffer garbage), and the evacuation present that clears a just-vacated monitor.
     fn present_surface_raw(&mut self, si: usize) {
         let Some(s) = self.surfaces.get_mut(si) else {
@@ -1203,18 +1273,10 @@ impl<A: FluorApp> DesktopShell<A> {
         if s.persistent_screen.len() != scr_px {
             s.persistent_screen.resize(scr_px, 0);
         }
-        #[cfg(target_os = "macos")]
-        {
-            let Some(renderer) = s.renderer.as_mut() else {
-                return;
-            };
-            let mut buffer = renderer.lock_buffer();
-            // A transient mismatch (scale change announced before the matching Resized) skips one present rather than panicking in copy_from_slice.
-            if buffer.len() != s.persistent_screen.len() {
-                return;
-            }
-            buffer.copy_from_slice(&s.persistent_screen);
-            let _ = buffer.present();
+        #[cfg(fluor_gpu)]
+        if s.presenter.is_some() {
+            self.gpu_present(si, true, false);
+            return;
         }
         #[cfg(target_os = "windows")]
         {
@@ -1685,6 +1747,26 @@ impl<A: FluorApp> DesktopShell<A> {
     }
 
     /// Create one fullscreen transparent OS surface pinned to `monitor` — window attributes as the old single-window `resumed` PLUS the monitor-origin position, softbuffer/wgpu at monitor size, work area from the (origin, size) signature. We deliberately avoid `with_fullscreen` — it triggers the WM's animated transition (default-window-size → grow → fullscreen) which makes the chrome appear to scale up from the top-left. Instead, ask for a plain borderless transparent window covering the monitor: the WM creates it at the requested geometry directly, no animation.
+    /// The GPU present on `window`: fluor's device made with the first surface (asking the app what it needs), then a presenter per surface. `None` when there is no device (Linux, the app not asking) or it can't present here.
+    #[cfg(fluor_gpu)]
+    fn make_presenter(&mut self, window: &Arc<Window>, w: u32, h: u32) -> Option<super::gpu::Presenter> {
+        let instance = match &self.gpu {
+            Some(g) => g.instance.clone(),
+            None if self.gpu_tried => return None,
+            None => super::gpu::Gpu::instance(),
+        };
+        let surface = instance
+            .create_surface(window.clone())
+            .map_err(|e| log::warn!("fluor gpu: no surface on the window: {e}"))
+            .ok()?;
+        if self.gpu.is_none() {
+            self.gpu_tried = true;
+            let app = &self.app;
+            self.gpu = Some(super::gpu::Gpu::new(instance, &surface, |adapter| app.gpu_request(adapter))?);
+        }
+        super::gpu::Presenter::new(self.gpu.as_ref()?, window.clone(), surface, w, h)
+    }
+
     fn create_monitor_surface(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -1780,17 +1862,23 @@ impl<A: FluorApp> DesktopShell<A> {
         // Per-monitor work area (monitor minus panels/taskbars/menu-bar+Dock), in GLOBAL desktop units, so the visible window — and especially its bottom chrome status band — doesn't end up under a taskbar.
         let work_area = monitor_work_area(origin, size);
 
-        // Renderer sized to BACKING pixels (points × scale = the raw physical size winit reported). It owns an Arc of the window now — the old `&'static` transmute is gone.
-        #[cfg(target_os = "macos")]
-        let renderer = Some(super::renderer_wgpu::Renderer::new(
-            window.clone(),
+        // The GPU present, sized to BACKING pixels (points × scale = the raw physical size winit reported). macOS always has it; on Linux it exists only when the app asked for fluor's device and the device presents to this window.
+        #[cfg(fluor_gpu)]
+        let presenter = self.make_presenter(
+            &window,
             // WHY/PROOF: the size is winit's, 0 on a minimized window — wgpu panics configuring a zero-sized surface.
-            ((size.0 as f64) * scale).round().max(1.0) as u32,
-            ((size.1 as f64) * scale).round().max(1.0) as u32,
-        ));
-        // Windows presents via UpdateLayeredWindow from `persistent_screen` directly (softbuffer's BitBlt present is opaque), so it needs no softbuffer surface. Every other non-macOS target (Linux/X11, Redox/Orbital) uses softbuffer.
+            ((size.0 as f64) * pixel_ratio).round().max(1.0) as u32,
+            ((size.1 as f64) * pixel_ratio).round().max(1.0) as u32,
+        );
+        #[cfg(target_os = "macos")]
+        assert!(presenter.is_some(), "fluor: no Metal device presents to the window");
+        // Windows presents via UpdateLayeredWindow from `persistent_screen` directly (softbuffer's BitBlt present is opaque), so it needs no softbuffer surface. Every other non-macOS target (Linux/X11, Redox/Orbital) uses softbuffer, unless the GPU presents.
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows"), fluor_gpu))]
+        let gpu_presents = presenter.is_some();
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows"), not(fluor_gpu)))]
+        let gpu_presents = false;
         #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-        let surface = {
+        let surface = if gpu_presents { None } else {
             use std::num::NonZeroU32;
             let context =
                 softbuffer::Context::new(window.clone()).expect("softbuffer Context::new");
@@ -1826,8 +1914,8 @@ impl<A: FluorApp> DesktopShell<A> {
             scale,
             pixel_ratio,
             work_area,
-            #[cfg(target_os = "macos")]
-            renderer,
+            #[cfg(fluor_gpu)]
+            presenter,
             #[cfg(not(target_os = "macos"))]
             surface,
             persistent_screen: vec![0u32; bw * bh],
@@ -1907,9 +1995,9 @@ impl<A: FluorApp> DesktopShell<A> {
         self.surfaces[si].size = unit_size;
 
         // Platform present buffers stay at BACKING pixels — the raw physical size the OS just reported.
-        #[cfg(target_os = "macos")]
-        if let Some(renderer) = self.surfaces[si].renderer.as_mut() {
-            renderer.resize(size.width, size.height);
+        #[cfg(fluor_gpu)]
+        if let (Some(p), Some(gpu)) = (self.surfaces[si].presenter.as_mut(), self.gpu.as_ref()) {
+            p.resize(gpu, size.width, size.height);
         }
         #[cfg(not(target_os = "macos"))]
         if let Some(surface) = self.surfaces[si].surface.as_mut() {
@@ -2217,6 +2305,11 @@ impl<A: FluorApp> DesktopShell<A> {
         self.app.render(&mut self.scratch, &mut ctx);
         drop(ctx);
         let app_dt = app_start.elapsed().as_secs_f32();
+        // The layer of this pass-0 render, held for every present until the next (an extra pass below renders the app again at another size).
+        #[cfg(fluor_gpu)]
+        {
+            self.under = self.app.under_layer();
+        }
 
         // Phase C: mixed-DPI straddle — one extra full pass per involved scale that differs from window_scale, app swapped back to pass-0 geometry afterwards.
         self.render_extra_passes();
@@ -2339,6 +2432,7 @@ impl<A: FluorApp> DesktopShell<A> {
                     by1,
                     dy_backing,
                 );
+                self.surfaces[si].mark(bx0 as i32, by0 as i32, bx1 as i32, by1 as i32);
             }
         }
 
@@ -2354,9 +2448,15 @@ impl<A: FluorApp> DesktopShell<A> {
                 let b = ((*px & 0xFF) as u8).saturating_sub(FADE_STEP) as u32;
                 *px = a | (r << 16) | (g << 8) | b;
             }
+            self.surfaces[si].mark(0, 0, scr_w as i32, scr_h as i32);
         }
 
         // Finalize: on a full repaint we copy every pixel from scratch (AA + opaque alike). On an incremental frame we narrow to damage_clip AND skip non-opaque source pixels — the chrome perimeter AA pixels in persistent_screen already carry their finalized RGB and the shadow boost from the last full repaint, and overwriting them would (a) drop the shadow integration and (b) require re-running paint_shadow. The opaque-only path uses left/right scans per row to find the bounded copy range, then does a contiguous finalize on that range (no per-pixel if-gating).
+        // The app's picture goes under the chrome on the GPU: the chrome's anti-aliased edges are finalized for it (see `finalize_into_screen`'s `over`).
+        #[cfg(fluor_gpu)]
+        let over = self.under.is_some() && self.surfaces[si].presenter.is_some();
+        #[cfg(not(fluor_gpu))]
+        let over = false;
         let t = Instant::now();
         if !damage_clip.is_empty() {
             crate::paint::finalize_into_screen(
@@ -2370,7 +2470,12 @@ impl<A: FluorApp> DesktopShell<A> {
                 rect_y,
                 damage_clip,
                 full_repaint,
+                over,
             );
+            self.surfaces[si].mark(rect_x + damage_clip.x0 as i32, rect_y + damage_clip.y0 as i32, rect_x + damage_clip.x1 as i32, rect_y + damage_clip.y1 as i32);
+        }
+        if full_repaint {
+            self.surfaces[si].mark(0, 0, scr_w as i32, scr_h as i32);
         }
         let finalize_dt = t.elapsed().as_secs_f32();
 
@@ -2409,7 +2514,7 @@ impl<A: FluorApp> DesktopShell<A> {
                 if self.last_overlay_active.len() != current.len() {
                     self.last_overlay_active.resize(current.len(), false);
                 }
-                crate::paint::apply_overlay(
+                let touched = crate::paint::apply_overlay(
                     src_scratch,
                     &mut self.surfaces[si].persistent_screen,
                     scr_w,
@@ -2422,6 +2527,9 @@ impl<A: FluorApp> DesktopShell<A> {
                     &bboxes,
                     &mut self.last_overlay_active,
                 );
+                if let Some(r) = touched {
+                    self.surfaces[si].mark(rect_x + r.x0 as i32, rect_y + r.y0 as i32, rect_x + r.x1 as i32, rect_y + r.y1 as i32);
+                }
             }
         }
 
@@ -2475,47 +2583,36 @@ impl<A: FluorApp> DesktopShell<A> {
                     ps[ps_row + scr_x] = 0xFF00_0000 | (v & 0x00FF_FFFF);
                 }
             }
+            self.surfaces[si].mark(rect_x, rect_y_top, rect_x + win_w as i32, rect_y_top + strip_h as i32);
         }
 
         // Copy persistent_screen → platform back buffer (whichever softbuffer/wgpu hands us this frame; it may be stale or rotated, but we always overwrite the whole thing from our owned persistent_screen). The damage outline overlay is stamped AFTER this copy and BEFORE present so it lives for exactly one frame and never touches persistent_screen.
-        #[cfg(target_os = "macos")]
-        {
-            let s = &mut self.surfaces[si];
-            let Some(renderer) = s.renderer.as_mut() else {
-                return (fill_dt, finalize_dt, shadow_dt);
-            };
-            // First composite after a wake (cross-monitor move / window entering a dormant surface):
-            // the renderer's wgpu surface was `configure`d back at creation time, while this window
-            // was dormant/off-screen, so its CAMetalLayer drawable is stale — `get_current_texture`
-            // hands back a black drawable and every later present inherits it (root cause of the
-            // "move to the other monitor → solid black, stays black" field report). Re-configure the
-            // surface to its current backing here so the layer re-establishes a live drawable bound
-            // to the monitor it's actually showing on. One-shot: `first_after_wake` was consumed above.
+        // The GPU present (macOS always; Linux when the app draws on fluor's device): the changed part of persistent_screen uploaded, the app's layer laid under it on the GPU. The damage outline (a dev overlay) is stamped into a copy presented whole, and the next present uploads the clean buffer whole again.
+        #[cfg(fluor_gpu)]
+        if self.surfaces[si].presenter.is_some() {
+            // First composite after a wake (cross-monitor move / window entering a dormant surface): the surface was configured back at creation, while this window was dormant/off-screen, so its CAMetalLayer drawable is stale — `get_current_texture` hands back a black drawable and every later present inherits it (root cause of the "move to the other monitor → solid black, stays black" field report). Configure it again at its current backing so the layer re-establishes a live drawable bound to the monitor it's actually showing on. One-shot: `first_after_wake` was consumed above.
             if first_after_wake {
-                renderer.resize(scr_w as u32, scr_h as u32);
+                if let (Some(p), Some(gpu)) = (self.surfaces[si].presenter.as_mut(), self.gpu.as_ref()) {
+                    p.resize(gpu, scr_w as u32, scr_h as u32);
+                }
             }
-            let mut buffer = renderer.lock_buffer();
-            // A transient mismatch (scale change announced before the matching Resized lands) skips one present rather than panicking in copy_from_slice.
-            if buffer.len() != s.persistent_screen.len() {
-                return (fill_dt, finalize_dt, shadow_dt);
-            }
-            buffer.copy_from_slice(&s.persistent_screen);
             if outline_active && !damage_clip.is_empty() {
-                crate::paint::stamp_damage_outline_visible(
-                    &mut buffer,
-                    scr_w,
-                    scr_h,
-                    damage_clip,
-                    rect_x,
-                    rect_y,
-                );
+                let mut stamped = self.surfaces[si].persistent_screen.clone();
+                crate::paint::stamp_damage_outline_visible(&mut stamped, scr_w, scr_h, damage_clip, rect_x, rect_y);
+                let clean = std::mem::replace(&mut self.surfaces[si].persistent_screen, stamped);
+                self.gpu_present(si, true, full_repaint);
+                self.surfaces[si].persistent_screen = clean;
+                self.surfaces[si].mark(0, 0, scr_w as i32, scr_h as i32);
+            } else {
+                self.gpu_present(si, false, full_repaint);
             }
-            let _ = buffer.present();
             // Update the global mouse monitor's window rect for re-entry detection — GLOBAL desktop points now (the monitor flips NSEvent's bottom-left mouseLocation against the primary screen height, landing in the same global top-left point space window_rect lives in).
+            #[cfg(target_os = "macos")]
             if let Some(ref monitor) = self.hittest_monitor {
                 let (hx, hy, hw, hh) = self.hittable_rect();
                 monitor.update_rect(hx, hy, hw, hh);
             }
+            return (fill_dt, finalize_dt, shadow_dt);
         }
         // Windows: present the owned screen buffer thru the layered window (per-pixel alpha + click-thru on α=0). The damage outline (a dev overlay) is stamped into a scratch copy first so it lives one frame and never touches persistent_screen, matching the softbuffer path.
         #[cfg(target_os = "windows")]
@@ -2580,17 +2677,17 @@ impl<A: FluorApp> DesktopShell<A> {
         // Unit delta → backing-pixel delta under the standard rounding convention; on X11/Windows pixel_ratio is 1 so this is the old integer delta.
         let dxp = ((dx as f64) * s.pixel_ratio).round() as i32;
         let dyp = ((dy as f64) * s.pixel_ratio).round() as i32;
-        #[cfg(target_os = "macos")]
-        {
-            let Some(renderer) = s.renderer.as_mut() else {
-                return;
-            };
-            let mut buffer = renderer.lock_buffer();
-            if buffer.len() != scr_w * scr_h {
+        // The GPU present: shift our copy and upload it whole; the app's layer is laid under at the window's new place, so it moves with the window without a render.
+        #[cfg(fluor_gpu)]
+        if s.presenter.is_some() {
+            if s.persistent_screen.len() != scr_w * scr_h {
                 return;
             }
-            crate::paint::shift_screen_wrap(&mut buffer, scr_w, scr_h, dxp, dyp);
-            let _ = buffer.present();
+            crate::paint::shift_screen_wrap(&mut s.persistent_screen, scr_w, scr_h, dxp, dyp);
+            self.gpu_present(si, true, false);
+            self.push_input_region(si);
+            self.last_painted_rect = self.window_rect;
+            return;
         }
         // Windows: no softbuffer surface — shift the surface's owned persistent_screen and re-present it thru the layered window. (The layered window already moves with window_rect via the α channel, so there's no OS input-region call to push like X11 does below.)
         #[cfg(target_os = "windows")]
@@ -3198,6 +3295,12 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
         let win_px = (self.viewport.width_px as usize) * (self.viewport.height_px as usize);
         self.scratch = vec![0u32; win_px];
         self.clip_mask = vec![255u8; win_px];
+
+        // fluor's device (made with the first surface) to the app before its init, so it draws on it from the first frame.
+        #[cfg(fluor_gpu)]
+        if let Some(gpu) = self.gpu.clone() {
+            self.app.gpu_ready(&gpu);
+        }
 
         // Hand control to the consumer's init.
         {
