@@ -1,6 +1,6 @@
 [package]
 name = "fluor"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 authors = ["Nick Spiker <fractaldecoder@proton.me>"]
 license = "MIT OR Apache-2.0"
