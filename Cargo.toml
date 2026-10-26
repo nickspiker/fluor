@@ -1,6 +1,6 @@
 [package]
 name = "fluor"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2024"
 authors = ["Nick Spiker <fractaldecoder@proton.me>"]
 license = "MIT OR Apache-2.0"
@@ -38,7 +38,7 @@ amber = []
 # macOS uses wgpu/Metal for PostMultiplied alpha (transparent squircle corners);
 # Linux/Windows/Redox use softbuffer (CPU blit, no GPU dependency).
 # wgpu + pollster (macOS-only) and arboard (clipboard; every desktop EXCEPT Redox, which has no arboard backend) are NOT in this set — they're pulled by the per-target dependency blocks below so a host-winit build for Redox (winit's Orbital backend + softbuffer, both of which support Redox) doesn't drag in deps that won't compile there. The non-macOS softbuffer present path in host/app.rs is `cfg(not(target_os = "macos"))`, so it already covers Redox with zero source changes.
-host-winit = ["std", "text", "icon", "dep:winit", "dep:softbuffer"]
+host-winit = ["std", "text", "icon", "dep:winit", "dep:softbuffer", "dep:arboard"]
 host-softbuffer = ["std", "icon", "dep:softbuffer"]
 host-bare = []
 # gpu — the GPU present on Linux (Vulkan thru wgpu; macOS always presents thru wgpu/Metal): an app that asks for it (FluorApp::gpu_request) draws on fluor's own device, and its picture goes under the chrome on the GPU, composited straight onto the window surface — no readback, no CPU copy of the frame. Without it, or when the app does not ask, Linux keeps softbuffer.
@@ -103,6 +103,7 @@ libc = { version = "0.2", optional = true }
 # x11rb is Linux-only. Used for `xcb_shape_rectangles(SK_INPUT, ...)` to set the click-thru input region — the fullscreen transparent surface only accepts clicks inside `window_rect`; everything else passes thru to whatever's behind us. `shape` feature pulls in the XShape extension bindings; `randr` reads the monitor layout straight from the server after a screen change (rebuild_span).
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["shape", "randr"] }
+arboard = { version = "3", optional = true }
 # File drag-out (host/file_drag.rs): dlopen of the X libraries winit already loaded, to release its implicit pointer grab.
 libc = "0.2"
 # The `gpu` feature's Vulkan present.
@@ -113,6 +114,7 @@ pollster = { version = "0.4", optional = true }
 # click-thru on α=0 pixels) presented via UpdateLayeredWindow — softbuffer's BitBlt present is opaque
 # and can't do either, so the Windows present path bypasses it (host/app.rs gates on target_os).
 [target.'cfg(target_os = "windows")'.dependencies]
+arboard = { version = "3", optional = true }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
@@ -134,6 +136,7 @@ windows-core = "0.58"
 
 # objc2 + AppKit bindings for macOS click-thru: NSEvent global mouse monitor + NSWindow mouseLocationOutsideOfEventStream. wgpu/Metal + pollster live here too — the GPU present path is macOS-only (host/app.rs gates it on `cfg(target_os = "macos")`), so no other target compiles wgpu.
 [target.'cfg(target_os = "macos")'.dependencies]
+arboard = { version = "3", optional = true }
 wgpu = { version = "28", default-features = false, features = ["metal", "wgsl"] }
 pollster = "0.4"
 objc2 = "0.6"

@@ -11,6 +11,9 @@ pub trait WindowHandle {
 
     /// Set the OS window title — what the task switcher, the window menu, Mission Control and the Dock read. Distinct from any title the app DRAWS: a client-decorated app paints its own bar, and the OS never sees that string unless it is also set here, so a title that tracks the open document has to come through this. Default is a no-op, for hosts with no OS-level title to set (Android's surface IS the window).
     fn set_title(&self, _title: &str) {}
+
+    /// Put text on the system clipboard — the one call every app's copy button makes (Nick 2026-10-26). On a desktop it goes to the OS clipboard through one handle kept for the life of the process (an X11 or Wayland clipboard is served by its owner, and a handle made for each copy and dropped lost most copies, photon 2026-09-02); on Android the shell holds it for the activity's clipboard manager ([`crate::host::android::AndroidShell::take_clipboard`]). Default is a no-op, for a host with no clipboard.
+    fn set_clipboard(&self, _text: &str) {}
 }
 
 #[cfg(feature = "host-winit")]
@@ -21,5 +24,9 @@ impl WindowHandle for winit::window::Window {
 
     fn set_title(&self, title: &str) {
         winit::window::Window::set_title(self, title);
+    }
+
+    fn set_clipboard(&self, text: &str) {
+        crate::host::clipboard::set_text(text);
     }
 }

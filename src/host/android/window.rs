@@ -5,19 +5,28 @@
 //! The flag uses interior mutability via `AtomicBool` so the trait can take `&self` (which widgets and apps assume).
 
 use core::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use crate::host::WindowHandle;
 
 /// Atomic dirty-flag holder. App side calls `request_redraw` to set; shell reads + clears before each frame so the next `nativeDraw` is allowed to do the full pipeline. Constructed dirty so the first `nativeDraw` after `nativeInit` is guaranteed to paint.
 pub struct AndroidWindow {
     dirty: AtomicBool,
+    /// Text an app put on the clipboard, until the activity takes it to the clipboard manager (Android's clipboard is Java's; the shell cannot reach it without the activity).
+    clipboard: Mutex<Option<String>>,
 }
 
 impl AndroidWindow {
     pub fn new() -> Self {
         Self {
             dirty: AtomicBool::new(true),
+            clipboard: Mutex::new(None),
         }
+    }
+
+    /// The text an app asked onto the clipboard since last taken, once: the JNI shim hands it to the activity each frame.
+    pub fn take_clipboard(&self) -> Option<String> {
+        self.clipboard.lock().ok().and_then(|mut c| c.take())
     }
 
     /// True if the app has marked the window dirty since the last `clear_dirty`. The shell reads this each frame to decide whether to run the full render pipeline.
@@ -40,5 +49,11 @@ impl Default for AndroidWindow {
 impl WindowHandle for AndroidWindow {
     fn request_redraw(&self) {
         self.dirty.store(true, Ordering::Release);
+    }
+
+    fn set_clipboard(&self, text: &str) {
+        if let Ok(mut c) = self.clipboard.lock() {
+            *c = Some(text.to_string());
+        }
     }
 }

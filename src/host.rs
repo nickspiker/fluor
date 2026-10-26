@@ -12,6 +12,8 @@ pub mod menu;
 pub mod icon;
 pub mod wake;
 pub mod window_handle;
+#[cfg(all(feature = "host-winit", not(target_os = "redox")))]
+pub mod clipboard;
 /// Drag a file out of the window (a promise on macOS, a virtual file on Windows, an XDND source on X11) and the macOS save panel.
 #[cfg(feature = "host-winit")]
 pub mod file_drag;

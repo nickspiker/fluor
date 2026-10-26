@@ -303,6 +303,11 @@ impl<A: FluorApp> AndroidShell<A> {
     }
 
     /// Poll `FluorApp::wants_input_reset` → `1` (the Activity should `InputMethodManager.restartInput` to clear a stale IME composing buffer after a programmatic text clear) or `0`. One-shot, drained here.
+    /// Text an app put on the clipboard since last taken, once, for the activity's clipboard manager (the JNI shim polls this each frame beside the keyboard).
+    pub fn take_clipboard(&self) -> Option<String> {
+        self.window.take_clipboard()
+    }
+
     pub fn poll_input_reset(&mut self) -> i32 {
         self.app.wants_input_reset() as i32
     }
