@@ -20,6 +20,17 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 /// The display's granted HDR/SDR ratio, Q16 (65536 = 1×: no headroom, the safe start).
 static GRANTED_Q16: AtomicU32 = AtomicU32::new(65536);
 
+/// What the live surface last declared (the light its buffer spans) and asked for (its frame's brightest light), Q16; meaningful while [`LIVE`].
+static DECLARED_Q16: AtomicU32 = AtomicU32::new(65536);
+static DESIRED_Q16: AtomicU32 = AtomicU32::new(65536);
+/// An extended-range surface exists and presents (built, not yet dropped).
+static LIVE: AtomicBool = AtomicBool::new(false);
+
+/// The HDR state a settings page can show: (granted, declared, desired), each ×SDR white — `None` while no extended-range surface is presenting (this Android lacks one, or the 8-bit path is in charge).
+pub fn status() -> Option<(f32, f32, f32)> {
+    LIVE.load(Ordering::Relaxed).then(|| (granted(), DECLARED_Q16.load(Ordering::Relaxed) as f32 / 65536.0, DESIRED_Q16.load(Ordering::Relaxed) as f32 / 65536.0))
+}
+
 /// Opt the window into the extended-range surface (the app calls this once at startup, before the first frame).
 pub fn enable() {
     ENABLED.store(true, Ordering::Relaxed);
@@ -196,6 +207,7 @@ impl HdrSurface {
                 }
             }
             log::info!("HDR: extended-range surface {}×{} (RGBA_1010102, BT.2020 γ2.2 extended), granted {:.2}×", width, height, granted());
+            LIVE.store(true, Ordering::Relaxed);
             Some(HdrSurface { fns, sc, window, width, height, slots, shown: None, table: Hdr10Table::new(1.0), peak_code: 194, pending: false })
         }
     }
@@ -244,6 +256,8 @@ impl HdrSurface {
             (f.set_buffer)(tx, self.sc, slot.hb, acquire);
             (f.set_dataspace)(tx, self.sc, DATASPACE_BT2020_GAMMA22_EXTENDED);
             (f.set_extended)(tx, self.sc, current, desired);
+            DECLARED_Q16.store((current * 65536.0) as u32, Ordering::Relaxed);
+            DESIRED_Q16.store((desired * 65536.0) as u32, Ordering::Relaxed);
             if crate::paint::OPAQUE_BACKDROP.load(Ordering::Relaxed) {
                 (f.set_transparency)(tx, self.sc, TRANSPARENCY_OPAQUE);
             }
@@ -271,6 +285,7 @@ impl HdrSurface {
 
 impl Drop for HdrSurface {
     fn drop(&mut self) {
+        LIVE.store(false, Ordering::Relaxed);
         let f = self.fns;
         unsafe {
             let tx = (f.tx_create)();
