@@ -26,6 +26,8 @@ pub enum EventResponse {
     Pass,
     /// Consumer wants the host to begin a window-move drag (typical: mouse-down on chrome strip with no button hit).
     StartWindowDrag,
+    /// Consumer wants the host to drag a FILE out of the window, the one named by [`crate::host::file_drag::request`] just before: the pending click is cancelled and the platform's own drag takes the pointer (desktop; ignored where there is none).
+    StartFileDrag,
     /// Consumer wants the host to begin a window-resize drag in the given edge direction.
     StartResize(ResizeEdge),
     /// Consumer requests window close. Host calls `std::process::exit(0)` (Killswitch-compliant).

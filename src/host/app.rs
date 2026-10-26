@@ -2745,6 +2745,18 @@ impl<A: FluorApp> DesktopShell<A> {
                 self.start_resize(edge);
                 false
             }
+            EventResponse::StartFileDrag => {
+                // The press that crossed the threshold becomes the OS's drag: no click fires on its release (the platform drag eats it) and no window move arms.
+                self.pointer.on_cancel();
+                self.move_drag_armed = false;
+                if let Some(file) = super::file_drag::take() {
+                    let name = file.name.clone();
+                    if !super::file_drag::start(&window, file) {
+                        log::info!("FLUOR: file drag of {} unavailable on this platform or session", name);
+                    }
+                }
+                false
+            }
             EventResponse::Close => {
                 // Same policy gate as the OS CloseRequested path: a resident app hides instead of dying.
                 if self.app.on_close_requested() {
