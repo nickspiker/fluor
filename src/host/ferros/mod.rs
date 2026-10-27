@@ -147,6 +147,8 @@ pub struct FerrosShell<A: FluorApp> {
     /// The contact the pointer follows: the first finger down, until it leaves.
     finger: Option<u8>,
     close: bool,
+    /// Frames drawn, for the first-frame rule and the console line.
+    pub frames: u64,
 }
 
 impl<A: FluorApp> FerrosShell<A> {
@@ -173,6 +175,7 @@ impl<A: FluorApp> FerrosShell<A> {
             touch_travel: 0.0,
             finger: None,
             close: false,
+            frames: 0,
         };
         shell.with_context(|app, ctx| app.init(ctx));
         shell.with_context(|app, ctx| app.on_resize(width, height, ctx));
@@ -199,10 +202,12 @@ impl<A: FluorApp> FerrosShell<A> {
         }
         let (win_w, win_h) = (self.viewport.width_px as usize, self.viewport.height_px as usize);
         let viewport_rect = PixelRect::new(0, 0, win_w, win_h);
-        let damage_clip = self.app.damage_rect(self.viewport).unwrap_or(viewport_rect);
+        // The first frame is the whole frame, whatever the app says is dirty: nothing has been shown yet.
+        let damage_clip = if self.frames == 0 { viewport_rect } else { self.app.damage_rect(self.viewport).unwrap_or(viewport_rect) };
         if damage_clip.is_empty() {
             return false;
         }
+        self.frames += 1;
         if damage_clip != viewport_rect {
             if let Some((rect, dy)) = self.app.scroll_hint(self.viewport) {
                 crate::paint::scroll_copy_rect(&mut self.scratch, win_w, win_h, rect.x0, rect.y0, rect.x1, rect.y1, dy);
@@ -430,10 +435,17 @@ pub fn run_app<A: FluorApp + 'static>(app: A, caps: Caps, ru: Coord, size: Optio
     } else {
         (1.0, 1.0)
     };
+    println!("fluor: ferros host up, a {w} x {h} frame at ({fx}, {fy}) on a {pw} x {ph} panel");
     let mut shell = FerrosShell::new(app, w as u32, h as u32, ru);
     let frame = sys::freq() / 120;
     let mut contacts: Vec<Contact> = Vec::with_capacity(16);
+    let (mut shown, mut touched, mut last_line) = (0u64, 0u64, sys::now());
     loop {
+        // A line every ten seconds while there is no window system to look at: frames shown, contacts seen.
+        if sys::now().wrapping_sub(last_line) > sys::freq() * 10 {
+            last_line = sys::now();
+            println!("fluor: {shown} frames shown, {} drawn, {touched} contacts", shell.frames);
+        }
         let n = sys::call(touch, &[0], &mut r) as usize;
         contacts.clear();
         if n >= 1 && n != sys::ERR as usize {
@@ -451,6 +463,7 @@ pub fn run_app<A: FluorApp + 'static>(app: A, caps: Caps, ru: Coord, size: Optio
             }
         }
         if !contacts.is_empty() {
+            touched += contacts.len() as u64;
             shell.on_contacts(&contacts);
         }
         if shell.close {
@@ -470,6 +483,10 @@ pub fn run_app<A: FluorApp + 'static>(app: A, caps: Caps, ru: Coord, size: Optio
             let mut rr = [0u8; 4];
             if sys::call(display, &m, &mut rr) == sys::ERR {
                 return Err(String::from("the display refused the frame"));
+            }
+            shown += 1;
+            if shown == 1 {
+                println!("fluor: the first frame is on the panel");
             }
         }
         sys::sleep_until(t + frame);
