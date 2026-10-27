@@ -120,11 +120,11 @@ impl WindowHandle for FerrosWindow {
 }
 
 /// A contact record from the touch server (12 bytes): id, phase (0 enter, 1 move, 2 leave), kind, pressure, x, y, and the rest unused here.
-struct Contact {
-    id: u8,
-    phase: u8,
-    x: u16,
-    y: u16,
+pub struct Contact {
+    pub id: u8,
+    pub phase: u8,
+    pub x: u16,
+    pub y: u16,
 }
 
 /// The app and everything the host keeps for it between frames.
