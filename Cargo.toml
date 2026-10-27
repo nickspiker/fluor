@@ -179,3 +179,7 @@ panic = "abort"
 [[example]]
 name = "font_pack"
 required-features = ["packs-publish"]
+
+# target_os = "ferros" is the phone as a ferros process (a JSON target, STD-TARGET.md in the ferros repo): rustc does not know the name, so the cfg is declared here.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"))'] }
