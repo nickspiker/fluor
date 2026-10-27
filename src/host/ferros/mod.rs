@@ -217,8 +217,8 @@ impl<A: FluorApp> FerrosShell<A> {
     /// The scratch buffer as the display's working values, into the surface (row-major, `w × h` u64).
     pub fn present(&self, surface: &mut [u64]) {
         let lut = gamma_table();
-        let n = surface.len().min(self.scratch.len());
-        for (dst, &px) in surface[..n].iter_mut().zip(self.scratch.iter()) {
+        // The surface and the scratch are both the frame, w x h; zip pairs them.
+        for (dst, &px) in surface.iter_mut().zip(self.scratch.iter()) {
             let a = px >> 24;
             let (r, g, b) = (255 - ((px >> 16) & 255), 255 - ((px >> 8) & 255), 255 - (px & 255));
             let (r, g, b) = ((r * a + 127) / 255, (g * a + 127) / 255, (b * a + 127) / 255);
@@ -414,7 +414,9 @@ pub fn run_app<A: FluorApp + 'static>(app: A, caps: Caps, ru: Coord, size: Optio
         return Err(String::from("no display server behind the display grant"));
     }
     let (pw, ph) = (u16::from_le_bytes([r[0], r[1]]) as usize, u16::from_le_bytes([r[2], r[3]]) as usize);
-    let (w, h) = size.map_or((pw, ph), |(w, h)| ((w as usize).min(pw), (h as usize).min(ph)));
+    // A frame larger than the panel is a bug in the caller, not something to trim.
+    let (w, h) = size.map_or((pw, ph), |(w, h)| (w as usize, h as usize));
+    assert!(w <= pw && h <= ph, "the app frame does not fit the panel");
     let (fx, fy) = ((pw - w) / 2, (ph - h) / 2);
     let base = sys::dma(sys::cap(caps.surface));
     if base == 0 || base == sys::ERR || w * h * 8 > 32 << 20 {
@@ -435,12 +437,17 @@ pub fn run_app<A: FluorApp + 'static>(app: A, caps: Caps, ru: Coord, size: Optio
         let n = sys::call(touch, &[0], &mut r) as usize;
         contacts.clear();
         if n >= 1 && n != sys::ERR as usize {
-            let count = (r[0] as usize).min((n - 1) / 12);
+            // The touch server says how many records it sent; a reply shorter than its count is a bug there, and the slice panics on it.
+            let count = r[0] as usize;
             for k in 0..count {
                 let rec = &r[1 + k * 12..1 + (k + 1) * 12];
                 let x = (u16::from_le_bytes([rec[4], rec[5]]) as f32 * sx) as i32 - fx as i32;
                 let y = (u16::from_le_bytes([rec[6], rec[7]]) as f32 * sy) as i32 - fy as i32;
-                contacts.push(Contact { id: rec[0], phase: rec[1], x: x.clamp(0, w as i32 - 1) as u16, y: y.clamp(0, h as i32 - 1) as u16 });
+                // A finger outside the app's frame is not the app's; it is dropped, not pulled to the edge.
+                if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
+                    continue;
+                }
+                contacts.push(Contact { id: rec[0], phase: rec[1], x: x as u16, y: y as u16 });
             }
         }
         if !contacts.is_empty() {
