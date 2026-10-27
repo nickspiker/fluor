@@ -28,14 +28,17 @@ pub use window_handle::WindowHandle;
 pub mod chrome_widget;
 
 // `app` contains the `FluorApp` trait + `Context` + (gated below) `DesktopShell`. The trait and Context compile on any host with `text` + `winit` (data types only — see Cargo.toml's host-android comment); DesktopShell + run_app stay host-winit-only.
-#[cfg(all(feature = "text", any(feature = "host-winit", feature = "host-android")))]
+#[cfg(all(feature = "text", any(feature = "host-winit", feature = "host-android", feature = "host-ferros")))]
 pub mod app;
 
 #[cfg(all(feature = "host-android", target_os = "android"))]
 pub mod android;
 
+#[cfg(all(feature = "host-ferros", target_os = "ferros"))]
+pub mod ferros;
+
 // OS input-timing settings (double-click interval, …). Available on ANY host — the pointer gestures that consume it (multi-click word/all select) are host-agnostic; only the query backends are per-OS (Linux XSettings/gsettings; everywhere else the 400 ms default until a native query lands).
-#[cfg(any(feature = "host-winit", feature = "host-android"))]
+#[cfg(any(feature = "host-winit", feature = "host-android", feature = "host-ferros"))]
 pub mod os_input;
 
 // Widget abstraction (Container, Widget, Click, Key, Focus, Hover capability traits). Available on any host with `text` because the capability traits speak fluor-native events now — apps build their widget tree against this regardless of which host (winit/android/future) is driving the event loop.

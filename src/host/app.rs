@@ -503,6 +503,7 @@ pub trait FluorApp {
     ///
     /// **Platform reach.** This drives winit's `set_window_icon`, which only takes effect on
     /// **Windows and X11**. On **Wayland** the icon is sourced from a `.desktop` file matched by `app_id`, and on **macOS** from the `.app` bundle's `.icns` — both are build-time packaging, not a runtime call, so this hook is a no-op there. Returns `None` by default (no OS icon set).
+    #[cfg(feature = "icon")]
     fn window_icon(&self) -> Option<&crate::host::icon::Icon> {
         None
     }
