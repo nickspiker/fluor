@@ -1288,6 +1288,10 @@ impl<A: FluorApp> DesktopShell<A> {
             let Some(surface) = s.surface.as_mut() else {
                 return;
             };
+            // The present buffer follows the surface (see the home present): a stale size never strands a raw present either.
+            if let (Some(w), Some(h)) = (std::num::NonZeroU32::new(scr_w as u32), std::num::NonZeroU32::new(scr_h as u32)) {
+                surface.resize(w, h).expect("softbuffer Surface::resize");
+            }
             let mut buffer = surface.buffer_mut().expect("softbuffer buffer_mut");
             if buffer.len() != s.persistent_screen.len() {
                 return;
@@ -2641,6 +2645,11 @@ impl<A: FluorApp> DesktopShell<A> {
             let Some(surface) = s.surface.as_mut() else {
                 return (fill_dt, finalize_dt, shadow_dt);
             };
+            // THE PRESENT BUFFER FOLLOWS THE SURFACE (Nick 2026-10-27, a black screen over both monitors after every resolution change): a layout change records the new span size before the OS resizes the window, so the Resized that follows matched it and returned before resizing softbuffer — and every present after skipped on the length mismatch below, forever, leaving the grown window unpainted.
+            // Sizing the present buffer to the surface's backing here (softbuffer's resize is a no-op at an unchanged size) means no path can strand it.
+            if let (Some(w), Some(h)) = (std::num::NonZeroU32::new(scr_w as u32), std::num::NonZeroU32::new(scr_h as u32)) {
+                surface.resize(w, h).expect("softbuffer Surface::resize");
+            }
             let mut buffer = surface.buffer_mut().expect("softbuffer buffer_mut");
             // A monitor layout change can resize the surface between the paint and this present (field 2026-09-10, Nick's desktop: span 2560×1569 arrived mid-frame, 4016640 vs 8290560 bytes) — the same guard the macOS branch already had. Skip this present; the resize repaints at the new size.
             if buffer.len() != s.persistent_screen.len() {
@@ -2708,6 +2717,10 @@ impl<A: FluorApp> DesktopShell<A> {
             };
             // Shift OUR copy, then hand the platform the whole of it: the buffer softbuffer returns is only the last frame when its age is 1 (X11). On Wayland it rotates two or more buffers, and shifting a two-frames-old buffer by one frame's delta put the window at alternating positions every other frame (Emma's Arch laptop, 2026-10-25: "jitters while you drag, stops when you stop").
             crate::paint::shift_screen_wrap(&mut s.persistent_screen, scr_w, scr_h, dxp, dyp);
+            // The present buffer follows the surface (see the home present): a stale size never strands the drag shift either.
+            if let (Some(w), Some(h)) = (std::num::NonZeroU32::new(scr_w as u32), std::num::NonZeroU32::new(scr_h as u32)) {
+                surface.resize(w, h).expect("softbuffer Surface::resize");
+            }
             let mut buffer = surface.buffer_mut().expect("softbuffer buffer_mut");
             if buffer.len() != s.persistent_screen.len() {
                 return;
