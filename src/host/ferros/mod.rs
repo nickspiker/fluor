@@ -16,7 +16,7 @@ use crate::coord::Coord;
 use crate::event::{ElementState, Event as FEvent, ModifiersState as FModifiersState, MouseButton, MouseScrollDelta};
 use crate::geom::Viewport;
 use crate::host::app::{Context, FluorApp};
-use crate::host::wake::NoopWakeSender;
+use crate::host::wake::{WakeError, WakeSender};
 use crate::host::{EventResponse, WindowHandle};
 use crate::paint::{HitId, HIT_NONE};
 use crate::text::TextRenderer;
@@ -119,6 +119,18 @@ impl WindowHandle for FerrosWindow {
     }
 }
 
+/// The wake sender an app's background threads hold on ferros: events queue here and the host drains them at the top of each frame, waking the app — there is no event loop to post to, the frame loop is the loop.
+pub struct FerrosWakeSender<E> {
+    queue: Mutex<Vec<E>>,
+}
+
+impl<E: Send + 'static> WakeSender<E> for FerrosWakeSender<E> {
+    fn send(&self, event: E) -> Result<(), WakeError> {
+        self.queue.lock().unwrap().push(event);
+        Ok(())
+    }
+}
+
 /// A contact record from the touch server (12 bytes): id, phase (0 enter, 1 move, 2 leave), kind, pressure, x, y, and the rest unused here.
 pub struct Contact {
     pub id: u8,
@@ -149,13 +161,14 @@ pub struct FerrosShell<A: FluorApp> {
     close: bool,
     /// Frames drawn, for the first-frame rule and the console line.
     pub frames: u64,
+    wake: Arc<FerrosWakeSender<A::UserEvent>>,
 }
 
 impl<A: FluorApp> FerrosShell<A> {
     pub fn new(mut app: A, width: u32, height: u32, ru: Coord) -> Self {
         let viewport = Viewport::new(width, height).with_ru(ru);
-        let wake: Arc<dyn crate::host::wake::WakeSender<A::UserEvent>> = Arc::new(NoopWakeSender);
-        app.set_event_proxy(wake);
+        let wake = Arc::new(FerrosWakeSender { queue: Mutex::new(Vec::new()) });
+        app.set_event_proxy(wake.clone());
         let px = (width as usize) * (height as usize);
         let mut shell = Self {
             app,
@@ -176,6 +189,7 @@ impl<A: FluorApp> FerrosShell<A> {
             finger: None,
             close: false,
             frames: 0,
+            wake,
         };
         shell.with_context(|app, ctx| app.init(ctx));
         shell.with_context(|app, ctx| app.on_resize(width, height, ctx));
@@ -184,6 +198,14 @@ impl<A: FluorApp> FerrosShell<A> {
 
     /// Tick the app and, when anything is dirty, render into the scratch buffer. True when a frame was drawn.
     pub fn draw(&mut self) -> bool {
+        // What the background threads sent since the last frame, delivered first.
+        let events: Vec<A::UserEvent> = core::mem::take(&mut *self.wake.queue.lock().unwrap());
+        for e in events {
+            if self.with_context(|app, ctx| app.on_user_event(e, ctx)) == EventResponse::Close {
+                self.close = true;
+            }
+            self.window.mark_dirty();
+        }
         if let Some(ru) = self.app.take_zoom_request() {
             if ru.is_finite() && ru > 0.0 {
                 self.set_zoom_and_relayout(ru);
