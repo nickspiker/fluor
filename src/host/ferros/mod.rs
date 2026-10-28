@@ -1,6 +1,6 @@
-//! The ferros host: a `FluorApp` on the phone as a ferros process (ferros STD-TARGET.md). No window system — the display server owns the panel, and an app in front draws 16-bit pixels into the `app-surface` region and asks the display to show them (op 22); touches come from the `touch` server's endpoint as contact records. This shell is the Android shell's twin with those two in place of a `NativeWindow` and the JNI touch callbacks: the same press-hold-release arbiter, the same drag-to-scroll, the same `Context`.
+//! The ferros host: a `FluorApp` on the phone as a ferros process (ferros STD-TARGET.md). No window system — the display server owns the panel, and an app draws 16-bit pixels into its own full-screen surface and asks the display to show its window (op 22; ferros WINDOWS.md); touches come from the `touch` server's endpoint as contact records. This shell is the Android shell's twin with those two in place of a `NativeWindow` and the JNI touch callbacks: the same press-hold-release arbiter, the same drag-to-scroll, the same `Context`.
 //!
-//! The process holds three capabilities the caller names by grant slot (`Caps`): the display endpoint, the touch endpoint, the surface region. The syscalls are inlined here (ferros_sys is not a published crate): `call`, `dma`, `sleep`, the counter.
+//! The process holds three capabilities the caller names by grant slot (`Caps`): the display endpoint, the touch endpoint, its own surface (a full screen of 64-bit pixels; ferros WINDOWS.md). The syscalls are inlined here (ferros_sys is not a published crate): `call`, `dma`, `sleep`, the counter.
 //!
 //! Pixels: fluor's `0xααRRGGBB` darkness buffer becomes the display's working values — gamma 2 encoded, white = 16384 (Q14), R, G, B in bits 0-15, 16-31, 32-47 of a u64 — through one 256-entry table (fluor's bytes are gamma 2.2, so the display wants `(c/255)^1.1`). Opacity composites over black. The whole frame is converted and shown each time the app drew; the damage rect narrows that later.
 
@@ -79,7 +79,7 @@ mod sys {
     }
 }
 
-/// The grant slots a fluor app on ferros is spawned with: `--use display --use touch --dma app-surface`, in whatever order the spawner chose.
+/// The grant slots a fluor app on ferros is spawned with: `--use display --use touch --dma surface`, in whatever order the spawner chose.
 #[derive(Clone, Copy, Debug)]
 pub struct Caps {
     pub display: u64,
@@ -241,15 +241,18 @@ impl<A: FluorApp> FerrosShell<A> {
         true
     }
 
-    /// The scratch buffer as the display's working values, into the surface (row-major, `w × h` u64).
-    pub fn present(&self, surface: &mut [u64]) {
+    /// The scratch buffer as the display's working values, into the surface: a full screen at the panel's width `stride`, the frame at (`fx`, `fy`) on it (ferros WINDOWS.md: every app's surface is the whole screen).
+    pub fn present(&self, surface: &mut [u64], stride: usize, fx: usize, fy: usize) {
         let lut = gamma_table();
-        // The surface and the scratch are both the frame, w x h; zip pairs them.
-        for (dst, &px) in surface.iter_mut().zip(self.scratch.iter()) {
-            let a = px >> 24;
-            let (r, g, b) = (255 - ((px >> 16) & 255), 255 - ((px >> 8) & 255), 255 - (px & 255));
-            let (r, g, b) = ((r * a + 127) / 255, (g * a + 127) / 255, (b * a + 127) / 255);
-            *dst = lut[r as usize] as u64 | (lut[g as usize] as u64) << 16 | (lut[b as usize] as u64) << 32;
+        let w = self.viewport.width_px as usize;
+        for (y, src) in self.scratch.chunks_exact(w).enumerate() {
+            let row = &mut surface[(fy + y) * stride + fx..(fy + y) * stride + fx + w];
+            for (dst, &px) in row.iter_mut().zip(src.iter()) {
+                let a = px >> 24;
+                let (r, g, b) = (255 - ((px >> 16) & 255), 255 - ((px >> 8) & 255), 255 - (px & 255));
+                let (r, g, b) = ((r * a + 127) / 255, (g * a + 127) / 255, (b * a + 127) / 255);
+                *dst = lut[r as usize] as u64 | (lut[g as usize] as u64) << 16 | (lut[b as usize] as u64) << 32;
+            }
         }
     }
 
@@ -432,6 +435,17 @@ fn gamma_table() -> &'static [u16; 256] {
     })
 }
 
+/// Whether a screen point is this window's (ferros display op 27): the frontmost window covering it, inside the circle an app lives in.
+fn mine(display: u64, base: u64, x: u16, y: u16) -> bool {
+    let mut m = [0u8; 13];
+    m[0] = 27;
+    m[1..9].copy_from_slice(&base.to_le_bytes());
+    m[9..11].copy_from_slice(&x.to_le_bytes());
+    m[11..13].copy_from_slice(&y.to_le_bytes());
+    let mut r = [0u8; 4];
+    sys::call(display, &m, &mut r) >= 1 && r[0] == 1
+}
+
 /// Run `app` on the panel until it asks to close (an `EventResponse::Close`): frames at most 120 a second, touches polled between them. `ru` is the resolution unit for the viewport (what the device's density would set on Android; 1.0 is fluor's native scale). `size` is the app's frame, centred on the panel, or the whole panel — a 1344 × 2992 frame is 16 MiB of scratch alone, more than a small arc holds.
 pub fn run_app<A: FluorApp + 'static>(app: A, caps: Caps, ru: Coord, size: Option<(u32, u32)>) -> Result<(), String> {
     let display = sys::cap(caps.display);
@@ -446,10 +460,11 @@ pub fn run_app<A: FluorApp + 'static>(app: A, caps: Caps, ru: Coord, size: Optio
     assert!(w <= pw && h <= ph, "the app frame does not fit the panel");
     let (fx, fy) = ((pw - w) / 2, (ph - h) / 2);
     let base = sys::dma(sys::cap(caps.surface));
-    if base == 0 || base == sys::ERR || w * h * 8 > 32 << 20 {
+    if base == 0 || base == sys::ERR || pw * ph * 8 > 32 << 20 {
         return Err(String::from("no app surface behind the surface grant"));
     }
-    let surface = unsafe { core::slice::from_raw_parts_mut(base as *mut u64, w * h) };
+    // The whole screen: an app's surface is a full panel, and the window covers the frame's part of it.
+    let surface = unsafe { core::slice::from_raw_parts_mut(base as *mut u64, pw * ph) };
     // The touch panel's coordinate range, scaled to the panel's pixels.
     let (sx, sy) = if sys::call(touch, &[2], &mut r) >= 4 {
         let (xm, ym) = (u16::from_le_bytes([r[0], r[1]]) as f32, u16::from_le_bytes([r[2], r[3]]) as f32);
@@ -461,6 +476,8 @@ pub fn run_app<A: FluorApp + 'static>(app: A, caps: Caps, ru: Coord, size: Optio
     let mut shell = FerrosShell::new(app, w as u32, h as u32, ru);
     let frame = sys::freq() / 120;
     let mut contacts: Vec<Contact> = Vec::with_capacity(16);
+    // Contacts that entered on another window or a corner: not this app's until they leave (a bit per contact id).
+    let mut foreign = 0u16;
     let (mut shown, mut touched, mut last_line) = (0u64, 0u64, sys::now());
     loop {
         // A line every ten seconds while there is no window system to look at: frames shown, contacts seen.
@@ -477,8 +494,17 @@ pub fn run_app<A: FluorApp + 'static>(app: A, caps: Caps, ru: Coord, size: Optio
                 let rec = &r[1 + k * 12..1 + (k + 1) * 12];
                 let x = (u16::from_le_bytes([rec[4], rec[5]]) as f32 * sx) as i32 - fx as i32;
                 let y = (u16::from_le_bytes([rec[6], rec[7]]) as f32 * sy) as i32 - fy as i32;
-                // A finger outside the app's frame is not the app's; it is dropped, not pulled to the edge.
+                // A finger outside the app's frame is not the app's; it is dropped, not pulled to the edge. Nor is one that landed where another window (or a corner of the circle) is in front: the display says, once per contact as it enters.
                 if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
+                    continue;
+                }
+                if rec[1] == 0 && !mine(display, base, (x + fx as i32) as u16, (y + fy as i32) as u16) {
+                    foreign |= 1 << (rec[0] & 15);
+                }
+                if foreign >> (rec[0] & 15) & 1 == 1 {
+                    if rec[1] == 2 {
+                        foreign &= !(1 << (rec[0] & 15));
+                    }
                     continue;
                 }
                 contacts.push(Contact { id: rec[0], phase: rec[1], x: x as u16, y: y as u16 });
@@ -489,19 +515,23 @@ pub fn run_app<A: FluorApp + 'static>(app: A, caps: Caps, ru: Coord, size: Optio
             shell.on_contacts(&contacts);
         }
         if shell.close {
-            let mut m = [0u8; 4];
-            sys::call(display, &[23], &mut m);
+            let mut m = [0u8; 9];
+            m[0] = 23;
+            m[1..9].copy_from_slice(&base.to_le_bytes());
+            sys::call(display, &m[..9], &mut [0u8; 4]);
             return Ok(());
         }
         let t = sys::now();
         if shell.draw() {
-            shell.present(surface);
-            let mut m = [0u8; 9];
+            shell.present(surface, pw, fx, fy);
+            // The window (ferros WINDOWS.md): the frame's part of the screen, this surface, the app level.
+            let mut m = [0u8; 18];
             m[0] = 22;
             m[1..3].copy_from_slice(&(fx as u16).to_le_bytes());
             m[3..5].copy_from_slice(&(fy as u16).to_le_bytes());
             m[5..7].copy_from_slice(&(w as u16).to_le_bytes());
             m[7..9].copy_from_slice(&(h as u16).to_le_bytes());
+            m[9..17].copy_from_slice(&base.to_le_bytes());
             let mut rr = [0u8; 4];
             if sys::call(display, &m, &mut rr) == sys::ERR {
                 return Err(String::from("the display refused the frame"));
