@@ -230,19 +230,71 @@ mod x11_atomic {
         (!out.is_empty()).then_some(out)
     }
 
-    /// Drain queued X events and report whether any RandR layout change arrived. NON-BLOCKING: it
-    /// empties a queue that is already there rather than asking the server anything, so calling it
-    /// once per event-loop cycle costs nothing while the layout is quiet — no timer, no polling.
-    pub fn screen_changed() -> bool {
-        use x11rb::protocol::Event;
+    /// Ask for raw key events on the root at X Input 2.2. From 2.1 on the server delivers raw events to every client that selected them REGARDLESS of grabs, which is the point: the desktop's move-to-monitor chord is grabbed by the window manager, so neither the window's own key events nor winit's raw ones (measured 2026-10-28: winit saw Super's press but only the RELEASES of Shift and the arrow) ever carry it. Called once at startup. Returns `false` off X11 or without XI 2.1.
+    pub fn watch_raw_keys() -> bool {
+        use x11rb::protocol::xinput::{ConnectionExt as _, Device, EventMask, XIEventMask};
         let Some(conn) = conn() else { return false };
-        let mut changed = false;
+        let Some(root) = conn.setup().roots.first().map(|s| s.root) else {
+            return false;
+        };
+        let Some(v) = conn.xinput_xi_query_version(2, 2).ok().and_then(|c| c.reply().ok()) else {
+            return false;
+        };
+        if v.major_version < 2 || (v.major_version == 2 && v.minor_version < 1) {
+            return false;
+        }
+        let mask = EventMask { deviceid: Device::ALL_MASTER.into(), mask: vec![(XIEventMask::RAW_KEY_PRESS | XIEventMask::RAW_KEY_RELEASE).into()] };
+        let ok = conn.xinput_xi_select_events(root, &[mask]).is_ok();
+        let _ = conn.flush();
+        ok
+    }
+
+    /// Is `window` the window manager's active window (EWMH `_NET_ACTIVE_WINDOW` on the root)? Unlike the window's own focus, this does not change while the WM holds a key grab.
+    pub fn is_active(window: &winit::window::Window) -> bool {
+        use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+        let Ok(handle) = window.window_handle() else {
+            return false;
+        };
+        let xid = match handle.as_raw() {
+            RawWindowHandle::Xcb(h) => h.window.get(),
+            RawWindowHandle::Xlib(h) => h.window as u32,
+            _ => return false,
+        };
+        let Some(conn) = conn() else { return false };
+        let Some(root) = conn.setup().roots.first().map(|s| s.root) else {
+            return false;
+        };
+        let Some(atom) = conn.intern_atom(false, b"_NET_ACTIVE_WINDOW").ok().and_then(|c| c.reply().ok()).map(|r| r.atom) else {
+            return false;
+        };
+        let Some(reply) = conn.get_property(false, root, atom, AtomEnum::WINDOW, 0, 1).ok().and_then(|c| c.reply().ok()) else {
+            return false;
+        };
+        reply.value32().and_then(|mut v| v.next()) == Some(xid)
+    }
+
+    /// What one drain of fluor's own X queue found: whether a RandR layout change arrived, and the raw keys in order as (X keycode, pressed).
+    pub struct Drained {
+        pub screen_changed: bool,
+        pub keys: Vec<(u32, bool)>,
+    }
+
+    /// Drain queued X events: RandR layout changes and raw keys. NON-BLOCKING: it empties a queue
+    /// that is already there rather than asking the server anything, so calling it once per
+    /// event-loop cycle costs nothing while nothing happens — no timer, no polling.
+    pub fn drain() -> Drained {
+        use x11rb::protocol::Event;
+        let mut d = Drained { screen_changed: false, keys: Vec::new() };
+        let Some(conn) = conn() else { return d };
         while let Ok(Some(ev)) = conn.poll_for_event() {
-            if matches!(ev, Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_)) {
-                changed = true;
+            match ev {
+                Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_) => d.screen_changed = true,
+                Event::XinputRawKeyPress(k) => d.keys.push((k.detail, true)),
+                Event::XinputRawKeyRelease(k) => d.keys.push((k.detail, false)),
+                _ => {}
             }
         }
-        changed
+        d
     }
 
     /// The desktop work area `(x, y, w, h)` — the monitor minus space reserved by panels /
@@ -932,6 +984,8 @@ struct DesktopShell<A: FluorApp> {
     is_focused: bool,
     /// The display is dark (macOS: asleep, or the session is not the active one — host/macos_screen.rs). Folded into `is_focused`: screen off reads as the app losing focus (Nick 2026-10-15).
     display_asleep: bool,
+    /// The modifiers held as raw (X Input 2.2) key events report them, one bit each: Super left, Super right, Shift left, Shift right. Raw because the desktop's move-to-monitor chord is grabbed by the window manager, so the window's own key events never see it (see `raw_key`).
+    raw_mods: u8,
 
     /// Live render-pipeline counters. Updated every `render_frame` call (composite-time EMA + frame counter); rendered to a bottom-of-window debug strip when [`paint::DEBUG_SHOW_FPS`] is set via the `[]f` chord.
     debug_stats: crate::paint::DebugStats,
@@ -1032,6 +1086,7 @@ impl<A: FluorApp> DesktopShell<A> {
             },
             is_focused: true,
             display_asleep: false,
+            raw_mods: 0,
             debug_stats: crate::paint::DebugStats::default(),
             pending_damage: crate::canvas::Damage::new(),
             last_strip_active: false,
@@ -1163,6 +1218,20 @@ impl<A: FluorApp> DesktopShell<A> {
             size: (1, 1),
             work_area: (0, 0, 1, 1),
         })
+    }
+
+    /// The monitor a newly opened window belongs on: the one under the pointer, where the operator is looking, else the primary (first in `monitors`).
+    /// Never the desktop-spanning Linux surface: centred on that, a window opens on whichever screen sits in the middle of the union, which on a three-monitor desk is often one nobody is looking at (Nick 2026-10-28: apps that "never appeared" had opened there).
+    fn launch_monitor(&self) -> Option<MonitorRect> {
+        #[cfg(target_os = "linux")]
+        if let Some((px, py)) = x11_atomic::global_pointer() {
+            if let Some(m) = self.monitors.iter().find(|m| {
+                px >= m.origin.0 && px < m.origin.0 + m.size.0 as i32 && py >= m.origin.1 && py < m.origin.1 + m.size.1 as i32
+            }) {
+                return Some(*m);
+            }
+        }
+        self.monitors.first().copied()
     }
 
     /// The monitor the visible window currently sits on, by its centre point.
@@ -2054,7 +2123,7 @@ impl<A: FluorApp> DesktopShell<A> {
             // screens. Before the first placement that's the primary monitor; after it, whichever
             // monitor the window currently sits on.
             let mon = if !was_ready {
-                self.monitors.first().copied().unwrap_or(MonitorRect {
+                self.launch_monitor().unwrap_or(MonitorRect {
                     origin,
                     size: (uw, uh),
                     work_area: (origin.0, origin.1, uw, uh),
@@ -2891,6 +2960,81 @@ impl<A: FluorApp> DesktopShell<A> {
         self.apply_window_rect(rect);
     }
 
+    /// One raw key (X keycode, pressed?) from fluor's own X Input 2.2 subscription: tracks Super and Shift, and on Super+Shift+Arrow — the desktop's move-to-monitor chord on Muffin and Mutter — moves the window that way, when this app is the window manager's active window (which is when the WM would have moved it).
+    /// Keycodes are the X server's evdev ones (evdev code + 8), which every current Linux X server uses: Super 133/134, Shift 50/62, arrows Up 111, Left 113, Right 114, Down 116.
+    #[cfg(target_os = "linux")]
+    fn raw_key(&mut self, code: u32, down: bool) {
+        let bit = match code {
+            133 => 1,
+            134 => 1 << 1,
+            50 => 1 << 2,
+            62 => 1 << 3,
+            _ => 0,
+        };
+        if bit != 0 {
+            self.raw_mods = if down { self.raw_mods | bit } else { self.raw_mods & !bit };
+            return;
+        }
+        let chord = self.raw_mods & 0b0011 != 0 && self.raw_mods & 0b1100 != 0;
+        if !down || !chord || self.is_dragging_move || self.is_dragging_resize {
+            return;
+        }
+        // Ours to move only when the window manager's active window is this app: winit's focus reads false here, because the WM's grab on Super already sent the window a focus-out (measured 2026-10-28), while the WM's own record of the active window stays put through the grab.
+        if !self.surfaces.iter().any(|s| x11_atomic::is_active(&s.window)) {
+            return;
+        }
+        let (dx, dy) = match code {
+            113 => (-1, 0),
+            114 => (1, 0),
+            111 => (0, -1),
+            116 => (0, 1),
+            _ => return,
+        };
+        self.move_to_monitor_dir(dx, dy);
+    }
+
+    /// Move the visible window to the monitor next to its own in direction `(dx, dy)` (each −1, 0 or +1), the way the desktop's move-to-monitor shortcut moves an ordinary window: the nearest monitor whose centre lies that way, with the window keeping its size and its place relative to the monitor's work area, clamped onto the new one.
+    /// A maximized window stays maximized, filling the new monitor's work area, and its restore rect travels with it. No monitor that way: nothing happens (no wrap, as Muffin does).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn move_to_monitor_dir(&mut self, dx: i32, dy: i32) {
+        let here = self.window_monitor();
+        let centre = |m: &MonitorRect| (m.origin.0 as i64 + m.size.0 as i64 / 2, m.origin.1 as i64 + m.size.1 as i64 / 2);
+        let (hx, hy) = centre(&here);
+        let mut best: Option<(i64, MonitorRect)> = None;
+        for m in &self.monitors {
+            let (mx, my) = centre(m);
+            let (ox, oy) = (mx - hx, my - hy);
+            // That way: the step along the asked axis has the asked sign and outweighs the step across it.
+            let along = ox * dx as i64 + oy * dy as i64;
+            let across = (ox * dy as i64 - oy * dx as i64).abs();
+            if along > 0 && along >= across {
+                let d = ox * ox + oy * oy;
+                if best.map_or(true, |(bd, _)| d < bd) {
+                    best = Some((d, *m));
+                }
+            }
+        }
+        let Some((_, there)) = best else {
+            return;
+        };
+        let area = |m: &MonitorRect| if m.work_area.2 > 1 && m.work_area.3 > 1 { m.work_area } else { (m.origin.0, m.origin.1, m.size.0, m.size.1) };
+        let (fx, fy, _, _) = area(&here);
+        let (tx, ty, tw, th) = area(&there);
+        let carry = |r: WindowRect| WindowRect { x: r.x - fx + tx, y: r.y - fy + ty, w: r.w, h: r.h };
+        log::info!("FLUOR-MON: move-to-monitor ({dx}, {dy}) {:?} → {:?}", here.origin, there.origin);
+        let rect = match self.saved_rect_for_maximize {
+            Some(prev) => {
+                self.saved_rect_for_maximize = Some(self.clamp_rect_to_monitors(carry(prev)));
+                WindowRect { x: tx, y: ty, w: tw, h: th }
+            }
+            None => self.clamp_rect_to_monitors(carry(self.window_rect)),
+        };
+        self.apply_window_rect(rect);
+        if let Some(w) = self.home_window() {
+            w.request_redraw();
+        }
+    }
+
     /// Flip `window_rect` between the user-sized rect (saved in `saved_rect_for_maximize`) and the home surface's work area. Mirrors the geometry-change tail of `resize_drag_update`: resize scratch + clip_mask, reflow viewport, notify the consumer via `on_resize`, mark full-repaint, and update the X11 input region. No-op if the home surface's size is still a placeholder — first `Resized` event hasn't landed yet, no real geometry to swap to.
     fn toggle_maximized(&mut self) {
         if self.home_window().is_none() {
@@ -3226,6 +3370,8 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
         // Layout changes invalidate the spanning surface below — subscribe before it can happen.
         #[cfg(target_os = "linux")]
         x11_atomic::watch_screen_changes();
+        #[cfg(target_os = "linux")]
+        x11_atomic::watch_raw_keys();
         log::info!("FLUOR-MON: {} monitor(s): {:?}", self.monitors.len(), self.monitors);
 
         // LINUX: ONE surface spanning every monitor. Mutter-family WMs run their own placement
@@ -3296,8 +3442,12 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
         // that covers the menu bar. Same spec, same click queue.
         super::macos_menu::install_dock_menu(&self.app.dock_menu());
 
-        // Initial visible-window size: app-supplied (defaults to half the screen in each axis), clamped to the surface's work area and centred within it — the work area is already in GLOBAL desktop units, so the centering math places the window correctly even when the primary monitor isn't at (0, 0). Apps with aspect-ratio opinions override [`FluorApp::initial_size`].
-        let (wa_x, wa_y, wa_w, wa_h) = self.surfaces[0].work_area;
+        // Initial visible-window size: app-supplied (defaults to half the screen in each axis), clamped to the LAUNCH MONITOR's work area and centred within it (see `launch_monitor`: the pointer's monitor, else the primary). Work areas are in GLOBAL desktop units, so the centering places the window correctly even when that monitor isn't at (0, 0). The surface's own work area is only the fallback when no monitor is known — on Linux it spans every monitor. Apps with aspect-ratio opinions override [`FluorApp::initial_size`].
+        let (wa_x, wa_y, wa_w, wa_h) = match self.launch_monitor() {
+            Some(m) if m.work_area.2 > 1 && m.work_area.3 > 1 => m.work_area,
+            Some(m) => (m.origin.0, m.origin.1, m.size.0, m.size.1),
+            None => self.surfaces[0].work_area,
+        };
         let (req_w, req_h) = self.app.initial_size((wa_w, wa_h));
         // WHY/PROOF: the requested size is the app's, and it must fit the OS work area and keep at least 1 px.
         let initial_w = req_w.max(1).min(wa_w);
@@ -3372,8 +3522,14 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
         // RandR layout change (hotplug, or the fgtw host's framebuffer following a remote viewer)?
         // Draining the queue is free when nothing happened — see `x11_atomic::screen_changed`.
         #[cfg(target_os = "linux")]
-        if x11_atomic::screen_changed() {
-            self.rebuild_span(event_loop);
+        {
+            let drained = x11_atomic::drain();
+            if drained.screen_changed {
+                self.rebuild_span(event_loop);
+            }
+            for (code, down) in drained.keys {
+                self.raw_key(code, down);
+            }
         }
         // The display went dark or came back (macos_screen): fold it into the app's focus and deliver the edge exactly as a window's focus change is delivered — the raw Focused event, then on_focus_changed.
         #[cfg(target_os = "macos")]
