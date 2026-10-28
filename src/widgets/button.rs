@@ -272,6 +272,14 @@ impl Button {
         self.font_size = font_size;
     }
 
+    /// Set the label size, SHRUNK so the label and its padding fit the pill's current width — the fit rule [`Self::draw_pill_immediate`] uses for immediate pills, for a retained one: never grown past `desired`, floored by nothing, so a narrow slot yields smaller text instead of a clipped label. Call after [`Self::set_rect`].
+    pub fn set_font_size_fitted(&mut self, desired: Coord, text: &mut TextRenderer) {
+        let tw = text.measure_text(&self.label, &TextStyle::new(desired, 0).font(self.font));
+        let need = tw + desired * 1.6;
+        let size = if need > self.width { desired * self.width / need } else { desired };
+        self.set_font_size(size);
+    }
+
     /// Returns `true` if the button has been clicked since the last call to `take_click`. The internal counter is monotonic; this call advances the consumer's read pointer to the current value. Multiple clicks between polls coalesce into a single `true` — buttons aren't a rate-limited event source, they're "did the user activate this thing recently."
     pub fn take_click(&mut self) -> bool {
         if self.click_counter != self.last_seen_click_counter {
