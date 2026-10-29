@@ -552,7 +552,7 @@ pub fn draw_app_icon<P: Pixel>(
     let stroke_width = (r >> 5) + 2;
     // TOP-DOWN, not partitioned. The icon is the top layer; the ring sits beneath it. Paint the icon FIRST with a soft edge, then fill the ring as a FULL disk underneath. Under-blend is "topmost paints first, the layer beneath shows thru", so the ring bleeds thru the icon's partial-alpha rim → the icon↔ring boundary anti-aliases with no hard step; the background, painted under the whole orb afterward, gives the outer AA.
     //
-    // Each edge is a 1-px coverage ramp biased INWARD, not centred and not a band tacked outside. From d ≈ R + (dist²−R²)/2R, coverage = (R²−dist²)/(2R−1): full (255) at dist²=(R−1)², zero at dist²=R², the single AA pixel landing at R. Biasing inward (rather than half-straddling R) lands the edge cleanly on the grid with no 50%-at-the-radius pixel and pulls the solid radius in by 1. BOTH edges are biased the same way so the icon reaches 0 exactly where the ring is still solid — two straddling ramps would overlap into a translucent dip (a see-thru ring) at the boundary. The icon image is unchanged: same sampling, just a clean AA rim.
+    // Each edge is a 1-px coverage ramp biased INWARD, not centred and not a band tacked outside. From d ≈ R + (dist²−R²)/2R, coverage = (R²−dist²)/(2R−1): full (ONE, the depth's opaque α) at dist²=(R−1)², zero at dist²=R², the single AA pixel landing at R. Biasing inward (rather than half-straddling R) lands the edge cleanly on the grid with no 50%-at-the-radius pixel and pulls the solid radius in by 1. BOTH edges are biased the same way so the icon reaches 0 exactly where the ring is still solid — two straddling ramps would overlap into a translucent dip (a see-thru ring) at the boundary. The icon image is unchanged: same sampling, just a clean AA rim.
     let r_icon = r - 1;
     let r_icon2 = r_icon * r_icon;
     let two_icon = 2 * r_icon - 1; // ramp denominator for the icon edge: (R²)−(R−1)²
@@ -990,7 +990,7 @@ pub fn draw_minimize_symbol<P: Pixel>(
             }
             let idx = (py as usize) * width + (px as usize);
             let gradient = ((r4 - dist4) << P::DEPTH) / (r3 << 2);
-            // AA via α-byte: opacity = gradient/256, capped at 255 (fully opaque) — not a guard: the interior's gradient grows past 255 by construction and would carry out of the α byte.
+            // AA via α: opacity = gradient / 2^DEPTH, capped at ONE (fully opaque) — not a guard: the interior's gradient grows past ONE by construction and would carry out of the α field.
             let chrome_alpha = gradient.min(P::ONE as usize) as u32;
             if chrome_alpha == 0 {
                 continue;
@@ -1065,7 +1065,7 @@ pub fn draw_maximize_symbol<P: Pixel>(
                 let dist_from_outer = r4 - dist4;
                 if dist_from_outer <= outer_thresh {
                     let gradient = (dist_from_outer << P::DEPTH) / outer_thresh;
-                    // Capped at 255 (fully opaque): gradient reaches 256 at the ring's inner edge of the ramp and would carry out of the α byte.
+                    // Capped at ONE (fully opaque): gradient reaches 2^DEPTH at the ring's inner edge of the ramp and would carry out of the α field.
                     let chrome_alpha = gradient.min(P::ONE as usize) as u32;
                     if chrome_alpha == 0 {
                         continue;
@@ -1082,7 +1082,7 @@ pub fn draw_maximize_symbol<P: Pixel>(
 
 /// Rasterize the close glyph — an ✕ of two 45° diagonal capsules — centred at `(cx, cy)` with arm radius `r`. Integer math, same spirit as [`draw_minimize_symbol`]/[`draw_maximize_symbol`]: per pixel, the squared distance to the relevant diagonal is compared against the stroke radius in a scaled (`×8`) integer domain, with a 1-pixel AA band. No floating point, no `sqrt`.
 ///
-/// Coordinates run in a doubled, pixel-centred frame (`ax = 2·dx + 1 = 2·x_actual`), so the half-pixel sample offset and the diagonal's `1/√2` factor fall out as exact integers: a diagonal's perpendicular squared distance is `perp²/8` of the true value and a cap endpoint's is `[(ax−epx)²+(ay−epy)²]/4`. Multiplying thru by 8 (`d8`) clears both, so every test is against `radius²·8 = 2·rad²`. The only division is the AA ramp, whose divisor `denom = 8·rad ≥ 8` is provably non-zero and whose result is provably `< 256` in the ramp branch (there `d8 > inner8`, so `outer8 − d8 < denom`).
+/// Coordinates run in a doubled, pixel-centred frame (`ax = 2·dx + 1 = 2·x_actual`), so the half-pixel sample offset and the diagonal's `1/√2` factor fall out as exact integers: a diagonal's perpendicular squared distance is `perp²/8` of the true value and a cap endpoint's is `[(ax−epx)²+(ay−epy)²]/4`. Multiplying thru by 8 (`d8`) clears both, so every test is against `radius²·8 = 2·rad²`. The only division is the AA ramp, whose divisor `denom = 8·rad ≥ 8` is provably non-zero and whose result is provably below `2^DEPTH` (at most ONE) in the ramp branch (there `d8 > inner8`, so `outer8 − d8 < denom`).
 pub fn draw_close_symbol<P: Pixel>(
     pixels: &mut [P],
     width: usize,
