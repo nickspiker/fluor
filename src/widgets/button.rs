@@ -8,12 +8,13 @@ use crate::coord::Coord;
 use crate::paint::{self, Clip, HitId};
 use crate::region::Region;
 use crate::text::TextRenderer;
+use crate::pixel::{Argb8, Pixel};
 use crate::theme;
 use crate::widgets::textbox::{blit_cache_to_target, region_to_pixelrect};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-pub struct Button {
+pub struct Button<P: Pixel = Argb8> {
     /// Allocated at construction; stamped into the host hit map at every opaque pill pixel.
     hit_id: HitId,
     /// Label text — single line, no editing. Mutate via [`Self::set_label`] so caches invalidate.
@@ -57,11 +58,11 @@ pub struct Button {
     last_seen_click_counter: u32,
 
     // --- Caches (same layering as Textbox: pill_cache holds squircle bg + AA edges, text_cache holds the label glyphs clipped to the inner-pill silhouette, both blit topmost-first into target via under()) ---
-    pill_cache: Vec<u32>,
+    pill_cache: Vec<P>,
     pill_cache_w: usize,
     pill_cache_h: usize,
     pill_cache_dirty: bool,
-    text_cache: Vec<u32>,
+    text_cache: Vec<P>,
     text_cache_w: usize,
     text_cache_h: usize,
     text_cache_dirty: bool,
@@ -74,8 +75,24 @@ pub struct Button {
 }
 
 impl Button {
-    /// `hit_counter` is the app's monotonic [`HitId`] allocator (see [`crate::host::widget::next_id`]). Each Button claims one ID at construction.
+    /// The 8-bit widget; [`Button::with_depth`] builds one at another pixel depth.
+    /// `new` lives on the 8-bit type alone so `Button::new(..)` needs no annotation where nothing else fixes the depth.
     pub fn new(
+        hit_counter: &mut HitId,
+        center_x: Coord,
+        center_y: Coord,
+        width: Coord,
+        height: Coord,
+        font_size: Coord,
+        label: impl Into<String>,
+    ) -> Self {
+        Self::with_depth(hit_counter, center_x, center_y, width, height, font_size, label)
+    }
+}
+
+impl<P: Pixel> Button<P> {
+    /// `hit_counter` is the app's monotonic [`HitId`] allocator (see [`crate::host::widget::next_id`]). Each Button claims one ID at construction.
+    pub fn with_depth(
         hit_counter: &mut HitId,
         center_x: Coord,
         center_y: Coord,
@@ -356,7 +373,7 @@ impl Button {
     /// Paint the button into `canvas` at its viewport-space `center_*` / `width` / `height`, stamping `hit_id` into `hit_map` at every opaque pill pixel. Same three-step blit as Textbox: text_cache (glyphs) → pill_cache (squircle bg + AA edges) → focus glow on top. No selection rect, no blinkey — just label + pill + optional glow.
     pub fn render_content_into(
         &mut self,
-        canvas: &mut crate::canvas::Canvas,
+        canvas: &mut crate::canvas::Canvas<P>,
         offset_x: Coord,
         offset_y: Coord,
         text: &mut TextRenderer,
@@ -392,7 +409,7 @@ impl Button {
         if self.pill_cache_dirty {
             paint::RASTERIZE_OPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             self.pill_cache.clear();
-            self.pill_cache.resize(cw * ch, 0);
+            self.pill_cache.resize(cw * ch, P::EMPTY);
             self.pill_cache_w = cw;
             self.pill_cache_h = ch;
             let inner_x = stroke_px;
@@ -420,7 +437,8 @@ impl Button {
             self.inner_pill_mask.clear();
             self.inner_pill_mask.resize(cw * ch, 0);
             for i in 0..(cw * ch) {
-                self.inner_pill_mask[i] = ((self.pill_cache[i] >> 24) & 0xFF) as u8;
+                // The mask is bytes at every depth: the top byte of α.
+                self.inner_pill_mask[i] = (self.pill_cache[i].alpha() >> (P::DEPTH - 8)) as u8;
             }
             {
                 let mut cache_canvas =
@@ -448,7 +466,7 @@ impl Button {
         if self.text_cache_dirty {
             paint::RASTERIZE_OPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             self.text_cache.clear();
-            self.text_cache.resize(cw * ch, 0);
+            self.text_cache.resize(cw * ch, P::EMPTY);
             self.text_cache_w = cw;
             self.text_cache_h = ch;
             if !self.label.is_empty() && self.font_size > 0.0 {
@@ -553,7 +571,7 @@ impl Button {
     /// Fit-to-slot: the font shrinks so a label never overruns its slot (pills sharing a row don't collide), scaling all the way down; the pill grows only when the label needs more than `rect.w` (never shrinks the pill).
     #[allow(clippy::too_many_arguments)]
     pub fn draw_pill_immediate(
-        canvas: &mut crate::canvas::Canvas,
+        canvas: &mut crate::canvas::Canvas<P>,
         text: &mut TextRenderer,
         hit_map: Option<&mut [HitId]>,
         buf_w: usize,
@@ -623,7 +641,7 @@ impl Button {
                 let row = py as usize * buf_w;
                 for px in sx..x1 {
                     let i = row + px as usize;
-                    if canvas.pixels[i] < 0xFF00_0000 {
+                    if canvas.pixels[i].alpha() != P::ONE {
                         hm[i] = hit_id;
                     }
                 }
@@ -690,7 +708,7 @@ impl Button {
             }
             for cx in 0..cw {
                 // Any alpha at all = the pill touches this pixel → BOINK.
-                if (self.pill_cache[cy * cw + cx] >> 24) == 0 {
+                if self.pill_cache[cy * cw + cx].alpha() == 0 {
                     continue;
                 }
                 let tx = pill_x + cx as isize;
@@ -714,13 +732,14 @@ mod widget_impls {
     //! [`crate::host::widget`] capability traits for [`Button`]. Mirrors `textbox::widget_impls`: Click increments the action counter, Focus / Hover route thru Button's setters, Key activates on Enter / Space. Speaks fluor-native event types so the same impls work on every host (host-winit on desktop, host-android on Android).
 
     use super::Button;
+    use crate::pixel::Pixel;
     use crate::coord::Coord;
     use crate::event::{ElementState, Key as FKey, KeyEvent, ModifiersState, NamedKey};
     use crate::host::widget::{Click, Focus, Hover, Key, PaintCtx, Widget};
     use crate::paint::HitId;
     use crate::text::TextRenderer;
 
-    impl Widget for Button {
+    impl<P: Pixel> Widget for Button<P> {
         fn id(&self) -> HitId {
             self.hit_id()
         }
@@ -745,7 +764,7 @@ mod widget_impls {
         }
     }
 
-    impl Click for Button {
+    impl<P: Pixel> Click for Button<P> {
         fn on_click(
             &mut self,
             _x: Coord,
@@ -760,7 +779,7 @@ mod widget_impls {
         }
     }
 
-    impl Key for Button {
+    impl<P: Pixel> Key for Button<P> {
         fn on_key(
             &mut self,
             kev: &KeyEvent,
@@ -780,7 +799,7 @@ mod widget_impls {
         }
     }
 
-    impl Focus for Button {
+    impl<P: Pixel> Focus for Button<P> {
         fn set_focused(&mut self, focused: bool) {
             Button::set_focused(self, focused);
         }
@@ -794,7 +813,7 @@ mod widget_impls {
         }
     }
 
-    impl Hover for Button {
+    impl<P: Pixel> Hover for Button<P> {
         fn set_hovered(&mut self, hovered: bool) {
             Button::set_hovered(self, hovered);
         }

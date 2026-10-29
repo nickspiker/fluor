@@ -12,6 +12,7 @@ use crate::coord::Coord;
 use crate::paint::{self, Clip, HitId};
 use crate::region::Region;
 use crate::text::TextRenderer;
+use crate::pixel::{Argb8, Pixel};
 use crate::theme;
 use crate::widgets::textbox::{blit_cache_to_target, region_to_pixelrect};
 use alloc::string::String;
@@ -37,7 +38,7 @@ impl DropdownRow {
 }
 
 /// Discrete-choice selector. Closed: a pill with the selected option's label and a chevron. Open: a popup listing every option, one hoverable/clickable row each.
-pub struct Dropdown {
+pub struct Dropdown<P: Pixel = Argb8> {
     /// The pill's hit id (allocated first, then one per row, all from the same counter).
     hit_id: HitId,
     options: Vec<String>,
@@ -64,11 +65,11 @@ pub struct Dropdown {
     last_seen_change_counter: u32,
 
     // --- Pill cache (closed state): squircle bg + AA edges; label + chevron in text cache. Same layering as Button. ---
-    pill_cache: Vec<u32>,
+    pill_cache: Vec<P>,
     pill_cache_w: usize,
     pill_cache_h: usize,
     pill_cache_dirty: bool,
-    text_cache: Vec<u32>,
+    text_cache: Vec<P>,
     text_cache_dirty: bool,
     inner_pill_mask: Vec<u8>,
     /// `true` when the caches were rasterized with the disabled (dimmed) palette — so enable/disable transitions re-rasterize.
@@ -84,8 +85,24 @@ pub struct Dropdown {
 }
 
 impl Dropdown {
-    /// `hit_counter` is the app's monotonic [`HitId`] allocator. The dropdown claims `1 + options.len()` ids: the pill first, then one per row in option order.
+    /// The 8-bit widget; [`Dropdown::with_depth`] builds one at another pixel depth.
+    /// `new` lives on the 8-bit type alone so `Dropdown::new(..)` needs no annotation where nothing else fixes the depth.
     pub fn new(
+        hit_counter: &mut HitId,
+        center_x: Coord,
+        center_y: Coord,
+        width: Coord,
+        height: Coord,
+        font_size: Coord,
+        options: Vec<String>,
+    ) -> Self {
+        Self::with_depth(hit_counter, center_x, center_y, width, height, font_size, options)
+    }
+}
+
+impl<P: Pixel> Dropdown<P> {
+    /// `hit_counter` is the app's monotonic [`HitId`] allocator. The dropdown claims `1 + options.len()` ids: the pill first, then one per row in option order.
+    pub fn with_depth(
         hit_counter: &mut HitId,
         center_x: Coord,
         center_y: Coord,
@@ -438,14 +455,14 @@ impl Dropdown {
             theme::TEXTBOX_TEXT
         } else {
             // Greyed: keep the darkness payload, halve the α so the label visibly dims.
-            (theme::TEXTBOX_TEXT & 0x00FF_FFFF) | 0x8000_0000
+            theme::TEXTBOX_TEXT.rgb().with_alpha(0x80)
         }
     }
 
     /// Paint the OPEN popup into `canvas`, stamping each row's hit id over its band. MUST be called before any content the popup should cover (top of the app's render — see module docs). No-op when closed or disabled.
     pub fn render_popup_into(
         &mut self,
-        canvas: &mut crate::canvas::Canvas,
+        canvas: &mut crate::canvas::Canvas<P>,
         text: &mut TextRenderer,
         clip: Option<Clip>,
         mut hit_map: Option<&mut [HitId]>,
@@ -542,7 +559,7 @@ impl Dropdown {
     /// Paint the closed-state pill (selected label + chevron) in normal widget order, stamping the pill's hit id. Mirrors [`super::Button::render_content_into`].
     pub fn render_content_into(
         &mut self,
-        canvas: &mut crate::canvas::Canvas,
+        canvas: &mut crate::canvas::Canvas<P>,
         offset_x: Coord,
         offset_y: Coord,
         text: &mut TextRenderer,
@@ -570,7 +587,7 @@ impl Dropdown {
         if self.pill_cache_dirty {
             paint::RASTERIZE_OPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             self.pill_cache.clear();
-            self.pill_cache.resize(cw * ch, 0);
+            self.pill_cache.resize(cw * ch, P::EMPTY);
             self.pill_cache_w = cw;
             self.pill_cache_h = ch;
             let mut cache_damage = crate::canvas::Damage::new();
@@ -596,7 +613,8 @@ impl Dropdown {
             self.inner_pill_mask.clear();
             self.inner_pill_mask.resize(cw * ch, 0);
             for i in 0..(cw * ch) {
-                self.inner_pill_mask[i] = ((self.pill_cache[i] >> 24) & 0xFF) as u8;
+                // The mask is bytes at every depth: the top byte of α.
+                self.inner_pill_mask[i] = (self.pill_cache[i].alpha() >> (P::DEPTH - 8)) as u8;
             }
             {
                 let mut cache_canvas =
@@ -622,7 +640,7 @@ impl Dropdown {
         if self.text_cache_dirty {
             paint::RASTERIZE_OPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             self.text_cache.clear();
-            self.text_cache.resize(cw * ch, 0);
+            self.text_cache.resize(cw * ch, P::EMPTY);
             let colour = self.text_colour();
             let mut text_damage = crate::canvas::Damage::new();
             let mut text_canvas =
@@ -730,13 +748,14 @@ mod widget_impls {
     //! Capability traits. The Dropdown itself is the pill widget (click toggles, keyboard navigates/commits); each [`DropdownRow`] is a click+hover widget that records a fired flag for the parent to fold in at [`Dropdown::take_change`].
 
     use super::{Dropdown, DropdownRow};
+    use crate::pixel::Pixel;
     use crate::coord::Coord;
     use crate::event::{ElementState, Key as FKey, KeyEvent, ModifiersState, NamedKey};
     use crate::host::widget::{Click, Focus, Hover, Key, PaintCtx, Widget};
     use crate::paint::HitId;
     use crate::text::TextRenderer;
 
-    impl Widget for Dropdown {
+    impl<P: Pixel> Widget for Dropdown<P> {
         fn id(&self) -> HitId {
             self.hit_id()
         }
@@ -757,7 +776,7 @@ mod widget_impls {
         }
     }
 
-    impl Click for Dropdown {
+    impl<P: Pixel> Click for Dropdown<P> {
         fn on_click(
             &mut self,
             _x: Coord,
@@ -773,7 +792,7 @@ mod widget_impls {
         }
     }
 
-    impl Key for Dropdown {
+    impl<P: Pixel> Key for Dropdown<P> {
         fn on_key(
             &mut self,
             kev: &KeyEvent,
@@ -825,7 +844,7 @@ mod widget_impls {
         }
     }
 
-    impl Focus for Dropdown {
+    impl<P: Pixel> Focus for Dropdown<P> {
         fn set_focused(&mut self, focused: bool) {
             Dropdown::set_focused(self, focused);
         }
@@ -840,7 +859,7 @@ mod widget_impls {
         }
     }
 
-    impl Hover for Dropdown {
+    impl<P: Pixel> Hover for Dropdown<P> {
         fn set_hovered(&mut self, hovered: bool) {
             Dropdown::set_hovered(self, hovered);
         }

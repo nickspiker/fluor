@@ -16,10 +16,6 @@ const EIGHT_BIT: &[(&str, &str)] = &[
     ("paint/argb8.rs", "the 8-bit colour boundary (pack_argb), the theme-delta byte arithmetic, and the overlay, damage outline and control glyphs on the finalized screen"),
     ("text/argb8.rs", "the legacy byte-buffer draws and the additive / subtractive wrapping blits"),
     ("host/", "the hosts' present and chrome code; phase 5 takes ferros to G2t16"),
-    ("widgets/button.rs", "phase 4: pill and text caches are Vec<u32>"),
-    ("widgets/dropdown.rs", "phase 4: pill and text caches are Vec<u32>"),
-    ("widgets/multitextbox.rs", "phase 4: pill and text caches are Vec<u32>"),
-    ("widgets/textbox.rs", "phase 4: pill and text caches are Vec<u32>, and its premultiplied cache blit"),
     ("golden.rs", "test scenes author 8-bit colours"),
     ("gate.rs", "this file names the patterns it refuses"),
 ];

@@ -595,7 +595,9 @@ pub struct Context<'a> {
 pub use super::event_response::EventResponse;
 
 /// What a consumer implements to drive the desktop host.
-pub trait FluorApp {
+///
+/// `P` is the pixel depth the app renders at, 8-bit unless named: the desktop, Android and the default ferros host run `FluorApp` (= `FluorApp<Argb8>`); a ferros app can implement `FluorApp<G2t16>` and run on the 16-bit shell.
+pub trait FluorApp<P: crate::pixel::Pixel = crate::pixel::Argb8> {
     /// Custom user-event payload for cross-thread wake-up. Background tasks (network, file I/O, async ceremonies) clone the `Arc<dyn WakeSender<Self::UserEvent>>` from [`Self::set_event_proxy`] and call `proxy.send(payload)` to wake the host; the host dispatches the payload back thru [`Self::on_user_event`] on the UI thread. Apps that don't need cross-thread wake-up declare `type UserEvent = ();` and skip the two methods.
     type UserEvent: 'static + Send;
 
@@ -715,7 +717,7 @@ pub trait FluorApp {
     }
 
     /// Per-frame paint into the host's CPU present buffer. Flatten owned Groups onto `target`. The damage clip computed pre-render is in `ctx.damage_clip`; thread it thru every flatten / blit / glow call to skip pixels outside the dirty region.
-    fn render(&mut self, target: &mut [u32], ctx: &mut Context);
+    fn render(&mut self, target: &mut [P], ctx: &mut Context);
 
     /// Draw on fluor's GPU (macOS always presents thru wgpu; Linux with fluor's `gpu` feature): `Some` asks for a device with these features and limits, made once, on the adapter that presents to the window, before [`Self::init`]. `None` (the default) keeps Linux on softbuffer and gives macOS a plain device.
     #[cfg(fluor_gpu)]

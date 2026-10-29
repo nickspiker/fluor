@@ -10,6 +10,7 @@ use crate::canvas::{Canvas, PixelRect};
 use crate::coord::Coord;
 use crate::event::{KeyEvent, ModifiersState};
 use crate::paint::{Clip, HitId};
+use crate::pixel::{Argb8, Pixel};
 use crate::text::TextRenderer;
 
 pub use crate::paint::HIT_NONE;
@@ -26,8 +27,10 @@ pub fn next_id(counter: &mut HitId) -> HitId {
 /// Per-paint scratchpad bundling everything a widget's [`Widget::paint`] method needs: a mutable canvas for drawing, the shared font + glyph cache for text widgets, the shared per-pixel hit map for stamping the widget's silhouette, and an optional clip rect for damage-narrowed paints. Built fresh by the host (or app) once per render call; widgets borrow it immutably-by-shape for the duration of a single `paint`.
 ///
 /// Lifetimes: the inner borrows all share `'ctx` (the duration of the per-frame paint call). Canvas's own buffer borrow `'buf` is separate so a long-lived canvas can be reused across paints without re-binding the lifetime.
-pub struct PaintCtx<'ctx, 'buf> {
-    pub canvas: &'ctx mut Canvas<'buf>,
+///
+/// `P` is the canvas's pixel depth, 8-bit unless named. [`Widget::paint`] takes the 8-bit context: the trait stays object-safe and non-generic so one `&mut dyn Widget` dispatches clicks, keys, focus and hover for a widget at any depth (none of which touch pixels), and every widget paints thru its own depth-generic `render_content_into`.
+pub struct PaintCtx<'ctx, 'buf, P: Pixel = Argb8> {
+    pub canvas: &'ctx mut Canvas<'buf, P>,
     pub text: &'ctx mut TextRenderer,
     pub hit_map: &'ctx mut [HitId],
     pub clip: Option<Clip>,

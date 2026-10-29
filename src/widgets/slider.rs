@@ -11,6 +11,7 @@
 use crate::canvas::PixelRect;
 use crate::coord::Coord;
 use crate::paint::{self, HitId};
+use crate::pixel::Pixel;
 use crate::region::Region;
 
 /// Opaque darkness-convention colours, lumis palette: white(left)/black(right), grey pair when disabled.
@@ -176,9 +177,9 @@ impl Slider {
 
     /// Paint the slider into `canvas` and stamp `hit_id` into `hit_map` across the whole grab band.
     /// Draws directly (no caches) — two rects and a circle are cheap enough to rasterize per frame.
-    pub fn render_content_into(
+    pub fn render_content_into<P: Pixel>(
         &mut self,
-        canvas: &mut crate::canvas::Canvas,
+        canvas: &mut crate::canvas::Canvas<P>,
         hit_map: Option<&mut [HitId]>,
         hit_id: HitId,
     ) {

@@ -8,11 +8,12 @@ use crate::coord::Coord;
 use crate::paint::{self, Clip, HitId};
 use crate::region::Region;
 use crate::text::TextRenderer;
+use crate::pixel::{Argb8, Pixel};
 use crate::theme;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-pub struct Textbox {
+pub struct Textbox<P: Pixel = Argb8> {
     /// Text content as a `Vec<char>` — character-indexed cursor + width arrays.
     pub chars: Vec<char>,
     /// Insertion point in `[0, chars.len()]`. Intentionally public — selection-drag in the app's `CursorMoved` handler mutates it directly each frame as the cursor moves; a setter would require either an opaque "extend-selection-to-pixel-x" API on Textbox (which would force the textbox to know about the drag state machine) or per-event call overhead. Treat as widget-internal otherwise.
@@ -57,7 +58,7 @@ pub struct Textbox {
     // --- Three-layer cache (front-to-back composition via under()) --- Pill bg (bottom): squircle fill + AA edges. Rarely changes (geometry / zoom only). Text glyphs (top, painted first to claim opaque pixels): per-char rasterized via TextRenderer. Changes on text edits. Selection bg (middle): painted fresh each frame from the cursor / selection_anchor range — no cache needed, it's just a coloured rect.
     //
     // Composition each frame: text_cache → target via under() (topmost wins on its opaque glyph pixels), selection rect → target via under() (claims empty selection-range cells beneath the glyphs), pill_cache → target via under() (fills remaining empty pill-interior cells beneath both). Result reads as the textbook text-field selection look: glyph colour unchanged over both selection and non-selection backgrounds.
-    pill_cache: Vec<u32>,
+    pill_cache: Vec<P>,
     pill_cache_w: usize,
     pill_cache_h: usize,
     /// Viewport-space top-left where the pill cache should blit. Recomputed in `render_content_into`.
@@ -66,7 +67,7 @@ pub struct Textbox {
     /// `true` → pill squircle needs re-rasterize on the next render. Set by `set_rect` / `set_font_size`.
     pill_cache_dirty: bool,
     /// Pre-rasterized text glyphs in α + darkness. Bbox-sized (same dims as pill_cache). Glyph pixels are opaque; surrounding cells are α = 0 so under()-blits expose whatever's below (selection bg or pill bg).
-    text_cache: Vec<u32>,
+    text_cache: Vec<P>,
     text_cache_w: usize,
     text_cache_h: usize,
     /// `true` → text glyphs need re-rasterize on the next render. Set by every text-mutating method (insert_char, backspace, etc.) and by geometry / font-size changes.
@@ -119,16 +120,17 @@ pub(crate) fn region_to_pixelrect(
 
 /// Blit the cache (pre-composed α + darkness, holding the BASE-colour squircle — no tint baked in) onto `canvas` at `(origin_x, origin_y)`. The cache stays tint-free; hover/focus tints are applied entirely by the host's post-finalize overlay pass against persistent_screen using `hit_test_map` and the per-hit-id delta table.
 ///
-/// Composition uses the `flatten_premult` formula (src is pre-attenuated, so we scale by `(256 − dst.α)` only — not by `(256 − dst.α) × src.α`).
+/// Composition is [`paint::flatten_premult`]'s kernel, row by row (src is pre-attenuated, so we scale by `(ONE + 1 − dst.α)` only — not by that × src.α): one copy of the maths for every premultiplied blit.
 ///
 /// Hit stamp: writes `hit_id` to `hit_map` at every opaque cache pixel during the same walk.
-pub(crate) fn blit_cache_to_target(
-    cache: &[u32],
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn blit_cache_to_target<P: Pixel>(
+    cache: &[P],
     cache_w: usize,
     cache_h: usize,
     origin_x: isize,
     origin_y: isize,
-    canvas: &mut crate::canvas::Canvas,
+    canvas: &mut crate::canvas::Canvas<P>,
     hit_map: Option<&mut [HitId]>,
     hit_id: HitId,
     clip: Option<paint::Clip>,
@@ -154,37 +156,17 @@ pub(crate) fn blit_cache_to_target(
     let target = &mut *canvas.pixels;
     let mut hit_map = hit_map;
     // Walk only the clipped range: [dx0, dx1) × [dy0, dy1) lies inside the target, the clip and the cache's footprint (dx0 ≥ origin_x, dx1 ≤ origin_x + cache_w), so no per-pixel bounds test.
+    let run = dx1 - dx0;
+    let cx0 = (dx0 as isize - origin_x) as usize;
     for ty in dy0..dy1 {
         let cy = (ty as isize - origin_y) as usize;
-        let cache_row = cy * cache_w;
-        let target_row = ty * target_w;
-        for tx in dx0..dx1 {
-            let cx = (tx as isize - origin_x) as usize;
-            let cache_idx = cache_row + cx;
-            let target_idx = target_row + tx;
-
-            let d = target[target_idx];
-            let s = cache[cache_idx];
-            let s_a = (s >> 24) & 0xFF;
-            let eff_r = (s >> 16) & 0xFF;
-            let eff_g = (s >> 8) & 0xFF;
-            let eff_b = s & 0xFF;
-            // flatten_premult: scale src contribution by (256 - dst.α) only — src.dark already premultiplied.
-            if d < 0xFF000000 {
-                let d_a = d >> 24;
-                let factor = 256 - d_a;
-                let d_r = (d >> 16) & 0xFF;
-                let d_g = (d >> 8) & 0xFF;
-                let d_b = d & 0xFF;
-                let new_a = d_a + ((factor * s_a) >> 8);
-                let new_r = d_r + ((factor * eff_r) >> 8);
-                let new_g = d_g + ((factor * eff_g) >> 8);
-                let new_b = d_b + ((factor * eff_b) >> 8);
-                target[target_idx] = (new_a << 24) | (new_r << 16) | (new_g << 8) | new_b;
-            }
-            if s_a == 0xFF {
-                if let Some(hm) = hit_map.as_deref_mut() {
-                    hm[target_idx] = hit_id;
+        let src = &cache[cy * cache_w + cx0..cy * cache_w + cx0 + run];
+        let target_row = ty * target_w + dx0;
+        paint::flatten_premult_chunk(&mut target[target_row..target_row + run], src);
+        if let Some(hm) = hit_map.as_deref_mut() {
+            for (i, s) in src.iter().enumerate() {
+                if s.alpha() == P::ONE {
+                    hm[target_row + i] = hit_id;
                 }
             }
         }
@@ -192,8 +174,23 @@ pub(crate) fn blit_cache_to_target(
 }
 
 impl Textbox {
-    /// `hit_counter` is the app's monotonic [`HitId`] allocator. Each Textbox claims one ID at construction via [`crate::host::widget::next_id`]; that ID is stamped into the host hit map at every opaque pill pixel, making click + hover dispatch a single map read.
+    /// The 8-bit widget; [`Textbox::with_depth`] builds one at another pixel depth.
+    /// `new` lives on the 8-bit type alone so `Textbox::new(..)` needs no annotation where nothing else fixes the depth.
     pub fn new(
+        hit_counter: &mut HitId,
+        center_x: Coord,
+        center_y: Coord,
+        width: Coord,
+        height: Coord,
+        font_size: Coord,
+    ) -> Self {
+        Self::with_depth(hit_counter, center_x, center_y, width, height, font_size)
+    }
+}
+
+impl<P: Pixel> Textbox<P> {
+    /// `hit_counter` is the app's monotonic [`HitId`] allocator. Each Textbox claims one ID at construction via [`crate::host::widget::next_id`]; that ID is stamped into the host hit map at every opaque pill pixel, making click + hover dispatch a single map read.
+    pub fn with_depth(
         hit_counter: &mut HitId,
         center_x: Coord,
         center_y: Coord,
@@ -865,7 +862,7 @@ impl Textbox {
     /// Squirdleyness = 3 (photon default; adjustable per [`paint::squircle_inset`]). Populates `self.mask` (255 inside outer silhouette, AA values on outer curve) for downstream glow.
     pub fn render_content_into(
         &mut self,
-        canvas: &mut crate::canvas::Canvas,
+        canvas: &mut crate::canvas::Canvas<P>,
         offset_x: Coord,
         offset_y: Coord,
         text: &mut TextRenderer,
@@ -891,7 +888,7 @@ impl Textbox {
         if self.pill_cache_dirty {
             paint::RASTERIZE_OPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             self.pill_cache.clear();
-            self.pill_cache.resize(cw * ch, 0);
+            self.pill_cache.resize(cw * ch, P::EMPTY);
             self.pill_cache_w = cw;
             self.pill_cache_h = ch;
 
@@ -923,7 +920,8 @@ impl Textbox {
             self.inner_pill_mask.clear();
             self.inner_pill_mask.resize(cw * ch, 0);
             for i in 0..(cw * ch) {
-                self.inner_pill_mask[i] = ((self.pill_cache[i] >> 24) & 0xFF) as u8;
+                // The mask is bytes at every depth: the top byte of α.
+                self.inner_pill_mask[i] = (self.pill_cache[i].alpha() >> (P::DEPTH - 8)) as u8;
             }
             // Button-exclusion hard cut: zero the mask columns under an overlaid button (right_inset from the pill's right edge) so overflowing text/selection can never paint beneath it. A vertical cut, no AA fade — the button's own opaque fill sits over the boundary, so the cut is never naked.
             if self.right_inset > 0.0 {
@@ -964,7 +962,7 @@ impl Textbox {
         if self.text_cache_dirty {
             paint::RASTERIZE_OPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             self.text_cache.clear();
-            self.text_cache.resize(cw * ch, 0);
+            self.text_cache.resize(cw * ch, P::EMPTY);
             self.text_cache_w = cw;
             self.text_cache_h = ch;
 
@@ -1168,19 +1166,12 @@ impl Textbox {
                         if w == 0 {
                             continue;
                         }
-                        // The wave peaks at (8/9)(16/9) × CURSOR_BRIGHTNESS (100) ≈ 158, so it already fits a byte.
-                        let w = w as u8;
+                        // The wave peaks at (8/9)(16/9) × CURSOR_BRIGHTNESS (100) ≈ 158, a byte's worth; ONE / 255 (1 at 8 bits, 257 at 16) puts it in the depth's darkness.
+                        let w = w * (P::ONE / 255);
                         let idx = (row_base as isize + blinkey_x as isize + dx as isize) as usize;
                         let p = pixels[idx];
-                        let a = p & 0xFF00_0000;
-                        let r = ((p >> 16) & 0xFF) as u8;
-                        let g = ((p >> 8) & 0xFF) as u8;
-                        let b = (p & 0xFF) as u8;
-                        // WHY/PROOF: not a guard — brightening a darkness byte stops at 0 (white); a plain subtract would wrap a near-white pixel to near-black.
-                        let r = r.saturating_sub(w);
-                        let g = g.saturating_sub(w);
-                        let b = b.saturating_sub(w);
-                        pixels[idx] = a | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+                        // WHY/PROOF: not a guard — brightening a darkness channel stops at 0 (white); a plain subtract would wrap a near-white pixel to near-black.
+                        pixels[idx] = P::from_channels(p.alpha(), p.channels().map(|c| c.saturating_sub(w)));
                     }
                 }
             }
@@ -1193,7 +1184,7 @@ impl Textbox {
     /// Render only the blinkey wave cursor into a buffer (typically a sub-viewport `cursor_group` buffer). `(offset_x, offset_y)` is the buffer's top-left in viewport coords. The buffer should be zeroed before calling — blinkey writes non-zero pixels for additive composition.
     pub fn render_blinkey_into(
         &self,
-        canvas: &mut crate::canvas::Canvas,
+        canvas: &mut crate::canvas::Canvas<P>,
         offset_x: Coord,
         offset_y: Coord,
     ) {
@@ -1280,13 +1271,14 @@ mod widget_impls {
     //! Click + Focus + Hover + Key make Textbox a first-class participant in the widget tree. Clipboard ops (Ctrl+C / Ctrl+X / Ctrl+V) deliberately stay with the app rather than living on Textbox — the OS clipboard adapter (arboard today) is a single global resource and threading it thru every widget that might want it would be premature abstraction. Apps intercept those chords before delivering the key to the focused widget; the widget never sees them.
 
     use super::Textbox;
+    use crate::pixel::Pixel;
     use crate::coord::Coord;
     use crate::event::{ElementState, Key as FKey, KeyEvent, ModifiersState, NamedKey};
     use crate::host::widget::{Click, Focus, Hover, Key, PaintCtx, Widget};
     use crate::paint::HitId;
     use crate::text::TextRenderer;
 
-    impl Widget for Textbox {
+    impl<P: Pixel> Widget for Textbox<P> {
         fn id(&self) -> HitId {
             self.hit_id()
         }
@@ -1314,7 +1306,7 @@ mod widget_impls {
         }
     }
 
-    impl Click for Textbox {
+    impl<P: Pixel> Click for Textbox<P> {
         fn on_click(
             &mut self,
             x: Coord,
@@ -1329,7 +1321,7 @@ mod widget_impls {
         // Textbox activates on release like every other item (default `activate_on_release() == true`): the press arms + shows the held colour, a release over the field places the cursor + focuses it, and a drag-off cancels. (Press-drag text selection is therefore not a textbox gesture — a focused field selects via keyboard / handles, not click-drag.)
     }
 
-    impl Focus for Textbox {
+    impl<P: Pixel> Focus for Textbox<P> {
         fn set_focused(&mut self, focused: bool) {
             Textbox::set_focused(self, focused);
         }
@@ -1343,7 +1335,7 @@ mod widget_impls {
         }
     }
 
-    impl Hover for Textbox {
+    impl<P: Pixel> Hover for Textbox<P> {
         fn set_hovered(&mut self, hovered: bool) {
             Textbox::set_hovered(self, hovered);
         }
@@ -1373,7 +1365,7 @@ mod widget_impls {
         }
     }
 
-    impl Key for Textbox {
+    impl<P: Pixel> Key for Textbox<P> {
         fn on_key(
             &mut self,
             kev: &KeyEvent,
@@ -1390,7 +1382,7 @@ mod widget_impls {
             let mut changed = false;
 
             // Shift+arrow / shift+Home / shift+End: extend existing selection or start one from the current cursor. Non-shift movement collapses any selection. Refactor of the per-arrow boilerplate from the old panes match — `start_selection_if_needed` ensures the anchor is set before the cursor moves so a fresh selection actually contains anything.
-            let start_selection_if_needed = |slf: &mut Textbox| {
+            let start_selection_if_needed = |slf: &mut Textbox<P>| {
                 if shift && slf.selection_anchor.is_none() {
                     slf.selection_anchor = Some(slf.cursor);
                 } else if !shift {

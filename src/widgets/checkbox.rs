@@ -6,6 +6,7 @@ use crate::paint::{self, Clip, HitId, HIT_NONE};
 use crate::region::Region;
 use crate::text::TextRenderer;
 use crate::text::TextStyle;
+use crate::pixel::Pixel;
 use crate::theme;
 use alloc::string::String;
 
@@ -169,9 +170,9 @@ impl Checkbox {
     }
 
     /// Paint the box (topmost-first: label glyphs, then tick, then the box fill that stamps the hit id) plus the label. Follows the same under-blend doctrine as Button — content the box should sit under is painted before the box fill claims its pixels.
-    pub fn render_content_into(
+    pub fn render_content_into<P: Pixel>(
         &mut self,
-        canvas: &mut Canvas,
+        canvas: &mut Canvas<P>,
         text: &mut TextRenderer,
         clip: Option<Clip>,
         mut hit_map: Option<&mut [HitId]>,

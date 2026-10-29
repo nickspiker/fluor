@@ -5,6 +5,7 @@ use crate::coord::Coord;
 use crate::paint::{self, Clip, HitId};
 use crate::region::Region;
 use crate::text::{TextRenderer, TextStyle};
+use crate::pixel::Pixel;
 use crate::theme;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -235,7 +236,7 @@ impl List {
     }
 
     /// Paint the rows that lie in the rect, topmost first (the picked row's band last, under its text), and stamp the hit id over the rect.
-    pub fn render_content_into(&mut self, canvas: &mut Canvas, text: &mut TextRenderer, clip: Option<Clip>, mut hit_map: Option<&mut [HitId]>) {
+    pub fn render_content_into<P: Pixel>(&mut self, canvas: &mut Canvas<P>, text: &mut TextRenderer, clip: Option<Clip>, mut hit_map: Option<&mut [HitId]>) {
         let font = self.font_size;
         // Everything this paints stays inside the list's rect, whatever clip the caller brought.
         let (cx0, cy0, cx1, cy1) = (self.x as usize, self.y as usize, (self.x + self.width) as usize, (self.y + self.height) as usize);
@@ -310,7 +311,7 @@ impl List {
     }
 
     /// A row's box: the checkbox's own square, ticked or not, at `side`.
-    fn paint_box(canvas: &mut Canvas, x0: Coord, mid: Coord, side: Coord, on: bool, clip: Option<Clip>) {
+    fn paint_box<P: Pixel>(canvas: &mut Canvas<P>, x0: Coord, mid: Coord, side: Coord, on: bool, clip: Option<Clip>) {
         let y0 = mid - side * 0.5;
         // The `+ 1` floor every widget carries: a floorless ring vanishes under the fill below a 32 px font.
         let stroke = (side / 42.0) as isize + 1;

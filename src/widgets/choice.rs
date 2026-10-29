@@ -1,6 +1,7 @@
 //! One of several — a row (or a column) of buttons of which one is in force and wears the held fill: a way of travel, a mode, a tool. The app reads which ([`Choice::selected`]) and the change edge ([`Choice::take_change`]), as it reads a button's click.
 
 use crate::canvas::Canvas;
+use crate::pixel::{Argb8, Pixel};
 use crate::coord::Coord;
 use crate::paint::{Clip, HitId};
 use crate::region::Region;
@@ -10,8 +11,8 @@ use crate::widgets::Button;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-pub struct Choice {
-    buttons: Vec<Button>,
+pub struct Choice<P: Pixel = Argb8> {
+    buttons: Vec<Button<P>>,
     selected: usize,
     /// Down a column rather than along a row.
     vertical: bool,
@@ -26,9 +27,16 @@ pub struct Choice {
 }
 
 impl Choice {
-    /// A button per label, each with its own [`HitId`]; `selected` the one in force.
+    /// A button per label, each with its own [`HitId`]; `selected` the one in force. 8-bit; [`Choice::with_depth`] builds one at another pixel depth.
     pub fn new(hit_counter: &mut HitId, labels: &[&str], selected: usize, font_size: Coord) -> Self {
-        let buttons = labels.iter().map(|l| Button::new(hit_counter, 0.0, 0.0, 10.0, 10.0, font_size, *l)).collect();
+        Self::with_depth(hit_counter, labels, selected, font_size)
+    }
+}
+
+impl<P: Pixel> Choice<P> {
+    /// The same control at depth `P`.
+    pub fn with_depth(hit_counter: &mut HitId, labels: &[&str], selected: usize, font_size: Coord) -> Self {
+        let buttons = labels.iter().map(|l| Button::with_depth(hit_counter, 0.0, 0.0, 10.0, 10.0, font_size, *l)).collect();
         Choice { buttons, selected, vertical: false, x: 0.0, y: 0.0, width: 10.0, height: 10.0, font_size, change_counter: 0, last_seen_change_counter: 0 }
     }
 
@@ -63,7 +71,7 @@ impl Choice {
         for (i, l) in labels.iter().enumerate() {
             match self.buttons.get_mut(i) {
                 Some(b) => b.set_label(*l),
-                None => self.buttons.push(Button::new(hit_counter, 0.0, 0.0, 10.0, 10.0, self.font_size, *l)),
+                None => self.buttons.push(Button::with_depth(hit_counter, 0.0, 0.0, 10.0, 10.0, self.font_size, *l)),
             }
         }
         if self.selected >= self.buttons.len() && !self.buttons.is_empty() {
@@ -133,7 +141,7 @@ impl Choice {
     }
 
     /// Lay the buttons out in the rect and paint them, the one in force on the held fill.
-    pub fn render_content_into(&mut self, canvas: &mut Canvas, text: &mut TextRenderer, clip: Option<Clip>, mut hit_map: Option<&mut [HitId]>) {
+    pub fn render_content_into(&mut self, canvas: &mut Canvas<P>, text: &mut TextRenderer, clip: Option<Clip>, mut hit_map: Option<&mut [HitId]>) {
         let n = self.buttons.len();
         if n == 0 {
             return;
@@ -152,7 +160,7 @@ impl Choice {
     }
 }
 
-impl crate::host::widget::Container for Choice {
+impl<P: Pixel> crate::host::widget::Container for Choice<P> {
     fn visit(&mut self, f: &mut dyn FnMut(&mut dyn crate::host::widget::Widget)) {
         for b in &mut self.buttons {
             f(b);

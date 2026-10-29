@@ -295,8 +295,9 @@ pub fn flatten_premult<P: Pixel>(dst: &mut [P], src: &[P]) {
     crate::par::par_chunks(&mut dst[..n], CHUNK, |off, chunk| flatten_premult_chunk(chunk, &src[off..off + chunk.len()]));
 }
 
+/// One run of [`flatten_premult`], sequential: the widgets' cache blit composes a row at a time thru it.
 #[inline]
-fn flatten_premult_chunk<P: Pixel>(dst: &mut [P], src: &[P]) {
+pub(crate) fn flatten_premult_chunk<P: Pixel>(dst: &mut [P], src: &[P]) {
     let n = dst.len();
     for i in 0..n {
         let d = dst[i];

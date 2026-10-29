@@ -12,6 +12,7 @@ use crate::paint::HitId;
 use crate::paint::{self, Clip};
 use crate::region::Region;
 use crate::text::{TextRenderer, TextStyle};
+use crate::pixel::{Argb8, Pixel};
 use crate::theme;
 
 use super::textbox::{blit_cache_to_target, region_to_pixelrect};
@@ -25,7 +26,7 @@ pub struct Span {
     pub dest: Option<String>,
 }
 
-pub struct MultiTextbox {
+pub struct MultiTextbox<P: Pixel = Argb8> {
     /// Text content as a `Vec<char>` — `'\n'` lives inline (a newline is a character of the text, zero-width, terminating its visual line).
     pub chars: Vec<char>,
     /// Insertion point in `[0, chars.len()]`.
@@ -70,12 +71,12 @@ pub struct MultiTextbox {
     pub blinkey_wave_top: bool,
 
     // --- Caches + damage protocol (the Textbox discipline, verbatim) ---
-    pill_cache: Vec<u32>,
+    pill_cache: Vec<P>,
     pill_cache_w: usize,
     pill_cache_h: usize,
     pill_cache_dirty: bool,
     inner_pill_mask: Vec<u8>,
-    text_cache: Vec<u32>,
+    text_cache: Vec<P>,
     text_cache_w: usize,
     text_cache_h: usize,
     text_cache_dirty: bool,
@@ -87,7 +88,15 @@ pub struct MultiTextbox {
 }
 
 impl MultiTextbox {
+    /// The 8-bit widget; [`MultiTextbox::with_depth`] builds one at another pixel depth.
+    /// `new` lives on the 8-bit type alone so `MultiTextbox::new(..)` needs no annotation where nothing else fixes the depth.
     pub fn new(hit_counter: &mut HitId, font_size: Coord, font: &'static str) -> Self {
+        Self::with_depth(hit_counter, font_size, font)
+    }
+}
+
+impl<P: Pixel> MultiTextbox<P> {
+    pub fn with_depth(hit_counter: &mut HitId, font_size: Coord, font: &'static str) -> Self {
         Self {
             chars: Vec::new(),
             cursor: 0,
@@ -972,7 +981,7 @@ impl MultiTextbox {
     #[allow(clippy::too_many_arguments)]
     pub fn render_content_into(
         &mut self,
-        canvas: &mut crate::canvas::Canvas,
+        canvas: &mut crate::canvas::Canvas<P>,
         offset_x: Coord,
         offset_y: Coord,
         text: &mut TextRenderer,
@@ -1005,7 +1014,7 @@ impl MultiTextbox {
         if self.pill_cache_dirty {
             paint::RASTERIZE_OPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             self.pill_cache.clear();
-            self.pill_cache.resize(cw * ch, 0);
+            self.pill_cache.resize(cw * ch, P::EMPTY);
             self.pill_cache_w = cw;
             self.pill_cache_h = ch;
             let inner_x = stroke_px;
@@ -1032,7 +1041,8 @@ impl MultiTextbox {
             self.inner_pill_mask.clear();
             self.inner_pill_mask.resize(cw * ch, 0);
             for i in 0..(cw * ch) {
-                self.inner_pill_mask[i] = ((self.pill_cache[i] >> 24) & 0xFF) as u8;
+                // The mask is bytes at every depth: the top byte of α.
+                self.inner_pill_mask[i] = (self.pill_cache[i].alpha() >> (P::DEPTH - 8)) as u8;
             }
             if self.right_inset > 0.0 {
                 let cut = (pill_w as Coord - self.right_inset) as usize;
@@ -1069,7 +1079,7 @@ impl MultiTextbox {
         if self.text_cache_dirty {
             paint::RASTERIZE_OPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             self.text_cache.clear();
-            self.text_cache.resize(cw * ch, 0);
+            self.text_cache.resize(cw * ch, P::EMPTY);
             self.text_cache_w = cw;
             self.text_cache_h = ch;
             let local_left = self.pad_x();
@@ -1218,7 +1228,7 @@ impl MultiTextbox {
     }
 }
 
-impl Widget for MultiTextbox {
+impl<P: Pixel> Widget for MultiTextbox<P> {
     fn id(&self) -> HitId {
         self.hit_id
     }
@@ -1245,7 +1255,7 @@ impl Widget for MultiTextbox {
     }
 }
 
-impl Click for MultiTextbox {
+impl<P: Pixel> Click for MultiTextbox<P> {
     fn on_click(&mut self, x: Coord, y: Coord, _mods: ModifiersState) -> crate::host::EventResponse {
         // A click accepts a pending label where it stands.
         self.relabel_pending = false;
@@ -1257,7 +1267,7 @@ impl Click for MultiTextbox {
     }
 }
 
-impl Focus for MultiTextbox {
+impl<P: Pixel> Focus for MultiTextbox<P> {
     fn set_focused(&mut self, focused: bool) {
         MultiTextbox::set_focused(self, focused);
     }
@@ -1270,7 +1280,7 @@ impl Focus for MultiTextbox {
     }
 }
 
-impl Hover for MultiTextbox {
+impl<P: Pixel> Hover for MultiTextbox<P> {
     fn set_hovered(&mut self, hovered: bool) {
         MultiTextbox::set_hovered(self, hovered);
     }
@@ -1288,7 +1298,7 @@ impl Hover for MultiTextbox {
     }
 }
 
-impl Key for MultiTextbox {
+impl<P: Pixel> Key for MultiTextbox<P> {
     fn on_key(
         &mut self,
         kev: &KeyEvent,
@@ -1312,7 +1322,7 @@ impl Key for MultiTextbox {
                 _ => {}
             }
         }
-        let start_selection_if_needed = |slf: &mut MultiTextbox| {
+        let start_selection_if_needed = |slf: &mut MultiTextbox<P>| {
             if shift && slf.selection_anchor.is_none() {
                 slf.selection_anchor = Some(slf.cursor);
             } else if !shift {
