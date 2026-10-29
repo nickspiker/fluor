@@ -160,12 +160,9 @@ pub fn apply_overlay<P: super::Finalize>(
                     continue;
                 }
                 let raw = scratch[map_idx];
-                // Only a pixel the frame painted OPAQUE takes the tint: the write below is opaque and un-premultiplied, so a translucent or empty pixel under the widget's hit stamp came out as a bright solid dot (Nick 2026-10-29, the 16-bit canvas: "a grid of white pixels" on the focused textbox). Everything else keeps exactly what finalize wrote.
-                if raw.alpha() != P::alpha_from8(255) {
-                    continue;
-                }
                 let scr_x = (x as i32 + win_ox) as usize;
-                let visible = raw.to_sdr_visible_at(scr_x, scr_y);
+                // ROUNDED, NOT DITHERED (Nick 2026-10-29, the 16-bit canvas: "a grid of white pixels" on the focused textbox, one per 8×8): the tint wrap-subtracts a delta built from exact 8-bit theme codes, and the ordered dither floors a near-black fill one code low at one position per cell — there the subtraction wrapped to ~255. The Bayer cell at (1, 0) holds 130, half a code, so every pixel rounds to the nearest code the delta was built against.
+                let visible = raw.to_sdr_visible_at(1, 0);
                 let (r, g, b) = if sqrt {
                     // Per-pixel gamma lift: v' = sqrt(v/255)·255 per channel. See the doc note above.
                     (
