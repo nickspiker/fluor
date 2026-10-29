@@ -163,32 +163,31 @@ mod x11_atomic {
         sent
     }
 
-    /// The window's silhouette as row-run rectangles, read off the carved clip mask (`clip`, `win_w × win_h`, 255 inside, 0 cut, AA values on the curve): per row the first and last pixel at least half covered, consecutive rows with the same span merged into one rectangle.
-    /// Offset by the window's blit origin on the surface (`ox`, `oy`) and scaled by the surface's pixel ratio, so the result is surface-local backing pixels.
-    pub fn silhouette_rects(clip: &[u8], win_w: usize, win_h: usize, ox: i32, oy: i32, ratio: f64) -> Vec<(i32, i32, u32, u32)> {
+    /// The window's silhouette as row-run rectangles, read off the carved clip mask (`clip`, `win_w × win_h`, 255 inside, 0 cut, AA values on the curve): per row the span from the first to the last pixel at least half covered, consecutive rows with the same span merged into one rectangle.
+    /// The clip is the raster pass for this surface, already at its backing scale and blitted 1:1 at (`ox`, `oy`), so the rectangles are that offset and nothing else.
+    pub fn silhouette_rects(clip: &[u8], win_w: usize, win_h: usize, ox: i32, oy: i32) -> Vec<(i32, i32, u32, u32)> {
         let mut out = Vec::new();
-        let scale = |v: usize| (v as f64 * ratio).round() as i32;
-        let mut push = |y0: usize, y1: usize, x0: usize, x1: usize| {
-            if x1 > x0 && y1 > y0 {
-                out.push((ox + scale(x0), oy + scale(y0), (scale(x1) - scale(x0)) as u32, (scale(y1) - scale(y0)) as u32));
+        let mut push = |y0: usize, y1: usize, span: Option<(usize, usize)>| {
+            if let Some((x0, x1)) = span {
+                out.push((ox + x0 as i32, oy + y0 as i32, (x1 - x0) as u32, (y1 - y0) as u32));
             }
         };
-        let mut run: Option<(usize, usize, usize)> = None;
+        // A row with no pixel half covered has no span (None) and adds nothing to the shape.
+        let mut run: Option<(usize, Option<(usize, usize)>)> = None;
         for r in 0..win_h {
             let row = &clip[r * win_w..(r + 1) * win_w];
-            let x0 = row.iter().position(|&a| a >= 128).unwrap_or(win_w);
-            let x1 = row.iter().rposition(|&a| a >= 128).map_or(x0, |p| p + 1);
+            let span = row.iter().position(|&a| a >= 1 << 7).map(|x0| (x0, row.iter().rposition(|&a| a >= 1 << 7).unwrap() + 1));
             match run {
-                Some((_, a, b)) if a == x0 && b == x1 => {}
-                Some((y0, a, b)) => {
-                    push(y0, r, a, b);
-                    run = Some((r, x0, x1));
+                Some((_, s)) if s == span => {}
+                Some((y0, s)) => {
+                    push(y0, r, s);
+                    run = Some((r, span));
                 }
-                None => run = Some((r, x0, x1)),
+                None => run = Some((r, span)),
             }
         }
-        if let Some((y0, a, b)) = run {
-            push(y0, win_h, a, b);
+        if let Some((y0, s)) = run {
+            push(y0, win_h, s);
         }
         out
     }
@@ -2580,7 +2579,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
         // The window's silhouette as this surface's X bounding shape (Josh 2026-10-28, a desktop without a compositor: every transparent pixel drew black; Nick: rounded corners as black wedges "We can't have that"). Read off the mask this frame carved, sent only when it changed; with a compositor the shape stays removed.
         #[cfg(target_os = "linux")]
         {
-            let rects = x11_atomic::silhouette_rects(src_clip, win_w, win_h, rect_x, rect_y, pr);
+            let rects = x11_atomic::silhouette_rects(src_clip, win_w, win_h, rect_x, rect_y);
             if self.surfaces[si].last_bounding.as_ref() != Some(&rects) {
                 x11_atomic::set_bounding_region(&self.surfaces[si].window, &rects);
                 self.surfaces[si].last_bounding = Some(rects);
@@ -4366,7 +4365,7 @@ mod silhouette_tests {
         let mut clip = vec![255u8; w * h];
         clip[0] = 0;
         clip[1] = 85;
-        let rects = silhouette_rects(&clip, w, h, 10, 20, 1.);
+        let rects = silhouette_rects(&clip, w, h, 10, 20);
         assert_eq!(rects, vec![(12, 20, 4, 1), (10, 21, 6, 3)]);
     }
 
@@ -4377,7 +4376,7 @@ mod silhouette_tests {
         let mut clip = vec![255u8; w * h];
         clip[..w].fill(0);
         clip[w] = 128;
-        let rects = silhouette_rects(&clip, w, h, 0, 0, 1.);
+        let rects = silhouette_rects(&clip, w, h, 0, 0);
         assert_eq!(rects, vec![(0, 1, 4, 2)]);
     }
 }

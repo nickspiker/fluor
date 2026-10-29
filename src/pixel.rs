@@ -126,6 +126,16 @@ pub trait Pixel: Blend + Copy + Eq + Send + Sync + core::fmt::Debug + 'static {
         a8 * (Self::ONE / 255)
     }
 
+    /// This pixel's darkness moved by an 8-bit `g2t` darkness delta (`delta`'s RGB bytes, each a signed step written mod 2⁸, as [`crate::paint::wrap_sub_rgb`] builds it from two theme colours), α kept.
+    /// [`Pixel::from_g2t8`] widens darkness `d` to `d·2^(DEPTH−8) + low ones`, so a step of `δ` codes is `δ·2^(DEPTH−8)` at this depth, and a pixel holding the delta's base colour lands exactly on its target colour.
+    /// The sum is taken mod 2^DEPTH (the mask): that is the delta's own encoding, a negative step written as its two's complement.
+    #[inline(always)]
+    fn tint_g2t8(self, delta: u32) -> Self {
+        let step = |c: u32, d: u32| (c + (d << (Self::DEPTH - 8))) & Self::ONE;
+        let [r, g, b] = self.channels();
+        Self::from_channels(self.alpha(), [step(r, (delta >> 16) & 0xFF), step(g, (delta >> 8) & 0xFF), step(b, delta & 0xFF)])
+    }
+
     /// `dst[i] = dst[i].under(src[i], Normal)` over a run: the hook a depth's SIMD kernel takes over (with the `simd` feature Argb8 runs 8 lanes of `wide::u32x8`, G2t16 8 pixels as two `u32x8` halves).
     #[inline]
     fn under_chunk_normal(dst: &mut [Self], src: &[Self]) {
@@ -777,6 +787,17 @@ mod tests {
         for a in 0..=255u32 {
             assert_eq!(Argb8::alpha_from8(a), a);
             assert_eq!(G2t16::alpha_from8(a), G2t16::from_g2t8(a << 24).alpha());
+        }
+    }
+
+    /// A theme fill tinted by the delta to its hover or active colour IS that colour at both depths, so the overlay's colour step draws exactly what finalize draws for the target at every dither cell (the focused textbox's white grid was a visible-space subtraction wrapping where the dither cut a code low).
+    #[test]
+    fn a_fill_tinted_by_its_delta_is_the_target_colour_at_every_depth() {
+        use crate::theme::{BUTTON_ACTIVE, BUTTON_FILL, BUTTON_HOVER, TEXTBOX_ACTIVE, TEXTBOX_FILL, TEXTBOX_HOVER};
+        for (target, base) in [(TEXTBOX_ACTIVE, TEXTBOX_FILL), (TEXTBOX_HOVER, TEXTBOX_FILL), (BUTTON_HOVER, BUTTON_FILL), (BUTTON_ACTIVE, BUTTON_FILL)] {
+            let delta = crate::paint::wrap_sub_rgb(target, base);
+            assert_eq!(Argb8::from_g2t8(base).tint_g2t8(delta).rgb(), Argb8::from_g2t8(target).rgb());
+            assert_eq!(G2t16::from_g2t8(base).tint_g2t8(delta).rgb(), G2t16::from_g2t8(target).rgb());
         }
     }
 

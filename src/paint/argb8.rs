@@ -54,7 +54,7 @@ const fn build_sqrt_brighten_lut() -> [u8; 256] {
 
 /// `deltas[id] == 0` means "this id is not currently tinted." `last_active[id] == true` means "we wrote this id last frame, so this frame we still need to restore its pixels to clean scratch baseline even if the tint is now zero." After the walk, `last_active` is updated to reflect which ids had non-zero delta this frame.
 ///
-/// Why wrap-sub when applying: chrome's hover-colour constants and `wrap_sub_rgb(THEME_HOVER, THEME_FILL)` are darkness-space deltas. The persistent screen is post-finalize visible-RGB. Since `visible = 255 − darkness` per channel, adding `delta` in darkness = subtracting `delta` in visible. So the same delta constants the bake path used apply here with a flipped operator.
+/// Why the tint goes on the canvas pixel: chrome's hover-colour constants and `wrap_sub_rgb(THEME_HOVER, THEME_FILL)` are darkness-space deltas between two theme colours. Added to the scratch pixel's darkness at its own depth ([`crate::pixel::Pixel::tint_g2t8`]) a fill pixel lands exactly on the target colour, and the colour step after it is the one finalize runs, dither cell and all. (Subtracting the delta from the visible 8-bit result instead, as this did until 2026-10-29, missed by the display curve, and at 16 bits a fill the dither cut one code low wrapped to white: "a grid of white pixels" on the focused textbox.)
 ///
 /// `win_ox / win_oy` are the screen-space offset of the window's top-left. `hit_test_map` and `scratch` are window-space (both length `win_w × win_h`). Pixels translating outside the screen are skipped.
 ///
@@ -146,9 +146,6 @@ pub fn apply_overlay<P: super::Finalize>(
             });
         }
         let sqrt = delta & OVERLAY_SQRT_BRIGHTEN != 0;
-        let dr = ((delta >> 16) & 0xFF) as u8;
-        let dg = ((delta >> 8) & 0xFF) as u8;
-        let db = (delta & 0xFF) as u8;
         let id_hit = id as HitId;
         for y in y0..y1 {
             let scr_y = (y as i32 + win_oy) as usize;
@@ -161,23 +158,15 @@ pub fn apply_overlay<P: super::Finalize>(
                 }
                 let raw = scratch[map_idx];
                 let scr_x = (x as i32 + win_ox) as usize;
-                // ROUNDED, NOT DITHERED (Nick 2026-10-29, the 16-bit canvas: "a grid of white pixels" on the focused textbox, one per 8×8): the tint wrap-subtracts a delta built from exact 8-bit theme codes, and the ordered dither floors a near-black fill one code low at one position per cell — there the subtraction wrapped to ~255. The Bayer cell at (1, 0) holds 130, half a code, so every pixel rounds to the nearest code the delta was built against.
-                let visible = raw.to_sdr_visible_at(1, 0);
-                let (r, g, b) = if sqrt {
-                    // Per-pixel gamma lift: v' = sqrt(v/255)·255 per channel. See the doc note above.
-                    (
-                        SQRT_BRIGHTEN_LUT[((visible >> 16) & 0xFF) as usize] as u32,
-                        SQRT_BRIGHTEN_LUT[((visible >> 8) & 0xFF) as usize] as u32,
-                        SQRT_BRIGHTEN_LUT[(visible & 0xFF) as usize] as u32,
-                    )
+                // The tint moves the canvas pixel's own darkness, at its own depth, and the result takes the same colour step finalize gives every other pixel at this screen place (the dither cell included), so a tinted fill is exactly the theme's target colour and its dither matches its neighbours'.
+                let visible = if sqrt {
+                    // Per-pixel gamma lift: v' = sqrt(v/255)·255 per visible channel. See the doc note above.
+                    let v = raw.to_sdr_visible_at(scr_x, scr_y);
+                    ((SQRT_BRIGHTEN_LUT[((v >> 16) & 0xFF) as usize] as u32) << 16) | ((SQRT_BRIGHTEN_LUT[((v >> 8) & 0xFF) as usize] as u32) << 8) | SQRT_BRIGHTEN_LUT[(v & 0xFF) as usize] as u32
                 } else {
-                    (
-                        (((visible >> 16) & 0xFF) as u8).wrapping_sub(dr) as u32,
-                        (((visible >> 8) & 0xFF) as u8).wrapping_sub(dg) as u32,
-                        ((visible & 0xFF) as u8).wrapping_sub(db) as u32,
-                    )
+                    raw.tint_g2t8(delta).to_sdr_visible_at(scr_x, scr_y)
                 };
-                persistent_screen[scr_row + scr_x] = 0xFF00_0000 | (r << 16) | (g << 8) | b;
+                persistent_screen[scr_row + scr_x] = 0xFF00_0000 | (visible & 0x00FF_FFFF);
             }
         }
     }
