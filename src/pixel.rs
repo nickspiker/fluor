@@ -362,10 +362,11 @@ macro_rules! impl_under {
                         one - bd_g.saturating_sub(td_g),
                         one - bd_b.saturating_sub(td_b),
                     ),
+                    // Multiply where the bottom is dark (darkness past the pivot): its colour is 2·cs·cb, so its darkness 1 − 2(1 − td)(1 − bd); screen where it is light: darkness 2·td·bd. Each branch stays within one by its own side of the pivot. They were the other way round until 2026-10-29, which let 2·td·bd on a dark bottom reach 2·ONE and carry into the next field, α included.
                     BlendMode::Overlay => (
-                        if bd_r > pivot { (2 * td_r * bd_r) >> D } else { one - ((2 * (one - td_r) * (one - bd_r)) >> D) },
-                        if bd_g > pivot { (2 * td_g * bd_g) >> D } else { one - ((2 * (one - td_g) * (one - bd_g)) >> D) },
-                        if bd_b > pivot { (2 * td_b * bd_b) >> D } else { one - ((2 * (one - td_b) * (one - bd_b)) >> D) },
+                        if bd_r > pivot { one - ((2 * (one - td_r) * (one - bd_r)) >> D) } else { (2 * td_r * bd_r) >> D },
+                        if bd_g > pivot { one - ((2 * (one - td_g) * (one - bd_g)) >> D) } else { (2 * td_g * bd_g) >> D },
+                        if bd_b > pivot { one - ((2 * (one - td_b) * (one - bd_b)) >> D) } else { (2 * td_b * bd_b) >> D },
                     ),
                     BlendMode::Darken => (td_r.max(bd_r), td_g.max(bd_g), td_b.max(bd_b)),
                     BlendMode::Lighten => (td_r.min(bd_r), td_g.min(bd_g), td_b.min(bd_b)),
@@ -568,7 +569,7 @@ mod tests {
         assert_eq!(p.rgb().with_alpha(7), 0x0007_5678_9ABC_DEF0);
     }
 
-    /// The 8-bit kernel exactly as it was before it moved into `impl_under!`, kept as the reference the macro's 8-bit stamp is held to.
+    /// The 8-bit kernel exactly as it was before it moved into `impl_under!`, kept as the reference the macro's 8-bit stamp is held to (with Overlay's branches put the right way round, as the kernel's were, 2026-10-29).
     fn reference_under_8(top: u32, bottom: u32, mode: BlendMode) -> u32 {
         if top >= 0xFF000000 {
             return top;
@@ -584,7 +585,7 @@ mod tests {
             BlendMode::Screen => (td * bd) >> 8,
             BlendMode::Add => (td + bd).saturating_sub(0xFF),
             BlendMode::Subtract => 0xFF - bd.saturating_sub(td),
-            BlendMode::Overlay => if bd > 0x80 { (2 * td * bd) >> 8 } else { 0xFF - ((2 * (0xFF - td) * (0xFF - bd)) >> 8) },
+            BlendMode::Overlay => if bd > 0x80 { 0xFF - ((2 * (0xFF - td) * (0xFF - bd)) >> 8) } else { (2 * td * bd) >> 8 },
             BlendMode::Darken => td.max(bd),
             BlendMode::Lighten => td.min(bd),
         };
@@ -625,7 +626,6 @@ mod tests {
     /// The 16-bit stamp tracks the 8-bit one: the same layers widened and composed at 16 bits, narrowed back to the nearest 8-bit codes ([`narrow_to_8`]), land within 3 steps per channel and 1 in α of the 8-bit composite.
     /// The bottom is a source colour, widened by `from_g2t8`; the top is an accumulated composite, whose darkness is (top code − code) × α, so its widening is `256·d + α` (`from_g2t8`'s `+ 255` is that at full α).
     /// Why 3 and not 1: the 8-bit kernel takes `>> 8` for `÷ 255` twice (`consumed` and the deposit) and floors twice, which leaves a dark deposit under partial cover up to 3 steps short of the exact composite (32 ÷ 255 of 232 is 2.3 short in `29221021 under f4e8a14a`); at 16 bits the same steps cost 1/256 of that, so the difference is the 8-bit kernel's, not the 16-bit one's.
-    /// Overlay is left out: its multiply branch `2·td·bd >> 8` reaches `2·ONE` and spills into the next field at either depth, so neither result is a pixel (a bug of the 8-bit kernel kept bit for bit here; see the report of this change).
     #[test]
     fn g2t16_under_tracks_argb8() {
         let widen_composite = |p: u32| G2t16::from_channels(p.alpha() * 257, p.channels().map(|d| (d << 8) + p.alpha()));
@@ -633,9 +633,6 @@ mod tests {
         for _ in 0..1 << 14 {
             let (top, bottom) = (invariant_pixel(&mut s), invariant_pixel(&mut s));
             for mode in MODES {
-                if mode == BlendMode::Overlay {
-                    continue;
-                }
                 let p8 = top.under(bottom, mode);
                 let n = narrow_to_8(widen_composite(top).under(G2t16::from_g2t8(bottom), mode));
                 assert!(n.alpha().abs_diff(p8.alpha()) <= 1, "{mode:?} α {} vs {}", n.alpha(), p8.alpha());

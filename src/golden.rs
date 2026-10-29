@@ -317,7 +317,7 @@ fn stack<P: Pixel>() -> Vec<P> {
 
 #[test]
 fn golden_compositing() {
-    check("flatten_modes", &flatten_modes::<Argb8>(), 0xe6e4_2538_b27c_e511);
+    check("flatten_modes", &flatten_modes::<Argb8>(), 0xab87_5179_3d8c_183c);
     check("stack", &stack::<Argb8>(), 0xfb5e_fc65_bbc7_6bb3);
 }
 
@@ -555,7 +555,6 @@ fn agreement(p8: &[u32], p16: &[u64]) -> Agreement {
 /// The bar the plan set (within one step, under 0.1 % of bytes differing) is not reachable while the 8-bit kernels stay bit-identical, and the differences all point one way: the 16-bit render, narrowed, is at or above the 8-bit one.
 /// The 8-bit `under` takes `>> 8` for `÷ 255` and floors, so an opaque colour laid into an empty pixel deposits `(d × 255) >> 8 = d − 1` (the noise scenes: every byte off by exactly one, none by more); partial cover floors twice more (paint_rects, shapes, squircles, stack, up to 3–4); the rotated rect's four coverage bytes floor before they multiply; and the glow's α table floors at every step of its decay, drifting up to 7 steps low over a ray (glow_rays).
 /// At 16 bits each of those floors costs 1/256 of a step, so the 16-bit render is the nearer one to the exact composite, and what this test can hold is the shape of the difference: no byte where the 16-bit render falls more than one step below the 8-bit one (a kernel still thinking in bytes would lose light or coverage at 16 bits, and it lands far below, not one step), and the excess above it within each scene's floors.
-/// Overlay is left out of flatten_modes: its multiply branch `2·td·bd >> DEPTH` reaches `2·ONE` and spills into the next field at either depth (an 8-bit bug kept bit for bit; the 8-bit render's α byte takes the carry).
 #[test]
 fn crosscheck_g2t16_against_argb8() {
     use crate::pixel::G2t16;
@@ -577,12 +576,9 @@ fn crosscheck_g2t16_against_argb8() {
     ];
     let (modes8, modes16) = (flatten_modes::<Argb8>(), flatten_modes::<G2t16>());
     for (i, mode) in MODES.into_iter().enumerate() {
-        if mode == BlendMode::Overlay {
-            continue;
-        }
         let r = i * W * H..(i + 1) * W * H;
-        // Multiply's 8-bit `255 − (product >> 8)` rounds the product down and so the result up, the one place the 8-bit render can sit above the 16-bit one by two.
-        let low = if mode == BlendMode::Multiply { -2 } else { -1 };
+        // Multiply's 8-bit `255 − (product >> 8)` rounds the product down and so the result up, where the 8-bit render can sit above the 16-bit one by two; Overlay's dark branch is the same expression doubled.
+        let low = if mode == BlendMode::Multiply || mode == BlendMode::Overlay { -2 } else { -1 };
         scenes.push((alloc::format!("flatten {mode:?}"), modes8[r.clone()].to_vec(), modes16[r].to_vec(), (low, 3)));
     }
     #[cfg(feature = "text")]
