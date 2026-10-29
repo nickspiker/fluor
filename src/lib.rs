@@ -25,6 +25,10 @@ pub(crate) mod simd;
 pub mod stack;
 pub mod theme;
 
+// Golden scenes hashed byte for byte, the bar the pixel-depth refactor holds to; x86_64 only because the recorded values take some AA from rsqrtss (see the module).
+#[cfg(all(test, target_arch = "x86_64"))]
+mod golden;
+
 #[cfg(feature = "text")]
 pub mod text;
 #[cfg(feature = "text")]

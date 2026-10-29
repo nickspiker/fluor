@@ -1,0 +1,469 @@
+//! Golden scenes: representative renders hashed byte for byte, so a refactor of the pixel layer (the `Pixel` trait, a generic `Canvas`, the kernels moving onto trait constants) can prove it changed no output.
+//! Each scene draws into a fixed-size buffer with the public API and compares an FNV-1a 64 hash of its bytes to the value recorded from the code before the refactor.
+//! A moved hash means the output moved: find out why before re-recording one, since re-recording is exactly how a silent change would get in.
+//!
+//! The values are for x86_64 only, and were recorded on an AMD Zen 3.
+//! The rotated rect, the circle and the ellipses take their AA from `rsqrtss` (paint/shape.rs `fast_inv_sqrt`), whose low bits are the vendor's own approximation, and the text goes thru float glyph rasterization; another architecture or CPU vendor can land a few edge pixels differently with nothing wrong.
+//! Those scenes are kept apart from the integer-only ones so a vendor difference shows up as exactly those tests and nothing else.
+//! The scenes draw in the release theme: the `amber` feature swaps theme colours and moves every hash, so these hold only without it.
+
+use crate::canvas::{Canvas, Damage, PixelRect};
+use crate::paint::{self, AlphaMask, BlendMode, Clip};
+use crate::theme;
+use alloc::vec;
+use alloc::vec::Vec;
+
+/// Scene width: wide enough for a pill with a glow on both sides and a run of text.
+const W: usize = 320;
+/// Scene height.
+const H: usize = 192;
+
+/// FNV-1a 64 over the little-endian bytes of the pixels: no dependency, and any one bit moving changes it.
+/// The multiply wraps because FNV is defined modulo 2⁶⁴; the wrap is the hash, not a guard.
+fn fnv(pixels: &[u32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &p in pixels {
+        for b in p.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// The same over a byte buffer (clip masks).
+fn fnv8(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Compare a scene's hash to its recorded value, printing the actual one so a deliberate change can be recorded from the failure.
+/// A scene that drew nothing would hash the same before and after any refactor and prove nothing, so an all-empty buffer fails here.
+fn check(name: &str, pixels: &[u32], want: u64) {
+    assert!(pixels.iter().any(|&p| p != 0), "golden scene `{name}` drew nothing");
+    check_hash(name, fnv(pixels), want);
+}
+
+/// [`check`] for a byte buffer (clip masks).
+fn check8(name: &str, bytes: &[u8], want: u64) {
+    assert!(bytes.iter().any(|&b| b != 0), "golden scene `{name}` is empty");
+    check_hash(name, fnv8(bytes), want);
+}
+
+/// The comparison itself, with the actual hash in the message.
+fn check_hash(name: &str, got: u64, want: u64) {
+    assert_eq!(got, want, "golden scene `{name}` moved: now {got:016x}, recorded {want:016x}");
+}
+
+/// A fresh empty buffer and damage accumulator at the scene size.
+fn scene() -> (Vec<u32>, Damage) {
+    (vec![0u32; W * H], Damage::new())
+}
+
+/// Every integer-only primitive in paint.rs: fill and stroke rects (plain, clipped, masked, hairline), the filled circle and the blinkey.
+#[test]
+fn golden_paint_rects() {
+    let (mut px, mut dmg) = scene();
+    let mask_bytes: Vec<u8> = (0..W * H).map(|i| ((i % W) * 255 / W) as u8).collect();
+    let mask = AlphaMask::new(&mask_bytes, W, H);
+    {
+        let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+        paint::fill_rect(&mut c, 8, 8, 120, 60, theme::BUTTON_FILL, None, None);
+        paint::fill_rect(&mut c, 40, 30, 200, 80, (theme::TEXTBOX_SELECTION_BG & 0x00FF_FFFF) | 0x8000_0000, Some(Clip::new(0, 0, 180, 100)), None);
+        paint::fill_rect(&mut c, 0, 120, W as isize, 40, theme::TEXTBOX_TEXT, None, Some(&mask));
+        paint::fill_rect(&mut c, 10, 170, 300, 0, theme::WINDOW_LIGHT_EDGE, None, None);
+        paint::stroke_rect(&mut c, 150, 10, 150, 90, 3, theme::WINDOW_SHADOW_EDGE, None, None);
+        paint::circle_filled(&mut c, 260, 150, 24, theme::CLOSE_HOVER, None, None);
+        paint::circle_filled(&mut c, 300, 30, 40, (theme::MAXIMIZE_HOVER & 0x00FF_FFFF) | 0x6000_0000, None, Some(&mask));
+    }
+    {
+        let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+        paint::draw_blinkey(&mut c, 100, 20, 40, true);
+        paint::draw_blinkey_tinted(&mut c, 120, 20, 40, false, (160, 80, 255));
+    }
+    check("paint_rects", &px, 0x219a_55dc_a5c7_3aca);
+}
+
+/// The float AA shapes in paint/shape.rs: axis rect with fractional edges, hairlines, rotated rect, AA circle, segmented ring.
+#[test]
+fn golden_shapes() {
+    let (mut px, mut dmg) = scene();
+    {
+        let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+        paint::draw_rect(&mut c, 60.3, 40.7, 90.4, 50.2, theme::BUTTON_HOVER, None);
+        paint::draw_rect(&mut c, 160., 20.5, 120., 0., theme::TEXT_COLOUR, None);
+        paint::draw_rect(&mut c, 20.5, 120., 0., 60., theme::TEXT_COLOUR, None);
+        paint::draw_rect_rotated(&mut c, 200., 100., 110., 36., 0.6, (theme::MINIMIZE_HOVER & 0x00FF_FFFF) | 0xC000_0000, None);
+        paint::draw_rect_rotated(&mut c, 90., 140., 60., 20., -1.1, theme::CLOSE_GLYPH, Some(Clip::new(70, 120, 200, 192)));
+        paint::draw_circle(&mut c, 270.5, 150.25, 30.7, theme::MAXIMIZE_GLYPH, None);
+        paint::draw_ring_segments(&mut c, 120., 96., 44., 6., 4., &[theme::CLOSE_HOVER, theme::MAXIMIZE_HOVER, theme::MINIMIZE_HOVER, 0, theme::WHITE], None);
+    }
+    check("shapes", &px, 0x6777_2b5d_1819_8f0d);
+}
+
+/// The ellipses (implicit form with the fast reciprocal square root).
+#[test]
+fn golden_ellipses() {
+    let (mut px, mut dmg) = scene();
+    {
+        let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+        paint::draw_ellipse(&mut c, 90.5, 80.25, 70.3, 40.6, theme::BUTTON_FILL, None);
+        paint::draw_ellipse_rotated(&mut c, 220., 110., 80., 30., 0.7, (theme::TEXTBOX_SELECTION_BG & 0x00FF_FFFF) | 0xA000_0000, None);
+    }
+    check("ellipses", &px, 0x21fd_a6cb_4194_1455);
+}
+
+/// Squircle pills and rounded rects, integer and fractional exponent, single colour and two-tone, asymmetric corners, stacked so the second composes under the first.
+#[test]
+fn golden_squircles() {
+    let (mut px, mut dmg) = scene();
+    {
+        let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+        paint::draw_squircle_pill(&mut c, 8, 8, 140, 44, theme::TEXTBOX_FILL, paint::SHAPE_POWER);
+        paint::draw_squircle_pill_f(&mut c, 160, 8, 150, 44, theme::BUTTON_FILL, 1.5);
+        paint::draw_squircle_pill_two_tone(&mut c, 4, 4, 148, 52, theme::TEXTBOX_LIGHT_EDGE, theme::TEXTBOX_SHADOW_EDGE, paint::SHAPE_POWER, None, 0);
+        paint::draw_squircle_pill_two_tone_f(&mut c, 156, 4, 158, 52, theme::TEXTBOX_LIGHT_EDGE, theme::TEXTBOX_SHADOW_EDGE, 1.5, None, 0);
+        paint::draw_squircle_rrect(&mut c, 12, 72, 130, 100, theme::BUTTON_HOVER, paint::asymmetric_radii(36.), paint::SHAPE_POWER);
+        paint::draw_squircle_rrect_f(&mut c, 170, 72, 136, 100, theme::WINDOW_CONTROLS_BG, [8., 30., 50., 16.], 2.5);
+        paint::draw_squircle_rrect_two_tone(&mut c, 8, 68, 138, 108, theme::WINDOW_LIGHT_EDGE, theme::WINDOW_SHADOW_EDGE, paint::asymmetric_radii(40.), paint::SHAPE_POWER, None, 0);
+        paint::draw_squircle_rrect_two_tone_f(&mut c, 166, 68, 144, 108, theme::WINDOW_LIGHT_EDGE, theme::WINDOW_SHADOW_EDGE, [12., 34., 54., 20.], 2.5, None, 0);
+    }
+    check("squircles", &px, 0x6041_ac40_23c4_68b4);
+}
+
+/// The textbox focus glow around a pill, its mask taken from the pill's own α in the scene, and the four directional ray glows the textbox and button paint.
+#[test]
+fn golden_glow() {
+    let (bw, bh) = (180usize, 48usize);
+    let (mut px, mut dmg) = scene();
+    let (cx, cy) = (W / 2, H / 2);
+    let (x, y) = ((cx - bw / 2) as isize, (cy - bh / 2) as isize);
+    {
+        let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+        paint::draw_squircle_pill(&mut c, x, y, bw as isize, bh as isize, theme::TEXTBOX_ACTIVE, paint::SHAPE_POWER);
+    }
+    let mask: Vec<u8> = px.iter().map(|p| (p >> 24) as u8).collect();
+    let pill = px.clone();
+    let mut rays = px.clone();
+    {
+        let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+        paint::apply_textbox_glow(&mut c, &mask, cx as isize, cy as isize, bw, bh, theme::WHITE);
+    }
+    {
+        let mut c = Canvas::new(&mut rays, W, H, &mut dmg);
+        let (w, h) = (bw as isize, bh as isize);
+        paint::apply_textbox_glow_right(&mut c, x, y, w, h, theme::GLOW_DEFAULT, 0x80, 236, None);
+        paint::apply_textbox_glow_left(&mut c, x, y, w, h, theme::GLOW_DEFAULT, 0x80, 236, None);
+        paint::apply_textbox_glow_top(&mut c, x, y, w, h, theme::GLOW_DEFAULT, 0x40, 220, None);
+        paint::apply_textbox_glow_bottom(&mut c, x, y, w, h, theme::GLOW_DEFAULT, 0x40, 220, Some(Clip::new(0, 0, 200, H)));
+    }
+    assert_ne!(px, pill, "the glow painted nothing");
+    assert_ne!(rays, pill, "the ray glows painted nothing");
+    check("glow", &px, 0xbb0c_f158_2b71_398d);
+    check("glow_rays", &rays, 0x9f2c_8327_2e06_eceb);
+}
+
+/// The window drop shadow's diagonal rays, cast from a squircle-cornered window already finalized into a screen buffer.
+#[test]
+fn golden_shadow() {
+    let (sw, sh) = (W, H);
+    let (ww, wh) = (200usize, 120usize);
+    let mut win = vec![0u32; ww * wh];
+    let mut wd = Damage::new();
+    {
+        let mut c = Canvas::new(&mut win, ww, wh, &mut wd);
+        paint::draw_squircle_rrect(&mut c, 0, 0, ww as isize, wh as isize, theme::WINDOW_CONTROLS_BG, paint::asymmetric_radii(30.), paint::SHAPE_POWER);
+    }
+    let mut screen = vec![0u32; sw * sh];
+    let clip = vec![255u8; ww * wh];
+    let (rx, ry) = (40i32, 20i32);
+    paint::finalize_into_screen(&win, &clip, ww, wh, &mut screen, sw, rx, ry, PixelRect::new(0, 0, ww, wh), true, false);
+    paint::paint_shadow(&mut screen, sw, 240, 0x80, (rx, ry, ww as i32, wh as i32));
+    check("shadow", &screen, 0x4c5b_f4f6_0458_97bb);
+}
+
+/// The present boundary: in-place finalize and finalize into a larger screen, full and damage-clipped, plain and over an under layer, with a clip mask that has partial coverage.
+#[test]
+fn golden_finalize() {
+    let (mut px, mut dmg) = scene();
+    {
+        let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+        paint::fill_rect(&mut c, 0, 0, W as isize / 2, H as isize, theme::WINDOW_CONTROLS_BG, None, None);
+        paint::draw_squircle_pill_two_tone(&mut c, 20, 20, 200, 60, theme::TEXTBOX_LIGHT_EDGE, theme::TEXTBOX_SHADOW_EDGE, paint::SHAPE_POWER, None, 0);
+        paint::fill_rect(&mut c, 30, 100, 260, 60, (theme::TEXTBOX_SELECTION_BG & 0x00FF_FFFF) | 0x7000_0000, None, None);
+        paint::draw_squircle_pill(&mut c, 230, 20, 80, 60, (theme::WHITE & 0x00FF_FFFF) | 0x9000_0000, paint::SHAPE_POWER);
+    }
+    // A clip mask that is opaque in the middle, empty at the very edge and ramps in between, so every finalize branch (full, partial, cut) sees pixels.
+    let clip: Vec<u8> = (0..W * H)
+        .map(|i| {
+            let (x, y) = (i % W, i / W);
+            let d = x.min(y).min(W - 1 - x).min(H - 1 - y);
+            if d >= 16 { 255 } else { (d * 16) as u8 }
+        })
+        .collect();
+
+    let mut in_place = px.clone();
+    paint::finalize_for_os(&mut in_place, &clip);
+
+    let (sw, sh) = (W + 64, H + 48);
+    let mut full = vec![0u32; sw * sh];
+    paint::finalize_into_screen(&px, &clip, W, H, &mut full, sw, 24, 16, PixelRect::new(0, 0, W, H), true, false);
+    let mut damaged = vec![0u32; sw * sh];
+    paint::finalize_into_screen(&px, &clip, W, H, &mut damaged, sw, -8, 30, PixelRect::new(10, 12, 250, 170), false, false);
+    let mut over = vec![0u32; sw * sh];
+    paint::finalize_into_screen(&px, &clip, W, H, &mut over, sw, 24, 16, PixelRect::new(0, 0, W, H), true, true);
+
+    check("finalize_in_place", &in_place, 0x3d1a_9c93_0655_c607);
+    check("finalize_into_full", &full, 0x90a8_55b0_fc87_b707);
+    check("finalize_into_damaged", &damaged, 0x62bb_dade_acd6_ce07);
+    assert_ne!(over, full, "the over finalize took the plain path");
+    check("finalize_into_over", &over, 0xb183_73ac_ecee_80ca);
+    check8("finalize_clip_mask", &clip, 0xa5b2_9342_0fa7_8f25);
+}
+
+/// Layer compositing: `flatten` in every blend mode (Normal takes the SIMD path where enabled), the stack compositor's program of pushes, a constant and unders.
+#[test]
+fn golden_compositing() {
+    let make = |seed: u32| -> Vec<u32> {
+        let mut v = vec![0u32; W * H];
+        let mut s = seed;
+        for p in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            let a = s >> 24;
+            // Keep each channel's darkness at or under α, the invariant every primitive maintains.
+            let d = |sh: u32| ((s >> sh) & 0xFF) * a >> 8;
+            *p = (a << 24) | (d(16) << 16) | (d(8) << 8) | d(0);
+        }
+        v
+    };
+    let top = make(0x1234_5678);
+    let bottom = make(0x9abc_def1);
+    let modes = [
+        BlendMode::Normal,
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Add,
+        BlendMode::Subtract,
+        BlendMode::Overlay,
+        BlendMode::Darken,
+        BlendMode::Lighten,
+    ];
+    let mut all = Vec::with_capacity(W * H * modes.len());
+    for mode in modes {
+        let mut dst = top.clone();
+        paint::flatten(&mut dst, &bottom, mode);
+        all.extend_from_slice(&dst);
+    }
+    check("flatten_modes", &all, 0xe6e4_2538_b27c_e511);
+
+    use crate::stack::{Op, StackCompositor};
+    let mut stack = StackCompositor::new(W, H);
+    let l0 = stack.new_layer();
+    let l1 = stack.new_layer();
+    stack.layers[l0].pixels.copy_from_slice(&top);
+    stack.layers[l1].pixels.copy_from_slice(&bottom);
+    stack.set_program(vec![Op::Push(l0), Op::Push(l1), Op::Under(BlendMode::Normal), Op::Constant(theme::BG_BASE | 0xFF00_0000), Op::Under(BlendMode::Screen)]);
+    let out = stack.evaluate().to_vec();
+    check("stack", &out, 0xfb5e_fc65_bbc7_6bb3);
+}
+
+/// The background noise field, its own base and a given one, scrolled.
+#[test]
+fn golden_background_noise() {
+    let (mut px, mut dmg) = scene();
+    {
+        let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+        paint::background_noise(&mut c, 3, false, 0, None, None);
+    }
+    let (mut px2, mut dmg2) = scene();
+    {
+        let mut c = Canvas::new(&mut px2, W, H, &mut dmg2);
+        paint::background_noise(&mut c, 7, true, 13, Some(Clip::new(0, 20, W, 150)), Some(theme::BUTTON_FILL));
+    }
+    check("noise", &px, 0xe5d4_3657_bbf2_f4cd);
+    check("noise_based_clipped", &px2, 0xdec6_5eba_0ebb_1243);
+}
+
+#[cfg(feature = "text")]
+mod text_scenes {
+    use super::*;
+    use crate::paint::HitId;
+    use crate::text::{TextRenderer, TextStyle};
+    use crate::widgets::{Button, Dropdown, Textbox};
+
+    /// Left, centred and right-aligned text, a bold weight, a sheared and a rotated run (the transform glyph path), and a clipped, masked run.
+    #[test]
+    fn golden_text() {
+        let mut text = TextRenderer::new();
+        let (mut px, mut dmg) = scene();
+        let mask_bytes: Vec<u8> = (0..W * H).map(|i| (255 - (i % W) * 255 / W) as u8).collect();
+        let mask = AlphaMask::new(&mask_bytes, W, H);
+        {
+            let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+            text.draw_text_left(&mut c, "Photon fluor Ag 0189", 6., 24., &TextStyle::new(20., theme::TEXT_COLOUR), None, None);
+            text.draw_text_center(&mut c, "centred ♥ ✓", W as f32 / 2., 56., &TextStyle::new(24., theme::TEXTBOX_TEXT).weight(700), None, None);
+            text.draw_text_right(&mut c, "right side", W as f32 - 6., 88., &TextStyle::new(16., theme::LABEL_COLOUR), None, None);
+            text.draw_text_left(&mut c, "sheared", 6., 120., &TextStyle::new(22., theme::TEXT_COLOUR).shear(0.2126), None, None);
+            text.draw_text_center(&mut c, "rotated", 220., 140., &TextStyle::new(22., theme::TEXT_COLOUR).rotation(0.3), None, None);
+            text.draw_text_left(&mut c, "clipped and masked text", 6., 176., &TextStyle::new(26., theme::WHITE), Some(Clip::new(20, 150, 260, 192)), Some(&mask));
+        }
+        // With the colour-emoji face bundled the fallback chain reaches it first for ♥ and ✓, so the scene has two recorded values.
+        check("text", &px, if cfg!(feature = "emoji") { 0xbb03_89af_6962_a770 } else { 0xe5f7_3920_8b1e_bb53 });
+    }
+
+    /// A button at rest, then with baked states (as a headless host draws it) hovered, pressed on a custom fill (the derived held ramp), and focused (its glow), each a fresh render.
+    #[test]
+    fn golden_button() {
+        let mut text = TextRenderer::new();
+        let mut ids: HitId = 0;
+        let mut b = Button::new(&mut ids, W as f32 / 2., H as f32 / 2., 160., 44., 20., "Attest");
+        let mut frames: Vec<Vec<u32>> = Vec::new();
+        let mut render = |b: &mut Button, text: &mut TextRenderer| {
+            let (mut px, mut dmg) = scene();
+            let mut hit = vec![0 as HitId; W * H];
+            {
+                let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+                let id = b.hit_id();
+                b.render_content_into(&mut c, 0., 0., text, None, Some(&mut hit), id);
+            }
+            frames.push(px);
+        };
+        render(&mut b, &mut text);
+        b.set_bake_states(true);
+        b.set_hovered(true);
+        render(&mut b, &mut text);
+        b.set_hovered(false);
+        b.set_fill(Some(theme::CLOSE_HOVER));
+        b.set_pressed(true);
+        render(&mut b, &mut text);
+        b.set_pressed(false);
+        b.set_focused(true);
+        render(&mut b, &mut text);
+        for i in 1..frames.len() {
+            assert_ne!(frames[i], frames[i - 1], "button frame {i} repeats the one before it");
+        }
+        check("button", &frames.concat(), 0x8dab_682d_768a_5774);
+    }
+
+    /// A textbox with text, unfocused, then focused with a selection (glow, selection band), then its blinkey.
+    #[test]
+    fn golden_textbox() {
+        let mut text = TextRenderer::new();
+        let mut ids: HitId = 0;
+        let mut t = Textbox::new(&mut ids, W as f32 / 2., H as f32 / 2., 240., 48., 22.);
+        t.set_text("hello golden world", &mut text);
+        let mut all = Vec::new();
+        {
+            let (mut px, mut dmg) = scene();
+            let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+            t.render_content_into(&mut c, 0., 0., &mut text, None, None, None, t.hit_id());
+            all.extend_from_slice(&px);
+        }
+        t.set_focused(true);
+        t.select_word_at(7);
+        {
+            let (mut px, mut dmg) = scene();
+            let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+            t.render_content_into(&mut c, 0., 0., &mut text, None, None, None, t.hit_id());
+            all.extend_from_slice(&px);
+        }
+        t.cursor_end();
+        t.flip_blinkey();
+        {
+            let (mut px, mut dmg) = scene();
+            let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+            t.render_content_into(&mut c, 0., 0., &mut text, None, None, None, t.hit_id());
+            t.render_blinkey_into(&mut c, 0., 0.);
+            all.extend_from_slice(&px);
+        }
+        let frames: Vec<&[u32]> = all.chunks(W * H).collect();
+        for i in 1..frames.len() {
+            assert_ne!(frames[i], frames[i - 1], "textbox frame {i} repeats the one before it");
+        }
+        check("textbox", &all, 0x5bb9_fae3_3104_3831);
+    }
+
+    /// A dropdown closed, then open with its popup painted first.
+    #[test]
+    fn golden_dropdown() {
+        let mut text = TextRenderer::new();
+        let mut ids: HitId = 0;
+        let options = vec!["Zil".into(), "Zila".into(), "Zilor".into(), "Ter".into()];
+        let mut d = Dropdown::new(&mut ids, W as f32 / 2., 30., 160., 36., 18., options);
+        d.set_selected(2);
+        let mut all = Vec::new();
+        {
+            let (mut px, mut dmg) = scene();
+            let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+            d.render_content_into(&mut c, 0., 0., &mut text, None, None);
+            all.extend_from_slice(&px);
+        }
+        d.open();
+        {
+            let (mut px, mut dmg) = scene();
+            let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+            d.render_popup_into(&mut c, &mut text, None, None);
+            d.render_content_into(&mut c, 0., 0., &mut text, None, None);
+            all.extend_from_slice(&px);
+        }
+        let frames: Vec<&[u32]> = all.chunks(W * H).collect();
+        for i in 1..frames.len() {
+            assert_ne!(frames[i], frames[i - 1], "dropdown frame {i} repeats the one before it");
+        }
+        check("dropdown", &all, 0x9097_5d06_bf10_3139);
+    }
+
+    /// Colour emoji thru the glyph's own pixels, only where the font is bundled.
+    #[cfg(feature = "emoji")]
+    #[test]
+    fn golden_emoji() {
+        let mut text = TextRenderer::new();
+        let (mut px, mut dmg) = scene();
+        {
+            let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+            text.draw_text_left(&mut c, "hi \u{2603}\u{1F600}\u{1F44D}\u{1F3FD}", 6., 60., &TextStyle::new(40., theme::TEXT_COLOUR), None, None);
+        }
+        check("emoji", &px, 0xb5ed_6608_8f8e_854a);
+    }
+}
+
+/// The window chrome without a window: edges and the clip-mask carve, the button strip's background, curves and hairlines, the three control glyphs and the title text.
+#[cfg(all(feature = "text", feature = "icon"))]
+#[test]
+fn golden_chrome() {
+    use crate::host::chrome;
+    use crate::host::chrome_widget::compute_squircle_crossings;
+    use crate::paint::{HitId, HIT_NONE};
+    let (w, h) = (480usize, 320usize);
+    let mut px = vec![0u32; w * h];
+    let mut hit = vec![HIT_NONE as HitId; w * h];
+    let mut clip = vec![255u8; w * h];
+    let span = 2. * w as f32 * h as f32 / (w as f32 + h as f32);
+    let base = span / 4.;
+    let (start_big, cross_big) = compute_squircle_crossings(base * 2., 24);
+    let (start_small, cross_small) = compute_squircle_crossings(base, 24);
+    chrome::draw_window_edges_and_mask(&mut px, &mut hit, &mut clip, w as u32, h as u32, start_big, &cross_big, start_small, &cross_small, theme::WINDOW_LIGHT_EDGE, theme::WINDOW_SHADOW_EDGE);
+    let button = 40usize;
+    let (bs, bc) = compute_squircle_crossings(button as f32 / 2., 8);
+    chrome::draw_strip_bg(&mut px, &mut hit, w as u32, h as u32, button, bs, &bc);
+    chrome::draw_strip_curves(&mut px, &mut hit, w as u32, h as u32, button, bs, &bc, theme::WINDOW_LIGHT_EDGE, theme::WINDOW_SHADOW_EDGE);
+    chrome::draw_strip_hairlines(&mut px, w as u32, h as u32, button, bs, &bc, theme::WINDOW_LIGHT_EDGE);
+    chrome::draw_minimize_symbol(&mut px, w, h, w - 100, 20, 8, theme::MINIMIZE_GLYPH, theme::WINDOW_CONTROLS_BG);
+    chrome::draw_maximize_symbol(&mut px, w, h, w - 60, 20, 8, theme::MAXIMIZE_GLYPH, theme::MAXIMIZE_GLYPH_INTERIOR, theme::WINDOW_CONTROLS_BG);
+    chrome::draw_close_symbol(&mut px, w, h, w - 20, 20, 8, theme::CLOSE_GLYPH, theme::WINDOW_CONTROLS_BG);
+    let mut text = crate::text::TextRenderer::new();
+    let mut dmg = Damage::new();
+    {
+        let mut c = Canvas::new(&mut px, w, h, &mut dmg);
+        chrome::draw_title_text(&mut c, "fluor golden", &mut text, button, w - 3 * button, 0, 20., theme::TITLE_TEXT);
+        chrome::draw_status_bar(&mut c, 24, theme::WINDOW_CONTROLS_BG, theme::WINDOW_LIGHT_EDGE, "status ok", &mut text, theme::LABEL_COLOUR);
+    }
+    check("chrome", &px, 0xa74e_33d5_c701_6453);
+    check8("chrome_clip", &clip, 0x6ef3_84cb_654d_5c65);
+}
