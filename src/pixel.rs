@@ -4,6 +4,9 @@
 //!
 //! **Internal pixel format**: `0xααRRGGBB` packed in a `u32` — top byte is **α (opacity)**; RGB bytes are **darkness** (`0 = white potential`, `255 = black ink`). LE byte layout `[B, G, R, α]`. Every paint primitive, every layer buffer, every Group composite uses this. `Argb8` is a type alias for `u32`; the byte layout matches a typical compositor pixel, but the RGB bytes are the *bitwise complement* of visible RGB.
 //!
+//! **Two depths, one convention** ([`Pixel`]): [`Argb8`] is the layout above; [`G2t16`] is the same layout widened to a `u64` (`α << 48 | R << 32 | G << 16 | B`, each field a 16-bit `g2t` code's darkness).
+//! Every rendering kernel is generic over the depth and reaches the fields thru the trait, so every 255, 256 and `>> 8` below reads as the depth's ONE, ONE + 1 and `>> DEPTH`; colours stay authored at 8 bits and widen at a kernel's entry ([`Pixel::from_g2t8`]).
+//!
 //! **Opacity semantics**: `α = 0` = fully transparent, `α = 255` = fully opaque — industry-standard direction. Empty pixel = `0x00000000` (no opacity, no darkness — calloc-free zero-init). Both halves of the pixel accumulate up from 0: α adds, darkness adds.
 //!
 //! **Why this convention** (mirroring the README): the Under accumulator is pure addition (`new_dark = top_dark + (mod_dark × consumed >> 8)`, `new_α = top_α + consumed`) — no `255 − x` anywhere on the hot path. Three subtractions saved per pixel per Under call versus the old visible-RGB convention. Hot-loop early-out fires when the top is fully opaque: `if self >= 0xFF000000` is "top α-byte is 0xFF" in one CMP (α-byte saturating implies the lower bits don't matter for the result — bottom is invisible). Empty marker is the zero pattern, so `vec![0u32; n]` uses calloc → zero pages → genuinely free init.

@@ -18,7 +18,7 @@ pub const WINDOW_POWER: i32 = 24;
 ///
 /// Photon-faithful: precompute squircle crossings once (`(inset_px, l_aa, h_aa)` per pixel-row offset into the cap), then walk pure integer indices per corner. Each crossing produces BOTH a vertical-edge AA pixel and a horizontal-edge AA pixel via the squircle's diagonal symmetry — no separate per-col walk needed.
 ///
-/// Every interior + AA-edge write composes the new pixel UNDERNEATH whatever's already in the buffer via [`Blend::under`] (`BlendMode::Normal`). Two stacked pills in the same buffer therefore behave like any other front-to-back composite: draw the topmost first (it lands cleanly into the empty buffer), then the underneath one (it fills only the remaining α budget the topmost left behind). No max-α tiebreaker, no inner/outer dual mode — one consistent kernel.
+/// Every interior + AA-edge write composes the new pixel UNDERNEATH whatever's already in the buffer via [`Blend::under`](crate::pixel::Blend::under) (`BlendMode::Normal`). Two stacked pills in the same buffer therefore behave like any other front-to-back composite: draw the topmost first (it lands cleanly into the empty buffer), then the underneath one (it fills only the remaining α budget the topmost left behind). No max-α tiebreaker, no inner/outer dual mode — one consistent kernel.
 pub fn draw_squircle_pill<P: Pixel>(
     canvas: &mut Canvas<P>,
     pill_x: isize,
@@ -135,7 +135,7 @@ fn draw_squircle_pill_with_crossings<P: Pixel>(
 ///
 /// No `fill` parameter — the pill is exactly two colours.
 ///
-/// Every pixel write composes UNDER the buffer via [`Blend::under`] (Normal) — same kernel as the single-colour path.
+/// Every pixel write composes UNDER the buffer via [`Blend::under`](crate::pixel::Blend::under) (Normal) — same kernel as the single-colour path.
 pub fn draw_squircle_pill_two_tone<P: Pixel>(
     canvas: &mut Canvas<P>,
     pill_x: isize,
@@ -604,7 +604,7 @@ pub fn squircle_crossings_f(radius: f32, squirdleyness: f32) -> alloc::vec::Vec<
     crossings
 }
 
-/// AA write at a proven-in-buffer index. Composes a partial-α pixel (α = the Q16 weight `h_aa` at the canvas's depth, straight darkness=`colour_rgb`) UNDERNEATH whatever's already in the buffer via [`Blend::under`] — same kernel as every other compositing op in fluor. The buffer is treated as the topmost-first composite (anything already painted there sits "above" this write). With `Normal` mode, an empty pixel (`0x00000000`) absorbs the new contribution fully; an already-opaque pixel takes the early-out and the new write is invisible.
+/// AA write at a proven-in-buffer index. Composes a partial-α pixel (α = the Q16 weight `h_aa` at the canvas's depth, straight darkness=`colour_rgb`) UNDERNEATH whatever's already in the buffer via [`Blend::under`](crate::pixel::Blend::under) — same kernel as every other compositing op in fluor. The buffer is treated as the topmost-first composite (anything already painted there sits "above" this write). With `Normal` mode, an empty pixel (`0x00000000`) absorbs the new contribution fully; an already-opaque pixel takes the early-out and the new write is invisible.
 #[inline]
 fn write_aa<P: Pixel>(pixels: &mut [P], idx: usize, colour_rgb: P, h_aa: u32) {
     let new_pixel = P::from_cov(colour_rgb, h_aa);

@@ -1,4 +1,4 @@
-//! AA shape rasterizers — axis-aligned rect, rotated rect, axis-aligned ellipse / circle, rotated ellipse — plus the per-row pixel-range solver and reciprocal-sqrt helper they share. Every entry point honours sub-pixel position + size, composes UNDER existing pixel content via the [`Blend::under`] kernel, and reports its bbox to the canvas damage accumulator.
+//! AA shape rasterizers — axis-aligned rect, rotated rect, axis-aligned ellipse / circle, rotated ellipse — plus the per-row pixel-range solver and reciprocal-sqrt helper they share. Every entry point honours sub-pixel position + size, composes UNDER existing pixel content via the [`Blend::under`](crate::pixel::Blend::under) kernel, and reports its bbox to the canvas damage accumulator.
 //!
 //! Conventions: colour is an authored 8-bit α + darkness `g2t` pixel (build with [`crate::paint::pack_argb`]), widened to the canvas depth at entry by `Pixel::from_g2t8`; `Coord` is fluor's `f32` alias. AA coverage is the standard analytical approximation — `0.5 + signed_distance_inside` saturated to the depth's field by [`Pixel::cov`]'s cast, multiplied across edges for rotated rects, or solved analytically via implicit-form math for ellipses (sqrt-and-divide fused into a single hardware reciprocal-sqrt where available).
 
@@ -20,7 +20,7 @@ fn alpha_of_four<P: Pixel>(alpha: u32, c: [u32; 4]) -> u32 {
     }
 }
 
-/// Filled rectangle, anti-aliased, axis-aligned. Centered at `(cx, cy)` with fractional dimensions `(rect_w, rect_h)` — sub-pixel position + size both honoured. Colour is α + darkness packed (build with [`crate::paint::pack_argb`]); the rect blends UNDER any existing pixel content in the buffer via [`Blend::under`].
+/// Filled rectangle, anti-aliased, axis-aligned. Centered at `(cx, cy)` with fractional dimensions `(rect_w, rect_h)` — sub-pixel position + size both honoured. Colour is α + darkness packed (build with [`crate::paint::pack_argb`]); the rect blends UNDER any existing pixel content in the buffer via [`Blend::under`](crate::pixel::Blend::under).
 ///
 /// AA: each pixel's coverage = `0.5 + distance_inside` against the nearest rect edge, saturated to the depth's field by [`Pixel::cov`]'s cast. Interior pixels saturate to coverage = 1.0 (full colour). Edge pixels get a fraction of the source α. Off-buffer pixels are clipped by the iteration bounds.
 ///
@@ -79,7 +79,7 @@ pub fn draw_rect<P: Pixel>(
     });
 }
 
-/// Blit a decoded image (`src`, α + darkness packed, row-major `src_w × src_h`) scaled into a dest rect centred at `(cx, cy)` with px size `(dst_w, dst_h)`. Nearest-neighbour sampling. Each sampled pixel composes UNDER existing content via [`Blend::under`] exactly like the other primitives, so draw order controls z. Source pixels are treated as opaque — the VSF image decoder packs α = `0xFF`; a source pixel's own α still rides thru `under`, so a decoder that emits transparency (future masked avatars) composites correctly with no change here.
+/// Blit a decoded image (`src`, α + darkness packed, row-major `src_w × src_h`) scaled into a dest rect centred at `(cx, cy)` with px size `(dst_w, dst_h)`. Nearest-neighbour sampling. Each sampled pixel composes UNDER existing content via [`Blend::under`](crate::pixel::Blend::under) exactly like the other primitives, so draw order controls z. Source pixels are treated as opaque — the VSF image decoder packs α = `0xFF`; a source pixel's own α still rides thru `under`, so a decoder that emits transparency (future masked avatars) composites correctly with no change here.
 ///
 /// Bounds are clamped/clipped like [`draw_rect`] (the dest rect may be partly off-buffer). Edges are hard (no boundary AA) — fine behind a rounded mask or at icon scale; add coverage later if bare-edged blits need softening.
 pub fn draw_image<P: Pixel>(

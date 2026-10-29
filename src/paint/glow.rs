@@ -57,7 +57,7 @@ pub fn ray_reach_px(seed: u32, factor_256: u32) -> usize {
     len
 }
 
-/// Right-edge glow ray pass. Per row in the pill's vertical span, scans the buffer's α byte from the right end of the bbox leftward to find that row's first fully-opaque pixel (α=0xFF — the pill's interior, set by the squircle's writes), then walks rightward writing a glow pixel each step whose α decays exponentially from `seed` via `factor_256` — same curve as [`crate::paint::paint_shadow`], just emitting white at 0°/180° instead of black at 45°. Each write composes UNDER the existing target via [`Blend::under`] (Normal).
+/// Right-edge glow ray pass. Per row in the pill's vertical span, scans the buffer's α byte from the right end of the bbox leftward to find that row's first fully-opaque pixel (α=0xFF — the pill's interior, set by the squircle's writes), then walks rightward writing a glow pixel each step whose α decays exponentially from `seed` via `factor_256` — same curve as [`crate::paint::paint_shadow`], just emitting white at 0°/180° instead of black at 45°. Each write composes UNDER the existing target via [`Blend::under`](crate::pixel::Blend::under) (Normal).
 ///
 /// `factor_256 ∈ [1, 255]`: 240 ≈ ×0.9375 per step (~60-pixel reach at seed=0x80), 250 ≈ ×0.9766 (~150-pixel). Caller derives this from `effective_span` (or font_size) so glow reach is RU-invariant. Uses [`compute_alphas`] to precompute the decay table — hot loop is a table lookup.
 pub fn apply_textbox_glow_right<P: Pixel>(
@@ -125,7 +125,7 @@ pub fn apply_textbox_glow_right<P: Pixel>(
     }
 }
 
-/// Left-edge glow ray pass. Mirror of [`apply_textbox_glow_right`]: per row in the pill's vertical span, scans the buffer's α byte from the LEFT end of the bbox rightward to find the first fully-opaque pixel, then walks `reach_px` steps LEFT writing a linearly-tapered glow underneath. Each write composes UNDER the existing target via [`Blend::under`] (Normal).
+/// Left-edge glow ray pass. Mirror of [`apply_textbox_glow_right`]: per row in the pill's vertical span, scans the buffer's α byte from the LEFT end of the bbox rightward to find the first fully-opaque pixel, then walks `reach_px` steps LEFT writing a linearly-tapered glow underneath. Each write composes UNDER the existing target via [`Blend::under`](crate::pixel::Blend::under) (Normal).
 pub fn apply_textbox_glow_left<P: Pixel>(
     canvas: &mut Canvas<P>,
     pill_x: isize,
@@ -197,7 +197,7 @@ pub fn apply_textbox_glow_left<P: Pixel>(
     }
 }
 
-/// Top-edge glow ray pass. Per column in the pill's horizontal span, scans the buffer's α byte from the TOP of the bbox downward to find the first fully-opaque pixel (α=0xFF — the squircle's interior), then walks `reach_px` steps UP writing a glow pixel each step whose α tapers linearly from `seed` down toward 0. Each write composes UNDER existing target via [`Blend::under`] (Normal).
+/// Top-edge glow ray pass. Per column in the pill's horizontal span, scans the buffer's α byte from the TOP of the bbox downward to find the first fully-opaque pixel (α=0xFF — the squircle's interior), then walks `reach_px` steps UP writing a glow pixel each step whose α tapers linearly from `seed` down toward 0. Each write composes UNDER existing target via [`Blend::under`](crate::pixel::Blend::under) (Normal).
 ///
 /// Why the scan only catches squircle pixels: the horizontal glow passes (left/right) write α ≤ `seed_horizontal` (typically 0x80) which is well below 0xFF, so they don't trigger the "fully opaque" scan condition — the vertical pass cleanly walks past horizontal glow pixels until it reaches the silhouette's actual α=0xFF interior.
 pub fn apply_textbox_glow_top<P: Pixel>(
@@ -354,7 +354,7 @@ fn glow_ceiling(x: u32) -> u32 {
 
 /// Paint a 4-directional blur glow around a textbox pill silhouette.
 ///
-/// Loop structure + adder/intensity math ported from photon's `apply_textbox_glow` (`compositing.rs:4479`). Pixel writes compose UNDER whatever's already in the buffer via [`Blend::under`] (Normal) — same kernel as every other fluor primitive. Caller paints squircle FIRST (topmost), then this; the squircle's opaque interior takes the under() early-out so glow stays outside the silhouette, AA-edge pixels (α<255) let glow bleed thru the soft transition.
+/// Loop structure + adder/intensity math ported from photon's `apply_textbox_glow` (`compositing.rs:4479`). Pixel writes compose UNDER whatever's already in the buffer via [`Blend::under`](crate::pixel::Blend::under) (Normal) — same kernel as every other fluor primitive. Caller paints squircle FIRST (topmost), then this; the squircle's opaque interior takes the under() early-out so glow stays outside the silhouette, AA-edge pixels (α<255) let glow bleed thru the soft transition.
 pub fn apply_textbox_glow<P: Pixel>(
     canvas: &mut Canvas<P>,
     mask: &[u8],

@@ -319,9 +319,9 @@ fn flatten_premult_chunk<P: Pixel>(dst: &mut [P], src: &[P]) {
 pub use crate::pixel::BlendMode;
 use crate::pixel::{Argb8, Pixel};
 
-/// Flatten `src` underneath `dst` across the whole slice, pixel-by-pixel, via [`Blend::under`]. `dst` is the partial composite already accumulated above (its α-byte = accumulated opacity); `src` is the new layer going behind. Per-pixel early-out fires when `dst.α == 0xFF`. Both slices must be the same length (a shorter `src` panics: a size mismatch is a bug upstream, never something to paper over).
+/// Flatten `src` underneath `dst` across the whole slice, pixel-by-pixel, via [`Blend::under`](crate::pixel::Blend::under). `dst` is the partial composite already accumulated above (its α-byte = accumulated opacity); `src` is the new layer going behind. Per-pixel early-out fires when `dst.α == 0xFF`. Both slices must be the same length (a shorter `src` panics: a size mismatch is a bug upstream, never something to paper over).
 ///
-/// For `BlendMode::Normal` (the 99% case) the kernel runs the depth's chunk hook ([`Pixel::under_chunk_normal`]: 8-wide SIMD for Argb8) + Rayon parallelism. Other modes fall back to scalar per-pixel with Rayon row-chunking still applied — the math just stays in the scalar [`Blend::under`] kernel.
+/// For `BlendMode::Normal` (the 99% case) the kernel runs the depth's chunk hook ([`Pixel::under_chunk_normal`]: 8-wide SIMD for Argb8) + Rayon parallelism. Other modes fall back to scalar per-pixel with Rayon row-chunking still applied — the math just stays in the scalar [`Blend::under`](crate::pixel::Blend::under) kernel.
 #[inline]
 pub fn flatten<P: Pixel>(dst: &mut [P], src: &[P], mode: BlendMode) {
     let n = dst.len();
