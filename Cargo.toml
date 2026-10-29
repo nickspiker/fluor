@@ -180,6 +180,11 @@ panic = "abort"
 name = "font_pack"
 required-features = ["packs-publish"]
 
+# A desktop window at either pixel depth (16-bit by default, `-- 8` for 8-bit): the present's dither against 8-bit banding.
+[[example]]
+name = "depth"
+required-features = ["host-winit"]
+
 # target_os = "ferros" is the phone as a ferros process (a JSON target, STD-TARGET.md in the ferros repo): rustc does not know the name, so the cfg is declared here.
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("ferros"))'] }
