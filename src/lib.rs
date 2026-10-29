@@ -29,6 +29,10 @@ pub mod theme;
 #[cfg(all(test, target_arch = "x86_64"))]
 mod golden;
 
+// The source gate: the 8-bit pixel layout written by hand stays in the files that are 8-bit on purpose.
+#[cfg(all(test, feature = "std"))]
+mod gate;
+
 #[cfg(feature = "text")]
 pub mod text;
 #[cfg(feature = "text")]
