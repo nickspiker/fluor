@@ -15,7 +15,7 @@ const EIGHT_BIT: &[(&str, &str)] = &[
     ("paint/shadow.rs", "runs on the finalized OS screen (visible premultiplied 8-bit), after the depth's own buffer is gone"),
     ("paint/argb8.rs", "the 8-bit colour boundary (pack_argb), the theme-delta byte arithmetic, and the overlay, damage outline and control glyphs on the finalized screen"),
     ("text/argb8.rs", "the legacy byte-buffer draws and the additive / subtractive wrapping blits"),
-    ("host/", "the hosts' present and chrome code; phase 5 takes ferros to G2t16"),
+    ("host/", "the desktop and Android presents write 8-bit OS surfaces, the chrome draws desktop windows only (ferros uses none), and panel.rs is each depth's own ferros present"),
     ("golden.rs", "test scenes author 8-bit colours"),
     ("gate.rs", "this file names the patterns it refuses"),
 ];
