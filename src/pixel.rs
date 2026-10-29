@@ -76,12 +76,13 @@ pub trait Blend {
     /// Starting from `0x00000000` (no opacity, no darkness), each new layer adds darkness and opacity to the running total. Multi-layer stacking is repeated addition until α saturates or layers exhaust.
     ///
     /// The operands are `Self` so the same kernel name serves every pixel depth: [`Pixel`] has `Blend` as a supertrait, which is how generic code reaches `under` thru a `P: Pixel` bound.
+    /// At 16 bits every 8, 255 and 256 above is the depth's own (16, 65535, 65536), and the floor proof carries over word for word.
     fn under(self, bottom: Self, mode: BlendMode) -> Self;
 }
 
 /// A pixel depth fluor can render at.
 /// Every depth holds the same thing, VSF `g2t` codes as α + darkness: empty is all zeros, opaque black is all ones, and a channel's darkness is (top code − code) × α.
-/// Only the width of the fields differs, so a kernel written against these constants and methods runs unchanged at 8 bits ([`Argb8`]) and, later, 16.
+/// Only the width of the fields differs, so a kernel written against these constants and methods runs unchanged at 8 bits ([`Argb8`]) and 16 ([`G2t16`]).
 ///
 /// `under` comes from the [`Blend`] supertrait rather than a method of its own: with both traits in scope a concrete `u32` would otherwise see two `under`s and every call would be ambiguous.
 pub trait Pixel: Blend + Copy + Eq + Send + Sync + core::fmt::Debug + 'static {
@@ -105,11 +106,32 @@ pub trait Pixel: Blend + Copy + Eq + Send + Sync + core::fmt::Debug + 'static {
     fn rgb(self) -> Self;
     /// These darkness channels under a new α (`0..=ONE`, not checked: a wider value spills out of the field, and that is a bug in the caller's math).
     fn with_alpha(self, a: u32) -> Self;
-    /// A pixel of darkness `rgb` at coverage `cov_q16`, coverage in Q16 (`0..=1 << 16`, `1 << 16` = whole pixel): α = `cov_q16 × ONE >> 16`, the darkness passing thru as it is, because `under` scales darkness by the α it consumes.
-    /// No kernel routes thru this yet: each computes its own α from its own coverage today, and moving one onto it has to show its α is the same for every coverage it produces.
+    /// The three darkness channels, red first, each `0..=ONE`.
+    fn channels(self) -> [u32; 3];
+    /// A pixel from α and three darkness channels, each `0..=ONE` (not checked, as [`Pixel::with_alpha`]).
+    fn from_channels(a: u32, rgb: [u32; 3]) -> Self;
+    /// A pixel of darkness `rgb` at coverage `cov_q16`, coverage in Q16 with `0xFFFF` the whole pixel: α is the coverage's top DEPTH bits, the darkness passing thru as it is, because `under` scales darkness by the α it consumes.
+    /// This is the squircle crossings' AA weight (`(√frac × 2¹⁶) as u16`): its top 8 bits are exactly the byte `(√frac × 2⁸) as u8` the 8-bit kernel always wrote, and at 16 bits the whole weight is the α.
     fn from_cov(rgb: Self, cov_q16: u32) -> Self;
+    /// A one-pixel edge ramp `v` (≤ 0 outside, ≥ 1 inside) as coverage in this depth's own scale, `0..=ONE`: `v × ONE`, the cast to the field's width saturating both ends, which is the whole clamp.
+    fn cov(v: f32) -> u32;
     /// A colour authored as an 8-bit `g2t` α + darkness pixel (the theme's palette, `theme::dark(fmt(vsf(..)))`) at this depth: the same light, widened.
     fn from_g2t8(c: u32) -> Self;
+
+    /// `dst[i] = dst[i].under(src[i], Normal)` over a run: the hook a depth's SIMD kernel takes over (Argb8 runs 8 lanes of `wide::u32x8` with the `simd` feature).
+    #[inline]
+    fn under_chunk_normal(dst: &mut [Self], src: &[Self]) {
+        for i in 0..dst.len() {
+            dst[i] = dst[i].under(src[i], BlendMode::Normal);
+        }
+    }
+    /// [`Pixel::under_chunk_normal`] with every source pixel the same: the interior run of a solid fill.
+    #[inline]
+    fn under_chunk_const(dst: &mut [Self], src: Self) {
+        for i in 0..dst.len() {
+            dst[i] = dst[i].under(src, BlendMode::Normal);
+        }
+    }
 }
 
 impl Pixel for Argb8 {
@@ -133,13 +155,130 @@ impl Pixel for Argb8 {
         (a << Self::ALPHA_SHIFT) | (self & Self::RGB_MASK)
     }
     #[inline(always)]
+    fn channels(self) -> [u32; 3] {
+        [(self >> (2 * Self::DEPTH)) & Self::ONE, (self >> Self::DEPTH) & Self::ONE, self & Self::ONE]
+    }
+    #[inline(always)]
+    fn from_channels(a: u32, rgb: [u32; 3]) -> Self {
+        (a << Self::ALPHA_SHIFT) | (rgb[0] << (2 * Self::DEPTH)) | (rgb[1] << Self::DEPTH) | rgb[2]
+    }
+    #[inline(always)]
     fn from_cov(rgb: Self, cov_q16: u32) -> Self {
-        (((cov_q16 * Self::ONE) >> 16) << Self::ALPHA_SHIFT) | (rgb & Self::RGB_MASK)
+        ((cov_q16 >> (16 - Self::DEPTH)) << Self::ALPHA_SHIFT) | (rgb & Self::RGB_MASK)
+    }
+    #[inline(always)]
+    fn cov(v: f32) -> u32 {
+        (v * Self::ONE as f32) as u8 as u32
     }
     /// The 8-bit palette is this depth's own encoding, so it passes as it is.
     #[inline(always)]
     fn from_g2t8(c: u32) -> Self {
         c
+    }
+
+    #[inline]
+    fn under_chunk_normal(dst: &mut [Self], src: &[Self]) {
+        #[cfg(feature = "simd")]
+        {
+            use crate::simd::{LANES, u32x8};
+            let n = dst.len();
+            let mut i = 0;
+            while i + LANES <= n {
+                let d_arr: [u32; 8] = dst[i..i + LANES].try_into().unwrap();
+                let s_arr: [u32; 8] = src[i..i + LANES].try_into().unwrap();
+                let out = under_x8_normal(u32x8::from(d_arr), u32x8::from(s_arr));
+                dst[i..i + LANES].copy_from_slice(out.as_array_ref());
+                i += LANES;
+            }
+            while i < n {
+                dst[i] = dst[i].under(src[i], BlendMode::Normal);
+                i += 1;
+            }
+        }
+        #[cfg(not(feature = "simd"))]
+        for i in 0..dst.len() {
+            dst[i] = dst[i].under(src[i], BlendMode::Normal);
+        }
+    }
+
+    /// The source is broadcast to all 8 lanes once, outside the loop.
+    #[inline]
+    fn under_chunk_const(dst: &mut [Self], src_const: Self) {
+        #[cfg(feature = "simd")]
+        {
+            use crate::simd::{LANES, u32x8};
+            let src = u32x8::splat(src_const);
+            let n = dst.len();
+            let mut i = 0;
+            while i + LANES <= n {
+                let d_arr: [u32; 8] = dst[i..i + LANES].try_into().unwrap();
+                let out = under_x8_normal(u32x8::from(d_arr), src);
+                dst[i..i + LANES].copy_from_slice(out.as_array_ref());
+                i += LANES;
+            }
+            while i < n {
+                dst[i] = dst[i].under(src_const, BlendMode::Normal);
+                i += 1;
+            }
+        }
+        #[cfg(not(feature = "simd"))]
+        for i in 0..dst.len() {
+            dst[i] = dst[i].under(src_const, BlendMode::Normal);
+        }
+    }
+}
+
+/// Packed 16-bit pixel in the α + darkness convention: the 8-bit layout widened, `α << 48 | R << 32 | G << 16 | B`, each field a 16-bit VSF `g2t` darkness (opaque: 65535 − code, code / 2¹⁶ the encoded value, light = atanh(code / 2¹⁶)²).
+/// A type alias for `u64` as [`Argb8`] is for `u32`: the name carries the convention.
+/// The top code is 34.7× diffuse white (8 bits stop at 9.7×), and every glow and edge has 2⁸ times the steps.
+pub type G2t16 = u64;
+
+impl Pixel for G2t16 {
+    const DEPTH: u32 = 16;
+    const ONE: u32 = (1 << Self::DEPTH) - 1;
+    const ALPHA_SHIFT: u32 = 3 * Self::DEPTH;
+    const RGB_MASK: Self = (1 << Self::ALPHA_SHIFT) - 1;
+    const OPAQUE: Self = (Self::ONE as u64) << Self::ALPHA_SHIFT;
+    const EMPTY: Self = 0;
+
+    #[inline(always)]
+    fn alpha(self) -> u32 {
+        (self >> Self::ALPHA_SHIFT) as u32
+    }
+    #[inline(always)]
+    fn rgb(self) -> Self {
+        self & Self::RGB_MASK
+    }
+    #[inline(always)]
+    fn with_alpha(self, a: u32) -> Self {
+        ((a as u64) << Self::ALPHA_SHIFT) | (self & Self::RGB_MASK)
+    }
+    #[inline(always)]
+    fn channels(self) -> [u32; 3] {
+        let one = Self::ONE as u64;
+        [((self >> (2 * Self::DEPTH)) & one) as u32, ((self >> Self::DEPTH) & one) as u32, (self & one) as u32]
+    }
+    #[inline(always)]
+    fn from_channels(a: u32, rgb: [u32; 3]) -> Self {
+        ((a as u64) << Self::ALPHA_SHIFT) | ((rgb[0] as u64) << (2 * Self::DEPTH)) | ((rgb[1] as u64) << Self::DEPTH) | rgb[2] as u64
+    }
+    #[inline(always)]
+    fn from_cov(rgb: Self, cov_q16: u32) -> Self {
+        ((cov_q16 as u64) << Self::ALPHA_SHIFT) | (rgb & Self::RGB_MASK)
+    }
+    #[inline(always)]
+    fn cov(v: f32) -> u32 {
+        (v * Self::ONE as f32) as u16 as u32
+    }
+    /// The same light at 16 bits, field by field.
+    /// `g2t` decodes a code at its bucket bottom, `atanh(code / 2ⁿ)²`, so 8-bit code `c` and 16-bit code `c × 2⁸` are the same encoded value and the same light, and VSF's settled encoder sends that light back to exactly `c × 2⁸` (held to vsf's codec by a test over all 256 codes).
+    /// In darkness that is `65535 − 256·(255 − d) = 256·d + 255`.
+    /// α is a fraction of full, not a code: `α × 257` takes 255 to 65535 and every byte to the same fraction.
+    #[inline(always)]
+    fn from_g2t8(c: u32) -> Self {
+        let wide = |d: u32| (d << 8) | ((1 << 8) - 1);
+        let [r, g, b] = Argb8::channels(c);
+        Self::from_channels((c >> 24) * 257, [wide(r), wide(g), wide(b)])
     }
 }
 
@@ -176,71 +315,102 @@ pub fn under_x8_normal(dst: wide::u32x8, src: wide::u32x8) -> wide::u32x8 {
     (opaque_mask & dst) | (not_mask & result)
 }
 
-impl Blend for Argb8 {
-    #[inline]
-    fn under(self, bottom: Argb8, mode: BlendMode) -> Argb8 {
-        if self >= 0xFF000000 {
-            return self;
-        } // top opaque — top wins, bottom invisible.
-        let top_a = self >> 24;
-        let bot_a = bottom >> 24;
+/// The one `under` kernel, written once and stamped out per depth in that depth's own integer width (`u32` for 8 bits, `u64` for 16), so the 8-bit build keeps its 32-bit arithmetic and 16 bits gets the room its products need (Overlay's `2·td·bd` reaches 2³³).
+/// `$d` is the depth: `one` = 2^d − 1 is the 8-bit `0xFF`, `one + 1` its `256`, `>> $d` its `>> 8`, and `1 << ($d − 1)` Overlay's `0x80` pivot, so at `$d = 8` every expression is the one the 8-bit kernel always had.
+macro_rules! impl_under {
+    ($t:ty, $d:expr) => {
+        impl Blend for $t {
+            #[inline]
+            fn under(self, bottom: $t, mode: BlendMode) -> $t {
+                const D: u32 = $d;
+                let one: $t = (1 << D) - 1;
+                if self >= one << (3 * D) {
+                    return self;
+                } // top opaque — top wins, bottom invisible.
+                let top_a = self >> (3 * D);
+                let bot_a = bottom >> (3 * D);
 
-        let consumed = ((256 - top_a) * bot_a) >> 8;
+                let consumed = ((one + 1 - top_a) * bot_a) >> D;
 
-        let td_r = (self >> 16) & 0xFF;
-        let td_g = (self >> 8) & 0xFF;
-        let td_b = self & 0xFF;
-        let bd_r = (bottom >> 16) & 0xFF;
-        let bd_g = (bottom >> 8) & 0xFF;
-        let bd_b = bottom & 0xFF;
+                let td_r = (self >> (2 * D)) & one;
+                let td_g = (self >> D) & one;
+                let td_b = self & one;
+                let bd_r = (bottom >> (2 * D)) & one;
+                let bd_g = (bottom >> D) & one;
+                let bd_b = bottom & one;
 
-        let (mr, mg, mb) = match mode {
-            BlendMode::Normal => (bd_r, bd_g, bd_b),
-            BlendMode::Multiply => (
-                0xFF - (((0xFF - td_r) * (0xFF - bd_r)) >> 8),
-                0xFF - (((0xFF - td_g) * (0xFF - bd_g)) >> 8),
-                0xFF - (((0xFF - td_b) * (0xFF - bd_b)) >> 8),
-            ),
-            BlendMode::Screen => ((td_r * bd_r) >> 8, (td_g * bd_g) >> 8, (td_b * bd_b) >> 8),
-            // WHY/PROOF: the saturation IS the Add and Subtract blend (light past white stays white, darkness past black stays black), not a guard — plain arithmetic would wrap a bright pair to a dark result and underflow u32 into the next lane.
-            BlendMode::Add => (
-                (td_r + bd_r).saturating_sub(0xFF),
-                (td_g + bd_g).saturating_sub(0xFF),
-                (td_b + bd_b).saturating_sub(0xFF),
-            ),
-            BlendMode::Subtract => (
-                0xFF - bd_r.saturating_sub(td_r),
-                0xFF - bd_g.saturating_sub(td_g),
-                0xFF - bd_b.saturating_sub(td_b),
-            ),
-            BlendMode::Overlay => (
-                if bd_r > 0x80 {
-                    (2 * td_r * bd_r) >> 8
-                } else {
-                    0xFF - ((2 * (0xFF - td_r) * (0xFF - bd_r)) >> 8)
-                },
-                if bd_g > 0x80 {
-                    (2 * td_g * bd_g) >> 8
-                } else {
-                    0xFF - ((2 * (0xFF - td_g) * (0xFF - bd_g)) >> 8)
-                },
-                if bd_b > 0x80 {
-                    (2 * td_b * bd_b) >> 8
-                } else {
-                    0xFF - ((2 * (0xFF - td_b) * (0xFF - bd_b)) >> 8)
-                },
-            ),
-            BlendMode::Darken => (td_r.max(bd_r), td_g.max(bd_g), td_b.max(bd_b)),
-            BlendMode::Lighten => (td_r.min(bd_r), td_g.min(bd_g), td_b.min(bd_b)),
-        };
+                let pivot: $t = 1 << (D - 1);
+                let (mr, mg, mb) = match mode {
+                    BlendMode::Normal => (bd_r, bd_g, bd_b),
+                    BlendMode::Multiply => (
+                        one - (((one - td_r) * (one - bd_r)) >> D),
+                        one - (((one - td_g) * (one - bd_g)) >> D),
+                        one - (((one - td_b) * (one - bd_b)) >> D),
+                    ),
+                    BlendMode::Screen => ((td_r * bd_r) >> D, (td_g * bd_g) >> D, (td_b * bd_b) >> D),
+                    // WHY/PROOF: the saturation IS the Add and Subtract blend (light past white stays white, darkness past black stays black), not a guard — plain arithmetic would wrap a bright pair to a dark result and underflow into the next lane.
+                    BlendMode::Add => (
+                        (td_r + bd_r).saturating_sub(one),
+                        (td_g + bd_g).saturating_sub(one),
+                        (td_b + bd_b).saturating_sub(one),
+                    ),
+                    BlendMode::Subtract => (
+                        one - bd_r.saturating_sub(td_r),
+                        one - bd_g.saturating_sub(td_g),
+                        one - bd_b.saturating_sub(td_b),
+                    ),
+                    BlendMode::Overlay => (
+                        if bd_r > pivot { (2 * td_r * bd_r) >> D } else { one - ((2 * (one - td_r) * (one - bd_r)) >> D) },
+                        if bd_g > pivot { (2 * td_g * bd_g) >> D } else { one - ((2 * (one - td_g) * (one - bd_g)) >> D) },
+                        if bd_b > pivot { (2 * td_b * bd_b) >> D } else { one - ((2 * (one - td_b) * (one - bd_b)) >> D) },
+                    ),
+                    BlendMode::Darken => (td_r.max(bd_r), td_g.max(bd_g), td_b.max(bd_b)),
+                    BlendMode::Lighten => (td_r.min(bd_r), td_g.min(bd_g), td_b.min(bd_b)),
+                };
 
-        let nr = td_r + ((mr * consumed) >> 8);
-        let ng = td_g + ((mg * consumed) >> 8);
-        let nb = td_b + ((mb * consumed) >> 8);
-        let na = top_a + consumed;
+                let nr = td_r + ((mr * consumed) >> D);
+                let ng = td_g + ((mg * consumed) >> D);
+                let nb = td_b + ((mb * consumed) >> D);
+                let na = top_a + consumed;
 
-        (na << 24) | (nr << 16) | (ng << 8) | nb
+                (na << (3 * D)) | (nr << (2 * D)) | (ng << D) | nb
+            }
+        }
+    };
+}
+
+impl_under!(Argb8, 8);
+impl_under!(G2t16, 16);
+
+/// A composite G2t16 pixel as the nearest 8-bit one, the cross-check's yardstick: α to the nearest 8-bit fraction, and each channel un-premultiplied to the 16-bit code it holds at full α, taken to the 8-bit code whose light (VSF's own decoder, bucket bottom) is nearest, and premultiplied back by the 8-bit α.
+#[cfg(test)]
+pub(crate) fn narrow_to_8(p: G2t16) -> Argb8 {
+    use vsf::colour::convert::{linearize_gamma2tanh_u16_f32, linearize_gamma2tanh_u8_f32};
+    let a16 = p.alpha();
+    let a8 = (a16 + 128) / 257;
+    if a16 == 0 {
+        return Argb8::from_channels(0, p.channels().map(|d| (d + 128) >> 8));
     }
+    let channel = |d: u32| {
+        // Darkness past α holds no code (Multiply and Overlay can leave it there, at either depth); it narrows linearly, the α share of the `256·d + α` widening taken back off.
+        if d > a16 {
+            return ((d - a16 / 257) + 128) >> 8;
+        }
+        let code16 = 65535. - d as f64 * 65535. / a16 as f64;
+        let light = linearize_gamma2tanh_u16_f32(code16.round().clamp(0., 65535.) as u16) as f64;
+        let mut code8 = 0u32;
+        while code8 < 255 && (linearize_gamma2tanh_u8_f32(code8 as u8 + 1) as f64) <= light {
+            code8 += 1;
+        }
+        if code8 < 255 {
+            let (lo, hi) = (linearize_gamma2tanh_u8_f32(code8 as u8) as f64, linearize_gamma2tanh_u8_f32(code8 as u8 + 1) as f64);
+            if hi - light < light - lo {
+                code8 += 1;
+            }
+        }
+        (((255 - code8) * a8) as f64 / 255.).round() as u32
+    };
+    Argb8::from_channels(a8, p.channels().map(channel))
 }
 
 #[cfg(test)]
@@ -333,28 +503,140 @@ mod tests {
         assert_eq!(<Argb8 as Pixel>::from_g2t8(p), p);
     }
 
-    /// Full coverage is full α, none is none, and every 8-bit coverage a kernel has today comes back as itself when carried in Q16 as `ceil(c × 2¹⁶ / 255)`: `(ceil(c·2¹⁶/255) × 255) >> 16` is `c` because the product lies in `[c·2¹⁶, c·2¹⁶ + 255)`.
+    /// Q16 coverage lands as its top DEPTH bits at each depth, and the squircle weights' identity holds: `(v·2¹⁶) as u16 >> 8` is `(v·2⁸) as u8` for every f32 `v`, since the products differ by an exact power of two and both casts saturate at their top.
     #[test]
-    fn from_cov_maps_q16_onto_the_8_bit_alpha() {
+    fn from_cov_takes_the_top_bits_of_q16() {
         let rgb: Argb8 = 0x00_AB_CD_EF;
-        assert_eq!(<Argb8 as Pixel>::from_cov(rgb, 1 << 16), 0xFF_AB_CD_EF);
-        assert_eq!(<Argb8 as Pixel>::from_cov(rgb, 0), 0x00_AB_CD_EF);
-        assert_eq!(<Argb8 as Pixel>::from_cov(0xFF_AB_CD_EF, 1 << 15).alpha(), 127, "α in the colour is replaced, not kept");
-        for c in 0..=255u32 {
-            let q16 = (c * (1 << 16) + 254) / 255;
-            assert_eq!(<Argb8 as Pixel>::from_cov(rgb, q16).alpha(), c, "byte coverage {c}");
+        for w in 0..=0xFFFFu32 {
+            assert_eq!(<Argb8 as Pixel>::from_cov(rgb, w), ((w >> 8) << 24) | rgb, "weight {w}");
+            assert_eq!(<G2t16 as Pixel>::from_cov(0x1234, w).alpha(), w);
+        }
+        assert_eq!(<Argb8 as Pixel>::from_cov(0xFF_AB_CD_EF, 1 << 15).alpha(), 128, "α in the colour is replaced, not kept");
+        let mut v = -0.25f32;
+        while v < 1.25 {
+            assert_eq!(((v * 65536.) as u16 >> 8) as u8, (v * 256.) as u8, "v {v}");
+            v += 1. / ((1 << 14) as f32);
         }
     }
 
-    /// `under` thru a `P: Pixel` bound is the `Blend` kernel itself.
+    /// The edge ramp at each depth: 0 and 1 at the ends, saturating past them, and the 8-bit one exactly the old `(v × 255) as u8`.
     #[test]
-    fn under_thru_the_pixel_bound_is_blend() {
-        fn generic<P: Pixel>(top: P, bottom: P, mode: BlendMode) -> P {
-            top.under(bottom, mode)
+    fn cov_saturates_at_each_depth() {
+        assert_eq!(<Argb8 as Pixel>::cov(-3.), 0);
+        assert_eq!(<Argb8 as Pixel>::cov(1.), 255);
+        assert_eq!(<Argb8 as Pixel>::cov(7.), 255);
+        assert_eq!(<G2t16 as Pixel>::cov(1.), 65535);
+        assert_eq!(<G2t16 as Pixel>::cov(7.), 65535);
+        assert_eq!(<G2t16 as Pixel>::cov(-0.5), 0);
+        let mut v = -0.5f32;
+        while v < 1.5 {
+            assert_eq!(<Argb8 as Pixel>::cov(v), (v * 255.0) as u8 as u32);
+            v += 1. / 1024.;
         }
-        for (top, bottom) in [(0u32, 0xFF_80_80_80u32), (0x80_20_30_40, 0x60_50_50_10), (0x33_11_22_33, 0xFF_FF_FF_FF)] {
-            for mode in [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen, BlendMode::Add, BlendMode::Subtract, BlendMode::Overlay, BlendMode::Darken, BlendMode::Lighten] {
-                assert_eq!(generic(top, bottom, mode), Blend::under(top, bottom, mode));
+    }
+
+    /// The 16-bit layout is the 8-bit one widened, and `from_g2t8` keeps the light of every authored code: VSF's own codec sends 8-bit code `c`'s light to 16-bit code `c × 2⁸`, which in darkness is `256·d + 255`.
+    #[test]
+    fn g2t16_from_g2t8_is_vsfs_light() {
+        use vsf::colour::convert::{delinearize_gamma2tanh_u16_f32, linearize_gamma2tanh_u8_f32};
+        assert_eq!(G2t16::DEPTH, 16);
+        assert_eq!(G2t16::ONE, 65535);
+        assert_eq!(G2t16::ALPHA_SHIFT, 48);
+        assert_eq!(G2t16::RGB_MASK, 0x0000_FFFF_FFFF_FFFF);
+        assert_eq!(G2t16::OPAQUE, 0xFFFF_0000_0000_0000);
+        for code in 0..=255u32 {
+            let code16 = delinearize_gamma2tanh_u16_f32(linearize_gamma2tanh_u8_f32(code as u8)) as u32;
+            assert_eq!(code16, code << 8, "vsf's 16-bit code for 8-bit code {code}");
+            let d8 = 255 - code;
+            let p = G2t16::from_g2t8(0xFF00_0000 | (d8 << 16) | ((d8 ^ 0x5A) << 8) | (255 - d8));
+            assert_eq!(p.alpha(), 65535);
+            assert_eq!(p.channels()[0], 65535 - code16, "darkness for code {code}");
+            assert_eq!(p.channels()[1], ((d8 ^ 0x5A) << 8) | 0xFF);
+            assert_eq!(p.channels()[2], (code << 8) | 0xFF);
+        }
+        for a in 0..=255u32 {
+            assert_eq!(G2t16::from_g2t8(a << 24).alpha(), a * 65535 / 255, "α {a} keeps its fraction");
+        }
+        let p = G2t16::from_channels(0x1234, [0x5678, 0x9ABC, 0xDEF0]);
+        assert_eq!(p, 0x1234_5678_9ABC_DEF0);
+        assert_eq!(p.channels(), [0x5678, 0x9ABC, 0xDEF0]);
+        assert_eq!(p.rgb().with_alpha(7), 0x0007_5678_9ABC_DEF0);
+    }
+
+    /// The 8-bit kernel exactly as it was before it moved into `impl_under!`, kept as the reference the macro's 8-bit stamp is held to.
+    fn reference_under_8(top: u32, bottom: u32, mode: BlendMode) -> u32 {
+        if top >= 0xFF000000 {
+            return top;
+        }
+        let top_a = top >> 24;
+        let bot_a = bottom >> 24;
+        let consumed = ((256 - top_a) * bot_a) >> 8;
+        let t = [(top >> 16) & 0xFF, (top >> 8) & 0xFF, top & 0xFF];
+        let b = [(bottom >> 16) & 0xFF, (bottom >> 8) & 0xFF, bottom & 0xFF];
+        let m = |td: u32, bd: u32| match mode {
+            BlendMode::Normal => bd,
+            BlendMode::Multiply => 0xFF - (((0xFF - td) * (0xFF - bd)) >> 8),
+            BlendMode::Screen => (td * bd) >> 8,
+            BlendMode::Add => (td + bd).saturating_sub(0xFF),
+            BlendMode::Subtract => 0xFF - bd.saturating_sub(td),
+            BlendMode::Overlay => if bd > 0x80 { (2 * td * bd) >> 8 } else { 0xFF - ((2 * (0xFF - td) * (0xFF - bd)) >> 8) },
+            BlendMode::Darken => td.max(bd),
+            BlendMode::Lighten => td.min(bd),
+        };
+        let n: [u32; 3] = core::array::from_fn(|i| t[i] + ((m(t[i], b[i]) * consumed) >> 8));
+        ((top_a + consumed) << 24) | (n[0] << 16) | (n[1] << 8) | n[2]
+    }
+
+    const MODES: [BlendMode; 8] = [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen, BlendMode::Add, BlendMode::Subtract, BlendMode::Overlay, BlendMode::Darken, BlendMode::Lighten];
+
+    /// A pixel that keeps the `dark ≤ α` invariant every buffer holds, from a xorshift state.
+    fn invariant_pixel(s: &mut u32) -> u32 {
+        *s ^= *s << 13;
+        *s ^= *s >> 17;
+        *s ^= *s << 5;
+        let a = *s >> 24;
+        let d = |sh: u32| (((*s >> sh) & 0xFF) * a) >> 8;
+        (a << 24) | (d(16) << 16) | (d(8) << 8) | d(0)
+    }
+
+    /// The macro's 8-bit stamp is bit for bit the kernel it replaced, over every mode and a spread of pixels (all α, opaque and empty included).
+    #[test]
+    fn argb8_under_is_the_old_kernel() {
+        let mut s = 0x2545_F491u32;
+        for _ in 0..1 << 16 {
+            let (top, bottom) = (invariant_pixel(&mut s), invariant_pixel(&mut s));
+            for mode in MODES {
+                assert_eq!(top.under(bottom, mode), reference_under_8(top, bottom, mode), "{top:08x} under {bottom:08x} {mode:?}");
+            }
+        }
+        for a in 0..=255u32 {
+            for mode in MODES {
+                let (top, bottom) = (a << 24, 0xFF00_0000 | (a << 16) | a);
+                assert_eq!(top.under(bottom, mode), reference_under_8(top, bottom, mode));
+            }
+        }
+    }
+
+    /// The 16-bit stamp tracks the 8-bit one: the same layers widened and composed at 16 bits, narrowed back to the nearest 8-bit codes ([`narrow_to_8`]), land within 3 steps per channel and 1 in α of the 8-bit composite.
+    /// The bottom is a source colour, widened by `from_g2t8`; the top is an accumulated composite, whose darkness is (top code − code) × α, so its widening is `256·d + α` (`from_g2t8`'s `+ 255` is that at full α).
+    /// Why 3 and not 1: the 8-bit kernel takes `>> 8` for `÷ 255` twice (`consumed` and the deposit) and floors twice, which leaves a dark deposit under partial cover up to 3 steps short of the exact composite (32 ÷ 255 of 232 is 2.3 short in `29221021 under f4e8a14a`); at 16 bits the same steps cost 1/256 of that, so the difference is the 8-bit kernel's, not the 16-bit one's.
+    /// Overlay is left out: its multiply branch `2·td·bd >> 8` reaches `2·ONE` and spills into the next field at either depth, so neither result is a pixel (a bug of the 8-bit kernel kept bit for bit here; see the report of this change).
+    #[test]
+    fn g2t16_under_tracks_argb8() {
+        let widen_composite = |p: u32| G2t16::from_channels(p.alpha() * 257, p.channels().map(|d| (d << 8) + p.alpha()));
+        let mut s = 0x9E37_79B9u32;
+        for _ in 0..1 << 14 {
+            let (top, bottom) = (invariant_pixel(&mut s), invariant_pixel(&mut s));
+            for mode in MODES {
+                if mode == BlendMode::Overlay {
+                    continue;
+                }
+                let p8 = top.under(bottom, mode);
+                let n = narrow_to_8(widen_composite(top).under(G2t16::from_g2t8(bottom), mode));
+                assert!(n.alpha().abs_diff(p8.alpha()) <= 1, "{mode:?} α {} vs {}", n.alpha(), p8.alpha());
+                for (c16, c8) in n.channels().into_iter().zip(p8.channels()) {
+                    assert!(c16.abs_diff(c8) <= 3, "{mode:?} {top:08x} under {bottom:08x}: {c16} vs {c8}");
+                }
             }
         }
     }

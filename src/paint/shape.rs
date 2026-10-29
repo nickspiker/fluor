@@ -13,24 +13,6 @@ fn cov8(v: Coord) -> u32 {
     (v * 255.0) as u8 as u32
 }
 
-/// Photon's `blend_rgb_only` helper: weighted RGB blend of two colours with explicit per-pixel weights. Verbatim port from [compositing.rs:5821](/mnt/Harbor/Code/photon/src/ui/compositing.rs#L5821). Used by `draw_window_controls` for AA squircle edges.
-pub fn blend_rgb_only(bg_colour: u32, fg_colour: u32, weight_bg: u8, weight_fg: u8) -> u32 {
-    let mut bg = bg_colour as u64;
-    bg = (bg | (bg << 16)) & 0x0000FFFF0000FFFF;
-    bg = (bg | (bg << 8)) & 0x00FF00FF00FF00FF;
-
-    let mut fg = fg_colour as u64;
-    fg = (fg | (fg << 16)) & 0x0000FFFF0000FFFF;
-    fg = (fg | (fg << 8)) & 0x00FF00FF00FF00FF;
-
-    let mut blended = bg * weight_bg as u64 + fg * weight_fg as u64;
-    blended = (blended >> 8) & 0x00FF00FF00FF00FF;
-    blended = (blended | (blended >> 8)) & 0x0000FFFF0000FFFF;
-    blended = (blended | (blended >> 16)) & 0x00FFFFFF;
-    // α + darkness: force opaque (α=0xFF) by setting the top byte. RGB darkness is whatever the blend produced.
-    (blended as u32) | 0xFF000000
-}
-
 /// Filled rectangle, anti-aliased, axis-aligned. Centered at `(cx, cy)` with fractional dimensions `(rect_w, rect_h)` — sub-pixel position + size both honoured. Colour is α + darkness packed (build with [`crate::paint::pack_argb`]); the rect blends UNDER any existing pixel content in the buffer via [`Blend::under`].
 ///
 /// AA: each pixel's coverage = `0.5 + distance_inside` against the nearest rect edge, saturated to a byte by [`cov8`]'s cast. Interior pixels saturate to coverage = 1.0 (full colour). Edge pixels get a fraction of the source α. Off-buffer pixels are clipped by the iteration bounds.
