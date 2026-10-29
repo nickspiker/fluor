@@ -2,6 +2,7 @@
 //!
 //! Pixel-space rectangles use [`PixelRect`] (half-open `[x0, x1) × [y0, y1)` in `usize`), matching what the rasterizers already compute internally via `Clip::intersect_bbox`. We do NOT reuse [`crate::region::Region`] here because Region carries a precomputed `span` (harmonic mean) which is meaningless overhead for damage rects and pollutes the equality/hash semantics.
 
+use crate::pixel::{Argb8, Pixel};
 use core::cmp::{max, min};
 
 /// Half-open pixel rectangle: covers pixels at `(x, y)` with `x0 ≤ x < x1`, `y0 ≤ y < y1`. Empty if `x0 >= x1` or `y0 >= y1`. Matches the integer ranges rasterizers produce after clipping.
@@ -107,17 +108,20 @@ impl Damage {
 /// Bundle of "what you're drawing on": a pixel buffer (with its dimensions) plus the [`Damage`] accumulator for this frame. Every public rasterizer takes `&mut Canvas`; the pixel buffer and damage are borrowed together so reporting damage cannot be skipped at a call site.
 ///
 /// The lifetimes are tied together — a Canvas borrows the pixel slice and damage from the host (or from a test scratch). It does not own them, which keeps it cheap to construct per-frame.
-pub struct Canvas<'a> {
-    pub pixels: &'a mut [u32],
+///
+/// `P` is the pixel depth ([`Pixel`]).
+/// It defaults to [`Argb8`], so `Canvas`, `&mut Canvas` and `Canvas<'a>` written anywhere still mean the 8-bit canvas, and `Canvas::new` takes its depth from the slice it is given.
+pub struct Canvas<'a, P: Pixel = Argb8> {
+    pub pixels: &'a mut [P],
     pub width: usize,
     pub height: usize,
     pub damage: &'a mut Damage,
 }
 
-impl<'a> Canvas<'a> {
+impl<'a, P: Pixel> Canvas<'a, P> {
     /// Build a canvas from caller-owned pixel storage and damage accumulator.
     #[inline]
-    pub fn new(pixels: &'a mut [u32], width: usize, height: usize, damage: &'a mut Damage) -> Self {
+    pub fn new(pixels: &'a mut [P], width: usize, height: usize, damage: &'a mut Damage) -> Self {
         Self {
             pixels,
             width,

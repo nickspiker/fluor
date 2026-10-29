@@ -74,7 +74,74 @@ pub trait Blend {
     /// consumed     = ((256 − top_α) × bot_α) >> 8         (0..=255 − top_α) — amount the new layer contributes (mr, mg, mb) = mode_kernel(top_dark, bot_dark)      (0..=255 per channel) in darkness space contrib_ch   = (m_ch × consumed) >> 8               (darkness this layer deposits) out_dark_ch  = top_dark_ch + contrib_ch             (plain +, bounded ≤ 255 by floor proof) new_α        = top_α + consumed                     (plain +, bounded ≤ 255 by floor proof)
     /// ```
     /// Starting from `0x00000000` (no opacity, no darkness), each new layer adds darkness and opacity to the running total. Multi-layer stacking is repeated addition until α saturates or layers exhaust.
-    fn under(self, bottom: Argb8, mode: BlendMode) -> Argb8;
+    ///
+    /// The operands are `Self` so the same kernel name serves every pixel depth: [`Pixel`] has `Blend` as a supertrait, which is how generic code reaches `under` thru a `P: Pixel` bound.
+    fn under(self, bottom: Self, mode: BlendMode) -> Self;
+}
+
+/// A pixel depth fluor can render at.
+/// Every depth holds the same thing, VSF `g2t` codes as α + darkness: empty is all zeros, opaque black is all ones, and a channel's darkness is (top code − code) × α.
+/// Only the width of the fields differs, so a kernel written against these constants and methods runs unchanged at 8 bits ([`Argb8`]) and, later, 16.
+///
+/// `under` comes from the [`Blend`] supertrait rather than a method of its own: with both traits in scope a concrete `u32` would otherwise see two `under`s and every call would be ambiguous.
+pub trait Pixel: Blend + Copy + Eq + Send + Sync + core::fmt::Debug + 'static {
+    /// Bits per field (α and each darkness channel).
+    /// On the `u32` depth, `Argb8::BITS` is u32's own inherent constant (32), which outranks this one: name it `<Argb8 as Pixel>::BITS`, or reach it thru a `P: Pixel` bound, where it is unambiguous.
+    const BITS: u32;
+    /// A full field: opaque α, or black's darkness in one channel.
+    const ONE: u32;
+    /// Where α sits: `pixel >> ALPHA_SHIFT` is the α field.
+    const ALPHA_SHIFT: u32;
+    /// The three darkness channels.
+    const RGB_MASK: Self;
+    /// α full, no darkness: the α field alone.
+    const OPAQUE: Self;
+    /// Nothing here yet: no opacity, no darkness.
+    const EMPTY: Self;
+
+    /// The α field, `0..=ONE`.
+    fn alpha(self) -> u32;
+    /// The darkness channels with α cleared.
+    fn rgb(self) -> Self;
+    /// These darkness channels under a new α (`0..=ONE`, not checked: a wider value spills out of the field, and that is a bug in the caller's math).
+    fn with_alpha(self, a: u32) -> Self;
+    /// A pixel of darkness `rgb` at coverage `cov_q16`, coverage in Q16 (`0..=1 << 16`, `1 << 16` = whole pixel): α = `cov_q16 × ONE >> 16`, the darkness passing thru as it is, because `under` scales darkness by the α it consumes.
+    /// No kernel routes thru this yet: each computes its own α from its own coverage today, and moving one onto it has to show its α is the same for every coverage it produces.
+    fn from_cov(rgb: Self, cov_q16: u32) -> Self;
+    /// A colour authored as an 8-bit `g2t` α + darkness pixel (the theme's palette, `theme::dark(fmt(vsf(..)))`) at this depth: the same light, widened.
+    fn from_g2t8(c: u32) -> Self;
+}
+
+impl Pixel for Argb8 {
+    // `Self::BITS` here would be u32's own inherent `BITS` (32), which outranks the trait's, so BITS is named thru the trait; the other names are not inherent to u32.
+    const BITS: u32 = 8;
+    const ONE: u32 = (1 << <Self as Pixel>::BITS) - 1;
+    const ALPHA_SHIFT: u32 = 3 * <Self as Pixel>::BITS;
+    const RGB_MASK: Self = (1 << Self::ALPHA_SHIFT) - 1;
+    const OPAQUE: Self = Self::ONE << Self::ALPHA_SHIFT;
+    const EMPTY: Self = 0;
+
+    #[inline(always)]
+    fn alpha(self) -> u32 {
+        self >> Self::ALPHA_SHIFT
+    }
+    #[inline(always)]
+    fn rgb(self) -> Self {
+        self & Self::RGB_MASK
+    }
+    #[inline(always)]
+    fn with_alpha(self, a: u32) -> Self {
+        (a << Self::ALPHA_SHIFT) | (self & Self::RGB_MASK)
+    }
+    #[inline(always)]
+    fn from_cov(rgb: Self, cov_q16: u32) -> Self {
+        (((cov_q16 * Self::ONE) >> 16) << Self::ALPHA_SHIFT) | (rgb & Self::RGB_MASK)
+    }
+    /// The 8-bit palette is this depth's own encoding, so it passes as it is.
+    #[inline(always)]
+    fn from_g2t8(c: u32) -> Self {
+        c
+    }
 }
 
 /// 8-wide SIMD version of [`Blend::under`] for `BlendMode::Normal` only — the 99% case in real compositing workloads. Same math as the scalar kernel lane-by-lane, plus a SIMD version of the `dst >= 0xFF000000` early-out: lanes where `dst.α == 0xFF` keep their original value via a masked blend with the SIMD result.
@@ -244,6 +311,53 @@ mod tests {
         let nr = (result >> 16) & 0xFF;
         assert_eq!(new_a, 0x33, "new_α expected 0x33 (~20%)");
         assert!(nr >= 0x31 && nr <= 0x33, "nr expected ~0x32, got {nr:#x}");
+    }
+
+    /// The trait's constants are the layout the rest of fluor spells out by hand today, so moving a kernel onto them changes nothing.
+    #[test]
+    fn argb8_constants_are_the_8_bit_layout() {
+        assert_eq!(<Argb8 as Pixel>::BITS, 8);
+        assert_eq!(<Argb8 as Pixel>::ONE, 255);
+        assert_eq!(<Argb8 as Pixel>::ALPHA_SHIFT, 24);
+        assert_eq!(<Argb8 as Pixel>::RGB_MASK, 0x00FF_FFFF);
+        assert_eq!(<Argb8 as Pixel>::OPAQUE, 0xFF00_0000);
+        assert_eq!(<Argb8 as Pixel>::EMPTY, 0);
+    }
+
+    #[test]
+    fn argb8_fields_round_trip() {
+        let p: Argb8 = 0x80_12_34_56;
+        assert_eq!(p.alpha(), 0x80);
+        assert_eq!(p.rgb(), 0x00_12_34_56);
+        assert_eq!(p.with_alpha(0xFF), 0xFF_12_34_56);
+        assert_eq!(p.with_alpha(0), 0x00_12_34_56);
+        assert_eq!(<Argb8 as Pixel>::from_g2t8(p), p);
+    }
+
+    /// Full coverage is full α, none is none, and every 8-bit coverage a kernel has today comes back as itself when carried in Q16 as `ceil(c × 2¹⁶ / 255)`: `(ceil(c·2¹⁶/255) × 255) >> 16` is `c` because the product lies in `[c·2¹⁶, c·2¹⁶ + 255)`.
+    #[test]
+    fn from_cov_maps_q16_onto_the_8_bit_alpha() {
+        let rgb: Argb8 = 0x00_AB_CD_EF;
+        assert_eq!(<Argb8 as Pixel>::from_cov(rgb, 1 << 16), 0xFF_AB_CD_EF);
+        assert_eq!(<Argb8 as Pixel>::from_cov(rgb, 0), 0x00_AB_CD_EF);
+        assert_eq!(<Argb8 as Pixel>::from_cov(0xFF_AB_CD_EF, 1 << 15).alpha(), 127, "α in the colour is replaced, not kept");
+        for c in 0..=255u32 {
+            let q16 = (c * (1 << 16) + 254) / 255;
+            assert_eq!(<Argb8 as Pixel>::from_cov(rgb, q16).alpha(), c, "byte coverage {c}");
+        }
+    }
+
+    /// `under` thru a `P: Pixel` bound is the `Blend` kernel itself.
+    #[test]
+    fn under_thru_the_pixel_bound_is_blend() {
+        fn generic<P: Pixel>(top: P, bottom: P, mode: BlendMode) -> P {
+            top.under(bottom, mode)
+        }
+        for (top, bottom) in [(0u32, 0xFF_80_80_80u32), (0x80_20_30_40, 0x60_50_50_10), (0x33_11_22_33, 0xFF_FF_FF_FF)] {
+            for mode in [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen, BlendMode::Add, BlendMode::Subtract, BlendMode::Overlay, BlendMode::Darken, BlendMode::Lighten] {
+                assert_eq!(generic(top, bottom, mode), Blend::under(top, bottom, mode));
+            }
+        }
     }
 
     #[test]
