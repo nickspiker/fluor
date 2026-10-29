@@ -540,15 +540,14 @@ mod text_scenes {
     }
 }
 
-/// The window chrome without a window: edges and the clip-mask carve, the button strip's background, curves and hairlines, the three control glyphs and the title text.
+/// The window chrome without a window at depth `P`: edges and the clip-mask carve, the button strip's background, curves and hairlines, the three control glyphs and the title text.
 #[cfg(all(feature = "text", feature = "icon"))]
-#[test]
-fn golden_chrome() {
+fn chrome_scene<P: Pixel>() -> (Vec<P>, Vec<u8>) {
     use crate::host::chrome;
     use crate::host::chrome_widget::compute_squircle_crossings;
     use crate::paint::{HitId, HIT_NONE};
     let (w, h) = (480usize, 320usize);
-    let mut px = vec![0u32; w * h];
+    let mut px = vec![P::EMPTY; w * h];
     let mut hit = vec![HIT_NONE as HitId; w * h];
     let mut clip = vec![255u8; w * h];
     let span = 2. * w as f32 * h as f32 / (w as f32 + h as f32);
@@ -571,8 +570,40 @@ fn golden_chrome() {
         chrome::draw_title_text(&mut c, "fluor golden", &mut text, button, w - 3 * button, 0, 20., theme::TITLE_TEXT);
         chrome::draw_status_bar(&mut c, 24, theme::WINDOW_CONTROLS_BG, theme::WINDOW_LIGHT_EDGE, "status ok", &mut text, theme::LABEL_COLOUR);
     }
+    (px, clip)
+}
+
+#[cfg(all(feature = "text", feature = "icon"))]
+#[test]
+fn golden_chrome() {
+    let (px, clip) = chrome_scene::<Argb8>();
     check("chrome", &px, 0xa74e_33d5_c701_6453);
     check8("chrome_clip", &clip, 0x6ef3_84cb_654d_5c65);
+    let (_, clip16) = chrome_scene::<crate::pixel::G2t16>();
+    assert_eq!(clip16, clip, "the clip mask is the crossings' top byte at either depth");
+}
+
+/// The app-icon orb at depth `P`: a gradient icon sampled into the disk with its ring (plain, darkened as unfocused, brightened as online), a ring-only status dot, and the press glow under one of them.
+#[cfg(all(feature = "text", feature = "icon"))]
+fn orb_scene<P: Pixel>() -> Vec<P> {
+    use crate::host::chrome;
+    use crate::host::icon::Icon;
+    use crate::paint::{HitId, HIT_NONE};
+    let icon = Icon { width: 16, height: 16, pixels: (0..256u32).map(|i| 0xFF00_0000 | ((i & 15) * 16) << 16 | ((i >> 4) * 16) << 8 | (255 - i)).collect() };
+    let mut px = vec![P::EMPTY; W * H];
+    let mut hit = vec![HIT_NONE as HitId; W * H];
+    chrome::draw_app_icon(&mut px, Some(&mut hit), 7, W, H, 50, 50, 36, Some(&icon), Some(theme::WINDOW_LIGHT_EDGE), 0, false);
+    chrome::draw_orb_press_glow(&mut px, W, H, 50, 50, 36);
+    chrome::draw_app_icon(&mut px, None, 0, W, H, 140, 60, 30, Some(&icon), Some(theme::LABEL_COLOUR), theme::ORB_DARKEN_UNFOCUSED, false);
+    chrome::draw_app_icon(&mut px, None, 0, W, H, 220, 60, 30, Some(&icon), Some(theme::CLOSE_HOVER), 0, true);
+    chrome::draw_app_icon(&mut px, None, 0, W, H, 290, 140, 20, None, Some(theme::MAXIMIZE_HOVER), 0, false);
+    px
+}
+
+#[cfg(all(feature = "text", feature = "icon"))]
+#[test]
+fn golden_orb() {
+    check("orb", &orb_scene::<Argb8>(), 0xe61d_7d15_318b_fe24);
 }
 
 /// How far a G2t16 render, narrowed to the nearest 8-bit codes ([`crate::pixel::narrow_to_8`]), sits from the Argb8 render of the same scene, byte by byte (α and each channel), signed as 16-bit minus 8-bit: the extremes, the share of bytes that differ at all, and the share that differ by more than one step.
@@ -644,6 +675,12 @@ fn crosscheck_g2t16_against_argb8() {
         for (i, (p8, p16)) in f8.into_iter().zip(f16).enumerate() {
             scenes.push((alloc::format!("{name} frame {i}"), p8, p16, (-1, highs[i])));
         }
+    }
+    // The window chrome and the orb: the perimeter, strip and glyph edges now carry their coverage at the depth's own precision (the crossings' Q16 weights, the glyph ramps × ONE), so the 8-bit floors on them are the same kind as the shapes'.
+    #[cfg(all(feature = "text", feature = "icon"))]
+    {
+        scenes.push(("chrome".into(), chrome_scene::<Argb8>().0, chrome_scene::<G2t16>().0, (-1, 3)));
+        scenes.push(("orb".into(), orb_scene(), orb_scene(), (-1, 3)));
     }
     let mut failures = Vec::new();
     for (name, p8, p16, (low, high)) in &scenes {

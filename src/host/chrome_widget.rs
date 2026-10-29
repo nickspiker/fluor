@@ -13,6 +13,7 @@ use crate::coord::Coord;
 use crate::geom::Viewport;
 use crate::group::Group;
 use crate::paint::BlendMode;
+use crate::pixel::{Argb8, Pixel};
 use crate::region::Region;
 use crate::stack::Op;
 use crate::text::TextRenderer;
@@ -151,9 +152,10 @@ impl widget::Key for ChromeButton {
 }
 
 /// Reusable window frame: controls, edges, hairlines, title, hover overlay.
-pub struct DefaultChrome {
+/// `P` is the pixel depth its layers and the target it paints into are held at, 8-bit unless built with [`DefaultChrome::with_depth`]; its colours stay authored 8-bit and widen as drawn, and its hover tints stay 8-bit visible deltas (the host applies them after the present).
+pub struct DefaultChrome<P: Pixel = Argb8> {
     /// Full-viewport Group with 3 layers (bg, chrome, hover) composed via Stack Notation. Topmost-first: `Push chrome, Push bg, Under(Normal)` for the minimal scaffold; expand to include hover via `Push hover, Push chrome, Under(Add), Push bg, Under(Normal)` as the design grows.
-    pub group: Group,
+    pub group: Group<P>,
     /// Per-pixel button-id map. `HIT_NONE` (0) for pixels outside any chrome button; otherwise the dense `HitId` of whichever button the pixel belongs to (min / max / close / app-icon — each id is allocated at chrome construction time via [`super::widget::next_id`]). Sized to `width * height` pixels of the current viewport.
     pub hit_test_map: Vec<HitId>,
     /// Window title rendered into the chrome layer (left-aligned in the controls strip). Empty string = skip text rendering.
@@ -206,10 +208,23 @@ fn orb_layout(button_size: usize, inset_top: isize, inset_left: isize) -> (isize
 }
 
 impl DefaultChrome {
+    /// The 8-bit chrome; [`DefaultChrome::with_depth`] builds one at another pixel depth.
+    pub fn new(
+        viewport: Viewport,
+        title: impl Into<String>,
+        app_icon: Option<crate::host::icon::Icon>,
+        status_text: Option<String>,
+        hit_counter: &mut HitId,
+    ) -> Self {
+        Self::with_depth(viewport, title, app_icon, status_text, hit_counter)
+    }
+}
+
+impl<P: Pixel> DefaultChrome<P> {
     /// Allocate the chrome group + hit_test_map sized to `viewport`. Three layers (bg, chrome, hover) all start dirty so the first frame paints from scratch.
     ///
     /// **Topmost-first scaffold:** the Stack program is the minimal front-to-back composite — `Push chrome, Push bg, Under(Normal)`. Chrome is the topmost layer (controls, edges, hairlines, title), bg is the layer behind it (background_noise + panes). Stack order matches the visual stack: first push lands on the bottom of the eval stack and is the topmost layer; second push goes underneath via `Under`. The hover layer still exists and is rasterized so the API surface is stable; it's omitted from the program until the hover overlay is wired back up via `Push hover, Under(Add)` as the topmost step. Corner knockout (formerly a separate silhouette layer + `Op::Or`) is handled at chrome rasterization time by writing `t=255` directly into the chrome layer's corner pixels — no separate Stack op under the unified Under model. Construct. `hit_counter` is the app's monotonic [`HitId`] allocator (see [`super::widget::next_id`]) — chrome registers four IDs (min, max, close, app icon, in that order). Construction order against the rest of the app is free: ids are opaque and queried thru [`Self::owns_hit`] / [`Self::hover_colour_for`], not compared by value.
-    pub fn new(
+    pub fn with_depth(
         viewport: Viewport,
         title: impl Into<String>,
         app_icon: Option<crate::host::icon::Icon>,
@@ -222,7 +237,7 @@ impl DefaultChrome {
             viewport.width_px as Coord,
             viewport.height_px as Coord,
         );
-        let mut group = Group::new(region, BlendMode::Normal);
+        let mut group = Group::with_depth(region, BlendMode::Normal);
         let layer_bg = group.new_layer();
         let layer_chrome = group.new_layer();
         // Front-to-back: chrome on top (controls + edges + hairlines), bg underneath (panes + background_noise). Hover / focus tint is NOT a separate layer — applied by the host's post-finalize overlay pass against persistent_screen instead of baked into chrome_buf, so chrome's partial-α AA edges stay clean (a separate premultiplied hover layer would re-premultiply them and trash the edge).
@@ -320,7 +335,7 @@ impl DefaultChrome {
     pub fn rasterize_bg(
         &mut self,
         damage: &mut crate::canvas::Damage,
-        paint: impl FnOnce(&mut crate::canvas::Canvas),
+        paint: impl FnOnce(&mut crate::canvas::Canvas<P>),
     ) {
         let (w, h) = self.dims();
         let layer = &mut self.group.rpn.layers[self.layer_bg];
@@ -329,7 +344,7 @@ impl DefaultChrome {
         }
         crate::paint::RASTERIZE_OPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // α + darkness: transparent init (α=0) so pixels the closure doesn't paint stay transparent rather than becoming spurious opaque content. The closure is expected to fully cover the bg, but defaulting to transparent is the safe failure mode. Zero-init is calloc-free.
-        layer.pixels.fill(0);
+        layer.pixels.fill(P::EMPTY);
         let mut canvas = crate::canvas::Canvas::new(&mut layer.pixels, w, h, damage);
         paint(&mut canvas);
     }
@@ -342,7 +357,7 @@ impl DefaultChrome {
         dy: i32,
         band: crate::canvas::PixelRect,
         damage: &mut crate::canvas::Damage,
-        paint: impl FnOnce(&mut crate::canvas::Canvas),
+        paint: impl FnOnce(&mut crate::canvas::Canvas<P>),
     ) {
         let (w, h) = self.dims();
         let layer = &mut self.group.rpn.layers[self.layer_bg];
@@ -353,7 +368,7 @@ impl DefaultChrome {
         // WHY/PROOF: band is the app's exposed-band rect, which can overhang the layer (a pane past a shrunken window) — the fill would index past the layer.
         let (bx0, bx1) = (band.x0.min(w), band.x1.min(w));
         for y in band.y0.min(h)..band.y1.min(h) {
-            layer.pixels[y * w + bx0..y * w + bx1].fill(0);
+            layer.pixels[y * w + bx0..y * w + bx1].fill(P::EMPTY);
         }
         let mut canvas = crate::canvas::Canvas::new(&mut layer.pixels, w, h, damage);
         paint(&mut canvas);
@@ -394,7 +409,7 @@ impl DefaultChrome {
     /// `full_edge` / `DEBUG_SKIP_CHROME` skip the hairline + carve entirely, leaving `clip_mask` at 255 (rectangular window) — same contract as the old in-chrome path.
     pub fn rasterize_perimeter(
         &mut self,
-        target: &mut [u32],
+        target: &mut [P],
         target_w: usize,
         target_h: usize,
         clip_mask: &mut [u8],
@@ -491,7 +506,7 @@ impl DefaultChrome {
 
         let chrome_buf = &mut self.group.rpn.layers[self.layer_chrome].pixels;
         // α + darkness: transparent init (α=0, dark=0) so the bg shows thru everywhere except the hairline + AA pixels.
-        chrome_buf.fill(0);
+        chrome_buf.fill(P::EMPTY);
 
         if vp_w < 2 || vp_h < 2 {
             return;
@@ -774,7 +789,7 @@ impl DefaultChrome {
     /// `clip`: optional damage-clip in target pixel coords; passed straight thru to [`Group::flatten_into`]. `None` = full target (current behavior).
     pub fn flatten_into(
         &mut self,
-        target: &mut [u32],
+        target: &mut [P],
         target_w: usize,
         target_h: usize,
         clip: Option<crate::paint::Clip>,
@@ -785,7 +800,7 @@ impl DefaultChrome {
     /// Flatten ONLY the chrome layer (buttons, orb, controls strip, title) into `target`. Call it BEFORE painting content: fluor is front-to-back, so the chrome then sits on top of everything the app draws — content scrolled up under the title strip, or a full-screen panel, can never bury the window controls. Pair with [`Self::flatten_bg_into`] after the content, in place of [`Self::flatten_into`].
     pub fn flatten_chrome_into(
         &mut self,
-        target: &mut [u32],
+        target: &mut [P],
         target_w: usize,
         target_h: usize,
         clip: Option<crate::paint::Clip>,
@@ -796,7 +811,7 @@ impl DefaultChrome {
     /// Flatten ONLY the bg layer (panes + background noise) into `target`: the LAST paint of the frame, under all content. See [`Self::flatten_chrome_into`].
     pub fn flatten_bg_into(
         &mut self,
-        target: &mut [u32],
+        target: &mut [P],
         target_w: usize,
         target_h: usize,
         clip: Option<crate::paint::Clip>,
@@ -969,7 +984,7 @@ impl DefaultChrome {
 }
 
 /// Visit the four chrome buttons in tab order (app-icon → minimize → maximize → close). Order is the keyboard-discoverability convention: the orb sits visually leftmost so it leads in left-to-right reading order, then the window controls flow right-to-left from minimize to close. The app's outer [`Container`] decides where the chrome's buttons land in the overall cycle (typically AFTER content widgets like textboxes, matching macOS / GNOME).
-impl Container for DefaultChrome {
+impl<P: Pixel> Container for DefaultChrome<P> {
     fn visit(&mut self, f: &mut dyn FnMut(&mut dyn Widget)) {
         f(&mut self.app_icon_btn);
         f(&mut self.min_btn);
@@ -1000,11 +1015,12 @@ pub(crate) fn glass_corner_params(g: Coord, w: Coord, h: Coord) -> (Coord, Coord
 }
 
 /// Compute squircle crossings table for a corner with the given `radius` and `squirdleyness`. Returns `(start, crossings)` where `start` is the distance from the corner-of-corner inward to the curve's first integer-row crossing, and `crossings` is the rev'd table indexed by `i in 0..count` such that at row offset `start + i` the curve is at column `inset_i` with AA values `h_cov_i` and `l_i`. Used for both the window perimeter (radius = span/4) and the controls-strip BL curve (radius = button_size).
+/// The AA values are Q16 (`√frac × 2¹⁶` and `√(1 − frac) × 2¹⁶`, each cast to u16, a whole pixel saturating at `0xFFFF`), as [`crate::paint::squircle_crossings`] gives them: a 16-bit layer takes the whole weight as its α ([`crate::pixel::Pixel::from_cov`]), an 8-bit layer and the clip mask the top byte, which is bit for bit the `× 256` byte this table held before.
 pub(crate) fn compute_squircle_crossings(
     radius: Coord,
     squirdleyness: i32,
-) -> (usize, Vec<(u16, u8, u8)>) {
-    let mut crossings: Vec<(u16, u8, u8)> = Vec::new();
+) -> (usize, Vec<(u16, u16, u16)>) {
+    let mut crossings: Vec<(u16, u16, u16)> = Vec::new();
     if radius <= 0.0 {
         return (0, crossings);
     }
@@ -1019,8 +1035,8 @@ pub(crate) fn compute_squircle_crossings(
         if inset > 0.0 {
             crossings.push((
                 inset as u16,
-                (crate::math::sqrt(crate::math::fract(inset)) * 256.0) as u8,
-                (crate::math::sqrt(1.0 - crate::math::fract(inset)) * 256.0) as u8,
+                (crate::math::sqrt(crate::math::fract(inset)) * 65536.) as u16,
+                (crate::math::sqrt(1.0 - crate::math::fract(inset)) * 65536.) as u16,
             ));
         }
         if x < y {
@@ -1029,7 +1045,7 @@ pub(crate) fn compute_squircle_crossings(
         y += 1.0;
     }
     let start = (radius - y) as usize;
-    let crossings: Vec<(u16, u8, u8)> = crossings.into_iter().rev().collect();
+    let crossings: Vec<(u16, u16, u16)> = crossings.into_iter().rev().collect();
     (start, crossings)
 }
 

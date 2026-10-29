@@ -11,11 +11,13 @@ use alloc::vec::Vec;
 const EIGHT_BIT: &[(&str, &str)] = &[
     ("pixel.rs", "the depths' own layouts: the trait's Argb8 and G2t16 impls, the 8-bit SIMD kernel"),
     ("theme.rs", "the authored 8-bit g2t palette and the present tables built from it"),
-    ("paint/finalize.rs", "writes the OS's 8-bit (and F16 / 10-bit) surface pixels; a G2t16 present is its own pass"),
+    ("paint/finalize.rs", "each depth's present writes the OS's 8-bit (and F16 / 10-bit) surface pixels"),
     ("paint/shadow.rs", "runs on the finalized OS screen (visible premultiplied 8-bit), after the depth's own buffer is gone"),
     ("paint/argb8.rs", "the 8-bit colour boundary (pack_argb), the theme-delta byte arithmetic, and the overlay, damage outline and control glyphs on the finalized screen"),
     ("text/argb8.rs", "the legacy byte-buffer draws and the additive / subtractive wrapping blits"),
-    ("host/", "the desktop and Android presents write 8-bit OS surfaces, the chrome draws desktop windows only (ferros uses none), and panel.rs is each depth's own ferros present"),
+    ("host/app.rs", "the debug fade and the FPS strip write the desktop's 8-bit screen buffer after the present"),
+    ("host/icon.rs", "the app icon decodes to 8-bit γ2 pixels (the OS taskbar copy reads them as they are), widened as the orb draws them"),
+    ("host/file_drag.rs", "the XDND version byte (`<< 24`) is a protocol field, not a pixel"),
     ("golden.rs", "test scenes author 8-bit colours"),
     ("gate.rs", "this file names the patterns it refuses"),
 ];

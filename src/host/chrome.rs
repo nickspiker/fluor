@@ -13,7 +13,7 @@ use crate::text::TextStyle;
 use crate::host::icon::Icon;
 use crate::math;
 use crate::paint::Clip;
-use crate::pixel::{Blend, BlendMode};
+use crate::pixel::{Argb8, BlendMode, Pixel};
 use crate::text::TextRenderer;
 use crate::theme;
 
@@ -84,21 +84,23 @@ pub fn get_resize_edge(viewport: crate::geom::Viewport, x: Coord, y: Coord) -> R
 /// Two-tone bevel (light from upper-left): top + left straight edges are light, bottom + right are shadow. TL and BR corners are uniform (both adjacent edges agree); TR and BL transition along the curve. The per-pixel colour test (`tr_colour`, `bl_colour`) is the same one we settled on previously — closer-to-light-edge wins.
 ///
 /// `hit_test_map` is preserved as a parameter for forward compatibility with the controls scaffold step but is not modified here.
-pub fn draw_window_edges_and_mask(
-    pixels: &mut [u32],
+pub fn draw_window_edges_and_mask<P: Pixel>(
+    pixels: &mut [P],
     hit_test_map: &mut [HitId],
     clip_mask: &mut [u8],
     width: u32,
     height: u32,
     start_big: usize,
-    crossings_big: &[(u16, u8, u8)],
+    crossings_big: &[(u16, u16, u16)],
     start_small: usize,
-    crossings_small: &[(u16, u8, u8)],
+    crossings_small: &[(u16, u16, u16)],
     light: u32,
     shadow: u32,
 ) {
     let w = width as usize;
     let h = height as usize;
+    // The bevel colours are authored 8-bit, widened once to the layer's depth; the crossings' AA weights are Q16, the inner pixel's α their complement at the depth's own precision and the clip mask their top byte.
+    let (light, shadow) = (P::from_g2t8(light), P::from_g2t8(shadow));
 
     // Per-corner cap = how far the corner curve reaches inward from its corner. The TL+BR diagonal uses the big table, TR+BL the small one — an asymmetric rounded rect built from one curve at two scales. Each corner is now independent, so the symmetric single-table x↔y walk is replaced by an explicit per-corner walk; the squircle is still self-symmetric within each corner (its own row-walk and col-walk share that corner's table), which is what keeps each corner's curvature continuous.
     let cap_big = start_big + crossings_big.len();
@@ -172,9 +174,9 @@ pub fn draw_window_edges_and_mask(
     }
 
     let tr_colour =
-        |row: usize, col: usize| -> u32 { if row < (w - 1 - col) { light } else { shadow } };
+        |row: usize, col: usize| -> P { if row < (w - 1 - col) { light } else { shadow } };
     let bl_colour =
-        |row: usize, col: usize| -> u32 { if col < (h - 1 - row) { light } else { shadow } };
+        |row: usize, col: usize| -> P { if col < (h - 1 - row) { light } else { shadow } };
 
     // Two-sided AA convention (unchanged from the symmetric version). OUTER pixel = on the curve, partially outside the window: clip_mask = h_cov trims against the OS bg; chrome stays opaque. INNER pixel = one step inside: clip_mask = 255; chrome's α-byte carries the hairline-vs-bg AA = 255 − h_cov.
 
@@ -184,8 +186,8 @@ pub fn draw_window_edges_and_mask(
         if inset >= cap_big {
             continue;
         }
-        let inner_alpha = ((255 - h_cov) as u32) << 24;
-        let light_inner = (light & 0x00FFFFFF) | inner_alpha;
+        let inner_alpha = 0xFFFF - h_cov as u32;
+        let light_inner = P::from_cov(light, inner_alpha);
         let row_top = start_big + i;
         let col_left = start_big + i;
 
@@ -194,7 +196,7 @@ pub fn draw_window_edges_and_mask(
         }
         let idx = row_top * w + inset;
         pixels[idx] = pixels[idx].under(light, BlendMode::Normal);
-        clip_mask[idx] = h_cov;
+        clip_mask[idx] = (h_cov >> 8) as u8;
         let idx = row_top * w + inset + 1;
         pixels[idx] = pixels[idx].under(light_inner, BlendMode::Normal);
         clip_mask[idx] = 255;
@@ -204,7 +206,7 @@ pub fn draw_window_edges_and_mask(
         }
         let idx = inset * w + col_left;
         pixels[idx] = pixels[idx].under(light, BlendMode::Normal);
-        clip_mask[idx] = h_cov;
+        clip_mask[idx] = (h_cov >> 8) as u8;
         let idx = (inset + 1) * w + col_left;
         pixels[idx] = pixels[idx].under(light_inner, BlendMode::Normal);
         clip_mask[idx] = 255;
@@ -216,8 +218,8 @@ pub fn draw_window_edges_and_mask(
         if inset >= cap_big {
             continue;
         }
-        let inner_alpha = ((255 - h_cov) as u32) << 24;
-        let shadow_inner = (shadow & 0x00FFFFFF) | inner_alpha;
+        let inner_alpha = 0xFFFF - h_cov as u32;
+        let shadow_inner = P::from_cov(shadow, inner_alpha);
         let row_bot = h - 1 - start_big - i;
         let col_right = w - 1 - start_big - i;
 
@@ -226,7 +228,7 @@ pub fn draw_window_edges_and_mask(
         }
         let idx = row_bot * w + (w - 1 - inset);
         pixels[idx] = pixels[idx].under(shadow, BlendMode::Normal);
-        clip_mask[idx] = h_cov;
+        clip_mask[idx] = (h_cov >> 8) as u8;
         let idx = row_bot * w + (w - 2 - inset);
         pixels[idx] = pixels[idx].under(shadow_inner, BlendMode::Normal);
         clip_mask[idx] = 255;
@@ -236,7 +238,7 @@ pub fn draw_window_edges_and_mask(
         }
         let idx = (h - 1 - inset) * w + col_right;
         pixels[idx] = pixels[idx].under(shadow, BlendMode::Normal);
-        clip_mask[idx] = h_cov;
+        clip_mask[idx] = (h_cov >> 8) as u8;
         let idx = (h - 2 - inset) * w + col_right;
         pixels[idx] = pixels[idx].under(shadow_inner, BlendMode::Normal);
         clip_mask[idx] = 255;
@@ -248,7 +250,7 @@ pub fn draw_window_edges_and_mask(
         if inset >= cap_small {
             continue;
         }
-        let inner_alpha = ((255 - h_cov) as u32) << 24;
+        let inner_alpha = 0xFFFF - h_cov as u32;
         let row_top = start_small + i;
         let col_right = w - 1 - start_small - i;
 
@@ -259,9 +261,9 @@ pub fn draw_window_edges_and_mask(
         let tr_in_col = w - 2 - inset;
         let idx = row_top * w + tr_out_col;
         pixels[idx] = pixels[idx].under(tr_colour(row_top, tr_out_col), BlendMode::Normal);
-        clip_mask[idx] = h_cov;
+        clip_mask[idx] = (h_cov >> 8) as u8;
         let idx = row_top * w + tr_in_col;
-        let layer = (tr_colour(row_top, tr_in_col) & 0x00FFFFFF) | inner_alpha;
+        let layer = P::from_cov(tr_colour(row_top, tr_in_col), inner_alpha);
         pixels[idx] = pixels[idx].under(layer, BlendMode::Normal);
         clip_mask[idx] = 255;
 
@@ -270,9 +272,9 @@ pub fn draw_window_edges_and_mask(
         }
         let idx = inset * w + col_right;
         pixels[idx] = pixels[idx].under(tr_colour(inset, col_right), BlendMode::Normal);
-        clip_mask[idx] = h_cov;
+        clip_mask[idx] = (h_cov >> 8) as u8;
         let idx = (inset + 1) * w + col_right;
-        let layer = (tr_colour(inset + 1, col_right) & 0x00FFFFFF) | inner_alpha;
+        let layer = P::from_cov(tr_colour(inset + 1, col_right), inner_alpha);
         pixels[idx] = pixels[idx].under(layer, BlendMode::Normal);
         clip_mask[idx] = 255;
     }
@@ -283,7 +285,7 @@ pub fn draw_window_edges_and_mask(
         if inset >= cap_small {
             continue;
         }
-        let inner_alpha = ((255 - h_cov) as u32) << 24;
+        let inner_alpha = 0xFFFF - h_cov as u32;
         let row_bot = h - 1 - start_small - i;
         let col_left = start_small + i;
 
@@ -292,9 +294,9 @@ pub fn draw_window_edges_and_mask(
         }
         let idx = row_bot * w + inset;
         pixels[idx] = pixels[idx].under(bl_colour(row_bot, inset), BlendMode::Normal);
-        clip_mask[idx] = h_cov;
+        clip_mask[idx] = (h_cov >> 8) as u8;
         let idx = row_bot * w + inset + 1;
-        let layer = (bl_colour(row_bot, inset + 1) & 0x00FFFFFF) | inner_alpha;
+        let layer = P::from_cov(bl_colour(row_bot, inset + 1), inner_alpha);
         pixels[idx] = pixels[idx].under(layer, BlendMode::Normal);
         clip_mask[idx] = 255;
 
@@ -305,9 +307,9 @@ pub fn draw_window_edges_and_mask(
         let bl_in_row = h - 2 - inset;
         let idx = bl_out_row * w + col_left;
         pixels[idx] = pixels[idx].under(bl_colour(bl_out_row, col_left), BlendMode::Normal);
-        clip_mask[idx] = h_cov;
+        clip_mask[idx] = (h_cov >> 8) as u8;
         let idx = bl_in_row * w + col_left;
-        let layer = (bl_colour(bl_in_row, col_left) & 0x00FFFFFF) | inner_alpha;
+        let layer = P::from_cov(bl_colour(bl_in_row, col_left), inner_alpha);
         pixels[idx] = pixels[idx].under(layer, BlendMode::Normal);
         clip_mask[idx] = 255;
     }
@@ -316,8 +318,8 @@ pub fn draw_window_edges_and_mask(
 }
 
 /// Rasterize the window title text into the chrome layer, left-aligned in the area between the perimeter hairline (left edge) and the controls strip (right edge). Vertically centered on `y_center` (the app-icon orb's row, so the title sits level with the orb wherever it's placed). `left_extra` shifts the start position right to make room for the orb (pass `0` when no orb). `colour` is darkness-packed (typically `theme::TEXT_COLOUR` when focused, `theme::LABEL_COLOUR` when unfocused). Bails on empty title or impractically small `button_size` (below readability — the text wouldn't be legible anyway). Clip rect prevents the title from painting over the controls strip even at long titles or narrow windows. Font is "Open Sans" regular at `button_size * 0.55` — proportional to the rest of the chrome under the current zoom (since button_size is derived from `effective_span`).
-pub fn draw_title_text(
-    canvas: &mut crate::canvas::Canvas,
+pub fn draw_title_text<P: Pixel>(
+    canvas: &mut crate::canvas::Canvas<P>,
     title: &str,
     text_renderer: &mut TextRenderer,
     button_size: usize,
@@ -390,8 +392,8 @@ pub fn draw_title_text(
 /// Rasterize the bottom status band: a thin strip at `height − band_h .. height` filled with `bg`, topped by a 1-px `hairline_colour` divider where the band meets the pane content. Optional left-aligned `text` paints in `text_colour` (Open Sans, font size = `band_h × 0.55`). The band is short — `band_h` is typically `button_size / 2` — so it reads as a secondary surface, distinct from the top controls strip.
 ///
 /// The window perimeter's clip_mask carving handles the BL/BR squircle corners for free: chrome pixels in the corner cutout are written but masked off at the OS boundary, so the band's rectangular fill becomes a rounded bottom edge without per-pixel geometry here. Bails on `band_h == 0` or impractical `band_h` (>= height) so the rasterizer can be called unconditionally from a `chrome_widget` that always has a status field, with `band_h = 0` meaning "no status bar".
-pub fn draw_status_bar(
-    canvas: &mut crate::canvas::Canvas,
+pub fn draw_status_bar<P: Pixel>(
+    canvas: &mut crate::canvas::Canvas<P>,
     band_h: usize,
     bg: u32,
     hairline_colour: u32,
@@ -423,10 +425,10 @@ pub fn draw_status_bar(
         }
     }
 
-    let pixels: &mut [u32] = canvas.pixels;
+    let pixels: &mut [P] = canvas.pixels;
 
     // Top hairline (1 px) — claims y_top across the full width. The squircle perimeter's clip_mask handles rounding at BL/BR.
-    let hairline = 0xFF000000 | (hairline_colour & 0x00FFFFFF);
+    let hairline = P::from_g2t8(hairline_colour).with_alpha(P::ONE);
     let row_top = y_top * width;
     for x in 0..width {
         let idx = row_top + x;
@@ -435,7 +437,7 @@ pub fn draw_status_bar(
 
     // BG fill — under-blends beneath the already-drawn text + hairline, filling the rest of the band interior. (Earlier writers — perimeter hairline, corner curve, status text —
     // keep their pixels; bg only lands where the band is still empty.)
-    let bg_opaque = 0xFF000000 | (bg & 0x00FFFFFF);
+    let bg_opaque = P::from_g2t8(bg).with_alpha(P::ONE);
     for y in (y_top + 1)..height {
         let row_base = y * width;
         for x in 0..width {
@@ -456,8 +458,8 @@ pub fn draw_status_bar(
 ///
 /// Precondition: the orb is the fixed top-left chrome badge, always fully on-screen (`cx, cy ≥ r_aa` and `cx+r_aa, cy+r_aa < dims` for the chrome's `button_size/2`-centred, `button_size/4`-radius orb), so the bbox is in-bounds by construction — no clamping. A violated precondition wraps a `usize` and panics on the index (fail loud). Without an `icon`, the interior fills with `ring_colour` as a solid disk; `hit_test_map` (when present) tags every pixel inside the solid ring with `hit_id`.
 /// The orb's press glow: the wordmark-family light, disk form. Rasterize the disk's coverage at the glow grey into a full-width band scratch, run the soft IIR blurs (horizontal factor 3/4, vertical 1/2 — the same character as photon's wordmark + text halos), then composite as a WHITE light layer via real `under()` — called AFTER the orb paints, so earliest-wins layering keeps every opaque disk pixel untouched and the bloom lands only in the transparent surround.
-pub fn draw_orb_press_glow(
-    pixels: &mut [u32],
+pub fn draw_orb_press_glow<P: Pixel>(
+    pixels: &mut [P],
     width: usize,
     height: usize,
     cx: isize,
@@ -525,12 +527,12 @@ pub fn draw_orb_press_glow(
         }
         let idx = i + band_top * width;
         // White light: diffuse white (theme::WHITE, not darkness 0, which is a 9.7× glow on HDR), α = blurred coverage. under() on the already-opaque disk pixels no-ops — the orb art protects itself.
-        pixels[idx] = pixels[idx].under(crate::theme::white_at(grey as u32), BlendMode::Normal);
+        pixels[idx] = pixels[idx].under(P::from_g2t8(crate::theme::white_at(grey as u32)), BlendMode::Normal);
     }
 }
 
-pub fn draw_app_icon(
-    pixels: &mut [u32],
+pub fn draw_app_icon<P: Pixel>(
+    pixels: &mut [P],
     hit_test_map: Option<&mut [HitId]>,
     hit_id: HitId,
     width: usize,
@@ -583,31 +585,31 @@ pub fn draw_app_icon(
 
             // Icon, topmost: inward 1-px coverage ramp on r_icon. Sample only fires while a_icon ≠ 0, i.e. dist2 < r_icon² = (r-1)² → sample_icon's |dx|,|dy| ≤ r-2 precondition holds with margin.
             let num_icon = r_icon2 - dist2;
-            let a_icon: u32 = if num_icon <= 0 {
+            let a_icon = if num_icon <= 0 {
                 0
             } else if num_icon >= two_icon {
-                255
+                P::ONE
             } else {
-                (num_icon * 255 / two_icon) as u32
+                (num_icon * P::ONE as isize / two_icon) as u32
             };
             if a_icon != 0 {
                 let s = sample_icon(icon, dx, dy, r, ring_colour.unwrap_or(0), darken, brighten);
-                pixels[idx] = pixels[idx].under((a_icon << 24) | (s & 0x00FF_FFFF), BlendMode::Normal);
+                pixels[idx] = pixels[idx].under(P::from_g2t8(s).with_alpha(a_icon), BlendMode::Normal);
             }
             // Ring, painted UNDER the icon: inward 1-px coverage ramp on r_ring, full disk within. Skipped where the icon is fully opaque (invisible there anyway); where the icon's rim is partial it shows thru → the inner-boundary AA. The ring is solid out to (r_ring−1)² ≥ r_icon², so it backs the entire icon rim — no translucent gap.
-            if a_icon != 255 {
+            if a_icon != P::ONE {
                 if let Some(ring) = ring_colour {
                     let num_ring = r_ring2 - dist2;
-                    let a_ring: u32 = if num_ring <= 0 {
+                    let a_ring = if num_ring <= 0 {
                         0
                     } else if num_ring >= two_ring {
-                        255
+                        P::ONE
                     } else {
-                        (num_ring * 255 / two_ring) as u32
+                        (num_ring * P::ONE as isize / two_ring) as u32
                     };
                     if a_ring != 0 {
                         pixels[idx] =
-                            pixels[idx].under((a_ring << 24) | (ring & 0x00FF_FFFF), BlendMode::Normal);
+                            pixels[idx].under(P::from_g2t8(ring).with_alpha(a_ring), BlendMode::Normal);
                     }
                 }
             }
@@ -636,9 +638,9 @@ fn sample_icon(
         // Icon pixels stay γ2 (the OS taskbar/tray read them as-is, `Icon::to_rgba_circular`); the `g2t` buffer takes the same light's code.
         crate::theme::darkness_from_gamma2(crate::theme::fmt(img.pixels[sy * img.width as usize + sx]))
     } else if fallback_ring != 0 {
-        0xFF000000 | (fallback_ring & 0x00FFFFFF)
+        fallback_ring.with_alpha(Argb8::ONE)
     } else {
-        0xFF7F7F7F
+        Argb8::from_channels(Argb8::ONE, [0x7F; 3])
     };
     modulate_icon_pixel(raw, darken, brighten)
 }
@@ -687,7 +689,7 @@ fn modulate_icon_pixel(pixel: u32, darken: u8, brighten: bool) -> u32 {
         db = (db * inv + grey * f) >> 8;
     }
 
-    (pixel & 0xFF000000) | (dr << 16) | (dg << 8) | db
+    Argb8::from_channels(pixel.alpha(), [dr, dg, db])
 }
 
 
@@ -719,8 +721,8 @@ fn strip_layout(
 /// Stop conditions per step: static wall (`chrome α == 0xFF` OR `clip_mask < 128`), or peak-descent (`current α < prev α`, single check). Since `start_col` is positioned one pixel inside the divider on the inner side, the scan goes **outward** across the slot toward the curve / silhouette / strip edge on the far side — no inward scan is needed because the divider itself is the inner boundary and we start past it.
 ///
 /// CRITICAL ordering: called AFTER hairlines + curves are painted, BEFORE symbols + bg fill paint — symbol and bg pixels are opaque and would be misread as walls, collapsing the scan immediately.
-pub fn paint_button_hit_row_scan(
-    chrome_buf: &[u32],
+pub fn paint_button_hit_row_scan<P: Pixel>(
+    chrome_buf: &[P],
     clip_mask: &[u8],
     hit_test_map: &mut [HitId],
     width: usize,
@@ -736,7 +738,7 @@ pub fn paint_button_hit_row_scan(
         return;
     }
     let static_wall =
-        |idx: usize| -> bool { (chrome_buf[idx] >> 24) == 0xFF || clip_mask[idx] < 128 };
+        |idx: usize| -> bool { chrome_buf[idx].alpha() == P::ONE || clip_mask[idx] < 128 };
     for row in row_start..row_end {
         let row_base = row * width;
         let start_idx = row_base + start_col;
@@ -744,7 +746,7 @@ pub fn paint_button_hit_row_scan(
             continue;
         }
         hit_test_map[start_idx] = hit_id;
-        let mut prev_a = (chrome_buf[start_idx] >> 24) & 0xFF;
+        let mut prev_a = chrome_buf[start_idx].alpha();
         if scan_right {
             let mut col = start_col + 1;
             while col < bound_x_max {
@@ -752,7 +754,7 @@ pub fn paint_button_hit_row_scan(
                 if static_wall(idx) {
                     break;
                 }
-                let a = (chrome_buf[idx] >> 24) & 0xFF;
+                let a = chrome_buf[idx].alpha();
                 if a < prev_a {
                     break;
                 }
@@ -768,7 +770,7 @@ pub fn paint_button_hit_row_scan(
                 if static_wall(idx) {
                     break;
                 }
-                let a = (chrome_buf[idx] >> 24) & 0xFF;
+                let a = chrome_buf[idx].alpha();
                 if a < prev_a {
                     break;
                 }
@@ -780,14 +782,14 @@ pub fn paint_button_hit_row_scan(
 }
 
 /// **Step 2** in the chrome rasterizer (after window perimeter). Paint the BL squircle hairline of the controls strip — row-walk (the curve's near-vertical leg) and col-walk (the near-horizontal leg). Uses [`paint_if_empty`] so writes from the window perimeter are not overwritten. Each curve pixel gets at most ONE writer (this function or the perimeter, whichever ran first).
-pub fn draw_strip_curves(
-    pixels: &mut [u32],
+pub fn draw_strip_curves<P: Pixel>(
+    pixels: &mut [P],
     hit_test_map: &mut [HitId],
     width: u32,
     height: u32,
     button_size: usize,
     start: usize,
-    crossings: &[(u16, u8, u8)],
+    crossings: &[(u16, u16, u16)],
     edge_vert: u32,
     edge_horiz: u32,
 ) {
@@ -799,6 +801,7 @@ pub fn draw_strip_curves(
     if start >= button_size {
         return;
     }
+    let (edge_vert, edge_horiz) = (P::from_g2t8(edge_vert), P::from_g2t8(edge_horiz));
     // Hairline geometry: a 1-pixel line extending inward from the curve into the strip body. Outer pixel coverage = 1 − fract → α = l (sqrt-gamma'd, stored directly). Inner pixel coverage = fract → α = h_cov (stored directly). Under composition handles the actual blending with whatever bg is below the chrome layer.
     //
     // Two colours: row-walk paints pixels along the curve's *vertical* face (extends UP the strip's left edge — continues the left-of-window light bevel), col-walk paints along the curve's *horizontal* face (extends RIGHT along the strip's bottom — continues the bottom-of-window shadow bevel). Same shape, two colours because two edges meet at this corner.
@@ -815,11 +818,11 @@ pub fn draw_strip_curves(
         }
         let py = last_row - dy;
         // α-conv: opacity α=l for the outer pixel (=255−old_t where old_t=255−l).
-        let outer_v = (edge_vert & 0x00FFFFFF) | ((l as u32) << 24);
+        let outer_v = P::from_cov(edge_vert, l as u32);
         let outer_idx = py * w + strip_x + inset;
         pixels[outer_idx] = pixels[outer_idx].under(outer_v, BlendMode::Normal);
         if inset + 1 < strip_w {
-            let inner_v = (edge_vert & 0x00FFFFFF) | ((h_cov as u32) << 24);
+            let inner_v = P::from_cov(edge_vert, h_cov as u32);
             let inner_idx = py * w + strip_x + inset + 1;
             pixels[inner_idx] = pixels[inner_idx].under(inner_v, BlendMode::Normal);
         }
@@ -836,11 +839,11 @@ pub fn draw_strip_curves(
             continue;
         }
         let outer_py = last_row - inset;
-        let outer_v = (edge_horiz & 0x00FFFFFF) | ((l as u32) << 24);
+        let outer_v = P::from_cov(edge_horiz, l as u32);
         let outer_idx = outer_py * w + strip_x + dx;
         pixels[outer_idx] = pixels[outer_idx].under(outer_v, BlendMode::Normal);
         if inset + 1 < button_size {
-            let inner_v = (edge_horiz & 0x00FFFFFF) | ((h_cov as u32) << 24);
+            let inner_v = P::from_cov(edge_horiz, h_cov as u32);
             let inner_py = last_row - (inset + 1);
             let inner_idx = inner_py * w + strip_x + dx;
             pixels[inner_idx] = pixels[inner_idx].under(inner_v, BlendMode::Normal);
@@ -850,13 +853,13 @@ pub fn draw_strip_curves(
 }
 
 /// **Step 3** in the chrome rasterizer. Vertical divider hairlines between min/max and max/close buttons, plus the linear bottom hairline (only relevant when the BL curve doesn't fit). Uses [`paint_if_empty`].
-pub fn draw_strip_hairlines(
-    pixels: &mut [u32],
+pub fn draw_strip_hairlines<P: Pixel>(
+    pixels: &mut [P],
     width: u32,
     height: u32,
     button_size: usize,
     start: usize,
-    crossings: &[(u16, u8, u8)],
+    crossings: &[(u16, u16, u16)],
     edge: u32,
 ) {
     let Some((w, _strip_w, strip_x, button_area_offset, last_row, _h)) =
@@ -864,6 +867,7 @@ pub fn draw_strip_hairlines(
     else {
         return;
     };
+    let edge = P::from_g2t8(edge);
     let div1 = button_area_offset + button_size;
     let div2 = button_area_offset + 2 * button_size;
     let cap = start + crossings.len();
@@ -893,14 +897,14 @@ pub fn draw_strip_hairlines(
 /// **Step 6** (last). Strip background fill. For every pixel in the strip's geometric interior (= NOT in the BL cutout, NOT the curve's outer pixel), compose `WINDOW_CONTROLS_BG` under via `paint_if_empty`. Empty pixels get filled with strip bg directly; partial-opacity pixels (curve inner, glyph AA) compose strip bg underneath, darkening them toward strip bg — making the chrome layer fully opaque in the strip area.
 ///
 /// The curve's OUTER pixel is explicitly skipped because geometrically it sits on the strip's boundary; its "behind" is the bg-layer (panes), not strip bg. Leaving it partial preserves the correct visible-over-panes composite at the Stack step.
-pub fn draw_strip_bg(
-    pixels: &mut [u32],
+pub fn draw_strip_bg<P: Pixel>(
+    pixels: &mut [P],
     hit_test_map: &mut [HitId],
     width: u32,
     height: u32,
     button_size: usize,
     start: usize,
-    crossings: &[(u16, u8, u8)],
+    crossings: &[(u16, u16, u16)],
 ) {
     // hit_test_map is no longer written here — population happens via per-button directional row scans (`paint_button_hit_row_scan`) BEFORE this bg pass runs, using the chrome buffer's post-hairlines/post-curves state as the wall geometry. Param retained for caller-signature stability.
     let _ = hit_test_map;
@@ -909,7 +913,7 @@ pub fn draw_strip_bg(
     else {
         return;
     };
-    let bg = theme::WINDOW_CONTROLS_BG;
+    let bg = P::from_g2t8(theme::WINDOW_CONTROLS_BG);
     let curve_active = start < button_size;
     let cap = start + crossings.len();
 
@@ -949,8 +953,8 @@ pub fn draw_strip_bg(
 }
 
 /// Rasterize the minimize glyph (a small horizontal squircle dash) centered at `(cx, cy)` with radius `r`. Top-down per-pixel: each pixel inside the squircle footprint computes its coverage and writes either the solid `stroke` colour or a `stroke`-blended-with-`bg` colour. The chrome layer is opaque at the button bg before this call; this function only overwrites pixels INSIDE the glyph footprint.
-pub fn draw_minimize_symbol(
-    pixels: &mut [u32],
+pub fn draw_minimize_symbol<P: Pixel>(
+    pixels: &mut [P],
     width: usize,
     height: usize,
     cx: usize,
@@ -960,6 +964,7 @@ pub fn draw_minimize_symbol(
     bg: u32,
 ) {
     let _ = bg;
+    let stroke = P::from_g2t8(stroke);
     let r = r + 1;
     let r_render = r / 4 + 1;
     let r2 = r_render * r_render;
@@ -984,21 +989,21 @@ pub fn draw_minimize_symbol(
                 continue;
             }
             let idx = (py as usize) * width + (px as usize);
-            let gradient = ((r4 - dist4) << 8) / (r3 << 2);
+            let gradient = ((r4 - dist4) << P::DEPTH) / (r3 << 2);
             // AA via α-byte: opacity = gradient/256, capped at 255 (fully opaque) — not a guard: the interior's gradient grows past 255 by construction and would carry out of the α byte.
-            let chrome_alpha = gradient.min(255) as u32;
+            let chrome_alpha = gradient.min(P::ONE as usize) as u32;
             if chrome_alpha == 0 {
                 continue;
             }
-            let value = (stroke & 0x00FFFFFF) | (chrome_alpha << 24);
+            let value = stroke.with_alpha(chrome_alpha);
             pixels[idx] = pixels[idx].under(value, BlendMode::Normal);
         }
     }
 }
 
 /// Rasterize the maximize glyph (a squircle ring — outer stroke, inner fill) centered at `(cx, cy)`. Top-down per-pixel inside the outer squircle footprint.
-pub fn draw_maximize_symbol(
-    pixels: &mut [u32],
+pub fn draw_maximize_symbol<P: Pixel>(
+    pixels: &mut [P],
     width: usize,
     height: usize,
     cx: usize,
@@ -1020,16 +1025,9 @@ pub fn draw_maximize_symbol(
     // r ≥ 1 and r_inner ≥ 1, so both thresholds are ≥ 4 — no zero divisor.
     let outer_thresh = r3 << 2;
     let inner_thresh = r_inner3 << 2;
-    let stroke_rgb = (
-        ((stroke >> 16) & 0xFF) as u32,
-        ((stroke >> 8) & 0xFF) as u32,
-        (stroke & 0xFF) as u32,
-    );
-    let fill_rgb = (
-        ((fill >> 16) & 0xFF) as u32,
-        ((fill >> 8) & 0xFF) as u32,
-        (fill & 0xFF) as u32,
-    );
+    // The glyph colours widened once to the layer's depth; the stroke ↔ fill blend runs on the depth's own channels (`s × inv + f × α` stays under `ONE × 2^DEPTH`, which fits a u32 at 16 bits).
+    let (stroke, fill) = (P::from_g2t8(stroke), P::from_g2t8(fill));
+    let (stroke_rgb, fill_rgb) = (stroke.channels(), fill.channels());
     let _ = bg;
 
     for h in -(r as isize)..=(r as isize) {
@@ -1054,13 +1052,11 @@ pub fn draw_maximize_symbol(
                 // INSIDE inner squircle = fill region. Inner edge (stroke ↔ fill) is between two known glyph colours, so pre-blending is correct here (both colours are deterministic, no bg layer involvement). Both `stroke` and `fill` are stored in darkness (theme constants); linear interpolation in darkness space = linear interpolation in visible space, so the formula is identical to the visible-space version. Theme constants are α=0xFF (opaque) by default.
                 let dist_from_inner = r_inner4 - dist4;
                 if dist_from_inner <= inner_thresh {
-                    let gradient = (dist_from_inner << 8) / inner_thresh;
+                    let gradient = (dist_from_inner << P::DEPTH) / inner_thresh;
                     let alpha = gradient as u32;
-                    let inv = 256 - alpha;
-                    let r_blend = (stroke_rgb.0 * inv + fill_rgb.0 * alpha) >> 8;
-                    let g_blend = (stroke_rgb.1 * inv + fill_rgb.1 * alpha) >> 8;
-                    let b_blend = (stroke_rgb.2 * inv + fill_rgb.2 * alpha) >> 8;
-                    0xFF000000 | (r_blend << 16) | (g_blend << 8) | b_blend
+                    let inv = (1 << P::DEPTH) - alpha;
+                    let blend: [u32; 3] = core::array::from_fn(|k| (stroke_rgb[k] * inv + fill_rgb[k] * alpha) >> P::DEPTH);
+                    P::from_channels(P::ONE, blend)
                 } else {
                     fill
                 }
@@ -1068,13 +1064,13 @@ pub fn draw_maximize_symbol(
                 // RING region (between inner and outer). Outer edge AA against the bg layer goes via the chrome α-byte — strip the theme const's default α=0xFF and replace with the AA-modulated value.
                 let dist_from_outer = r4 - dist4;
                 if dist_from_outer <= outer_thresh {
-                    let gradient = (dist_from_outer << 8) / outer_thresh;
+                    let gradient = (dist_from_outer << P::DEPTH) / outer_thresh;
                     // Capped at 255 (fully opaque): gradient reaches 256 at the ring's inner edge of the ramp and would carry out of the α byte.
-                    let chrome_alpha = gradient.min(255) as u32;
+                    let chrome_alpha = gradient.min(P::ONE as usize) as u32;
                     if chrome_alpha == 0 {
                         continue;
                     }
-                    (stroke & 0x00FFFFFF) | (chrome_alpha << 24)
+                    stroke.with_alpha(chrome_alpha)
                 } else {
                     stroke
                 }
@@ -1087,8 +1083,8 @@ pub fn draw_maximize_symbol(
 /// Rasterize the close glyph — an ✕ of two 45° diagonal capsules — centred at `(cx, cy)` with arm radius `r`. Integer math, same spirit as [`draw_minimize_symbol`]/[`draw_maximize_symbol`]: per pixel, the squared distance to the relevant diagonal is compared against the stroke radius in a scaled (`×8`) integer domain, with a 1-pixel AA band. No floating point, no `sqrt`.
 ///
 /// Coordinates run in a doubled, pixel-centred frame (`ax = 2·dx + 1 = 2·x_actual`), so the half-pixel sample offset and the diagonal's `1/√2` factor fall out as exact integers: a diagonal's perpendicular squared distance is `perp²/8` of the true value and a cap endpoint's is `[(ax−epx)²+(ay−epy)²]/4`. Multiplying thru by 8 (`d8`) clears both, so every test is against `radius²·8 = 2·rad²`. The only division is the AA ramp, whose divisor `denom = 8·rad ≥ 8` is provably non-zero and whose result is provably `< 256` in the ramp branch (there `d8 > inner8`, so `outer8 − d8 < denom`).
-pub fn draw_close_symbol(
-    pixels: &mut [u32],
+pub fn draw_close_symbol<P: Pixel>(
+    pixels: &mut [P],
     width: usize,
     height: usize,
     cx: usize,
@@ -1098,6 +1094,7 @@ pub fn draw_close_symbol(
     bg: u32,
 ) {
     let _ = bg;
+    let stroke = P::from_g2t8(stroke);
     let r = r + 1;
     // Doubled-frame stroke half-width (`rad = thickness`, since rad = 2·radius_actual) and arm half-length (`end = 2·(2r/3)`). `thickness ≥ 1` is a visible-stroke floor — a 0-px glyph draws nothing — not a degenerate-input guard.
     let thickness = (r / 3).max(1) as isize;
@@ -1141,16 +1138,16 @@ pub fn draw_close_symbol(
                 continue;
             }
             let alpha = if d8 <= inner8 {
-                255u32
+                P::ONE
             } else {
-                (((outer8 - d8) << 8) / denom) as u32
+                (((outer8 - d8) << P::DEPTH) / denom) as u32
             };
             if alpha == 0 {
                 continue;
             }
             let idx = py * width + px;
             pixels[idx] =
-                pixels[idx].under((stroke & 0x00FF_FFFF) | (alpha << 24), BlendMode::Normal);
+                pixels[idx].under(stroke.with_alpha(alpha), BlendMode::Normal);
         }
     }
 }
