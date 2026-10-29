@@ -2,7 +2,7 @@
 //!
 //! The process holds three capabilities the caller names by grant slot (`Caps`): the display endpoint, the touch endpoint, its own surface (a full screen of 64-bit pixels; ferros WINDOWS.md). The syscalls are inlined here (ferros_sys is not a published crate): `call`, `dma`, `sleep`, the counter.
 //!
-//! Pixels: fluor's `0xααRRGGBB` darkness buffer becomes the display's working values — gamma 2 encoded, white = 16384 (Q14), R, G, B in bits 0-15, 16-31, 32-47 of a u64 — through one 256-entry table (fluor's bytes are gamma 2.2, so the display wants `(c/255)^1.1`). Opacity composites over black. The whole frame is converted and shown each time the app drew; the damage rect narrows that later.
+//! Pixels: fluor's `0xααRRGGBB` darkness buffer becomes the display's working values — gamma 2 encoded, white = 16384 (Q14), R, G, B in bits 0-15, 16-31, 32-47 of a u64 — through one 256-entry table: fluor's bytes are VSF `g2t` codes (theme.rs, since 2026-10-20: 194 diffuse white, 255 9.7× white), whose light is atanh(c/256)², so the display's gamma 2 (√light) is atanh(c/256), 255 landing at 3.1 of the surface's 4.0. Opacity composites over black. The whole frame is converted and shown each time the app drew; the damage rect narrows that later.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -243,7 +243,7 @@ impl<A: FluorApp> FerrosShell<A> {
 
     /// The scratch buffer as the display's working values, into the surface: a full screen at the panel's width `stride`, the frame at (`fx`, `fy`) on it (ferros WINDOWS.md: every app's surface is the whole screen).
     pub fn present(&self, surface: &mut [u64], stride: usize, fx: usize, fy: usize) {
-        let lut = gamma_table();
+        let lut = g2t_table();
         let w = self.viewport.width_px as usize;
         for (y, src) in self.scratch.chunks_exact(w).enumerate() {
             let row = &mut surface[(fy + y) * stride + fx..(fy + y) * stride + fx + w];
@@ -423,13 +423,13 @@ fn clear_scratch_rect(scratch: &mut [u32], width: usize, rect: PixelRect) {
     }
 }
 
-/// fluor's gamma-2.2 byte to the display's gamma-2 Q14 working value: `16384 × (c / 255)^1.1`.
-fn gamma_table() -> &'static [u16; 256] {
+/// fluor's `g2t` byte to the display's gamma-2 Q14 working value: `16384 × atanh(c / 256)`, VSF's decode at the bucket's bottom (vsf colour `linearize_gamma2tanh_u8`: light = atanh(c/256)², and gamma 2 is its root). It was `(c/255)^1.1` from when the bytes were gamma 2.2, which put diffuse white (194) at 0.55 of white and nothing above it (2026-10-29).
+fn g2t_table() -> &'static [u16; 256] {
     static TABLE: std::sync::OnceLock<[u16; 256]> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
         let mut t = [0u16; 256];
         for (c, v) in t.iter_mut().enumerate() {
-            *v = (16384.0 * libm::powf(c as f32 / 255.0, 1.1) + 0.5) as u16;
+            *v = (16384.0 * libm::atanhf(c as f32 / 256.0) + 0.5) as u16;
         }
         t
     })
