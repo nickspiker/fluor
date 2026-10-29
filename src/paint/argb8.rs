@@ -160,6 +160,10 @@ pub fn apply_overlay<P: super::Finalize>(
                     continue;
                 }
                 let raw = scratch[map_idx];
+                // Only a pixel the frame painted OPAQUE takes the tint: the write below is opaque and un-premultiplied, so a translucent or empty pixel under the widget's hit stamp came out as a bright solid dot (Nick 2026-10-29, the 16-bit canvas: "a grid of white pixels" on the focused textbox). Everything else keeps exactly what finalize wrote.
+                if raw.alpha() != P::alpha_from8(255) {
+                    continue;
+                }
                 let scr_x = (x as i32 + win_ox) as usize;
                 let visible = raw.to_sdr_visible_at(scr_x, scr_y);
                 let (r, g, b) = if sqrt {
