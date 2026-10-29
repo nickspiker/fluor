@@ -12,16 +12,17 @@
 
 use crate::coord::Coord;
 use crate::paint;
-use crate::pixel::BlendMode;
+use crate::pixel::{Argb8, BlendMode, Pixel};
 use crate::region::Region;
 use crate::stack::{Op, StackCompositor};
 use alloc::vec::Vec;
 
-pub struct Group {
+/// A group at pixel depth `P` (8-bit unless named).
+pub struct Group<P: Pixel = Argb8> {
     /// Pixel-space bbox in target-buffer coordinates. Buffers (Stack layers, hitmask, text_clip) are sized to `(region.w, region.h)`.
     pub region: Region,
     /// Internal RGB compositing — bbox-sized layer buffers + Stack program.
-    pub rpn: StackCompositor,
+    pub rpn: StackCompositor<P>,
     /// Binary hit mask (group-local, one byte per pixel, 0 or 1). `None` = decorative; clicks pass thru.
     pub hitmask: Option<Vec<u8>>,
     /// Per-pixel alpha mask consumed by text rasterizers drawing into this group's RGB layers (group-local). `None` = no soft clip.
@@ -33,13 +34,22 @@ pub struct Group {
 }
 
 impl Group {
-    /// New group with bbox = `region`, no side channels, Stack with no layers and an empty program. Allocate side channels separately via [`enable_hitmask`](Self::enable_hitmask) / [`enable_text_clip`](Self::enable_text_clip); add layers via [`new_layer`](Self::new_layer); set the compositing program via [`set_program`](Self::set_program).
+    /// An 8-bit group; [`Group::with_depth`] names another depth.
+    /// `new` lives on the 8-bit type alone so `Group::new(..)` needs no annotation where nothing else fixes the depth.
     pub fn new(region: Region, blend: BlendMode) -> Self {
+        Self::with_depth(region, blend)
+    }
+}
+
+impl<P: Pixel> Group<P> {
+    /// New group with bbox = `region`, no side channels, Stack with no layers and an empty program. Allocate side channels separately via [`enable_hitmask`](Self::enable_hitmask) / [`enable_text_clip`](Self::enable_text_clip); add layers via [`new_layer`](Self::new_layer); set the compositing program via [`set_program`](Self::set_program).
+    /// `Group::<G2t16>::with_depth(region, blend)` for a group at another depth.
+    pub fn with_depth(region: Region, blend: BlendMode) -> Self {
         let w = region.w as usize;
         let h = region.h as usize;
         Self {
             region,
-            rpn: StackCompositor::new(w, h),
+            rpn: StackCompositor::with_depth(w, h),
             hitmask: None,
             text_clip: None,
             blend,
@@ -140,7 +150,7 @@ impl Group {
     /// Per-pixel transparent shortcut (`pixel >= 0xFF000000`) inside each blend kernel skips contribution-less pixels for free — no sub-region damage tracking needed at this layer.
     pub fn flatten_into(
         &mut self,
-        target: &mut [u32],
+        target: &mut [P],
         target_w: usize,
         target_h: usize,
         clip: Option<paint::Clip>,
@@ -154,7 +164,7 @@ impl Group {
     pub fn flatten_layer_into(
         &mut self,
         idx: usize,
-        target: &mut [u32],
+        target: &mut [P],
         target_w: usize,
         target_h: usize,
         clip: Option<paint::Clip>,
@@ -166,11 +176,11 @@ impl Group {
 }
 
 /// Composite a region-sized premultiplied buffer under `target` at the region's origin, clipped to the target and to `clip`. Normal takes the premultiplied blit (the buffer's darkness is already attenuated by its α); other modes the per-pixel kernel.
-fn blit_region(
-    src: &[u32],
+fn blit_region<P: Pixel>(
+    src: &[P],
     region: Region,
     blend: BlendMode,
-    target: &mut [u32],
+    target: &mut [P],
     target_w: usize,
     target_h: usize,
     clip: Option<paint::Clip>,

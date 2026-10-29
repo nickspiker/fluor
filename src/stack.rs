@@ -6,7 +6,7 @@
 //!
 //! Re-execution policy: a per-layer `dirty` flag gates expensive rasterization upstream of the Stack (text shaping, glyph rendering, squircle math). The Stack itself caches the *final* composite from the last `evaluate()`; if no layer is dirty, that cache returns directly without re-running the program. If anything is dirty, the entire program re-runs — no per-instruction snapshot cache. Under-blend's per-pixel early-out (`dst >= 0xFF000000`, i.e. α=0xFF opaque) makes the per-pixel work cheap, and the typical program is short enough (3-5 ops) that running it whole is faster than maintaining intermediate state.
 
-use crate::pixel::{Argb8, BlendMode};
+use crate::pixel::{Argb8, BlendMode, Pixel};
 use alloc::vec::Vec;
 
 /// Stack Notation instruction — pushes a buffer onto the eval stack, or folds two buffers via `under`-with-mode.
@@ -14,56 +14,65 @@ use alloc::vec::Vec;
 pub enum Op {
     /// Push layer `idx` onto the evaluation stack.
     Push(usize),
-    /// Push a solid-colour buffer (all pixels same value).
+    /// Push a solid-colour buffer (all pixels same value): an authored 8-bit `g2t` colour, widened to the compositor's depth.
     Constant(Argb8),
     /// Pop two operands; the second-from-top is `top` (partial composite from above), the top-of-stack is `bottom` (new layer going behind). Apply `top.under(bottom, mode)` per pixel and push the result. The single compositing primitive — every blend mode flows thru here.
     Under(BlendMode),
 }
 
-/// A named pixel buffer that the consumer rasterizes into.
-pub struct StackLayer {
-    pub pixels: Vec<Argb8>,
+/// A named pixel buffer that the consumer rasterizes into, at depth `P` (8-bit unless named).
+pub struct StackLayer<P: Pixel = Argb8> {
+    pub pixels: Vec<P>,
     pub dirty: bool,
 }
 
-impl StackLayer {
+impl<P: Pixel> StackLayer<P> {
     pub fn new(size: usize) -> Self {
         Self {
-            pixels: alloc::vec![0u32; size],
+            pixels: alloc::vec![P::EMPTY; size],
             dirty: true,
         }
     }
 
     /// Reset every pixel to the canonical empty value: `0x00000000` — `α = 0` (fully transparent), darkness = 0 (no ink). Both halves of the pixel accumulate up from 0, so empty is the natural zero element of the Under accumulator. Zero-init means `vec![0u32; n]` uses calloc → zero pages → genuinely free; `Vec::fill(0)` is also the fastest possible re-clear.
     pub fn clear(&mut self) {
-        self.pixels.fill(0);
+        self.pixels.fill(P::EMPTY);
     }
 
     pub fn resize(&mut self, size: usize) {
-        self.pixels.resize(size, 0);
-        self.pixels.fill(0);
+        self.pixels.resize(size, P::EMPTY);
+        self.pixels.fill(P::EMPTY);
         self.dirty = true;
     }
 }
 
-/// Stack compositing engine.
-pub struct StackCompositor {
+/// Stack compositing engine, at depth `P` (8-bit unless named).
+pub struct StackCompositor<P: Pixel = Argb8> {
     /// Named pixel buffers, indexed by `Op::Push(idx)`.
-    pub layers: Vec<StackLayer>,
+    pub layers: Vec<StackLayer<P>>,
     /// The compositing program.
     pub program: Vec<Op>,
     /// Evaluation stack (reused across evaluations to avoid re-alloc).
-    stack: Vec<Vec<Argb8>>,
+    stack: Vec<Vec<P>>,
     /// Pool of reusable temporary buffers (avoids alloc churn on repeated evaluations).
-    pool: Vec<Vec<Argb8>>,
+    pool: Vec<Vec<P>>,
     /// The final composite from the last `evaluate()`. Returned directly when no layer is dirty.
-    composite: Vec<Argb8>,
+    composite: Vec<P>,
     /// Pixels per layer.
     size: usize,
 }
 
 impl StackCompositor {
+    /// An 8-bit compositor; [`StackCompositor::with_depth`] names another depth.
+    /// `new` lives on the 8-bit type alone so `StackCompositor::new(..)` needs no annotation where nothing else fixes the depth.
     pub fn new(width: usize, height: usize) -> Self {
+        Self::with_depth(width, height)
+    }
+}
+
+impl<P: Pixel> StackCompositor<P> {
+    /// A compositor at depth `P`: `StackCompositor::<G2t16>::with_depth(w, h)`.
+    pub fn with_depth(width: usize, height: usize) -> Self {
         Self {
             layers: Vec::new(),
             program: Vec::new(),
@@ -89,7 +98,7 @@ impl StackCompositor {
 
     /// Read-only access to the cached composite from the last `evaluate()`. Returns an empty slice if `evaluate()` has never run on a non-empty program.
     #[inline]
-    pub fn composite(&self) -> &[Argb8] {
+    pub fn composite(&self) -> &[P] {
         &self.composite
     }
 
@@ -103,18 +112,18 @@ impl StackCompositor {
     }
 
     /// Acquire a temporary buffer from the pool or allocate a new one. New buffers start fully-transparent.
-    fn acquire_buf(&mut self) -> Vec<Argb8> {
+    fn acquire_buf(&mut self) -> Vec<P> {
         if let Some(mut buf) = self.pool.pop() {
-            buf.resize(self.size, 0);
-            buf.fill(0);
+            buf.resize(self.size, P::EMPTY);
+            buf.fill(P::EMPTY);
             buf
         } else {
-            alloc::vec![0u32; self.size]
+            alloc::vec![P::EMPTY; self.size]
         }
     }
 
     /// Return a temporary buffer to the pool.
-    fn release_buf(&mut self, buf: Vec<Argb8>) {
+    fn release_buf(&mut self, buf: Vec<P>) {
         self.pool.push(buf);
     }
 
@@ -130,7 +139,7 @@ impl StackCompositor {
     /// Evaluate the program. Returns a reference to the final composite.
     ///
     /// If no layer is dirty AND a cached composite exists, returns the cache directly. Otherwise runs the entire program: walks each `Op` in order, allocating temporary buffers from the pool. The per-pixel work inside `Op::Under` is dominated by `Blend::under`'s `dst >= 0xFF000000` (top opaque) early-out, so re-running the whole program is cheap even when only one layer changed — no per-instruction snapshot machinery needed.
-    pub fn evaluate(&mut self) -> &[Argb8] {
+    pub fn evaluate(&mut self) -> &[P] {
         if self.program.is_empty() {
             return &[];
         }
@@ -158,7 +167,7 @@ impl StackCompositor {
                 }
                 Op::Constant(colour) => {
                     let mut buf = self.acquire_buf();
-                    buf.fill(colour);
+                    buf.fill(P::from_g2t8(colour));
                     self.stack.push(buf);
                 }
                 Op::Under(mode) => {

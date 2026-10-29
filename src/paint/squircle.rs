@@ -4,7 +4,7 @@
 
 use super::HitId;
 use crate::canvas::Canvas;
-use crate::pixel::{Blend, BlendMode};
+use crate::pixel::{BlendMode, Pixel};
 
 /// THE WIDGET CORNER POWER (Nick 2026-10-23/24): the textbox's smooth squircle, shared by every button, checkbox, dropdown and textbox so each carries the same corner — the buttons' old 1.75 pulled theirs toward a diamond.
 /// NOT the window's power: the desktop perimeter keeps its own `WINDOW_POWER`, which only reads smooth at a window-sized radius — at a widget's radius it draws a square (v125 shipped that for a day: "They are all squares now").
@@ -19,8 +19,8 @@ pub const WINDOW_POWER: i32 = 24;
 /// Photon-faithful: precompute squircle crossings once (`(inset_px, l_aa, h_aa)` per pixel-row offset into the cap), then walk pure integer indices per corner. Each crossing produces BOTH a vertical-edge AA pixel and a horizontal-edge AA pixel via the squircle's diagonal symmetry — no separate per-col walk needed.
 ///
 /// Every interior + AA-edge write composes the new pixel UNDERNEATH whatever's already in the buffer via [`Blend::under`] (`BlendMode::Normal`). Two stacked pills in the same buffer therefore behave like any other front-to-back composite: draw the topmost first (it lands cleanly into the empty buffer), then the underneath one (it fills only the remaining α budget the topmost left behind). No max-α tiebreaker, no inner/outer dual mode — one consistent kernel.
-pub fn draw_squircle_pill(
-    canvas: &mut Canvas,
+pub fn draw_squircle_pill<P: Pixel>(
+    canvas: &mut Canvas<P>,
     pill_x: isize,
     pill_y: isize,
     pill_w: isize,
@@ -34,8 +34,8 @@ pub fn draw_squircle_pill(
 }
 
 /// Fractional-exponent variant of [`draw_squircle_pill`]. Identical rasterization (shares the inner `_with_crossings` worker) — only the crossings-table computation differs, using [`squircle_crossings_f`]'s `powf` path so non-integer `squirdleyness` traces smooth in-between shapes (e.g. `1.5` between ellipse and diamond). Slower per-call; use only when the desired shape can't be expressed with an integer exponent.
-pub fn draw_squircle_pill_f(
-    canvas: &mut Canvas,
+pub fn draw_squircle_pill_f<P: Pixel>(
+    canvas: &mut Canvas<P>,
     pill_x: isize,
     pill_y: isize,
     pill_w: isize,
@@ -49,14 +49,14 @@ pub fn draw_squircle_pill_f(
 }
 
 /// Shared rasterizer body for [`draw_squircle_pill`] and [`draw_squircle_pill_f`]. Takes pre-computed `crossings` so the two entry points can dispatch thru one painting kernel — the integer / fractional choice lives entirely in which crossings generator the caller used.
-fn draw_squircle_pill_with_crossings(
-    canvas: &mut Canvas,
+fn draw_squircle_pill_with_crossings<P: Pixel>(
+    canvas: &mut Canvas<P>,
     pill_x: isize,
     pill_y: isize,
     pill_w: isize,
     pill_h: isize,
     colour: u32,
-    crossings: &[(u16, u8, u8)],
+    crossings: &[(u16, u16, u16)],
 ) {
     let buf_w = canvas.width;
     let buf_h = canvas.height;
@@ -80,10 +80,11 @@ fn draw_squircle_pill_with_crossings(
     }
 
     let radius = (pill_h / 2) as isize;
-    // α + darkness: force opaque (α=0xFF) by setting the top byte. RGB darkness intact.
-    let solid = (colour & 0x00FF_FFFF) | 0xFF000000;
-    let colour_rgb = colour & 0x00FF_FFFF;
-    let pixels: &mut [u32] = canvas.pixels;
+    // α + darkness: force opaque (α = ONE) by setting the α field. RGB darkness intact.
+    let colour = P::from_g2t8(colour);
+    let solid = colour.rgb().with_alpha(P::ONE);
+    let colour_rgb = colour.rgb();
+    let pixels: &mut [P] = canvas.pixels;
 
     // Fast/slow split. Fast path: pill bbox fully inside the buffer → no per-pixel checks. Slow path: partial overhang (scroll/resize transitions) → range clips at the corner-block boundary so each AA write has its row already proven in-buffer.
     let fully_inside =
@@ -135,8 +136,8 @@ fn draw_squircle_pill_with_crossings(
 /// No `fill` parameter — the pill is exactly two colours.
 ///
 /// Every pixel write composes UNDER the buffer via [`Blend::under`] (Normal) — same kernel as the single-colour path.
-pub fn draw_squircle_pill_two_tone(
-    canvas: &mut Canvas,
+pub fn draw_squircle_pill_two_tone<P: Pixel>(
+    canvas: &mut Canvas<P>,
     pill_x: isize,
     pill_y: isize,
     pill_w: isize,
@@ -155,8 +156,8 @@ pub fn draw_squircle_pill_two_tone(
 }
 
 /// Fractional-exponent variant of [`draw_squircle_pill_two_tone`]. Identical seam logic and rasterizer — only the crossings-table computation swaps to [`squircle_crossings_f`] for non-integer `squirdleyness`. Used by [`crate::widgets::Button`] for its in-between-ellipse-and-diamond silhouette.
-pub fn draw_squircle_pill_two_tone_f(
-    canvas: &mut Canvas,
+pub fn draw_squircle_pill_two_tone_f<P: Pixel>(
+    canvas: &mut Canvas<P>,
     pill_x: isize,
     pill_y: isize,
     pill_w: isize,
@@ -174,15 +175,15 @@ pub fn draw_squircle_pill_two_tone_f(
     );
 }
 
-fn draw_squircle_pill_two_tone_with_crossings(
-    canvas: &mut Canvas,
+fn draw_squircle_pill_two_tone_with_crossings<P: Pixel>(
+    canvas: &mut Canvas<P>,
     pill_x: isize,
     pill_y: isize,
     pill_w: isize,
     pill_h: isize,
     light: u32,
     shadow: u32,
-    crossings: &[(u16, u8, u8)],
+    crossings: &[(u16, u16, u16)],
     hit_map: Option<&mut [HitId]>,
     hit_id: HitId,
 ) {
@@ -206,11 +207,12 @@ fn draw_squircle_pill_two_tone_with_crossings(
     }
 
     let radius = (pill_h / 2) as isize;
-    let light_solid = (light & 0x00FF_FFFF) | 0xFF000000;
-    let shadow_solid = (shadow & 0x00FF_FFFF) | 0xFF000000;
-    let light_rgb = light & 0x00FF_FFFF;
-    let shadow_rgb = shadow & 0x00FF_FFFF;
-    let pixels: &mut [u32] = canvas.pixels;
+    let (light, shadow) = (P::from_g2t8(light), P::from_g2t8(shadow));
+    let light_solid = light.rgb().with_alpha(P::ONE);
+    let shadow_solid = shadow.rgb().with_alpha(P::ONE);
+    let light_rgb = light.rgb();
+    let shadow_rgb = shadow.rgb();
+    let pixels: &mut [P] = canvas.pixels;
     let mut hit_map = hit_map;
 
     // Football-seam pick: 45° from TR down-left into the right cap → flat across the centerline → 45° down-left to BL. dy ≤ seam_y(dx) → light, which puts TL inside the light region and BR inside the shadow region.
@@ -226,14 +228,14 @@ fn draw_squircle_pill_two_tone_with_crossings(
             half_h
         }
     };
-    let pick_rgb = |dx: isize, dy: isize| -> u32 {
+    let pick_rgb = |dx: isize, dy: isize| -> P {
         if dy <= seam_y(dx) {
             light_rgb
         } else {
             shadow_rgb
         }
     };
-    let pick_solid = |dx: isize, dy: isize| -> u32 {
+    let pick_solid = |dx: isize, dy: isize| -> P {
         if dy <= seam_y(dx) {
             light_solid
         } else {
@@ -372,17 +374,17 @@ fn draw_squircle_pill_two_tone_with_crossings(
 ///   - Therefore `row * buf_w + col < buf_h * buf_w = pixels.len()`.
 ///
 /// PREVENTS: nothing — this path runs only when the proof holds. Bounds-check elision lets the compiler emit unchecked stores.
-fn draw_squircle_pill_unclipped(
-    pixels: &mut [u32],
+fn draw_squircle_pill_unclipped<P: Pixel>(
+    pixels: &mut [P],
     buf_w: usize,
     pill_x: usize,
     pill_y: usize,
     pill_w: usize,
     pill_h: usize,
     radius: usize,
-    crossings: &[(u16, u8, u8)],
-    colour_rgb: u32,
-    solid: u32,
+    crossings: &[(u16, u16, u16)],
+    colour_rgb: P,
+    solid: P,
 ) {
     for (i, &(inset, _l, h)) in crossings.iter().enumerate() {
         if inset as usize > i {
@@ -456,8 +458,8 @@ fn draw_squircle_pill_unclipped(
 /// PROOF that no closed-form i-range clip suffices: `inset[i]` is non-linear in `i` (squircle curve), so the AA-pixel column `pill_x + inset` can't be cleanly bracketed by a single i-range when the pill straddles `x=0` or `x=buf_w`. Linear-in-`i` coords (rows and `h_col`) ARE clipped at the corner-block level — one branch per corner instead of one per pixel. The inset-dependent AA column gets one inline check.
 ///
 /// PREVENTS: OOB pixel write / slice panic at the math↔buffer boundary when the pill's geometric corner falls outside the buffer.
-fn draw_squircle_pill_clipped(
-    pixels: &mut [u32],
+fn draw_squircle_pill_clipped<P: Pixel>(
+    pixels: &mut [P],
     buf_w: usize,
     buf_h: usize,
     pill_x: isize,
@@ -465,9 +467,9 @@ fn draw_squircle_pill_clipped(
     pill_w: isize,
     pill_h: isize,
     radius: isize,
-    crossings: &[(u16, u8, u8)],
-    colour_rgb: u32,
-    solid: u32,
+    crossings: &[(u16, u16, u16)],
+    colour_rgb: P,
+    solid: P,
 ) {
     let buf_w_i = buf_w as isize;
     let buf_h_i = buf_h as isize;
@@ -550,11 +552,11 @@ fn draw_squircle_pill_clipped(
     }
 }
 
-/// Generate photon's squircle crossings: one entry per pixel-row offset from the cap edge into the diagonal. Each entry is `(inset_int, l_aa, h_aa)` where `inset_int` is the integer column offset where the curve crosses that row, and `l/h_aa = sqrt(frac(inset))*256` / `sqrt(1-frac(inset))*256` are the perceptual AA weights (low = outside fraction, high = inside fraction). Verbatim port of photon's loop in `compositing.rs::draw_textbox`.
+/// Generate photon's squircle crossings: one entry per pixel-row offset from the cap edge into the diagonal. Each entry is `(inset_int, l_aa, h_aa)` where `inset_int` is the integer column offset where the curve crosses that row, and `l/h_aa = sqrt(frac(inset))*2¹⁶` / `sqrt(1-frac(inset))*2¹⁶` are the perceptual AA weights in Q16 (low = outside fraction, high = inside fraction), each cast to u16 so a whole pixel saturates at `0xFFFF`. Verbatim port of photon's loop in `compositing.rs::draw_textbox`, with the weights widened from photon's ×256 bytes: a 16-bit canvas takes the whole weight as its α, an 8-bit one its top byte, which is bit for bit the byte the ×256 cast gave (`Pixel::from_cov`).
 ///
 /// **Integer-exponent fast path.** `powi(x, n)` for small `n` is `n−1` multiplies (`x*x*x` for `n=3`), while `powf` is `exp(y * ln(x))` — orders of magnitude slower. Chrome's perimeter at `n=24`, textbox's `n=3`, and most "pill or rounded-rect" shapes use integer values; they get the fast path here. For fractional shapes (e.g. button's `n=1.5` for an in-between ellipse / diamond), see [`squircle_crossings_f`].
-pub fn squircle_crossings(radius: f32, squirdleyness: i32) -> alloc::vec::Vec<(u16, u8, u8)> {
-    let mut crossings: alloc::vec::Vec<(u16, u8, u8)> = alloc::vec::Vec::new();
+pub fn squircle_crossings(radius: f32, squirdleyness: i32) -> alloc::vec::Vec<(u16, u16, u16)> {
+    let mut crossings: alloc::vec::Vec<(u16, u16, u16)> = alloc::vec::Vec::new();
     let mut offset = 0f32;
     loop {
         let y_norm = offset / radius;
@@ -565,8 +567,8 @@ pub fn squircle_crossings(radius: f32, squirdleyness: i32) -> alloc::vec::Vec<(u
         let cx = x_norm * radius;
         let inset = radius - cx;
         if inset >= 0. {
-            let l = (crate::math::sqrt(crate::math::fract(inset)) * 256.) as u8;
-            let h = (crate::math::sqrt(1. - crate::math::fract(inset)) * 256.) as u8;
+            let l = (crate::math::sqrt(crate::math::fract(inset)) * 65536.) as u16;
+            let h = (crate::math::sqrt(1. - crate::math::fract(inset)) * 65536.) as u16;
             crossings.push((inset as u16, l, h));
         }
         if cx < offset {
@@ -578,8 +580,8 @@ pub fn squircle_crossings(radius: f32, squirdleyness: i32) -> alloc::vec::Vec<(u
 }
 
 /// Fractional-exponent variant of [`squircle_crossings`]. Same math, swaps the inner `powi` for `powf` so non-integer `squirdleyness` (e.g. `1.5`, `1.41`, `2.5`) traces the in-between curves between ellipse / diamond / squared-pill. Slower per iteration; only worth using when the desired shape can't be expressed with an integer exponent. Outer root in the integer version is already `powf(x, 1/n)` so the speed gap is roughly the inner `powi` vs `powf` — ~2× total for small `n`.
-pub fn squircle_crossings_f(radius: f32, squirdleyness: f32) -> alloc::vec::Vec<(u16, u8, u8)> {
-    let mut crossings: alloc::vec::Vec<(u16, u8, u8)> = alloc::vec::Vec::new();
+pub fn squircle_crossings_f(radius: f32, squirdleyness: f32) -> alloc::vec::Vec<(u16, u16, u16)> {
+    let mut crossings: alloc::vec::Vec<(u16, u16, u16)> = alloc::vec::Vec::new();
     let mut offset = 0f32;
     loop {
         let y_norm = offset / radius;
@@ -590,8 +592,8 @@ pub fn squircle_crossings_f(radius: f32, squirdleyness: f32) -> alloc::vec::Vec<
         let cx = x_norm * radius;
         let inset = radius - cx;
         if inset >= 0. {
-            let l = (crate::math::sqrt(crate::math::fract(inset)) * 256.) as u8;
-            let h = (crate::math::sqrt(1. - crate::math::fract(inset)) * 256.) as u8;
+            let l = (crate::math::sqrt(crate::math::fract(inset)) * 65536.) as u16;
+            let h = (crate::math::sqrt(1. - crate::math::fract(inset)) * 65536.) as u16;
             crossings.push((inset as u16, l, h));
         }
         if cx < offset {
@@ -602,10 +604,10 @@ pub fn squircle_crossings_f(radius: f32, squirdleyness: f32) -> alloc::vec::Vec<
     crossings
 }
 
-/// AA write at a proven-in-buffer index. Composes a partial-α pixel (`α=h_aa`, straight darkness=`colour_rgb`) UNDERNEATH whatever's already in the buffer via [`Blend::under`] — same kernel as every other compositing op in fluor. The buffer is treated as the topmost-first composite (anything already painted there sits "above" this write). With `Normal` mode, an empty pixel (`0x00000000`) absorbs the new contribution fully; an already-opaque pixel takes the early-out and the new write is invisible.
+/// AA write at a proven-in-buffer index. Composes a partial-α pixel (α = the Q16 weight `h_aa` at the canvas's depth, straight darkness=`colour_rgb`) UNDERNEATH whatever's already in the buffer via [`Blend::under`] — same kernel as every other compositing op in fluor. The buffer is treated as the topmost-first composite (anything already painted there sits "above" this write). With `Normal` mode, an empty pixel (`0x00000000`) absorbs the new contribution fully; an already-opaque pixel takes the early-out and the new write is invisible.
 #[inline]
-fn write_aa(pixels: &mut [u32], idx: usize, colour_rgb: u32, h_aa: u32) {
-    let new_pixel = (h_aa << 24) | colour_rgb;
+fn write_aa<P: Pixel>(pixels: &mut [P], idx: usize, colour_rgb: P, h_aa: u32) {
+    let new_pixel = P::from_cov(colour_rgb, h_aa);
     pixels[idx] = pixels[idx].under(new_pixel, BlendMode::Normal);
 }
 
@@ -628,8 +630,8 @@ pub fn squircle_inset(y_from_center: f32, radius: f32, squirdleyness: i32) -> f3
 pub type CornerRadii = [f32; 4];
 
 /// Squircle ROUNDED RECT with a radius per corner — the pill kernel's corner quadrant walk (row pass + column pass, AA on both curves) run once per corner with that corner's own crossings table, plus a per-row solid fill between the corner quadrants. Unlike the pill, the radius is the caller's, not `h/2`: a multi-line textbox keeps the corner of its one-line self instead of growing a half-height cap, and the four corners can differ (Nick 2026-09-09: "based on text height, not textbox height… asymmetric, same idea as the outer edges"). Every write composes UNDER the buffer like the pill. Radii clamp to half the box on each axis.
-pub fn draw_squircle_rrect(
-    canvas: &mut Canvas,
+pub fn draw_squircle_rrect<P: Pixel>(
+    canvas: &mut Canvas<P>,
     x: isize,
     y: isize,
     w: isize,
@@ -638,15 +640,16 @@ pub fn draw_squircle_rrect(
     radii: CornerRadii,
     squirdleyness: i32,
 ) {
-    let solid = (colour & 0x00FF_FFFF) | 0xFF000000;
-    let rgb = colour & 0x00FF_FFFF;
+    let colour = P::from_g2t8(colour);
+    let solid = colour.rgb().with_alpha(P::ONE);
+    let rgb = colour.rgb();
     let curve = |r: f32| squircle_crossings(r, squirdleyness);
     draw_squircle_rrect_kernel(canvas, x, y, w, h, radii, &curve, &|_, _| (rgb, solid), None, 0);
 }
 
 /// Fractional-exponent variant of [`draw_squircle_rrect`], for in-between shapes (the widget family now shares the integer [`SHAPE_POWER`]).
-pub fn draw_squircle_rrect_f(
-    canvas: &mut Canvas,
+pub fn draw_squircle_rrect_f<P: Pixel>(
+    canvas: &mut Canvas<P>,
     x: isize,
     y: isize,
     w: isize,
@@ -655,8 +658,9 @@ pub fn draw_squircle_rrect_f(
     radii: CornerRadii,
     squirdleyness: f32,
 ) {
-    let solid = (colour & 0x00FF_FFFF) | 0xFF000000;
-    let rgb = colour & 0x00FF_FFFF;
+    let colour = P::from_g2t8(colour);
+    let solid = colour.rgb().with_alpha(P::ONE);
+    let rgb = colour.rgb();
     let curve = |r: f32| squircle_crossings_f(r, squirdleyness);
     draw_squircle_rrect_kernel(canvas, x, y, w, h, radii, &curve, &|_, _| (rgb, solid), None, 0);
 }
@@ -668,8 +672,8 @@ pub fn asymmetric_radii(big: f32) -> CornerRadii {
 
 /// Two-tone variant of [`draw_squircle_rrect`]: `light` on the top-left side of the box's anti-diagonal, `shadow` below it (the pill's football seam collapses to exactly this for a square, and a rounded rect with small corners reads the same way). Optional hit stamping like the pill.
 #[allow(clippy::too_many_arguments)]
-pub fn draw_squircle_rrect_two_tone(
-    canvas: &mut Canvas,
+pub fn draw_squircle_rrect_two_tone<P: Pixel>(
+    canvas: &mut Canvas<P>,
     x: isize,
     y: isize,
     w: isize,
@@ -681,12 +685,13 @@ pub fn draw_squircle_rrect_two_tone(
     hit_map: Option<&mut [HitId]>,
     hit_id: HitId,
 ) {
-    let light_solid = (light & 0x00FF_FFFF) | 0xFF000000;
-    let shadow_solid = (shadow & 0x00FF_FFFF) | 0xFF000000;
-    let light_rgb = light & 0x00FF_FFFF;
-    let shadow_rgb = shadow & 0x00FF_FFFF;
+    let (light, shadow) = (P::from_g2t8(light), P::from_g2t8(shadow));
+    let light_solid = light.rgb().with_alpha(P::ONE);
+    let shadow_solid = shadow.rgb().with_alpha(P::ONE);
+    let light_rgb = light.rgb();
+    let shadow_rgb = shadow.rgb();
     let (wf, hf) = (w as f32, h as f32);
-    let pick = move |dx: isize, dy: isize| -> (u32, u32) {
+    let pick = move |dx: isize, dy: isize| -> (P, P) {
         // Anti-diagonal seam: dx/w + dy/h ≤ 1 is the light (top-left) side.
         if dx as f32 / wf + dy as f32 / hf <= 1.0 {
             (light_rgb, light_solid)
@@ -700,8 +705,8 @@ pub fn draw_squircle_rrect_two_tone(
 
 /// Fractional-exponent variant of [`draw_squircle_rrect_two_tone`].
 #[allow(clippy::too_many_arguments)]
-pub fn draw_squircle_rrect_two_tone_f(
-    canvas: &mut Canvas,
+pub fn draw_squircle_rrect_two_tone_f<P: Pixel>(
+    canvas: &mut Canvas<P>,
     x: isize,
     y: isize,
     w: isize,
@@ -713,12 +718,13 @@ pub fn draw_squircle_rrect_two_tone_f(
     hit_map: Option<&mut [HitId]>,
     hit_id: HitId,
 ) {
-    let light_solid = (light & 0x00FF_FFFF) | 0xFF000000;
-    let shadow_solid = (shadow & 0x00FF_FFFF) | 0xFF000000;
-    let light_rgb = light & 0x00FF_FFFF;
-    let shadow_rgb = shadow & 0x00FF_FFFF;
+    let (light, shadow) = (P::from_g2t8(light), P::from_g2t8(shadow));
+    let light_solid = light.rgb().with_alpha(P::ONE);
+    let shadow_solid = shadow.rgb().with_alpha(P::ONE);
+    let light_rgb = light.rgb();
+    let shadow_rgb = shadow.rgb();
     let (wf, hf) = (w as f32, h as f32);
-    let pick = move |dx: isize, dy: isize| -> (u32, u32) {
+    let pick = move |dx: isize, dy: isize| -> (P, P) {
         if dx as f32 / wf + dy as f32 / hf <= 1.0 {
             (light_rgb, light_solid)
         } else {
@@ -731,15 +737,15 @@ pub fn draw_squircle_rrect_two_tone_f(
 
 /// The shared rounded-rect rasterizer: `pick(dx, dy) → (rgb, solid)` chooses the colour per pixel (a constant for the plain fill, the seam for two-tone). Bounds-checked per write, so partial overhangs are safe.
 #[allow(clippy::too_many_arguments)]
-fn draw_squircle_rrect_kernel(
-    canvas: &mut Canvas,
+fn draw_squircle_rrect_kernel<P: Pixel>(
+    canvas: &mut Canvas<P>,
     x: isize,
     y: isize,
     w: isize,
     h: isize,
     radii: CornerRadii,
-    crossings_for: &dyn Fn(f32) -> alloc::vec::Vec<(u16, u8, u8)>,
-    pick: &dyn Fn(isize, isize) -> (u32, u32),
+    crossings_for: &dyn Fn(f32) -> alloc::vec::Vec<(u16, u16, u16)>,
+    pick: &dyn Fn(isize, isize) -> (P, P),
     hit_map: Option<&mut [HitId]>,
     hit_id: HitId,
 ) {
@@ -770,7 +776,7 @@ fn draw_squircle_rrect_kernel(
         radii[2].clamp(0.0, cap) as isize,
         radii[3].clamp(0.0, cap) as isize,
     ];
-    let pixels: &mut [u32] = canvas.pixels;
+    let pixels: &mut [P] = canvas.pixels;
     let mut hit_map = hit_map;
 
     // Corner quadrants: (flip_x, flip_y) → which corner; the pill kernel's walk verbatim, with this corner's radius and table.
