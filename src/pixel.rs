@@ -86,8 +86,8 @@ pub trait Blend {
 /// `under` comes from the [`Blend`] supertrait rather than a method of its own: with both traits in scope a concrete `u32` would otherwise see two `under`s and every call would be ambiguous.
 pub trait Pixel: Blend + Copy + Eq + Send + Sync + core::fmt::Debug + 'static {
     /// Bits per field (α and each darkness channel).
-    /// On the `u32` depth, `Argb8::BITS` is u32's own inherent constant (32), which outranks this one: name it `<Argb8 as Pixel>::BITS`, or reach it thru a `P: Pixel` bound, where it is unambiguous.
-    const BITS: u32;
+    /// Named DEPTH, not BITS: on the `u32` depth `Argb8::BITS` is u32's own inherent constant (32) and would silently outrank a trait constant of that name.
+    const DEPTH: u32;
     /// A full field: opaque α, or black's darkness in one channel.
     const ONE: u32;
     /// Where α sits: `pixel >> ALPHA_SHIFT` is the α field.
@@ -113,10 +113,9 @@ pub trait Pixel: Blend + Copy + Eq + Send + Sync + core::fmt::Debug + 'static {
 }
 
 impl Pixel for Argb8 {
-    // `Self::BITS` here would be u32's own inherent `BITS` (32), which outranks the trait's, so BITS is named thru the trait; the other names are not inherent to u32.
-    const BITS: u32 = 8;
-    const ONE: u32 = (1 << <Self as Pixel>::BITS) - 1;
-    const ALPHA_SHIFT: u32 = 3 * <Self as Pixel>::BITS;
+    const DEPTH: u32 = 8;
+    const ONE: u32 = (1 << Self::DEPTH) - 1;
+    const ALPHA_SHIFT: u32 = 3 * Self::DEPTH;
     const RGB_MASK: Self = (1 << Self::ALPHA_SHIFT) - 1;
     const OPAQUE: Self = Self::ONE << Self::ALPHA_SHIFT;
     const EMPTY: Self = 0;
@@ -316,7 +315,7 @@ mod tests {
     /// The trait's constants are the layout the rest of fluor spells out by hand today, so moving a kernel onto them changes nothing.
     #[test]
     fn argb8_constants_are_the_8_bit_layout() {
-        assert_eq!(<Argb8 as Pixel>::BITS, 8);
+        assert_eq!(Argb8::DEPTH, 8);
         assert_eq!(<Argb8 as Pixel>::ONE, 255);
         assert_eq!(<Argb8 as Pixel>::ALPHA_SHIFT, 24);
         assert_eq!(<Argb8 as Pixel>::RGB_MASK, 0x00FF_FFFF);
