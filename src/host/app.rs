@@ -33,7 +33,7 @@ use winit::keyboard::ModifiersState;
 #[cfg(feature = "host-winit")]
 use winit::window::{Window, WindowAttributes, WindowId};
 
-/// X11-only XShape helpers — direct XCB calls that winit doesn't expose. Currently houses [`x11_atomic::set_input_region`] (window-shape input clipping); historically also held an atomic-geometry helper that's gone now. The `x11_atomic` name is retained because the (single) remaining helper still operates on an XCB connection independent of winit's, which is the property the name actually tracks.
+/// X11-only XShape helpers — direct XCB calls that winit doesn't expose. Currently houses [`x11_atomic::set_input_region`] (window-shape input clipping) and [`x11_atomic::set_bounding_region`] (the window's silhouette as the paint shape when no compositor runs); historically also held an atomic-geometry helper that's gone now. The `x11_atomic` name is retained because the (single) remaining helper still operates on an XCB connection independent of winit's, which is the property the name actually tracks.
 #[cfg(all(feature = "host-winit", target_os = "linux"))]
 mod x11_atomic {
     use std::sync::OnceLock;
@@ -105,22 +105,26 @@ mod x11_atomic {
     }
 
     /// Whether a compositing manager owns `_NET_WM_CM_S0` (EWMH). Without one (XFCE with compositing off) an ARGB window's α is ignored and every transparent pixel of our desktop-spanning surface shows as opaque black. `None` when the connection fails.
+    /// The atom is interned once; each call is one round trip for the selection owner, so a compositor started or stopped mid-session is seen on the next shape change.
     fn compositor_running() -> Option<bool> {
         use x11rb::protocol::xproto::ConnectionExt as _;
+        static ATOM: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         let c = conn()?;
-        let atom = c.intern_atom(false, b"_NET_WM_CM_S0").ok()?.reply().ok()?.atom;
+        let atom = match ATOM.get() {
+            Some(a) => *a,
+            None => {
+                let a = c.intern_atom(false, b"_NET_WM_CM_S0").ok()?.reply().ok()?.atom;
+                *ATOM.get_or_init(|| a)
+            }
+        };
         let owner = c.get_selection_owner(atom).ok()?.reply().ok()?.owner;
         Some(owner != 0)
     }
 
-    /// Clip the window's BOUNDING shape to the visible window rect (surface-local units) when no compositor runs, so the X server itself leaves everything outside the rect unpainted — the desktop shows thru instead of a black wall. With a compositor the bounding shape is reset to the whole window (α already does the job, and a hard shape would lose the soft edges). A zero `w` or `h` shapes the window to nothing. Returns `true` if the request was sent.
-    pub fn set_bounding_region(
-        window: &winit::window::Window,
-        x: i32,
-        y: i32,
-        w: u32,
-        h: u32,
-    ) -> bool {
+    /// Set the window's BOUNDING shape to the window's silhouette when no compositor runs, so the X server paints nothing outside it — the desktop shows thru where the transparent surface would otherwise be opaque black, rounded corners included.
+    /// `rects` are surface-local `(x, y, w, h)` rectangles: one per run of identical rows of the carved clip mask, so a squircle corner is a stack of row strips and the straight middle one rectangle; empty = nothing painted on this surface.
+    /// Without a compositor nothing can blend, so the curve is hard-edged (a pixel at least half covered is in); with a compositor the shape is removed and α draws the soft edge as before. Returns `true` if the request was sent.
+    pub fn set_bounding_region(window: &winit::window::Window, rects: &[(i32, i32, u32, u32)]) -> bool {
         use x11rb::protocol::shape::{ConnectionExt as _, SK, SO};
         use x11rb::protocol::xproto::{ClipOrdering, Rectangle};
 
@@ -136,27 +140,53 @@ mod x11_atomic {
             return false;
         };
         let sent = if compositor_running() == Some(false) {
-            // WHY/PROOF: XShape rectangles carry i16 x/y and u16 width/height; an off-screen or giant window would wrap the cast into a wrong shape.
-            let rect = Rectangle {
-                x: x.max(0).min(i16::MAX as i32) as i16,
-                y: y.max(0).min(i16::MAX as i32) as i16,
-                width: w.min(u16::MAX as u32) as u16,
-                height: h.min(u16::MAX as u32) as u16,
-            };
-            let rects: &[Rectangle] = if w == 0 || h == 0 {
-                &[]
-            } else {
-                std::slice::from_ref(&rect)
-            };
-            conn.shape_rectangles(SO::SET, SK::BOUNDING, ClipOrdering::UNSORTED, xid, 0, 0, rects)
-                .is_ok()
+            let xr: Vec<Rectangle> = rects
+                .iter()
+                .map(|&(x, y, w, h)| Rectangle {
+                    // WHY/PROOF: XShape rectangles carry i16 x/y and u16 width/height; a window dragged far past a surface edge can sit outside i16, and a wrapped cast would put its shape on the wrong side of the screen.
+                    x: x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                    y: y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                    width: w.min(u16::MAX as u32) as u16,
+                    height: h.min(u16::MAX as u32) as u16,
+                })
+                .collect();
+            conn.shape_rectangles(SO::SET, SK::BOUNDING, ClipOrdering::Y_SORTED, xid, 0, 0, &xr).is_ok()
         } else {
             // Pixmap NONE removes the bounding shape.
-            conn.shape_mask(SO::SET, SK::BOUNDING, xid, 0, 0, x11rb::NONE)
-                .is_ok()
+            conn.shape_mask(SO::SET, SK::BOUNDING, xid, 0, 0, x11rb::NONE).is_ok()
         };
         let _ = conn.flush();
         sent
+    }
+
+    /// The window's silhouette as row-run rectangles, read off the carved clip mask (`clip`, `win_w × win_h`, 255 inside, 0 cut, AA values on the curve): per row the first and last pixel at least half covered, consecutive rows with the same span merged into one rectangle.
+    /// Offset by the window's blit origin on the surface (`ox`, `oy`) and scaled by the surface's pixel ratio, so the result is surface-local backing pixels.
+    pub fn silhouette_rects(clip: &[u8], win_w: usize, win_h: usize, ox: i32, oy: i32, ratio: f64) -> Vec<(i32, i32, u32, u32)> {
+        let mut out = Vec::new();
+        let scale = |v: usize| (v as f64 * ratio).round() as i32;
+        let mut push = |y0: usize, y1: usize, x0: usize, x1: usize| {
+            if x1 > x0 && y1 > y0 {
+                out.push((ox + scale(x0), oy + scale(y0), (scale(x1) - scale(x0)) as u32, (scale(y1) - scale(y0)) as u32));
+            }
+        };
+        let mut run: Option<(usize, usize, usize)> = None;
+        for r in 0..win_h {
+            let row = &clip[r * win_w..(r + 1) * win_w];
+            let x0 = row.iter().position(|&a| a >= 128).unwrap_or(win_w);
+            let x1 = row.iter().rposition(|&a| a >= 128).map_or(x0, |p| p + 1);
+            match run {
+                Some((_, a, b)) if a == x0 && b == x1 => {}
+                Some((y0, a, b)) => {
+                    push(y0, r, a, b);
+                    run = Some((r, x0, x1));
+                }
+                None => run = Some((r, x0, x1)),
+            }
+        }
+        if let Some((y0, a, b)) = run {
+            push(y0, win_h, a, b);
+        }
+        out
     }
 
     /// Tell the compositor to NEVER unredirect this window (`_NET_WM_BYPASS_COMPOSITOR = 2`). Mutter/KWin fast-path a window that exactly covers a monitor by bypassing compositing — and an unredirected window loses its alpha channel, so every transparent pixel of our monitor-sized surface renders OPAQUE BLACK (observed: the taskbar strip going black "on occasion"). The hint is advisory but honoured by both major compositors; set once per surface at creation.
@@ -930,6 +960,8 @@ struct MonitorSurface {
     needs_full_blit: bool,
     /// Last input region pushed to the OS for this surface, in surface-local desktop units, `(0, 0, 0, 0)` meaning fully click-thru. Used by [`DesktopShell::push_input_region`] to dedupe the XShape call (and the macOS `set_cursor_hittest` equivalent).
     last_input_region: (i32, i32, u32, u32),
+    /// Last BOUNDING shape sent for this surface (Linux, no compositor): the window's silhouette as row-run rectangles in surface-local backing pixels, read off the carved clip mask after each composite. `None` until the first send; deduped so an unchanged silhouette costs nothing.
+    last_bounding: Option<Vec<(i32, i32, u32, u32)>>,
 }
 
 #[cfg(feature = "host-winit")]
@@ -1866,24 +1898,11 @@ impl<A: FluorApp> DesktopShell<A> {
         s.last_input_region = region;
         #[cfg(target_os = "linux")]
         x11_atomic::set_input_region(&s.window, region.0, region.1, region.2, region.3);
+        // The window left this surface: nothing of it is painted here, so the surface's shape empties. Where the window overlaps, composite_and_present sets the exact silhouette from the carved clip mask after each frame.
         #[cfg(target_os = "linux")]
-        {
-            let r = &self.window_rect;
-            let bx0 = r.x.max(s.origin.0);
-            let by0 = r.y.max(s.origin.1);
-            let bx1 = (r.x + r.w as i32).min(s.origin.0 + s.size.0 as i32);
-            let by1 = (r.y + r.h as i32).min(s.origin.1 + s.size.1 as i32);
-            if bx0 < bx1 && by0 < by1 {
-                x11_atomic::set_bounding_region(
-                    &s.window,
-                    bx0 - s.origin.0,
-                    by0 - s.origin.1,
-                    (bx1 - bx0) as u32,
-                    (by1 - by0) as u32,
-                );
-            } else {
-                x11_atomic::set_bounding_region(&s.window, 0, 0, 0, 0);
-            }
+        if region.2 == 0 || region.3 == 0 {
+            x11_atomic::set_bounding_region(&s.window, &[]);
+            s.last_bounding = Some(Vec::new());
         }
         #[cfg(target_os = "macos")]
         {
@@ -2073,6 +2092,7 @@ impl<A: FluorApp> DesktopShell<A> {
             needs_full_blit: false,
             // Sentinel that can never equal a computed region (x is never negative there), so the first push always reaches the OS.
             last_input_region: (i32::MIN, i32::MIN, 0, 0),
+            last_bounding: None,
         }
     }
 
@@ -2548,6 +2568,16 @@ impl<A: FluorApp> DesktopShell<A> {
             ),
             None => (&self.scratch, &self.clip_mask),
         };
+
+        // The window's silhouette as this surface's X bounding shape (Josh 2026-10-28, a desktop without a compositor: every transparent pixel drew black; Nick: rounded corners as black wedges "We can't have that"). Read off the mask this frame carved, sent only when it changed; with a compositor the shape stays removed.
+        #[cfg(target_os = "linux")]
+        {
+            let rects = x11_atomic::silhouette_rects(src_clip, win_w, win_h, rect_x, rect_y, pr);
+            if self.surfaces[si].last_bounding.as_ref() != Some(&rects) {
+                x11_atomic::set_bounding_region(&self.surfaces[si].window, &rects);
+                self.surfaces[si].last_bounding = Some(rects);
+            }
+        }
 
         // Persistent screen lives across frames so the post-finalize overlay (blinkey) can mutate just a few pixels each frame without re-running finalize. Resize on surface-size change; new pixels start at 0 which is fine — finalize on the next render will populate them.
         let scr_px = scr_w * scr_h;
@@ -4315,4 +4345,31 @@ fn set_unfocused_cursor(icon: FCursorIcon) {
         FCursorIcon::NwseResize | FCursorIcon::NeswResize | FCursorIcon::Hidden => return,
     };
     cursor.set();
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod silhouette_tests {
+    use super::x11_atomic::silhouette_rects;
+
+    /// A 6×4 window whose top-left corner pixel is cut and whose next pixel is only a third covered: the top row starts two in, the rest is one rectangle, and the whole thing is offset by the blit origin.
+    #[test]
+    fn corner_rows_become_strips_and_the_middle_one_rectangle() {
+        let (w, h) = (6usize, 4usize);
+        let mut clip = vec![255u8; w * h];
+        clip[0] = 0;
+        clip[1] = 85;
+        let rects = silhouette_rects(&clip, w, h, 10, 20, 1.);
+        assert_eq!(rects, vec![(12, 20, 4, 1), (10, 21, 6, 3)]);
+    }
+
+    /// A half-covered pixel is in, and a fully cut row draws nothing.
+    #[test]
+    fn half_covered_is_in_and_an_empty_row_is_skipped() {
+        let (w, h) = (4usize, 3usize);
+        let mut clip = vec![255u8; w * h];
+        clip[..w].fill(0);
+        clip[w] = 128;
+        let rects = silhouette_rects(&clip, w, h, 0, 0, 1.);
+        assert_eq!(rects, vec![(0, 1, 4, 2)]);
+    }
 }
