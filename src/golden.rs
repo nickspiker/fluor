@@ -375,14 +375,13 @@ mod text_scenes {
     }
 
     /// A button at rest, then with baked states (as a headless host draws it) hovered, pressed on a custom fill (the derived held ramp), and focused (its glow), each a fresh render.
-    #[test]
-    fn golden_button() {
+    pub(super) fn button<P: Pixel>() -> Vec<Vec<P>> {
         let mut text = TextRenderer::new();
         let mut ids: HitId = 0;
-        let mut b = Button::new(&mut ids, W as f32 / 2., H as f32 / 2., 160., 44., 20., "Attest");
-        let mut frames: Vec<Vec<u32>> = Vec::new();
-        let mut render = |b: &mut Button, text: &mut TextRenderer| {
-            let (mut px, mut dmg) = scene();
+        let mut b = Button::<P>::with_depth(&mut ids, W as f32 / 2., H as f32 / 2., 160., 44., 20., "Attest");
+        let mut frames: Vec<Vec<P>> = Vec::new();
+        let mut render = |b: &mut Button<P>, text: &mut TextRenderer| {
+            let (mut px, mut dmg) = scene::<P>();
             let mut hit = vec![0 as HitId; W * H];
             {
                 let mut c = Canvas::new(&mut px, W, H, &mut dmg);
@@ -402,6 +401,12 @@ mod text_scenes {
         b.set_pressed(false);
         b.set_focused(true);
         render(&mut b, &mut text);
+        frames
+    }
+
+    #[test]
+    fn golden_button() {
+        let frames = button::<Argb8>();
         for i in 1..frames.len() {
             assert_ne!(frames[i], frames[i - 1], "button frame {i} repeats the one before it");
         }
@@ -409,71 +414,79 @@ mod text_scenes {
     }
 
     /// A textbox with text, unfocused, then focused with a selection (glow, selection band), then its blinkey.
-    #[test]
-    fn golden_textbox() {
+    pub(super) fn textbox<P: Pixel>() -> Vec<Vec<P>> {
         let mut text = TextRenderer::new();
         let mut ids: HitId = 0;
-        let mut t = Textbox::new(&mut ids, W as f32 / 2., H as f32 / 2., 240., 48., 22.);
+        let mut t = Textbox::<P>::with_depth(&mut ids, W as f32 / 2., H as f32 / 2., 240., 48., 22.);
         t.set_text("hello golden world", &mut text);
-        let mut all = Vec::new();
+        let mut frames = Vec::new();
         {
-            let (mut px, mut dmg) = scene();
+            let (mut px, mut dmg) = scene::<P>();
             let mut c = Canvas::new(&mut px, W, H, &mut dmg);
             t.render_content_into(&mut c, 0., 0., &mut text, None, None, None, t.hit_id());
-            all.extend_from_slice(&px);
+            frames.push(px);
         }
         t.set_focused(true);
         t.select_word_at(7);
         {
-            let (mut px, mut dmg) = scene();
+            let (mut px, mut dmg) = scene::<P>();
             let mut c = Canvas::new(&mut px, W, H, &mut dmg);
             t.render_content_into(&mut c, 0., 0., &mut text, None, None, None, t.hit_id());
-            all.extend_from_slice(&px);
+            frames.push(px);
         }
         t.cursor_end();
         t.flip_blinkey();
         {
-            let (mut px, mut dmg) = scene();
+            let (mut px, mut dmg) = scene::<P>();
             let mut c = Canvas::new(&mut px, W, H, &mut dmg);
             t.render_content_into(&mut c, 0., 0., &mut text, None, None, None, t.hit_id());
             t.render_blinkey_into(&mut c, 0., 0.);
-            all.extend_from_slice(&px);
+            frames.push(px);
         }
-        let frames: Vec<&[u32]> = all.chunks(W * H).collect();
+        frames
+    }
+
+    #[test]
+    fn golden_textbox() {
+        let frames = textbox::<Argb8>();
         for i in 1..frames.len() {
             assert_ne!(frames[i], frames[i - 1], "textbox frame {i} repeats the one before it");
         }
-        check("textbox", &all, 0x5bb9_fae3_3104_3831);
+        check("textbox", &frames.concat(), 0x5bb9_fae3_3104_3831);
     }
 
     /// A dropdown closed, then open with its popup painted first.
-    #[test]
-    fn golden_dropdown() {
+    pub(super) fn dropdown<P: Pixel>() -> Vec<Vec<P>> {
         let mut text = TextRenderer::new();
         let mut ids: HitId = 0;
         let options = vec!["Zil".into(), "Zila".into(), "Zilor".into(), "Ter".into()];
-        let mut d = Dropdown::new(&mut ids, W as f32 / 2., 30., 160., 36., 18., options);
+        let mut d = Dropdown::<P>::with_depth(&mut ids, W as f32 / 2., 30., 160., 36., 18., options);
         d.set_selected(2);
-        let mut all = Vec::new();
+        let mut frames = Vec::new();
         {
-            let (mut px, mut dmg) = scene();
+            let (mut px, mut dmg) = scene::<P>();
             let mut c = Canvas::new(&mut px, W, H, &mut dmg);
             d.render_content_into(&mut c, 0., 0., &mut text, None, None);
-            all.extend_from_slice(&px);
+            frames.push(px);
         }
         d.open();
         {
-            let (mut px, mut dmg) = scene();
+            let (mut px, mut dmg) = scene::<P>();
             let mut c = Canvas::new(&mut px, W, H, &mut dmg);
             d.render_popup_into(&mut c, &mut text, None, None);
             d.render_content_into(&mut c, 0., 0., &mut text, None, None);
-            all.extend_from_slice(&px);
+            frames.push(px);
         }
-        let frames: Vec<&[u32]> = all.chunks(W * H).collect();
+        frames
+    }
+
+    #[test]
+    fn golden_dropdown() {
+        let frames = dropdown::<Argb8>();
         for i in 1..frames.len() {
             assert_ne!(frames[i], frames[i - 1], "dropdown frame {i} repeats the one before it");
         }
-        check("dropdown", &all, 0x9097_5d06_bf10_3139);
+        check("dropdown", &frames.concat(), 0x9097_5d06_bf10_3139);
     }
 
     /// Colour emoji thru the glyph's own pixels, only where the font is bundled.
@@ -583,6 +596,18 @@ fn crosscheck_g2t16_against_argb8() {
     }
     #[cfg(feature = "text")]
     scenes.push(("text".into(), text_scenes::text(), text_scenes::text(), (-1, 2)));
+    // The widgets, frame by frame, each frame its own row: a pill with its label sits within the shapes' floors (3); a focused frame carries the focus glow, whose 8-bit decay table drifts low as glow_rays does (7) — button frame 3, textbox frames 1 and 2.
+    #[cfg(feature = "text")]
+    for (name, f8, f16, highs) in [
+        ("button", text_scenes::button::<Argb8>(), text_scenes::button::<G2t16>(), &[3, 3, 3, 7][..]),
+        ("textbox", text_scenes::textbox::<Argb8>(), text_scenes::textbox::<G2t16>(), &[3, 7, 7][..]),
+        ("dropdown", text_scenes::dropdown::<Argb8>(), text_scenes::dropdown::<G2t16>(), &[3, 3][..]),
+    ] {
+        assert_eq!(f8.len(), highs.len());
+        for (i, (p8, p16)) in f8.into_iter().zip(f16).enumerate() {
+            scenes.push((alloc::format!("{name} frame {i}"), p8, p16, (-1, highs[i])));
+        }
+    }
     let mut failures = Vec::new();
     for (name, p8, p16, (low, high)) in &scenes {
         let a = agreement(p8, p16);
