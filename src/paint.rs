@@ -285,7 +285,7 @@ pub const HIT_NONE: HitId = 0;
 /// Compose `src` underneath `dst` where `src` is in *pre-composed* α + darkness form (the result of a chain of `under()` writes starting from empty — so `src.dark` is already attenuated by `src.α`). Unlike [`flatten`] with `BlendMode::Normal`, this kernel scales src's contribution by `(256 − dst.α)` only, NOT by `(256 − dst.α) × src.α`, avoiding the second premult that would dim every AA pixel.
 ///
 /// Use case: blit a cached widget layer (built by repeated `under()` from empty) onto a target buffer — every Stack layer, Group composite and chrome layer is one.
-pub fn flatten_premult(dst: &mut [u32], src: &[u32]) {
+pub fn flatten_premult<P: Pixel>(dst: &mut [P], src: &[P]) {
     let n = dst.len();
     if n == 0 {
         return;
@@ -296,39 +296,34 @@ pub fn flatten_premult(dst: &mut [u32], src: &[u32]) {
 }
 
 #[inline]
-fn flatten_premult_chunk(dst: &mut [u32], src: &[u32]) {
+fn flatten_premult_chunk<P: Pixel>(dst: &mut [P], src: &[P]) {
     let n = dst.len();
     for i in 0..n {
         let d = dst[i];
-        if d >= 0xFF000000 {
+        let d_a = d.alpha();
+        if d_a == P::ONE {
             continue;
         }
         let s = src[i];
-        let d_a = d >> 24;
-        let factor = 256 - d_a;
-        let s_a = (s >> 24) & 0xFF;
-        let s_r = (s >> 16) & 0xFF;
-        let s_g = (s >> 8) & 0xFF;
-        let s_b = s & 0xFF;
-        let d_r = (d >> 16) & 0xFF;
-        let d_g = (d >> 8) & 0xFF;
-        let d_b = d & 0xFF;
-        let new_a = d_a + ((factor * s_a) >> 8);
-        let new_r = d_r + ((factor * s_r) >> 8);
-        let new_g = d_g + ((factor * s_g) >> 8);
-        let new_b = d_b + ((factor * s_b) >> 8);
-        dst[i] = (new_a << 24) | (new_r << 16) | (new_g << 8) | new_b;
+        let factor = P::ONE + 1 - d_a;
+        let [s_r, s_g, s_b] = s.channels();
+        let [d_r, d_g, d_b] = d.channels();
+        let new_a = d_a + ((factor * s.alpha()) >> P::DEPTH);
+        let new_r = d_r + ((factor * s_r) >> P::DEPTH);
+        let new_g = d_g + ((factor * s_g) >> P::DEPTH);
+        let new_b = d_b + ((factor * s_b) >> P::DEPTH);
+        dst[i] = P::from_channels(new_a, [new_r, new_g, new_b]);
     }
 }
 
-use crate::pixel::Blend;
 pub use crate::pixel::BlendMode;
+use crate::pixel::{Argb8, Pixel};
 
 /// Flatten `src` underneath `dst` across the whole slice, pixel-by-pixel, via [`Blend::under`]. `dst` is the partial composite already accumulated above (its α-byte = accumulated opacity); `src` is the new layer going behind. Per-pixel early-out fires when `dst.α == 0xFF`. Both slices must be the same length (a shorter `src` panics: a size mismatch is a bug upstream, never something to paper over).
 ///
-/// For `BlendMode::Normal` (the 99% case) the kernel uses 8-wide SIMD + Rayon parallelism. Other modes fall back to scalar per-pixel with Rayon row-chunking still applied — the math just stays in the scalar [`Blend::under`] kernel.
+/// For `BlendMode::Normal` (the 99% case) the kernel runs the depth's chunk hook ([`Pixel::under_chunk_normal`]: 8-wide SIMD for Argb8) + Rayon parallelism. Other modes fall back to scalar per-pixel with Rayon row-chunking still applied — the math just stays in the scalar [`Blend::under`] kernel.
 #[inline]
-pub fn flatten(dst: &mut [u32], src: &[u32], mode: BlendMode) {
+pub fn flatten<P: Pixel>(dst: &mut [P], src: &[P], mode: BlendMode) {
     let n = dst.len();
     if n == 0 {
         return;
@@ -339,7 +334,7 @@ pub fn flatten(dst: &mut [u32], src: &[u32], mode: BlendMode) {
     if mode == BlendMode::Normal {
         crate::par::par_chunks(dst, CHUNK, |off, chunk| {
             let src_chunk = &src[off..off + chunk.len()];
-            under_chunk_normal_dispatch(chunk, src_chunk);
+            P::under_chunk_normal(chunk, src_chunk);
         });
     } else {
         crate::par::par_chunks(dst, CHUNK, |off, chunk| {
@@ -348,86 +343,6 @@ pub fn flatten(dst: &mut [u32], src: &[u32], mode: BlendMode) {
                 chunk[i] = chunk[i].under(src_chunk[i], mode);
             }
         });
-    }
-}
-
-/// Per-chunk Normal-under dispatcher: SIMD with the `simd` feature, scalar fallback otherwise. Output is bit-identical between paths.
-#[inline]
-pub(crate) fn under_chunk_normal_dispatch(dst: &mut [u32], src: &[u32]) {
-    #[cfg(feature = "simd")]
-    {
-        under_chunk_normal_simd(dst, src);
-    }
-    #[cfg(not(feature = "simd"))]
-    {
-        under_chunk_normal_scalar(dst, src);
-    }
-}
-
-/// 8-wide SIMD chunk kernel for Normal-mode under. Tail (0..7 leftover pixels) runs scalar.
-#[cfg(feature = "simd")]
-fn under_chunk_normal_simd(dst: &mut [u32], src: &[u32]) {
-    use crate::simd::{LANES, u32x8};
-    let n = dst.len();
-    let mut i = 0;
-    while i + LANES <= n {
-        let d_arr: [u32; 8] = dst[i..i + LANES].try_into().unwrap();
-        let s_arr: [u32; 8] = src[i..i + LANES].try_into().unwrap();
-        let out = crate::pixel::under_x8_normal(u32x8::from(d_arr), u32x8::from(s_arr));
-        dst[i..i + LANES].copy_from_slice(out.as_array_ref());
-        i += LANES;
-    }
-    while i < n {
-        dst[i] = dst[i].under(src[i], BlendMode::Normal);
-        i += 1;
-    }
-}
-
-/// Scalar Normal-under chunk kernel for `--no-default-features` (no `simd`) builds.
-#[cfg(not(feature = "simd"))]
-fn under_chunk_normal_scalar(dst: &mut [u32], src: &[u32]) {
-    for i in 0..dst.len() {
-        dst[i] = dst[i].under(src[i], BlendMode::Normal);
-    }
-}
-
-/// Per-chunk Normal-under dispatcher for a CONSTANT src pixel — what the rasterizer interior fast paths need: every dst pixel composes the same `full_pixel` underneath. Saves the cost of materializing an 8-pixel src array when all lanes are the same value (the SIMD path uses `u32x8::splat` instead).
-#[inline]
-pub(crate) fn under_chunk_const_dispatch(dst: &mut [u32], src_const: u32) {
-    #[cfg(feature = "simd")]
-    {
-        under_chunk_const_simd(dst, src_const);
-    }
-    #[cfg(not(feature = "simd"))]
-    {
-        under_chunk_const_scalar(dst, src_const);
-    }
-}
-
-/// 8-wide SIMD constant-src under kernel. `src_const` is broadcast to all 8 lanes once outside the inner loop. Tail scalar.
-#[cfg(feature = "simd")]
-fn under_chunk_const_simd(dst: &mut [u32], src_const: u32) {
-    use crate::simd::{LANES, u32x8};
-    let src = u32x8::splat(src_const);
-    let n = dst.len();
-    let mut i = 0;
-    while i + LANES <= n {
-        let d_arr: [u32; 8] = dst[i..i + LANES].try_into().unwrap();
-        let out = crate::pixel::under_x8_normal(u32x8::from(d_arr), src);
-        dst[i..i + LANES].copy_from_slice(out.as_array_ref());
-        i += LANES;
-    }
-    while i < n {
-        dst[i] = dst[i].under(src_const, BlendMode::Normal);
-        i += 1;
-    }
-}
-
-/// Scalar constant-src under for `--no-default-features` (no `simd`) builds.
-#[cfg(not(feature = "simd"))]
-fn under_chunk_const_scalar(dst: &mut [u32], src_const: u32) {
-    for i in 0..dst.len() {
-        dst[i] = dst[i].under(src_const, BlendMode::Normal);
     }
 }
 
@@ -475,8 +390,8 @@ fn clip_rect(
 /// **Hairline convention:** a `0` width or height means "1 pixel thick" along that axis — pass `rect_h = 0` for a horizontal hairline, `rect_w = 0` for a vertical one, both `0` for a single-pixel dot. This lets callers draw rules/dividers without inventing a thickness; for a thicker line pass the real pixel count. (Negative dimensions stay a no-op.)
 ///
 /// `mask: Some(&AlphaMask)` multiplies each pixel's mask alpha into `colour`'s opacity (`effective_opacity = colour_opacity * mask_alpha >> 8`) — used for shaped textbox interiors, scroll fades, etc. `mask: None` skips that math entirely.
-pub fn fill_rect(
-    canvas: &mut Canvas,
+pub fn fill_rect<P: Pixel>(
+    canvas: &mut Canvas<P>,
     x: isize,
     y: isize,
     rect_w: isize,
@@ -496,7 +411,8 @@ pub fn fill_rect(
     }
     let (x_min, y_min, x_max, y_max) = clip_rect(clip, x, y, rect_w, rect_h);
     canvas.damage.add_bounds(x_min, y_min, x_max, y_max);
-    let pixels: &mut [u32] = canvas.pixels;
+    let colour = P::from_g2t8(colour);
+    let pixels: &mut [P] = canvas.pixels;
     match mask {
         None => {
             for row in y_min..y_max {
@@ -509,19 +425,20 @@ pub fn fill_rect(
         }
         Some(m) => {
             // Mask convention matches `TextRenderer::render_buffer_u32`: `effective_α = colour_α × mask_α / 255` (opacity multiplies). Mask=0 → pixel fully clipped; mask=255 → colour passes thru at full α. The previous implementation here used `colour_opacity = 255 - α`, which inverted the semantics — for an opaque colour (α=0xFF) the mask was multiplied by zero and had no effect, so masks were silently ineffective on solid fills.
-            let colour_alpha = (colour >> 24) & 0xFF;
-            let colour_rgb = colour & 0x00FF_FFFF;
+            let colour_alpha = colour.alpha();
+            let colour_rgb = colour.rgb();
             for row in y_min..y_max {
                 let base = row * buf_w;
                 for col in x_min..x_max {
                     let idx = base + col;
                     let mask_a = m.pixels[idx] as u32;
                     // Floor `>> 8` with the +1 weight bump instead of `/ 255` (house convention, paint.rs module doc): mask 255 → +1 → ×256 passes colour_α thru EXACTLY, mask 0 → ×1 floors to 0, everything between lands within 1 LSB of the exact 255-division — and the shift is far cheaper than the division in this per-pixel loop.
+                    // The `>> 8` is the mask's own depth (an AlphaMask is bytes at every pixel depth), so α keeps the pixel's.
                     let effective_alpha = (colour_alpha * (mask_a + 1)) >> 8;
                     if effective_alpha == 0 {
                         continue;
                     }
-                    let masked = colour_rgb | (effective_alpha << 24);
+                    let masked = colour_rgb.with_alpha(effective_alpha);
                     pixels[idx] = pixels[idx].under(masked, BlendMode::Normal);
                 }
             }
@@ -530,8 +447,8 @@ pub fn fill_rect(
 }
 
 /// Stroke (outline) an axis-aligned rectangle. Draws four filled rect strips along the edges via [`fill_rect`]; corners are not joined separately because at 90° angles the strips meet cleanly.
-pub fn stroke_rect(
-    canvas: &mut Canvas,
+pub fn stroke_rect<P: Pixel>(
+    canvas: &mut Canvas<P>,
     x: isize,
     y: isize,
     rect_w: isize,
@@ -562,8 +479,8 @@ pub fn stroke_rect(
 /// SIMD inside a row is intentionally not done — the per-pixel RNG (`rng ^= rng.rotate_left(13).wrapping_add(const)`) is a serial dependency chain; vectorizing it would require N independent RNG streams per lane and would change photon's visual pattern. If profiling shows the per-row scalar work still dominating after Rayon, that's the next lever.
 ///
 /// Clip restricts the row range. Mask isn't supported here (background is bg — masking it would mean "draw nothing where mask is zero" which is the same as just clearing afterward; if you need that, do it explicitly).
-pub fn background_noise(
-    canvas: &mut Canvas,
+pub fn background_noise<P: Pixel>(
+    canvas: &mut Canvas<P>,
     shimmer: usize,
     fullscreen: bool,
     scroll_offset: isize,
@@ -577,8 +494,8 @@ pub fn background_noise(
 /// The noise mirrors left/right around `split_x` (the "texture origin"); `None` = the buffer centre `width/2` (what plain [`background_noise`] uses).
 /// `left_scroll = None` scrolls both halves together by `scroll_offset` (the chat / single-pane case); `Some(v)` scrolls the LEFT half by `v` while the right half keeps `scroll_offset` — so a split pane (e.g. the settings rail vs content) scrolls each half with its own pane, with the origin sitting on the divider between them.
 #[allow(clippy::too_many_arguments)]
-pub fn background_noise_split(
-    canvas: &mut Canvas,
+pub fn background_noise_split<P: Pixel>(
+    canvas: &mut Canvas<P>,
     shimmer: usize,
     fullscreen: bool,
     scroll_offset: isize,
@@ -613,7 +530,7 @@ pub fn background_noise_split(
         return;
     }
     canvas.damage.add_bounds(x_start, row_start, x_end, row_end);
-    let pixels: &mut [u32] = canvas.pixels;
+    let pixels: &mut [P] = canvas.pixels;
     let resolved_base = base.unwrap_or(crate::theme::BG_BASE);
     crate::par::par_rows(pixels, buf_w, row_start, row_end, |row_idx, row_pixels| {
         background_row(
@@ -634,8 +551,8 @@ pub fn background_noise_split(
 
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn background_row(
-    row_pixels: &mut [u32],
+fn background_row<P: Pixel>(
+    row_pixels: &mut [P],
     _width: usize,
     row: isize,
     height: usize,
@@ -648,13 +565,13 @@ fn background_row(
     base: u32,
 ) {
     use crate::theme::{BG_MASK, BG_SPECKLE};
-    // Noise math runs in visible-RGB space (matching photon's reference). At the store site we flip the visible result to stored darkness via XOR, then OR α=0xFF for opaque. Mask off the top byte first to strip any carry from `wrapping_add`.
-    const VISIBLE_TO_DARK_FLIP: u32 = 0x00FFFFFF;
-    const RGB_MASK: u32 = 0x00FFFFFF;
-    const OPAQUE_ALPHA: u32 = 0xFF000000;
-    // Hybrid 2-pass: pass 1 fills `noise_buf` with the row's chunk of noise values via the serial RNG/colour chain (branches stay scalar — predicating the speckle gate would cost as much as it saves). Pass 2 hands the chunk to the 8-wide SIMD under-blend kernel (`under_chunk_normal_dispatch`), which composites it into row_pixels at ~1 cycle/pixel amortized. Output is bit-identical to the old straight-scalar version.
+    // Noise math runs in visible-RGB space (matching photon's reference), on the 8-bit authored palette (BG_BASE, BG_MASK, BG_SPECKLE are bytes). At the store site we flip the visible result to stored darkness via XOR, then OR α=0xFF for opaque, and widen the 8-bit pixel to the canvas's depth. Mask off the top byte first to strip any carry from `wrapping_add`.
+    const VISIBLE_TO_DARK_FLIP: u32 = Argb8::RGB_MASK;
+    const RGB_MASK: u32 = Argb8::RGB_MASK;
+    const OPAQUE_ALPHA: u32 = Argb8::OPAQUE;
+    // Hybrid 2-pass: pass 1 fills `noise_buf` with the row's chunk of noise values via the serial RNG/colour chain (branches stay scalar — predicating the speckle gate would cost as much as it saves). Pass 2 hands the chunk to the depth's under-blend chunk kernel (`Pixel::under_chunk_normal`, 8-wide SIMD for Argb8), which composites it into row_pixels at ~1 cycle/pixel amortized. Output is bit-identical to the old straight-scalar version.
     const CHUNK: usize = 64;
-    let mut noise_buf = [0u32; CHUNK];
+    let mut noise_buf = [P::EMPTY; CHUNK];
     let ones = 0x0001_0101u32;
     // RNG chain is explicitly u64 (not usize) so the noise pattern is bit-identical on 32-bit targets (wasm32 browser renderer) and 64-bit desktops — same seed, same wrap points.
     // Each half's seed is keyed by its OWN scrolled row, so equal scroll → identical seed → the two halves stay mirror-locked (the chat case); different scroll → each half's texture tracks its pane (the split settings case).
@@ -685,9 +602,9 @@ fn background_row(
                 colour = colour.wrapping_sub(subtractor) & BG_MASK;
             }
             noise_buf[i] =
-                ((colour.wrapping_add(base) & RGB_MASK) ^ VISIBLE_TO_DARK_FLIP) | OPAQUE_ALPHA;
+                P::from_g2t8(((colour.wrapping_add(base) & RGB_MASK) ^ VISIBLE_TO_DARK_FLIP) | OPAQUE_ALPHA);
         }
-        under_chunk_normal_dispatch(&mut row_pixels[x..x + chunk_len], &noise_buf[..chunk_len]);
+        P::under_chunk_normal(&mut row_pixels[x..x + chunk_len], &noise_buf[..chunk_len]);
         x += chunk_len;
     }
 
@@ -709,9 +626,9 @@ fn background_row(
                 colour = colour.wrapping_sub(subtractor) & BG_MASK;
             }
             noise_buf[i] =
-                ((colour.wrapping_add(base) & RGB_MASK) ^ VISIBLE_TO_DARK_FLIP) | OPAQUE_ALPHA;
+                P::from_g2t8(((colour.wrapping_add(base) & RGB_MASK) ^ VISIBLE_TO_DARK_FLIP) | OPAQUE_ALPHA);
         }
-        under_chunk_normal_dispatch(&mut row_pixels[chunk_lo..x_hi], &noise_buf[..chunk_len]);
+        P::under_chunk_normal(&mut row_pixels[chunk_lo..x_hi], &noise_buf[..chunk_len]);
         x_hi = chunk_lo;
     }
 }
@@ -764,8 +681,8 @@ pub static DEBUG_SHOW_DAMAGE: core::sync::atomic::AtomicBool =
 ///
 /// Topmost-first: text glyphs paint first; the semi-opaque panel background fills the gaps behind them.
 #[cfg(feature = "text")]
-pub fn draw_chord_hint(
-    canvas: &mut Canvas,
+pub fn draw_chord_hint<P: Pixel>(
+    canvas: &mut Canvas<P>,
     text: &mut crate::text::TextRenderer,
     hints: &[(&str, &str)],
     span: Coord,
@@ -860,8 +777,8 @@ impl DebugStats {
 ///
 /// `strip_y` is the canvas-relative row where the strip's top edge lands. Callers can pass any value that fits inside the canvas (`strip_y + DEBUG_STRIP_H ≤ canvas.height`); the host typically points the canvas at a dedicated `DEBUG_STRIP_H`-tall staging buffer with `strip_y = 0` so the strip never touches the app's scratch.
 #[cfg(feature = "text")]
-pub fn draw_debug_strip(
-    canvas: &mut Canvas,
+pub fn draw_debug_strip<P: Pixel>(
+    canvas: &mut Canvas<P>,
     text: &mut crate::text::TextRenderer,
     stats: &DebugStats,
     strip_y: usize,
@@ -910,17 +827,21 @@ pub const DEBUG_STRIP_H: usize = 24;
 
 
 
-pub fn draw_blinkey(canvas: &mut Canvas, bx: usize, by: usize, height: usize, top_bright: bool) {
+pub fn draw_blinkey<P: Pixel>(canvas: &mut Canvas<P>, bx: usize, by: usize, height: usize, top_bright: bool) {
     draw_blinkey_tinted(canvas, bx, by, height, top_bright, (255, 255, 255));
 }
 
 /// The blinkey in a COLOUR: the same brightness wave, scaled per channel by `tint` (255 = the full wave, 0 = that channel stays dark). White tint = the plain blinkey; a link-purple caret is (160, 80, 255). Same bounds contract as [`draw_blinkey`].
-pub fn draw_blinkey_tinted(canvas: &mut Canvas, bx: usize, by: usize, height: usize, top_bright: bool, tint: (u8, u8, u8)) {
+pub fn draw_blinkey_tinted<P: Pixel>(canvas: &mut Canvas<P>, bx: usize, by: usize, height: usize, top_bright: bool, tint: (u8, u8, u8)) {
     let buf_w = canvas.width;
     // Damage: ±7 horizontal spread × `height` vertical band. Caller's bounds invariant (bx ≥ 7, bx < buf_w-7) guarantees this stays in-buffer.
     canvas.damage.add_bounds(bx - 7, by, bx + 8, by + height);
-    let pixels: &mut [u32] = canvas.pixels;
+    let pixels: &mut [P] = canvas.pixels;
     let half = height / 2;
+    // The white stop in this depth's darkness, per channel.
+    let white = P::from_g2t8(crate::theme::WHITE).channels();
+    // The wave is authored on the 8-bit scale (CURSOR_BRIGHTNESS); ONE / 255 is exactly 1 at 8 bits and carries the wave's fraction to 16.
+    let to_depth = P::ONE as f32 / 255.;
     for y in by..by + height {
         let idx = y * buf_w + bx;
         let t = (y - by - half) as isize as f32 / half as f32;
@@ -929,19 +850,16 @@ pub fn draw_blinkey_tinted(canvas: &mut Canvas, bx: usize, by: usize, height: us
         } else {
             (1.0 - t * t) * (1.0 + t) * (1.0 + t) * crate::theme::CURSOR_BRIGHTNESS
         };
-        let w = wave as u32;
+        let w = (wave * to_depth) as u32;
         for dx in -7i32..=7 {
             // The cursor is a BRIGHT wave. In the α + darkness convention (RGB bytes are darkness, `0 = white`), brightening means REDUCING darkness — a per-channel subtract (signed, floored by the white stop below), NOT the add the visible-RGB original used. (Photon's buffer was visible-space, so it added; the port kept the `+=` which silently darkened the cursor into invisibility against a dark field.) α is preserved.
             let k = w >> dx.unsigned_abs();
-            let (kr, kg, kb) = (k * tint.0 as u32 / 255, k * tint.1 as u32 / 255, k * tint.2 as u32 / 255);
+            let ks = [k * tint.0 as u32 / 255, k * tint.1 as u32 / 255, k * tint.2 as u32 / 255];
             let p = &mut pixels[(idx as isize + dx as isize) as usize];
-            let a = *p & 0xFF00_0000;
             // Brightening stops at diffuse white (theme::WHITE), never darkness 0: past white is a 9.7× glow on an HDR surface, and SDR clipped it to white anyway. A pixel already brighter than white keeps its own light.
-            let lift = |d: u32, k: u32, shift: u32| (d as i32 - k as i32).max(d.min((crate::theme::WHITE >> shift) & 0xFF) as i32) as u32;
-            let r = lift((*p >> 16) & 0xFF, kr, 16);
-            let g = lift((*p >> 8) & 0xFF, kg, 8);
-            let b = lift(*p & 0xFF, kb, 0);
-            *p = a | (r << 16) | (g << 8) | b;
+            let d = p.channels();
+            let lifted: [u32; 3] = core::array::from_fn(|c| (d[c] as i32 - ks[c] as i32).max(d[c].min(white[c]) as i32) as u32);
+            *p = P::from_channels(p.alpha(), lifted);
         }
     }
 }
@@ -950,8 +868,8 @@ pub fn draw_blinkey_tinted(canvas: &mut Canvas, bx: usize, by: usize, height: us
 /// Fill a circle with a 1-pixel-wide AA edge ring. Center `(cx, cy)` and `radius` are in pixels; `colour` is straight-alpha ARGB (the AA coverage modulates the supplied alpha, so a translucent fill stays translucent at the edge). Optional `mask` multiplies into the per-pixel alpha for soft clipping.
 ///
 /// AA via gradient-magnitude (no sqrt): for a pixel at squared distance `d²`, coverage is `(r_outer² - d²) / (r_outer² - r_inner²)` where `r_outer = radius` and `r_inner = radius - 1`. Gives a smooth 0→1 ramp across one pixel of edge.
-pub fn circle_filled(
-    canvas: &mut Canvas,
+pub fn circle_filled<P: Pixel>(
+    canvas: &mut Canvas<P>,
     cx: isize,
     cy: isize,
     radius: isize,
@@ -974,7 +892,7 @@ pub fn circle_filled(
         let y1 = (cy + radius + 1).min(c.y_end as isize).max(0) as usize;
         canvas.damage.add_bounds(x0, y0, x1, y1);
     }
-    let pixels: &mut [u32] = canvas.pixels;
+    let pixels: &mut [P] = canvas.pixels;
     let clip = Clip::resolve(clip, buf_w, buf_h);
     if let Some(m) = mask {
         assert_mask_matches_buffer(m, buf_w, buf_h);
@@ -994,9 +912,10 @@ pub fn circle_filled(
         2 * r_outer + 1,
     );
 
-    // α + darkness: top byte IS opacity; use directly. RGB darkness intact.
-    let fg_opacity = (colour >> 24) & 0xFF;
-    let colour_rgb = colour & 0x00FF_FFFF;
+    // α + darkness: the α field IS opacity; use directly. RGB darkness intact.
+    let colour = P::from_g2t8(colour);
+    let fg_opacity = colour.alpha();
+    let colour_rgb = colour.rgb();
 
     for py in y_min..y_max {
         let dy = py as isize - cy;
@@ -1008,18 +927,20 @@ pub fn circle_filled(
             if dist2 > r_outer2 {
                 continue;
             }
+            // Coverage in the depth's own fixed point, `1 << DEPTH` = whole pixel (256 at 8 bits).
             let coverage: u32 = if dist2 <= r_inner2 {
-                256
+                1 << P::DEPTH
             } else {
-                (((r_outer2 - dist2) << 8) / edge_range) as u32
+                (((r_outer2 - dist2) << P::DEPTH) / edge_range) as u32
             };
-            let scaled_opacity = (fg_opacity * coverage) >> 8;
+            let scaled_opacity = (fg_opacity * coverage) >> P::DEPTH;
             let idx = base + px;
+            // The mask is bytes at every depth, so its `>> 8` stays.
             let final_opacity = match mask {
                 Some(m) => (scaled_opacity * m.pixels[idx] as u32) >> 8,
                 None => scaled_opacity,
             };
-            let scaled_colour = colour_rgb | (final_opacity << 24);
+            let scaled_colour = colour_rgb.with_alpha(final_opacity);
             pixels[idx] = pixels[idx].under(scaled_colour, BlendMode::Normal);
         }
     }
@@ -1028,6 +949,7 @@ pub fn circle_filled(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pixel::Blend;
 
     #[test]
     fn pack_unpack_round_trip() {

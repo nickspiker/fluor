@@ -4,12 +4,15 @@
 
 use crate::canvas::{Canvas, Damage};
 use crate::paint::{AlphaMask, Clip, Transform};
-use crate::pixel::{Blend, BlendMode};
+use crate::pixel::{BlendMode, Pixel};
 use cosmic_text::fontdb::Database;
 use cosmic_text::{Attrs, Buffer, Fallback, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
 use unicode_script::Script;
 use swash::scale::{Render, ScaleContext, Source, image::Image as SwashImage};
 use swash::zeno::Transform as PathTransform;
+
+// The 8-bit-only blits (legacy byte buffers, additive tints), kept apart from the α + darkness path every depth shares.
+mod argb8;
 
 /// Report the painted text bbox to the canvas damage accumulator. Bbox is the alignment-adjusted text rect clipped to buffer dimensions — slightly conservative versus the per-glyph union, but cheap and never under-reports. `alignment`: 0 = center, 1 = left, 2 = right (matching `render_buffer_u32`'s convention).
 #[inline]
@@ -425,15 +428,15 @@ impl TextRenderer {
 
 
     /// Draw left-aligned styled text. `x, y` = left edge, vertical center. Returns the drawn width. The whole "how" lives in [`TextStyle`]; clip and mask stay positional because they're render-target concerns, not style.
-    pub fn draw_text_left(&mut self, canvas: &mut Canvas, text: &str, x: f32, y: f32, style: &TextStyle, clip: Option<Clip>, mask: Option<&AlphaMask>) -> f32 {
+    pub fn draw_text_left<P: Pixel>(&mut self, canvas: &mut Canvas<P>, text: &str, x: f32, y: f32, style: &TextStyle, clip: Option<Clip>, mask: Option<&AlphaMask>) -> f32 {
         self.draw_text_left_u32(canvas, text, x, y, style.size, style.weight, style.colour, style.font, clip, mask, style.transform(), style.shear)
     }
     /// Draw center-aligned styled text (`x` = center).
-    pub fn draw_text_center(&mut self, canvas: &mut Canvas, text: &str, x: f32, y: f32, style: &TextStyle, clip: Option<Clip>, mask: Option<&AlphaMask>) -> f32 {
+    pub fn draw_text_center<P: Pixel>(&mut self, canvas: &mut Canvas<P>, text: &str, x: f32, y: f32, style: &TextStyle, clip: Option<Clip>, mask: Option<&AlphaMask>) -> f32 {
         self.draw_text_center_u32(canvas, text, x, y, style.size, style.weight, style.colour, style.font, clip, mask, style.transform(), style.shear)
     }
     /// Draw right-aligned styled text (`x` = right edge).
-    pub fn draw_text_right(&mut self, canvas: &mut Canvas, text: &str, x: f32, y: f32, style: &TextStyle, clip: Option<Clip>, mask: Option<&AlphaMask>) -> f32 {
+    pub fn draw_text_right<P: Pixel>(&mut self, canvas: &mut Canvas<P>, text: &str, x: f32, y: f32, style: &TextStyle, clip: Option<Clip>, mask: Option<&AlphaMask>) -> f32 {
         self.draw_text_right_u32(canvas, text, x, y, style.size, style.weight, style.colour, style.font, clip, mask, style.transform(), style.shear)
     }
     /// Measure styled text width: summed advances × stretch (skew and rotation don't change advances). Build ONE style and share it between measure and draw — that's the intended pattern.
@@ -441,9 +444,9 @@ impl TextRenderer {
         self.measure_text_width_impl(text, style.size, style.weight, style.font) * style.stretch
     }
 
-    fn draw_text_center_u32(
+    fn draw_text_center_u32<P: Pixel>(
         &mut self,
-        canvas: &mut Canvas,
+        canvas: &mut Canvas<P>,
         text: &str,
         x: f32,
         y: f32,
@@ -515,9 +518,9 @@ impl TextRenderer {
         }
     }
 
-    fn draw_text_left_u32(
+    fn draw_text_left_u32<P: Pixel>(
         &mut self,
-        canvas: &mut Canvas,
+        canvas: &mut Canvas<P>,
         text: &str,
         x: f32,
         y: f32,
@@ -586,9 +589,9 @@ impl TextRenderer {
         }
     }
 
-    fn draw_text_right_u32(
+    fn draw_text_right_u32<P: Pixel>(
         &mut self,
-        canvas: &mut Canvas,
+        canvas: &mut Canvas<P>,
         text: &str,
         x: f32,
         y: f32,
@@ -654,171 +657,6 @@ impl TextRenderer {
             text_width
         } else {
             0.
-        }
-    }
-
-    pub fn draw_text_center_legacy(
-        &mut self,
-        pixels: &mut [u8],
-        width: u32,
-        height: u32,
-        text: &str,
-        x: f32,
-        y: f32,
-        size: f32,
-        weight: u16,
-        colour: Vec<u8>,
-        rotation: u16,
-        font: &str, // "Josefin Slab" for UI, "Open Sans" for user content
-    ) -> f32 {
-        let attrs = Attrs::new()
-            .family(Family::Name(font))
-            .weight(Weight(self.optical_weight(weight, size)));
-
-        let metrics = Metrics::relative(size, 1.2);
-        let mut buffer = Buffer::new(&mut self.font_system, metrics);
-
-        buffer.set_size(None, None);
-        let cjk = self.note_packs(text);
-        set_text_vs(&mut buffer, text, &attrs, cjk);
-        buffer.shape_until_scroll(&mut self.font_system, false);
-
-        if let Some(run) = buffer.layout_runs().next() {
-            // Calculate text width
-            let mut min_x = f32::MAX;
-            let mut max_x = f32::MIN;
-
-            for glyph in run.glyphs {
-                min_x = min_x.min(glyph.x);
-                max_x = max_x.max(glyph.x + glyph.w);
-            }
-
-            let text_width = max_x - min_x;
-            let text_height = run.line_height;
-
-            self.render_buffer(
-                &mut buffer,
-                pixels,
-                width,
-                height,
-                x,
-                y,
-                text_width,
-                text_height,
-                colour,
-                rotation,
-                0, // center alignment
-            );
-
-            text_width
-        } else {
-            0.0
-        }
-    }
-
-    pub fn draw_text_left_legacy(
-        &mut self,
-        pixels: &mut [u8],
-        width: u32,
-        height: u32,
-        text: &str,
-        x: f32,
-        y: f32,
-        size: f32,
-        weight: u16,
-        colour: Vec<u8>,
-        rotation: u16,
-        font: &str, // "Josefin Slab" for UI, "Open Sans" for user content
-    ) -> f32 {
-        let attrs = Attrs::new()
-            .family(Family::Name(font))
-            .weight(Weight(self.optical_weight(weight, size)));
-
-        let metrics = Metrics::relative(size, 1.2);
-        let mut buffer = Buffer::new(&mut self.font_system, metrics);
-
-        buffer.set_size(None, None);
-        let cjk = self.note_packs(text);
-        set_text_vs(&mut buffer, text, &attrs, cjk);
-        buffer.shape_until_scroll(&mut self.font_system, false);
-
-        if let Some(run) = buffer.layout_runs().next() {
-            let mut text_width = 0.0f32;
-            for glyph in run.glyphs {
-                text_width = text_width.max(glyph.x + glyph.w);
-            }
-            let text_height = run.line_height;
-
-            self.render_buffer(
-                &mut buffer,
-                pixels,
-                width,
-                height,
-                x,
-                y,
-                text_width,
-                text_height,
-                colour,
-                rotation,
-                1, // left alignment
-            );
-
-            text_width
-        } else {
-            0.0
-        }
-    }
-
-    pub fn draw_text_right_legacy(
-        &mut self,
-        pixels: &mut [u8],
-        width: u32,
-        height: u32,
-        text: &str,
-        x: f32,
-        y: f32,
-        size: f32,
-        weight: u16,
-        colour: Vec<u8>,
-        rotation: u16,
-        font: &str, // "Josefin Slab" for UI, "Open Sans" for user content
-    ) -> f32 {
-        let attrs = Attrs::new()
-            .family(Family::Name(font))
-            .weight(Weight(self.optical_weight(weight, size)));
-
-        let metrics = Metrics::relative(size, 1.2);
-        let mut buffer = Buffer::new(&mut self.font_system, metrics);
-
-        buffer.set_size(None, None);
-        let cjk = self.note_packs(text);
-        set_text_vs(&mut buffer, text, &attrs, cjk);
-        buffer.shape_until_scroll(&mut self.font_system, false);
-
-        if let Some(run) = buffer.layout_runs().next() {
-            let mut text_width = 0.0f32;
-            for glyph in run.glyphs {
-                text_width = text_width.max(glyph.x + glyph.w);
-            }
-            let text_height = run.line_height;
-
-            self.render_buffer(
-                &mut buffer,
-                pixels,
-                width,
-                height,
-                x,
-                y,
-                text_width,
-                text_height,
-                colour,
-                rotation,
-                2, // right alignment
-            );
-
-            text_width
-        } else {
-            0.0
         }
     }
 
@@ -827,10 +665,10 @@ impl TextRenderer {
     /// **Per-glyph entry-point clamp:** the glyph's natural pixel rect `[glyph_x, glyph_x + glyph_w) × [glyph_y, glyph_y + glyph_h)` is intersected with `clip` once at the start of each glyph. The `cx`/`cy` inner-loop ranges are then pre-clamped so the loop body carries **no per-pixel bounds checks** — the math at entry is the proof. Photon's old per-pixel `if final_x < 0 || final_y >= height` is gone.
     ///
     /// **Mask:** if `Some(&AlphaMask)`, `mask.pixels[idx]` multiplies into the glyph alpha (effective_alpha = glyph_alpha × mask_alpha / 256). Used for soft-clipping text by textbox shape, scroll fade, etc.
-    fn render_buffer_u32(
+    fn render_buffer_u32<P: Pixel>(
         &mut self,
         buffer: &mut Buffer,
-        pixels: &mut [u32],
+        pixels: &mut [P],
         buf_w: usize,
         buf_h: usize,
         anchor_x: f32,
@@ -857,8 +695,10 @@ impl TextRenderer {
         };
 
         // Topmost-first: split colour into its α channel (combined with per-pixel glyph coverage and optional mask to form the glyph pixel's effective α) and its RGB-darkness payload (passed straight thru to under()). Replaces the legacy SWAR over-blend — text now composites with the same under() kernel as every other rasterizer.
-        let colour_alpha = (colour >> 24) & 0xFF;
-        let colour_dark = colour & 0x00FF_FFFF;
+        // The style colour is authored 8-bit `g2t`; widened once here to the buffer's depth.
+        let colour = P::from_g2t8(colour);
+        let colour_alpha = colour.alpha();
+        let colour_dark = colour.rgb();
 
         // Identity-or-None: cosmic-text's SwashCache fast path. Non-identity transform splits two ways:
         //   1. **Contour transform** (linear part only — `a, b, c, d`, *no translation*) → fed to swash::scale to rotate/skew/scale the glyph outline in font space. Translation is intentionally stripped here because swash applies its transform to the contour in glyph-local coords (origin at 0,0 baseline-left); leaving translation in would translate the contour itself, blowing the placement bbox out into absolute pixel space. The linear part is *snapped* per-glyph to the 1-pixel-arc rotation grid via [`crate::paint::snap_rotation`], so consecutive frames within the same rotation bin reuse the same rasterized glyph (cache hit). Snapping the contour but **not** the position lets the run slide smoothly along its arc while each glyph's orientation steps in cache-friendly bins.
@@ -1031,6 +871,7 @@ impl TextRenderer {
                                 None => 0xFF,
                             };
                             // Combine the glyph's own α with the style α and the mask, same product the Mask path uses (just with `sa` in place of the coverage byte).
+                            // Glyph and mask are bytes (÷ 255 each) and the style α is the depth's own, so the result is in the depth's scale; at 16 bits the product peaks at 255 · 65535 · 255 < 2³², still a u32.
                             let effective_alpha =
                                 (sa as u32 * colour_alpha * mask_alpha) / (255 * 255);
                             if effective_alpha == 0 {
@@ -1042,8 +883,8 @@ impl TextRenderer {
                             let dark_b = 255 - glyph_data[px + 2] as u32;
                             // Platform channel order via theme::fmt (identity on desktop, R↔B on Android) — every colour that reaches the buffer rides fmt; the emoji payload skipping it was the "R and B emoji colours appear swapped" Android bug (same class as the old swapped ring). fmt reorders only the RGB bytes and preserves α, so it's correct on the darkness-packed value.
                             // The bitmap is γ2-ish display bytes; the buffer is `g2t`, so the darkness takes the same light's code.
-                            let glyph_pixel = (effective_alpha << 24)
-                                | crate::theme::darkness_from_gamma2(crate::theme::fmt((dark_r << 16) | (dark_g << 8) | dark_b));
+                            let glyph_pixel = P::from_g2t8(crate::theme::darkness_from_gamma2(crate::theme::fmt((dark_r << 16) | (dark_g << 8) | dark_b)))
+                                .with_alpha(effective_alpha);
                             pixels[idx] = pixels[idx].under(glyph_pixel, BlendMode::Normal);
                         }
                     }
@@ -1069,484 +910,8 @@ impl TextRenderer {
                             if effective_alpha == 0 {
                                 continue;
                             }
-                            let glyph_pixel = (effective_alpha << 24) | colour_dark;
+                            let glyph_pixel = colour_dark.with_alpha(effective_alpha);
                             pixels[idx] = pixels[idx].under(glyph_pixel, BlendMode::Normal);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn render_buffer(
-        &mut self,
-        buffer: &mut Buffer,
-        pixels: &mut [u8],
-        width: u32,
-        height: u32,
-        anchor_x: f32,
-        anchor_y: f32,
-        text_width: f32,
-        text_height: f32,
-        colour: Vec<u8>,
-        rotation: u16,
-        alignment: u8, // 0=center, 1=left, 2=right
-    ) {
-        let channels = colour.len();
-
-        // Calculate the offset based on alignment
-        let (offset_x, offset_y) = match alignment {
-            0 => (anchor_x - text_width / 2.0, anchor_y - text_height / 2.0), // center
-            1 => (anchor_x, anchor_y - text_height / 2.0),                    // left
-            2 => (anchor_x - text_width, anchor_y - text_height / 2.0),       // right
-            _ => (anchor_x, anchor_y),
-        };
-
-        for run in buffer.layout_runs() {
-            let baseline_offset = run.line_y;
-
-            for glyph in run.glyphs {
-                let physical_glyph = glyph.physical((offset_x, offset_y), 1.);
-
-                if let Some(image) = self
-                    .swash_cache
-                    .get_image(&mut self.font_system, physical_glyph.cache_key)
-                {
-                    let glyph_x = physical_glyph.x + image.placement.left;
-                    let glyph_y = physical_glyph.y + baseline_offset as i32 - image.placement.top;
-
-                    // Draw the glyph bitmap
-                    let glyph_width = image.placement.width as usize;
-                    let glyph_height = image.placement.height as usize;
-                    // This LEGACY path composites in VISIBLE-RGB byte space (raw channel bytes over-blended with the visible tint `colour[c]`), NOT the u32 α+darkness domain of `render_buffer_u32`. So the Color branch here writes the source's visible sRGB channels DIRECTLY (no darkness complement) — the buffer isn't XOR-flipped at finalize. Colour glyph = `Content::Color` RGBA (4 bytes/pixel); Mask glyph = 1-byte coverage.
-                    let is_colour = image.content == swash::scale::image::Content::Color;
-
-                    for cy in 0..glyph_height {
-                        for cx in 0..glyph_width {
-                            // Source α: coverage byte for a Mask, the RGBA α for a colour glyph.
-                            let alpha = if is_colour {
-                                image.data[(cy * glyph_width + cx) * 4 + 3]
-                            } else {
-                                image.data[cy * glyph_width + cx]
-                            };
-                            if alpha > 0 {
-                                let py_base = glyph_y + cy as i32;
-                                let px_base = glyph_x + cx as i32;
-
-                                // Calculate position relative to anchor point
-                                let rel_x = px_base as f32 - anchor_x;
-                                let rel_y = py_base as f32 - anchor_y;
-
-                                // Rotate around the anchor point
-                                let (rot_x, rot_y) = match rotation {
-                                    90 => (rel_y, -rel_x),
-                                    180 => (-rel_x, -rel_y),
-                                    270 => (-rel_y, rel_x),
-                                    _ => (rel_x, rel_y),
-                                };
-
-                                // Convert back to absolute coordinates
-                                let final_x = (anchor_x + rot_x) as i32;
-                                let final_y = (anchor_y + rot_y) as i32;
-                                // Clip to the buffer: a glyph can land partly (or wholly) off-canvas — e.g. a mid-rotation sliver resize (observed 1440×202 on Android) put final_y negative, and the `as usize` cast wrapped it to ~2^64, indexing OOB (samsung panic, 2026-07-15). Skip the off-canvas pixels instead.
-                                // WHY/PROOF: final_x and final_y come from glyph positioning, negative or past the buffer whenever text runs off an edge — the cast to usize would wrap and the write would land outside the pixel buffer.
-                                if final_x < 0
-                                    || final_y < 0
-                                    || final_x >= width as i32
-                                    || final_y >= height as i32
-                                {
-                                    continue;
-                                }
-                                let offset = (final_y as usize * width as usize + final_x as usize)
-                                    * channels;
-
-                                let alpha_u16 = alpha as u16;
-                                let inv_alpha = 256 - alpha_u16;
-
-                                if is_colour {
-                                    // Composite the glyph's OWN visible sRGB, ignoring the style `colour`. Map source r,g,b onto the first three channels; any 4th (alpha) channel keeps the mask-path behaviour of tinting toward `colour[3]`.
-                                    let base = (cy * glyph_width + cx) * 4;
-                                    for c in 0..channels {
-                                        let src = if c < 3 {
-                                            image.data[base + c] as u16
-                                        } else {
-                                            colour[c] as u16
-                                        };
-                                        pixels[offset + c] = ((pixels[offset + c] as u16 * inv_alpha
-                                            + src * alpha_u16)
-                                            >> 8)
-                                            as u8;
-                                    }
-                                } else {
-                                    for c in 0..channels {
-                                        pixels[offset + c] = ((pixels[offset + c] as u16 * inv_alpha
-                                            + colour[c] as u16 * alpha_u16)
-                                            >> 8)
-                                            as u8;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Draw left-aligned text with additive/subtractive compositing (u32 ARGB version) Uses wrapping add/sub so it's reversible - subtract same colour to remove text add_mode: true = add colour, false = subtract colour
-    pub fn draw_text_left_additive_u32(
-        &mut self,
-        pixels: &mut [u32],
-        width: usize,
-        text: &str,
-        x: f32,
-        y: f32,
-        size: f32,
-        weight: u16,
-        colour: u32,
-        font: &str,
-        add_mode: bool,
-    ) -> f32 {
-        let attrs = Attrs::new()
-            .family(Family::Name(font))
-            .weight(Weight(self.optical_weight(weight, size)));
-
-        let metrics = Metrics::relative(size, 1.2);
-        let mut buffer = Buffer::new(&mut self.font_system, metrics);
-
-        buffer.set_size(None, None);
-        let cjk = self.note_packs(text);
-        set_text_vs(&mut buffer, text, &attrs, cjk);
-        buffer.shape_until_scroll(&mut self.font_system, false);
-
-        if let Some(run) = buffer.layout_runs().next() {
-            let mut text_width = 0.0f32;
-            for glyph in run.glyphs {
-                text_width = text_width.max(glyph.x + glyph.w);
-            }
-            let text_height = run.line_height;
-
-            self.render_buffer_left_additive_u32(
-                &mut buffer,
-                pixels,
-                width,
-                x,
-                y,
-                text_height,
-                add_mode,
-                colour,
-            );
-
-            text_width
-        } else {
-            0.
-        }
-    }
-
-    /// Draw center-aligned text with additive/subtractive compositing (u32 ARGB version) Uses wrapping add/sub so it's reversible - subtract same colour to remove text add_mode: true = add colour, false = subtract colour
-    pub fn draw_text_center_additive_u32(
-        &mut self,
-        pixels: &mut [u32],
-        width: usize,
-        text: &str,
-        x: f32,
-        y: f32,
-        size: f32,
-        weight: u16,
-        colour: u32,
-        font: &str,
-        add_mode: bool,
-    ) -> f32 {
-        let attrs = Attrs::new()
-            .family(Family::Name(font))
-            .weight(Weight(self.optical_weight(weight, size)));
-
-        let metrics = Metrics::relative(size, 1.2);
-        let mut buffer = Buffer::new(&mut self.font_system, metrics);
-
-        buffer.set_size(None, None);
-        let cjk = self.note_packs(text);
-        set_text_vs(&mut buffer, text, &attrs, cjk);
-        buffer.shape_until_scroll(&mut self.font_system, false);
-
-        if let Some(run) = buffer.layout_runs().next() {
-            let mut text_width = 0.0f32;
-            for glyph in run.glyphs {
-                text_width = text_width.max(glyph.x + glyph.w);
-            }
-            let text_height = run.line_height;
-
-            self.render_buffer_center_additive_u32(
-                &mut buffer,
-                pixels,
-                width,
-                x,
-                y,
-                text_height,
-                add_mode,
-                colour,
-            );
-
-            text_width
-        } else {
-            0.
-        }
-    }
-
-    /// Draw right-aligned text with additive/subtractive compositing (u32 ARGB version) Uses wrapping add/sub so it's reversible - subtract same colour to remove text add_mode: true = add colour, false = subtract colour
-    pub fn draw_text_right_additive_u32(
-        &mut self,
-        pixels: &mut [u32],
-        width: usize,
-        text: &str,
-        x: f32,
-        y: f32,
-        size: f32,
-        weight: u16,
-        colour: u32,
-        font: &str,
-        add_mode: bool,
-    ) -> f32 {
-        let attrs = Attrs::new()
-            .family(Family::Name(font))
-            .weight(Weight(self.optical_weight(weight, size)));
-
-        let metrics = Metrics::relative(size, 1.2);
-        let mut buffer = Buffer::new(&mut self.font_system, metrics);
-
-        buffer.set_size(None, None);
-        let cjk = self.note_packs(text);
-        set_text_vs(&mut buffer, text, &attrs, cjk);
-        buffer.shape_until_scroll(&mut self.font_system, false);
-
-        if let Some(run) = buffer.layout_runs().next() {
-            let mut text_width = 0.0f32;
-            for glyph in run.glyphs {
-                text_width = text_width.max(glyph.x + glyph.w);
-            }
-            let text_height = run.line_height;
-
-            self.render_buffer_right_additive_u32(
-                &mut buffer,
-                pixels,
-                width,
-                x,
-                y,
-                text_height,
-                add_mode,
-                colour,
-            );
-
-            text_width
-        } else {
-            0.
-        }
-    }
-
-    /// Render buffer with additive/subtractive compositing (u32 version)
-    fn render_buffer_left_additive_u32(
-        &mut self,
-        buffer: &mut Buffer,
-        pixels: &mut [u32],
-        width: usize,
-        anchor_x: f32,
-        anchor_y: f32,
-        text_height: f32,
-        add_mode: bool,
-        colour: u32,
-    ) {
-        let offset_x = anchor_x;
-        let offset_y = anchor_y - text_height / 2.;
-
-        for run in buffer.layout_runs() {
-            let baseline_offset = run.line_y;
-
-            for glyph in run.glyphs {
-                let physical_glyph = glyph.physical((offset_x, offset_y), 1.);
-
-                if let Some(image) = self
-                    .swash_cache
-                    .get_image(&mut self.font_system, physical_glyph.cache_key)
-                {
-                    let glyph_x = physical_glyph.x + image.placement.left;
-                    let glyph_y = physical_glyph.y + baseline_offset as i32 - image.placement.top;
-
-                    let glyph_width = image.placement.width as usize;
-                    let glyph_height = image.placement.height as usize;
-
-                    for cy in 0..glyph_height {
-                        for cx in 0..glyph_width {
-                            let alpha = image.data[cy * glyph_width + cx];
-                            if alpha > 0 {
-                                let final_x = glyph_x as isize + cx as isize;
-                                let final_y = glyph_y as isize + cy as isize;
-
-                                // WHY/PROOF: final_x and final_y come from glyph positioning, negative or past the buffer whenever text runs off an edge — the cast to usize would wrap and the write would land outside the pixel buffer.
-                                if final_x < 0 || final_y < 0 || final_x >= width as isize {
-                                    continue;
-                                }
-                                let idx = final_y as usize * width + final_x as usize;
-                                if idx >= pixels.len() {
-                                    continue;
-                                }
-
-                                // Scale colour by alpha, per-channel
-                                let a = alpha as u32;
-                                let r = ((colour >> 16) & 0xFF) * a >> 8;
-                                let g = ((colour >> 8) & 0xFF) * a >> 8;
-                                let b = (colour & 0xFF) * a >> 8;
-                                let contribution = (r << 16) | (g << 8) | b;
-
-                                if add_mode {
-                                    pixels[idx] = pixels[idx].wrapping_add(contribution);
-                                } else {
-                                    pixels[idx] = pixels[idx].wrapping_sub(contribution);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Render buffer with additive/subtractive compositing, center-aligned (u32 version)
-    fn render_buffer_center_additive_u32(
-        &mut self,
-        buffer: &mut Buffer,
-        pixels: &mut [u32],
-        width: usize,
-        anchor_x: f32,
-        anchor_y: f32,
-        text_height: f32,
-        add_mode: bool,
-        colour: u32,
-    ) {
-        // Calculate text width for centering
-        let text_width: f32 = buffer.layout_runs().fold(0.0, |max_width, run| {
-            let run_width = run.glyphs.iter().map(|g| g.w).sum::<f32>();
-            max_width.max(run_width)
-        });
-
-        let offset_x = anchor_x - text_width / 2.0;
-        let offset_y = anchor_y - text_height / 2.;
-
-        for run in buffer.layout_runs() {
-            let baseline_offset = run.line_y;
-
-            for glyph in run.glyphs {
-                let physical_glyph = glyph.physical((offset_x, offset_y), 1.);
-
-                if let Some(image) = self
-                    .swash_cache
-                    .get_image(&mut self.font_system, physical_glyph.cache_key)
-                {
-                    let glyph_x = physical_glyph.x + image.placement.left;
-                    let glyph_y = physical_glyph.y + baseline_offset as i32 - image.placement.top;
-
-                    let glyph_width = image.placement.width as usize;
-                    let glyph_height = image.placement.height as usize;
-
-                    for cy in 0..glyph_height {
-                        for cx in 0..glyph_width {
-                            let alpha = image.data[cy * glyph_width + cx];
-                            if alpha > 0 {
-                                let final_x = glyph_x as isize + cx as isize;
-                                let final_y = glyph_y as isize + cy as isize;
-
-                                // WHY/PROOF: final_x and final_y come from glyph positioning, negative or past the buffer whenever text runs off an edge — the cast to usize would wrap and the write would land outside the pixel buffer.
-                                if final_x < 0 || final_y < 0 || final_x >= width as isize {
-                                    continue;
-                                }
-                                let idx = final_y as usize * width + final_x as usize;
-                                if idx >= pixels.len() {
-                                    continue;
-                                }
-
-                                let a = alpha as u32;
-                                let r = ((colour >> 16) & 0xFF) * a >> 8;
-                                let g = ((colour >> 8) & 0xFF) * a >> 8;
-                                let b = (colour & 0xFF) * a >> 8;
-                                let contribution = (r << 16) | (g << 8) | b;
-
-                                if add_mode {
-                                    pixels[idx] = pixels[idx].wrapping_add(contribution);
-                                } else {
-                                    pixels[idx] = pixels[idx].wrapping_sub(contribution);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Render buffer with additive/subtractive compositing, right-aligned (u32 version)
-    fn render_buffer_right_additive_u32(
-        &mut self,
-        buffer: &mut Buffer,
-        pixels: &mut [u32],
-        width: usize,
-        anchor_x: f32,
-        anchor_y: f32,
-        text_height: f32,
-        add_mode: bool,
-        colour: u32,
-    ) {
-        // Calculate text width for right-alignment
-        let text_width: f32 = buffer.layout_runs().fold(0.0, |max_width, run| {
-            let run_width = run.glyphs.iter().map(|g| g.w).sum::<f32>();
-            max_width.max(run_width)
-        });
-
-        let offset_x = anchor_x - text_width;
-        let offset_y = anchor_y - text_height / 2.;
-
-        for run in buffer.layout_runs() {
-            let baseline_offset = run.line_y;
-
-            for glyph in run.glyphs {
-                let physical_glyph = glyph.physical((offset_x, offset_y), 1.);
-
-                if let Some(image) = self
-                    .swash_cache
-                    .get_image(&mut self.font_system, physical_glyph.cache_key)
-                {
-                    let glyph_x = physical_glyph.x + image.placement.left;
-                    let glyph_y = physical_glyph.y + baseline_offset as i32 - image.placement.top;
-
-                    let glyph_width = image.placement.width as usize;
-                    let glyph_height = image.placement.height as usize;
-
-                    for cy in 0..glyph_height {
-                        for cx in 0..glyph_width {
-                            let alpha = image.data[cy * glyph_width + cx];
-                            if alpha > 0 {
-                                let final_x = glyph_x as isize + cx as isize;
-                                let final_y = glyph_y as isize + cy as isize;
-
-                                // WHY/PROOF: final_x and final_y come from glyph positioning, negative or past the buffer whenever text runs off an edge — the cast to usize would wrap and the write would land outside the pixel buffer.
-                                if final_x < 0 || final_y < 0 || final_x >= width as isize {
-                                    continue;
-                                }
-                                let idx = final_y as usize * width + final_x as usize;
-                                if idx >= pixels.len() {
-                                    continue;
-                                }
-
-                                let a = alpha as u32;
-                                let r = ((colour >> 16) & 0xFF) * a >> 8;
-                                let g = ((colour >> 8) & 0xFF) * a >> 8;
-                                let b = (colour & 0xFF) * a >> 8;
-                                let contribution = (r << 16) | (g << 8) | b;
-
-                                if add_mode {
-                                    pixels[idx] = pixels[idx].wrapping_add(contribution);
-                                } else {
-                                    pixels[idx] = pixels[idx].wrapping_sub(contribution);
-                                }
-                            }
                         }
                     }
                 }
@@ -1625,261 +990,6 @@ impl TextRenderer {
         widths
     }
 
-    /// Render a single character with additive blending (reversible with wrapping_add/sub) Returns the width of the rendered character in pixels
-    pub fn render_char_additive(
-        &mut self,
-        pixels: &mut [u8],
-        width: u32,
-        height: u32,
-        ch: char,
-        x_offset: f32, // Absolute x position
-        y_center: f32, // Vertical center position
-        size: f32,
-        weight: u16,
-        font: &str,
-        colour: [u8; 4],
-        textbox_mask: &[u8], // Single-channel mask for textbox boundaries
-        textbox_x: usize,    // Textbox top-left x
-        textbox_y: usize,    // Textbox top-left y
-        textbox_width: usize,
-        add_mode: bool, // true = add, false = subtract
-    ) -> f32 {
-        let attrs = Attrs::new()
-            .family(Family::Name(font))
-            .weight(Weight(self.optical_weight(weight, size)));
-
-        let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(size, size));
-        buffer.set_size(Some(size * 2.0), Some(size * 2.0));
-
-        let text = ch.to_string();
-        buffer.set_text(&text, &attrs, Shaping::Advanced, None);
-        // cosmic-text 0.19 shapes on demand: lay the text out before reading its runs.
-        buffer.shape_until_scroll(&mut self.font_system, false);
-
-        let mut char_width: f32 = 0.0;
-
-        // Render the character glyph
-        for run in buffer.layout_runs() {
-            char_width = char_width.max(run.line_w);
-            let baseline_offset = run.line_y;
-
-            for glyph in run.glyphs {
-                let offset_y = y_center - size / 2.0;
-                let physical_glyph = glyph.physical((x_offset, offset_y), 1.);
-
-                if let Some(image) = self
-                    .swash_cache
-                    .get_image(&mut self.font_system, physical_glyph.cache_key)
-                {
-                    let glyph_x = physical_glyph.x + image.placement.left;
-                    let glyph_y = physical_glyph.y + baseline_offset as i32 - image.placement.top;
-
-                    let glyph_width = image.placement.width as usize;
-                    let glyph_height = image.placement.height as usize;
-
-                    for cy in 0..glyph_height {
-                        for cx in 0..glyph_width {
-                            let glyph_alpha = image.data[cy * glyph_width + cx];
-                            if glyph_alpha > 0 {
-                                let final_x = glyph_x + cx as i32;
-                                let final_y = glyph_y + cy as i32;
-
-                                // Check bounds
-                                if final_x >= 0
-                                    && (final_x as u32) < width
-                                    && final_y >= 0
-                                    && (final_y as u32) < height
-                                {
-                                    // Get textbox mask value for this pixel
-                                    let rel_x = final_x as isize - textbox_x as isize;
-                                    let rel_y = final_y as isize - textbox_y as isize;
-
-                                    let mask_alpha = if rel_x >= 0
-                                        && rel_x < textbox_width as isize
-                                        && rel_y >= 0
-                                        && rel_y
-                                            < textbox_mask.len() as isize / textbox_width as isize
-                                    {
-                                        textbox_mask
-                                            [rel_y as usize * textbox_width + rel_x as usize]
-                                    } else {
-                                        0 // Outside textbox
-                                    };
-
-                                    if mask_alpha > 0 {
-                                        // Apply both glyph alpha and textbox mask
-                                        let combined_alpha =
-                                            (glyph_alpha as u16 * mask_alpha as u16) >> 8;
-
-                                        let pixel_idx = (final_y as usize * width as usize
-                                            + final_x as usize)
-                                            * 4;
-
-                                        // Apply colour with combined alpha to RGB channels (skip alpha channel)
-                                        for c in 0..3 {
-                                            let value =
-                                                ((colour[c] as u16 * combined_alpha) >> 8) as u8;
-                                            if add_mode {
-                                                pixels[pixel_idx + c] =
-                                                    pixels[pixel_idx + c].wrapping_add(value);
-                                            } else {
-                                                pixels[pixel_idx + c] =
-                                                    pixels[pixel_idx + c].wrapping_sub(value);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        char_width
-    }
-
-    /// Draw text range with horizontal scrolling, using additive/subtractive compositing Automatically clips using textbox_mask (same as blinkey blinking)
-    pub fn draw_text_scrollable_additive(
-        &mut self,
-        pixels: &mut [u8],
-        width: u32,
-        height: u32,
-        text: &str,
-        char_widths: &[usize],
-        start_char_index: usize,
-        end_char_index: usize,
-        x_start: f32,
-        y_center: f32,
-        size: f32,
-        weight: u16,
-        font: &str,
-        colour: [u8; 4],
-        textbox_mask: &[u8],
-        textbox_x: usize,
-        textbox_y: usize,
-        textbox_width: usize,
-        add_mode: bool,
-    ) {
-        let mut x_offset = x_start;
-        let chars: Vec<char> = text.chars().collect();
-
-        // WHY/PROOF: the char range is the caller's, which can run past the string — chars[i] would panic.
-        for i in start_char_index..end_char_index.min(chars.len()) {
-            let ch = chars[i];
-            self.render_char_additive(
-                pixels,
-                width,
-                height,
-                ch,
-                x_offset,
-                y_center,
-                size,
-                weight,
-                font,
-                colour,
-                textbox_mask,
-                textbox_x,
-                textbox_y,
-                textbox_width,
-                add_mode,
-            );
-            x_offset += char_widths[i] as f32;
-        }
-    }
-
-    /// Render single character with additive/subtractive compositing (u32 ARGB version) pixel += char_alpha * mask_alpha * brightness (or -= for subtract)
-    pub fn render_char_additive_u32(
-        &mut self,
-        pixels: &mut [u32],
-        width: usize,
-        ch: char,
-        x_offset: f32,
-        y_center: f32,
-        size: f32,
-        weight: u16,
-        font: &str,
-        colour: u32,
-        textbox_mask: &[u8],
-        add_mode: bool,
-    ) -> f32 {
-        let attrs = Attrs::new()
-            .family(Family::Name(font))
-            .weight(Weight(self.optical_weight(weight, size)));
-
-        let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(size, size));
-        buffer.set_size(Some(size * 2.0), Some(size * 2.0));
-
-        let text = ch.to_string();
-        buffer.set_text(&text, &attrs, Shaping::Advanced, None);
-        // cosmic-text 0.19 shapes on demand: lay the text out before reading its runs.
-        buffer.shape_until_scroll(&mut self.font_system, false);
-
-        let mut char_width: f32 = 0.0;
-
-        for run in buffer.layout_runs() {
-            let baseline_offset = run.line_y;
-
-            if run.glyphs.is_empty() {
-                char_width = run.line_w;
-            }
-
-            for glyph in run.glyphs {
-                char_width = char_width.max(glyph.x + glyph.w);
-
-                let offset_y = y_center - size / 2.0;
-                let physical_glyph = glyph.physical((x_offset, offset_y), 1.);
-
-                if let Some(image) = self
-                    .swash_cache
-                    .get_image(&mut self.font_system, physical_glyph.cache_key)
-                {
-                    let glyph_x = physical_glyph.x + image.placement.left;
-                    let glyph_y = physical_glyph.y + baseline_offset as i32 - image.placement.top;
-
-                    let glyph_width = image.placement.width as usize;
-                    let glyph_height = image.placement.height as usize;
-
-                    let height = pixels.len() / width;
-                    for cy in 0..glyph_height {
-                        for cx in 0..glyph_width {
-                            let final_x = glyph_x + cx as i32;
-                            let final_y = glyph_y + cy as i32;
-                            // WHY: Glyph can be partially off-screen when textbox is scrolled PROOF: final_x/final_y are i32, can be negative or exceed bounds PREVENTS: Index out of bounds panic on wrapped negative values
-                            // WHY/PROOF: final_x and final_y come from glyph positioning, negative or past the buffer whenever text runs off an edge — the cast to usize would wrap and the write would land outside the pixel buffer.
-                            if final_x < 0
-                                || final_y < 0
-                                || final_x as usize >= width
-                                || final_y as usize >= height
-                            {
-                                continue;
-                            }
-                            let idx = final_y as usize * width + final_x as usize;
-                            let char_alpha = image.data[cy * glyph_width + cx];
-                            let mask_alpha = textbox_mask[idx];
-
-                            let combined_alpha = (char_alpha as u32 * mask_alpha as u32) >> 8;
-
-                            // Mask out alpha, multiply each channel by combined_alpha in one SIMD-style op
-                            let rb = (colour & 0x00_FF_00_FF) * combined_alpha;
-                            let g = (colour & 0x00_00_FF_00) * combined_alpha;
-
-                            let contribution =
-                                ((rb >> 8) & 0x00_FF_00_FF) | ((g >> 8) & 0x00_00_FF_00);
-
-                            if add_mode {
-                                pixels[idx] += contribution;
-                            } else {
-                                pixels[idx] -= contribution;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        char_width
-    }
 }
 
 #[cfg(test)]

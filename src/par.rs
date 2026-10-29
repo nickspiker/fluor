@@ -46,9 +46,9 @@ where
 
 /// Iterate a flat `pixels` slice in equal-sized chunks of `chunk_len` (handles trailing tail of any length). Closure receives `(chunk_offset_in_pixels, &mut chunk_slice)`. Same Rayon-vs- sequential dispatch as [`par_rows`] — used for whole-buffer passes (finalize, flatten, Op::Under) where row geometry doesn't matter and chunking by a multiple of cache-line size gives the best throughput.
 #[inline]
-pub fn par_chunks<F>(pixels: &mut [u32], chunk_len: usize, f: F)
+pub fn par_chunks<T: Send, F>(pixels: &mut [T], chunk_len: usize, f: F)
 where
-    F: Fn(usize, &mut [u32]) + Send + Sync,
+    F: Fn(usize, &mut [T]) + Send + Sync,
 {
     if chunk_len == 0 || pixels.is_empty() {
         return;
