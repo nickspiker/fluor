@@ -159,6 +159,27 @@ pub const DARK_TO_SDR: [u8; 256] = {
     t
 };
 
+/// [`DARK_TO_SDR`] at 16 bits, indexed by a stored 16-bit DARKNESS (65535 − code), with 8 bits of fraction kept for the present's dither: the SDR display code × 2⁸, white 255 × 2⁸ = 65280.
+/// The display code is γ2 of the light and a `g2t` code's light is atanh(code / 2¹⁶)², so the code is atanh(code / 2¹⁶) itself, clipped at white, × 255.
+/// Built at compile time: atanh accumulated code by code as ∫ dt / (1 − t²), Simpson's rule over each step in f64, stopping at white (the codes past tanh(1) × 2¹⁶ all show as white); the accumulated error is far below the 2⁻⁸ step each entry is rounded to, and `tests::dark16_to_sdr_is_atanh` holds the table to libm's atanh.
+/// A static, not a const: 128 KiB is one table in the binary, read in place.
+pub static DARK16_TO_SDR_Q8: [u16; 1 << 16] = {
+    const WHITE_Q8: f64 = (255 << 8) as f64;
+    let mut t = [WHITE_Q8 as u16; 1 << 16];
+    let h = 1. / ((1 << 16) as f64);
+    let mut acc = 0f64;
+    let mut code = 0usize;
+    while code < 1 << 16 && acc <= 1. {
+        t[(1 << 16) - 1 - code] = (acc * WHITE_Q8 + 0.5) as u16;
+        let x = code as f64 * h;
+        let m = x + h / 2.;
+        let e = x + h;
+        acc += h / 6. * (1. / (1. - x * x) + 4. / (1. - m * m) + 1. / (1. - e * e));
+        code += 1;
+    }
+    t
+};
+
 /// Where the display map's roll-off starts, as a fraction of the display's peak, when content is brighter than the display can show — vsf's `colour::display::DISPLAY_KNEE` (a test holds the copy to it).
 pub const DISPLAY_KNEE: f32 = 0.75;
 
@@ -238,10 +259,12 @@ impl HdrTable {
 /// The 10-BIT extended-brightness table (HDR plan, Android: RGBA_1010102, BT.2020, γ2.2, extended range — the format the Pixel's display processor composites itself, where F16 forced a GPU pass into an 8-bit sRGB target).
 /// On that surface 1023 is SDR white × the DECLARED ratio (SurfaceFlinger: layerBrightnessNits = sdrWhitePointNits × currentHdrSdrRatio), so every stored DARKNESS byte maps to (light ÷ declared)^(1/2.2) × 1023, clipped at the top. Declared 1 is a plain SDR surface (white near 1015); declared 9.7 still leaves SDR white about 360 codes, more than the `g2t` buffer's 194 below white.
 /// Rebuilt only when the declared ratio changes (an SDR frame never does).
+/// A 16-bit buffer reads `wide` instead: every 16-bit darkness → the 10-bit code × 2⁶ (the 6 bits of fraction the present dithers away), empty unless built by [`Hdr10Table::new_wide`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hdr10Table {
     pub code: [u16; 256],
     pub declared_q16: u32,
+    pub wide: alloc::vec::Vec<u16>,
 }
 
 impl Hdr10Table {
@@ -254,7 +277,23 @@ impl Hdr10Table {
             let v = (l / d).min(1.);
             code[dark] = (libm::powf(v, 1. / 2.2) * 1023. + 0.5) as u16;
         }
-        Hdr10Table { code, declared_q16: (d * 65536. + 0.5) as u32 }
+        Hdr10Table { code, declared_q16: (d * 65536. + 0.5) as u32, wide: alloc::vec::Vec::new() }
+    }
+
+    /// [`Hdr10Table::new`] with the 16-bit table as well: each 16-bit code's own light, atanh(code / 2¹⁶)², over the declared ratio, γ2.2, × 1023 × 2⁶.
+    /// 2¹⁶ entries (128 KiB), one atanh and one pow each, a few milliseconds: rebuilt only when the declared ratio moves, as the 8-bit table is.
+    pub fn new_wide(declared: f32) -> Self {
+        let mut t = Self::new(declared);
+        let d = t.declared();
+        t.wide = (0..1u32 << 16)
+            .map(|dark| {
+                let a = libm::atanhf(((1 << 16) - 1 - dark) as f32 / ((1 << 16) as f32));
+                // WHY/PROOF: as in `new` — light past the declared ratio would code above 1023 × 2⁶ and carry into the next channel once the dither's fraction is added.
+                let v = (a * a / d).min(1.);
+                (libm::powf(v, 1. / 2.2) * ((1023 << 6) as f32) + 0.5) as u16
+            })
+            .collect();
+        t
     }
 
     pub fn declared(&self) -> f32 {
@@ -534,6 +573,39 @@ mod tests {
     fn rec2020_matrix_is_vsfs() {
         for (i, v) in vsf::colour::VSF_RGB2REC2020.iter().enumerate() {
             assert_eq!(VSF_RGB2REC2020_Q16[i], (*v as f64 * 65536.0).round() as i64, "element {i}");
+        }
+    }
+
+    /// The compile-time 16-bit SDR table is libm's atanh, clipped at white, to the rounding of its last step, and it is the 8-bit table at every 8-bit code's own 16-bit code (`c × 2⁸`, the same light) to within a code.
+    /// Not half a code: the 8-bit table goes thru the light in Q16 and floors it on the way to γ2 (`(l × 65025) >> 16`), which near black, where the light is a few Q16 units, drops it most of a code (code 1: 0.996 exact, 0 in the 8-bit table).
+    #[test]
+    fn dark16_to_sdr_is_atanh() {
+        for d in 0..1usize << 16 {
+            let code = ((1 << 16) - 1 - d) as f64;
+            let want = libm::atanh(code / 65536.).min(1.) * 65280.;
+            let got = DARK16_TO_SDR_Q8[d] as f64;
+            assert!((got - want).abs() <= 0.5 + 1e-6, "darkness {d}: {got} vs {want}");
+        }
+        for c in 0..256usize {
+            let d16 = (255 - c) * 256 + 255;
+            let (q8, sdr) = (DARK16_TO_SDR_Q8[d16] as f64 / 256., G2T_TO_SDR[c] as f64);
+            assert!((q8 - sdr).abs() <= 1., "code {c}: {q8} vs {sdr}");
+        }
+        assert_eq!(DARK16_TO_SDR_Q8[0], 65280, "the top code shows as white");
+        assert_eq!(DARK16_TO_SDR_Q8[(1 << 16) - 1], 0, "black");
+    }
+
+    /// The 16-bit 10-bit table agrees with the 8-bit one at every 8-bit code's own 16-bit code.
+    #[test]
+    fn hdr10_wide_table_is_the_8_bit_one_widened() {
+        for declared in [1., 2.5, 9.7] {
+            let t = Hdr10Table::new_wide(declared);
+            assert_eq!(t.wide.len(), 1 << 16);
+            for dark in 0..256usize {
+                let wide = t.wide[dark * 256 + 255] as f64 / 64.;
+                assert!((wide - t.code[dark] as f64).abs() <= 1., "declared {declared}, darkness {dark}: {wide} vs {}", t.code[dark]);
+            }
+            assert!(t.wide.iter().all(|&c| c <= 1023 << 6));
         }
     }
 

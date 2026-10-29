@@ -62,8 +62,8 @@ const fn build_sqrt_brighten_lut() -> [u8; 256] {
 /// `deltas` and `last_active` are caller-owned slices the same length, sized to `registry.next_id` (= 1 + number of registered hit zones). With the u16 hit-id widening a fixed `[T; 256]` would either truncate the ID space or balloon to 256 KB per frame; slices keep the per-frame cost proportional to live widget count. IDs past `deltas.len()` are treated as `HIT_NONE` for safety — defensive against a stale paint stamping with an unregistered ID.
 ///
 /// Besides the constant wrap-sub deltas, a delta with [`OVERLAY_SQRT_BRIGHTEN`] set applies a per-pixel gamma lift instead: each visible channel becomes `sqrt(v/255)·255` (LUT'd). Nonlinear, so it can't be a constant delta — it brightens midtones hard while leaving black and white alone, which reads as the whole image glowing rather than a flat tint wash. Used by the chrome app-icon orb's hover.
-pub fn apply_overlay(
-    scratch: &[u32],
+pub fn apply_overlay<P: super::Finalize>(
+    scratch: &[P],
     persistent_screen: &mut [u32],
     scr_w: usize,
     win_ox: i32,
@@ -159,7 +159,8 @@ pub fn apply_overlay(
                     continue;
                 }
                 let raw = scratch[map_idx];
-                let visible = crate::theme::to_sdr_visible(raw);
+                let scr_x = (x as i32 + win_ox) as usize;
+                let visible = raw.to_sdr_visible_at(scr_x, scr_y);
                 let (r, g, b) = if sqrt {
                     // Per-pixel gamma lift: v' = sqrt(v/255)·255 per channel. See the doc note above.
                     (
@@ -174,7 +175,6 @@ pub fn apply_overlay(
                         ((visible & 0xFF) as u8).wrapping_sub(db) as u32,
                     )
                 };
-                let scr_x = (x as i32 + win_ox) as usize;
                 persistent_screen[scr_row + scr_x] = 0xFF00_0000 | (r << 16) | (g << 8) | b;
             }
         }

@@ -5,7 +5,7 @@
 //! Why 10-bit and not F16 (measured on a Pixel 8 Pro, AOSP read): SurfaceFlinger classifies an F16 BT.2020-linear layer as GENERIC_HDR (tone-mapped like video), the display processor cannot scan F16 out (`MPPUnspported`), and the GPU pass composites it into an 8-bit sRGB client target that squeezes SDR into its bottom codes while boosted. An extended-range layer of any other format with a ratio above 1.01 "self-promotes" to DISPLAY_HDR, and 1010102 stays on the display processor.
 //! On that path 1023 means SDR white × `current` (SurfaceFlinger: layerBrightnessNits = sdrWhitePointNits × currentHdrSdrRatio), so `current` is what the buffer was encoded for: the frame's peak light, capped at what the display grants ([`set_display_headroom`], fed from `Display.getHdrSdrRatio` and its listener) — a declaration past the grant would dim the whole layer, white with it.
 //! `desired` is the frame's own brightest light, never a constant: an SDR frame declares and asks 1, and its table never changes.
-//! The 8-bit `g2t` buffer and its blending are untouched: finalize maps it thru [`crate::theme::Hdr10Table`] (one read per channel), rebuilt only when the declared ratio moves.
+//! The `g2t` buffer and its blending are untouched: finalize maps it thru [`crate::theme::Hdr10Table`] (one read per channel; a 16-bit buffer reads its 16-bit table and dithers from 16 bits to 10), rebuilt only when the declared ratio moves.
 //! A buffer is rewritten only after SurfaceFlinger released it (the transaction's OnComplete hands back the release fence of the buffer it replaced, and the CPU lock waits on that fence); a frame with no free buffer is kept pending and shown on the next vsync.
 //! Everything resolves thru `dlsym` (API-26 floor); any missing piece or failure leaves the host on the 8-bit `ANativeWindow` path.
 
@@ -181,7 +181,7 @@ pub struct HdrPresent {
 
 impl HdrSurface {
     /// Build the child surface and its buffers, or `None` (not enabled, an API missing, an allocation refused) — the caller stays on the 8-bit path.
-    pub fn new(window: *mut ndk_sys::ANativeWindow, width: usize, height: usize) -> Option<Self> {
+    pub fn new<P: crate::paint::Finalize>(window: *mut ndk_sys::ANativeWindow, width: usize, height: usize) -> Option<Self> {
         if !ENABLED.load(Ordering::Relaxed) || width == 0 || height == 0 {
             return None;
         }
@@ -208,7 +208,7 @@ impl HdrSurface {
             }
             log::info!("HDR: extended-range surface {}×{} (RGBA_1010102, BT.2020 γ2.2 extended), granted {:.2}×", width, height, granted());
             LIVE.store(true, Ordering::Relaxed);
-            Some(HdrSurface { fns, sc, window, width, height, slots, shown: None, table: Hdr10Table::new(1.0), peak_code: 194, pending: false })
+            Some(HdrSurface { fns, sc, window, width, height, slots, shown: None, table: P::hdr10_table(1.0), peak_code: 194, pending: false })
         }
     }
 
@@ -217,14 +217,14 @@ impl HdrSurface {
     }
 
     /// Finalize `scratch` into a free buffer and show it with its dataspace and ratios. `dirty = false` and an unchanged table post nothing: SurfaceFlinger keeps showing the last buffer.
-    pub fn present(&mut self, scratch: &[u32], clip_mask: &[u8], dirty: bool) -> HdrPresent {
+    pub fn present<P: crate::paint::Finalize>(&mut self, scratch: &[P], clip_mask: &[u8], dirty: bool) -> HdrPresent {
         let dirty = dirty || core::mem::take(&mut self.pending);
         // DECLARE what the buffer spans: the content's peak, but never more than the display grants (a declaration past the grant makes SurfaceFlinger dim the whole layer, white with it). An SDR frame declares 1 and its table never changes.
         // WHY/PROOF: ASurfaceTransaction_setExtendedRangeBrightness rejects ratios below 1, and granted() is what the display reports (0 or below 1 on an SDR panel) — both floors keep the declaration legal.
         let light = |code: u8| (crate::theme::G2T_LIGHT_Q16[code as usize] as f32 / 65536.0).max(1.0);
         let declared = light(self.peak_code).min(granted().max(1.0));
         if (self.table.declared_q16 as i64 - (declared * 65536.0) as i64).abs() > 64 {
-            self.table = Hdr10Table::new(declared);
+            self.table = P::hdr10_table(declared);
         } else if !dirty && self.shown.is_some() {
             return HdrPresent { wrote: false, again: false };
         }
@@ -273,8 +273,9 @@ impl HdrSurface {
             // Above white is a choice, never an accident: when the frame's peak moves past white, name the first pixel that carries it (one scan on the edge, not per frame).
             if again && peak > 200 {
                 let want = 255 - peak as u32;
-                if let Some(at) = scratch.iter().position(|&p| p >> 24 != 0 && ((p & 0xFF) == want || ((p >> 8) & 0xFF) == want || ((p >> 16) & 0xFF) == want)) {
-                    log::info!("HDR: frame peak code {} ({:.2}× white) first at x {} y {} — stored 0x{:08X}", peak, desired, at % self.width, at / self.width, scratch[at]);
+                let shift = P::DEPTH - 8;
+                if let Some(at) = scratch.iter().position(|&p| p.alpha() != 0 && p.channels().iter().any(|&c| c >> shift == want)) {
+                    log::info!("HDR: frame peak code {} ({:.2}× white) first at x {} y {} — stored {:X?}", peak, desired, at % self.width, at / self.width, scratch[at]);
                 }
             }
             self.peak_code = peak;

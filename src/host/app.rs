@@ -12,6 +12,10 @@ use crate::event::{CursorIcon as FCursorIcon, Event as FEvent, ModifiersState as
 use crate::geom::Viewport;
 use crate::text::TextRenderer;
 use std::time::Instant;
+#[cfg(feature = "host-winit")]
+use crate::paint::Finalize;
+#[cfg(feature = "host-winit")]
+use crate::pixel::Pixel;
 // FluorApp::set_event_proxy takes a fluor-native `Arc<dyn WakeSender<Self::UserEvent>>`. Concrete winit machinery (ApplicationHandler, EventLoop, EventLoopProxy, WindowAttributes, etc.) only enters via the desktop_shell sub-module below, behind the host-winit feature gate.
 
 #[cfg(feature = "host-winit")]
@@ -851,13 +855,13 @@ pub trait FluorApp<P: crate::pixel::Pixel = crate::pixel::Argb8> {
 
 /// Run the desktop host until the window closes. Builds an `EventLoop` typed on `A::UserEvent` so background-thread wake-ups via the WakeSender route thru [`FluorApp::on_user_event`]. The proxy is created up-front, wrapped in a [`winit_compat::WinitWakeSender`], and handed to the app via [`FluorApp::set_event_proxy`] BEFORE the event loop starts, so apps can clone-and-ship the Arc to background tasks during their own constructor or [`FluorApp::init`].
 #[cfg(feature = "host-winit")]
-pub fn run_app<A: FluorApp + 'static>(app: A) -> Result<(), EventLoopError> {
+pub fn run_app<P: Finalize, A: FluorApp<P> + 'static>(app: A) -> Result<(), EventLoopError> {
     run_app_recoverable(app).1
 }
 
 /// Like [`run_app`] but the app SURVIVES the loop: on return the caller gets it back alongside the verdict — `Err` means the loop died out from under a living app (the X-death class: winit's x11rb dispatch error exits the loop with a code instead of killing the process), and the caller may keep running it display-free (photon's headless lifeline, docs/headless-lifeline.md there).
 #[cfg(feature = "host-winit")]
-pub fn run_app_recoverable<A: FluorApp + 'static>(
+pub fn run_app_recoverable<P: Finalize, A: FluorApp<P> + 'static>(
     mut app: A,
 ) -> (A, Result<(), EventLoopError>) {
     let mut builder = EventLoop::<A::UserEvent>::with_user_event();
@@ -894,7 +898,7 @@ struct WindowRect {
 
 /// Damage-clipped fill(0) — wipes only the `rect` sub-region of `scratch` (viewport-flat slice, row-major width `win_w`). Replaces a full-buffer `fill(0)` so pixels outside the damage rect persist between frames. Each row inside the rect uses the SIMD-friendly slice `fill(0)` so the per-row cost is the same as the full-buffer call, just over fewer rows.
 #[cfg(feature = "host-winit")]
-fn clear_scratch_rect(scratch: &mut [u32], win_w: usize, rect: crate::canvas::PixelRect) {
+fn clear_scratch_rect<P: Pixel>(scratch: &mut [P], win_w: usize, rect: crate::canvas::PixelRect) {
     if rect.is_empty() {
         return;
     }
@@ -909,7 +913,7 @@ fn clear_scratch_rect(scratch: &mut [u32], win_w: usize, rect: crate::canvas::Pi
     }
     for y in y0..y1 {
         let row_base = y * win_w;
-        scratch[row_base + x0..row_base + x1].fill(0);
+        scratch[row_base + x0..row_base + x1].fill(P::EMPTY);
     }
 }
 
@@ -999,10 +1003,10 @@ const STRADDLE_DUAL_RASTER: bool = true;
 /// One rasterization pass at a specific monitor scale (phase C). Pass 0 is the shell's own `viewport` + `scratch` + `clip_mask` trio at `window_scale`; a `RasterPass` exists ONLY for an involved surface whose scale differs mid-straddle (deduped by scale, dropped when the straddle ends).
 /// Pass geometry: on X11/Windows desktop units are physical px, so every pass shares the window dims and the density difference enters purely thru `viewport.ru` (= user ru × pass scale ÷ `window_scale`). On macOS desktop units are POINTS, so pass dims = points × pass scale and `ru` stays the bare user zoom — fluor's layout is span-relative, so the scaled dims already carry the density and the two passes lay out identically at different pixel counts.
 #[cfg(feature = "host-winit")]
-struct RasterPass {
+struct RasterPass<P: Pixel> {
     scale: f64,
     viewport: Viewport,
-    scratch: Vec<u32>,
+    scratch: Vec<P>,
     clip_mask: Vec<u8>,
 }
 
@@ -1010,7 +1014,7 @@ struct RasterPass {
 ///
 /// **Compositor architecture.** The OS window is fullscreen borderless transparent — fluor owns the entire screen buffer. The consumer paints into a window-sized scratch buffer (sized to `viewport` = `window_rect.w × window_rect.h`); the host then blits that scratch into the screen buffer at the `window_rect` offset. Pixels outside the window stay α=0 so the OS compositor shows whatever's behind us. Click-thru is via a per-resize input-region call (set later, see step 2 of the fullscreen-compositor pivot) so clicks outside `window_rect` route to whatever's underneath.
 #[cfg(feature = "host-winit")]
-struct DesktopShell<A: FluorApp> {
+struct DesktopShell<A: FluorApp<P>, P: Finalize> {
     app: A,
     /// Per-monitor OS surfaces. Phase A: exactly one entry (the primary monitor), created in `resumed`; empty until then.
     // Empty until `resumed` creates the first OS window and shrinks on a monitor unplug, so every lookup by `home` or a surface index goes thru get() (WHY/PROOF: the OS decides when surfaces exist).
@@ -1036,9 +1040,9 @@ struct DesktopShell<A: FluorApp> {
     /// Where the visible window lives, in GLOBAL virtual-desktop units (winit's monitor-position space; physical px on X11/Windows, points on macOS). Driven by drag-to-move + resize-drag; on a single monitor at origin (0, 0) these are numerically the old screen-buffer coords.
     window_rect: WindowRect,
     /// Pass-0 window-sized scratch buffer. The consumer renders into this (at viewport dimensions); the host runs `finalize_for_os` on it with the window-space clip mask, then blits row-by-row into each involved surface's buffer at `(window_rect.xy − surface.origin) × pixel_ratio`. Resized on `window_rect` size change.
-    scratch: Vec<u32>,
+    scratch: Vec<P>,
     /// Straddle-only raster passes at scales other than `window_scale` (phase C) — see [`RasterPass`]. Empty except while the window straddles a differing-scale surface with [`STRADDLE_DUAL_RASTER`] on.
-    extra_passes: Vec<RasterPass>,
+    extra_passes: Vec<RasterPass<P>>,
 
     // --- Shared resources ---
     text: Option<TextRenderer>,
@@ -1128,7 +1132,7 @@ struct DesktopShell<A: FluorApp> {
 }
 
 #[cfg(feature = "host-winit")]
-impl<A: FluorApp> DesktopShell<A> {
+impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
     /// Hand the app back after the loop ends — the recoverable-run contract (surfaces and their dead window handles drop here).
     fn into_app(self) -> A {
         self.app
@@ -1664,7 +1668,7 @@ impl<A: FluorApp> DesktopShell<A> {
     fn rebuild_pass0_geometry(&mut self) {
         self.viewport = self.pass0_viewport(self.window_rect.w, self.window_rect.h, self.viewport.ru);
         let win_px = (self.viewport.width_px as usize) * (self.viewport.height_px as usize);
-        self.scratch = vec![0u32; win_px];
+        self.scratch = vec![P::EMPTY; win_px];
         self.clip_mask = vec![255u8; win_px];
         self.pending_full_repaint = true;
         let (vw, vh) = (self.viewport.width_px, self.viewport.height_px);
@@ -1759,9 +1763,9 @@ impl<A: FluorApp> DesktopShell<A> {
             };
             self.extra_passes[pi].viewport = vp;
             if self.extra_passes[pi].scratch.len() != px {
-                self.extra_passes[pi].scratch = vec![0u32; px];
+                self.extra_passes[pi].scratch = vec![P::EMPTY; px];
             } else {
-                self.extra_passes[pi].scratch.fill(0);
+                self.extra_passes[pi].scratch.fill(P::EMPTY);
             }
             // Reset to fully-visible before the swap-in `on_resize` — the app re-carves its window shape (corner cutouts) in its resize path.
             self.extra_passes[pi].clip_mask.clear();
@@ -2280,7 +2284,7 @@ impl<A: FluorApp> DesktopShell<A> {
                 self.update_home();
                 self.viewport = self.pass0_viewport(new_w, new_h, self.viewport.ru);
                 let win_px = (self.viewport.width_px as usize) * (self.viewport.height_px as usize);
-                self.scratch = vec![0u32; win_px];
+                self.scratch = vec![P::EMPTY; win_px];
                 self.clip_mask = vec![255u8; win_px];
                 // Surface-driven resize → window geometry changed → full repaint required.
                 self.pending_full_repaint = true;
@@ -2383,7 +2387,7 @@ impl<A: FluorApp> DesktopShell<A> {
         let win_px = win_w * win_h;
         // Keep scratch + clip_mask in sync with the consumer-visible viewport (= window_rect dims). Resize-drag (later step) changes these; we re-allocate when the size shifts.
         if self.scratch.len() != win_px {
-            self.scratch = vec![0u32; win_px];
+            self.scratch = vec![P::EMPTY; win_px];
         }
         if self.clip_mask.len() != win_px {
             self.clip_mask = vec![255u8; win_px];
@@ -2563,7 +2567,7 @@ impl<A: FluorApp> DesktopShell<A> {
         let px_w = ((self.window_rect.w as f64) * pr).round() as i32;
         let px_h = ((self.window_rect.h as f64) * pr).round() as i32;
         // Source pass buffers — plain field-path borrows so the `&mut self.surfaces[..]` borrows below stay disjoint.
-        let (src_scratch, src_clip): (&[u32], &[u8]) = match pass {
+        let (src_scratch, src_clip): (&[P], &[u8]) = match pass {
             Some(pi) => (
                 &self.extra_passes[pi].scratch,
                 &self.extra_passes[pi].clip_mask,
@@ -3218,7 +3222,7 @@ impl<A: FluorApp> DesktopShell<A> {
         if size_changed || scale_changed {
             self.viewport = self.pass0_viewport(new_rect.w, new_rect.h, self.viewport.ru);
             let win_px = (self.viewport.width_px as usize) * (self.viewport.height_px as usize);
-            self.scratch = vec![0u32; win_px];
+            self.scratch = vec![P::EMPTY; win_px];
             self.clip_mask = vec![255u8; win_px];
             self.pending_full_repaint = true;
 
@@ -3395,7 +3399,7 @@ impl<A: FluorApp> DesktopShell<A> {
             // Carry the user's zoom (ru) across the resize so Ctrl+/Ctrl-/Ctrl+scroll state survives.
             self.viewport = self.pass0_viewport(new_w, new_h, self.viewport.ru);
             let win_px = (self.viewport.width_px as usize) * (self.viewport.height_px as usize);
-            self.scratch = vec![0u32; win_px];
+            self.scratch = vec![P::EMPTY; win_px];
             self.clip_mask = vec![255u8; win_px];
             // Window dims changed → perimeter, AA edges, shadow rays all need a fresh single-pass repaint.
             self.pending_full_repaint = true;
@@ -3429,7 +3433,7 @@ impl<A: FluorApp> DesktopShell<A> {
 }
 
 #[cfg(feature = "host-winit")]
-impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A> {
+impl<A: FluorApp<P> + 'static, P: Finalize> ApplicationHandler<A::UserEvent> for DesktopShell<A, P> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // Watch app activation so a Dock click can reach the window layer at all — see macos_reopen.
         #[cfg(target_os = "macos")]
@@ -3575,7 +3579,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
 
         // Scratch + clip_mask are sized to the pass-0 viewport, NOT the screen. The host blits scratch into each involved surface's buffer at the window_rect offset; pixels outside the window stay at the screen buffer's α=0 init.
         let win_px = (self.viewport.width_px as usize) * (self.viewport.height_px as usize);
-        self.scratch = vec![0u32; win_px];
+        self.scratch = vec![P::EMPTY; win_px];
         self.clip_mask = vec![255u8; win_px];
 
         // fluor's device (made with the first surface) to the app before its init, so it draws on it from the first frame.
@@ -4144,7 +4148,7 @@ impl<A: FluorApp + 'static> ApplicationHandler<A::UserEvent> for DesktopShell<A>
 }
 
 #[cfg(feature = "host-winit")]
-impl<A: FluorApp + 'static> DesktopShell<A> {
+impl<A: FluorApp<P> + 'static, P: Finalize> DesktopShell<A, P> {
     /// Apply a zoom change to `self.viewport.ru` and propagate to the consumer. `steps = Some(s)` adjusts by `s` photon-asymmetric log steps (positive in, negative out); `steps = None` resets to 1.0 (Ctrl+0 binding). Calls `app.on_resize` with unchanged pixel dimensions so the consumer's existing resize path picks up the new `ctx.viewport.ru`, marks chrome / widget layers dirty (via their internal Group resize), and re-rasterizes at the new effective span. No separate `on_zoom` callback needed — the consumer's on_resize is the single "viewport changed" entry point.
     /// Drain the app's one-shot placement requests — restored zoom, then restored window geometry. Called from TWO sites: the top of the home surface's `RedrawRequested` (so frame one adopts the restored placement BEFORE any pixels are presented — the launch-flash fix) and `about_to_wait` (requests armed outside a redraw, e.g. a later settings load). Geometry is taken only once the home surface has real dimensions, so an early pass can't burn the one-shot against placeholders.
     fn consume_app_placement_requests(&mut self) {

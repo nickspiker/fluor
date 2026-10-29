@@ -120,6 +120,11 @@ pub trait Pixel: Blend + Copy + Eq + Send + Sync + core::fmt::Debug + 'static {
     fn cov(v: f32) -> u32;
     /// A colour authored as an 8-bit `g2t` α + darkness pixel (the theme's palette, `theme::dark(fmt(vsf(..)))`) at this depth: the same light, widened.
     fn from_g2t8(c: u32) -> Self;
+    /// An 8-bit α (`0..=255`, a coverage byte a rasterizer computed) as this depth's α: the same fraction, `a × ONE / 255`, which is how [`Pixel::from_g2t8`] widens α (× 1 at 8 bits, × 257 at 16).
+    #[inline(always)]
+    fn alpha_from8(a8: u32) -> u32 {
+        a8 * (Self::ONE / 255)
+    }
 
     /// `dst[i] = dst[i].under(src[i], Normal)` over a run: the hook a depth's SIMD kernel takes over (Argb8 runs 8 lanes of `wide::u32x8` with the `simd` feature).
     #[inline]
@@ -283,6 +288,101 @@ impl Pixel for G2t16 {
         let [r, g, b] = Argb8::channels(c);
         Self::from_channels((c >> 24) * 257, [wide(r), wide(g), wide(b)])
     }
+
+    #[inline]
+    fn under_chunk_normal(dst: &mut [Self], src: &[Self]) {
+        #[cfg(feature = "simd")]
+        {
+            use crate::simd::LANES;
+            let n = dst.len();
+            let mut i = 0;
+            while i + LANES <= n {
+                let (dh, dl) = g2t16_halves(&dst[i..i + LANES]);
+                let (sh, sl) = g2t16_halves(&src[i..i + LANES]);
+                let (h, l) = under_x8_normal_g2t16(dh, dl, sh, sl);
+                g2t16_join(h, l, &mut dst[i..i + LANES]);
+                i += LANES;
+            }
+            while i < n {
+                dst[i] = dst[i].under(src[i], BlendMode::Normal);
+                i += 1;
+            }
+        }
+        #[cfg(not(feature = "simd"))]
+        for i in 0..dst.len() {
+            dst[i] = dst[i].under(src[i], BlendMode::Normal);
+        }
+    }
+
+    /// The source's halves are split and broadcast once, outside the loop.
+    #[inline]
+    fn under_chunk_const(dst: &mut [Self], src_const: Self) {
+        #[cfg(feature = "simd")]
+        {
+            use crate::simd::{LANES, u32x8};
+            let (sh, sl) = (u32x8::splat((src_const >> 32) as u32), u32x8::splat(src_const as u32));
+            let n = dst.len();
+            let mut i = 0;
+            while i + LANES <= n {
+                let (dh, dl) = g2t16_halves(&dst[i..i + LANES]);
+                let (h, l) = under_x8_normal_g2t16(dh, dl, sh, sl);
+                g2t16_join(h, l, &mut dst[i..i + LANES]);
+                i += LANES;
+            }
+            while i < n {
+                dst[i] = dst[i].under(src_const, BlendMode::Normal);
+                i += 1;
+            }
+        }
+        #[cfg(not(feature = "simd"))]
+        for i in 0..dst.len() {
+            dst[i] = dst[i].under(src_const, BlendMode::Normal);
+        }
+    }
+}
+
+/// Eight G2t16 pixels as two `u32x8` halves: the high words (`α << 16 | R`) and the low (`G << 16 | B`).
+#[cfg(feature = "simd")]
+#[inline(always)]
+fn g2t16_halves(p: &[G2t16]) -> (wide::u32x8, wide::u32x8) {
+    let hi: [u32; 8] = core::array::from_fn(|k| (p[k] >> 32) as u32);
+    let lo: [u32; 8] = core::array::from_fn(|k| p[k] as u32);
+    (wide::u32x8::from(hi), wide::u32x8::from(lo))
+}
+
+/// [`g2t16_halves`] undone into eight pixels.
+#[cfg(feature = "simd")]
+#[inline(always)]
+fn g2t16_join(hi: wide::u32x8, lo: wide::u32x8, out: &mut [G2t16]) {
+    let (h, l) = (hi.as_array_ref(), lo.as_array_ref());
+    for k in 0..8 {
+        out[k] = ((h[k] as u64) << 32) | l[k] as u64;
+    }
+}
+
+/// [`under_x8_normal`] at 16 bits: eight G2t16 pixels as their two `u32x8` halves ([`g2t16_halves`]), the scalar kernel lane by lane and bit for bit.
+/// Every product fits a u32 lane, which is why the halves suffice and no 64-bit multiply is needed: `consumed = (2¹⁶ − top_α) × bot_α ≤ 2¹⁶ × (2¹⁶ − 1) < 2³²` before its shift, and each deposit `bot_d × consumed ≤ (2¹⁶ − 1)² < 2³²`.
+/// The sums stay inside their fields by the floor proof on [`Blend::under`] (dark ≤ α ≤ ONE).
+/// Lanes whose top is opaque keep it, as the scalar early-out does.
+#[cfg(feature = "simd")]
+#[inline]
+pub fn under_x8_normal_g2t16(dst_hi: wide::u32x8, dst_lo: wide::u32x8, src_hi: wide::u32x8, src_lo: wide::u32x8) -> (wide::u32x8, wide::u32x8) {
+    use wide::u32x8;
+    let field = u32x8::splat((1 << 16) - 1);
+    let whole = u32x8::splat(1 << 16);
+    let da: u32x8 = dst_hi >> 16;
+    let dr: u32x8 = dst_hi & field;
+    let dg: u32x8 = dst_lo >> 16;
+    let db: u32x8 = dst_lo & field;
+    let sa: u32x8 = src_hi >> 16;
+    let consumed: u32x8 = ((whole - da) * sa) >> 16;
+    let nr: u32x8 = dr + (((src_hi & field) * consumed) >> 16);
+    let ng: u32x8 = dg + (((src_lo >> 16) * consumed) >> 16);
+    let nb: u32x8 = db + (((src_lo & field) * consumed) >> 16);
+    let na: u32x8 = da + consumed;
+    let opaque = da.cmp_eq(field);
+    let keep = opaque ^ u32x8::splat(u32::MAX);
+    ((opaque & dst_hi) | (keep & ((na << 16) | nr)), (opaque & dst_lo) | (keep & ((ng << 16) | nb)))
 }
 
 /// 8-wide SIMD version of [`Blend::under`] for `BlendMode::Normal` only — the 99% case in real compositing workloads. Same math as the scalar kernel lane-by-lane, plus a SIMD version of the `dst >= 0xFF000000` early-out: lanes where `dst.α == 0xFF` keep their original value via a masked blend with the SIMD result.
@@ -640,6 +740,43 @@ mod tests {
                     assert!(c16.abs_diff(c8) <= 3, "{mode:?} {top:08x} under {bottom:08x}: {c16} vs {c8}");
                 }
             }
+        }
+    }
+
+    /// The 16-bit chunk kernels (SIMD with the `simd` feature, the scalar loop without) are the scalar `under` pixel for pixel, over runs that are not a whole number of lanes, opaque and empty tops included.
+    #[test]
+    fn g2t16_chunks_are_the_scalar_kernel() {
+        let mut s = 0x1234_5678u32;
+        let mut widened = || {
+            let p = invariant_pixel(&mut s);
+            G2t16::from_channels(p.alpha() * 257, p.channels().map(|d| (d << 8) + p.alpha()))
+        };
+        for n in [0usize, 1, 7, 8, 9, 31, 64, 67] {
+            let mut dst: Vec<G2t16> = (0..n).map(|_| widened()).collect();
+            let src: Vec<G2t16> = (0..n).map(|_| widened()).collect();
+            if n > 2 {
+                dst[1] = G2t16::OPAQUE | 0x1234;
+                dst[2] = G2t16::EMPTY;
+            }
+            let want: Vec<G2t16> = dst.iter().zip(&src).map(|(&d, &s)| d.under(s, BlendMode::Normal)).collect();
+            let mut got = dst.clone();
+            G2t16::under_chunk_normal(&mut got, &src);
+            assert_eq!(got, want, "run of {n}");
+            if n > 0 {
+                let want: Vec<G2t16> = dst.iter().map(|&d| d.under(src[0], BlendMode::Normal)).collect();
+                let mut got = dst.clone();
+                G2t16::under_chunk_const(&mut got, src[0]);
+                assert_eq!(got, want, "const run of {n}");
+            }
+        }
+    }
+
+    /// An 8-bit α widens to the same fraction `from_g2t8` gives it.
+    #[test]
+    fn alpha_from8_is_from_g2t8s_alpha() {
+        for a in 0..=255u32 {
+            assert_eq!(Argb8::alpha_from8(a), a);
+            assert_eq!(G2t16::alpha_from8(a), G2t16::from_g2t8(a << 24).alpha());
         }
     }
 

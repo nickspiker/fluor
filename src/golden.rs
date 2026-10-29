@@ -209,10 +209,9 @@ fn golden_shadow() {
     check("shadow", &screen, 0x4c5b_f4f6_0458_97bb);
 }
 
-/// The present boundary: in-place finalize and finalize into a larger screen, full and damage-clipped, plain and over an under layer, with a clip mask that has partial coverage.
-#[test]
-fn golden_finalize() {
-    let (mut px, mut dmg) = scene();
+/// The present boundary's scene at depth `P`: a fill, a two-tone pill, a translucent band and a translucent white pill, with a clip mask that is opaque in the middle, empty at the very edge and ramps in between, so every finalize branch (full, partial, cut) sees pixels.
+fn finalize_scene<P: Pixel>() -> (Vec<P>, Vec<u8>) {
+    let (mut px, mut dmg) = scene::<P>();
     {
         let mut c = Canvas::new(&mut px, W, H, &mut dmg);
         paint::fill_rect(&mut c, 0, 0, W as isize / 2, H as isize, theme::WINDOW_CONTROLS_BG, None, None);
@@ -220,7 +219,6 @@ fn golden_finalize() {
         paint::fill_rect(&mut c, 30, 100, 260, 60, (theme::TEXTBOX_SELECTION_BG & 0x00FF_FFFF) | 0x7000_0000, None, None);
         paint::draw_squircle_pill(&mut c, 230, 20, 80, 60, (theme::WHITE & 0x00FF_FFFF) | 0x9000_0000, paint::SHAPE_POWER);
     }
-    // A clip mask that is opaque in the middle, empty at the very edge and ramps in between, so every finalize branch (full, partial, cut) sees pixels.
     let clip: Vec<u8> = (0..W * H)
         .map(|i| {
             let (x, y) = (i % W, i / W);
@@ -228,17 +226,28 @@ fn golden_finalize() {
             if d >= 16 { 255 } else { (d * 16) as u8 }
         })
         .collect();
+    (px, clip)
+}
 
-    let mut in_place = px.clone();
-    paint::finalize_for_os(&mut in_place, &clip);
-
+/// The scene finalized into a larger screen three ways: full, damage-clipped with the window hanging off the left edge, and over an under layer.
+fn finalize_presents<P: paint::Finalize>(px: &[P], clip: &[u8]) -> [Vec<u32>; 3] {
     let (sw, sh) = (W + 64, H + 48);
     let mut full = vec![0u32; sw * sh];
-    paint::finalize_into_screen(&px, &clip, W, H, &mut full, sw, 24, 16, PixelRect::new(0, 0, W, H), true, false);
+    paint::finalize_into_screen(px, clip, W, H, &mut full, sw, 24, 16, PixelRect::new(0, 0, W, H), true, false);
     let mut damaged = vec![0u32; sw * sh];
-    paint::finalize_into_screen(&px, &clip, W, H, &mut damaged, sw, -8, 30, PixelRect::new(10, 12, 250, 170), false, false);
+    paint::finalize_into_screen(px, clip, W, H, &mut damaged, sw, -8, 30, PixelRect::new(10, 12, 250, 170), false, false);
     let mut over = vec![0u32; sw * sh];
-    paint::finalize_into_screen(&px, &clip, W, H, &mut over, sw, 24, 16, PixelRect::new(0, 0, W, H), true, true);
+    paint::finalize_into_screen(px, clip, W, H, &mut over, sw, 24, 16, PixelRect::new(0, 0, W, H), true, true);
+    [full, damaged, over]
+}
+
+/// The present boundary: in-place finalize and finalize into a larger screen, full and damage-clipped, plain and over an under layer, with a clip mask that has partial coverage.
+#[test]
+fn golden_finalize() {
+    let (px, clip) = finalize_scene::<Argb8>();
+    let mut in_place = px.clone();
+    paint::finalize_for_os(&mut in_place, &clip);
+    let [full, damaged, over] = finalize_presents(&px, &clip);
 
     check("finalize_in_place", &in_place, 0x3d1a_9c93_0655_c607);
     check("finalize_into_full", &full, 0x90a8_55b0_fc87_b707);
@@ -246,6 +255,34 @@ fn golden_finalize() {
     assert_ne!(over, full, "the over finalize took the plain path");
     check("finalize_into_over", &over, 0xb183_73ac_ecee_80ca);
     check8("finalize_clip_mask", &clip, 0xa5b2_9342_0fa7_8f25);
+}
+
+/// The 16-bit present of the same scene rendered at 16 bits: the dithered 8-bit screen pixels hashed (the dither is a function of value and screen position, so the hash is as fixed as the 8-bit one), and held against the 8-bit present byte for byte.
+/// Measured 16 − 8 in [−1, 3] (full, damaged) and [−2, 3] (over), under a quarter of the bytes differing at all: two biases that partly cancel, the 16-bit render up to 3 of its steps above the 8-bit one (the cross-check below, these primitives' floors) and the present itself 0 to 4 above (`paint::finalize`'s `g2t16_present_tracks_argb8`), against the dither, which is a step either way; the over finalize divides darkness by a partial α, which can stretch an 8-bit floor of under one step to two.
+#[test]
+fn golden_finalize_g2t16() {
+    use crate::pixel::G2t16;
+    let (px8, clip) = finalize_scene::<Argb8>();
+    let (px16, _) = finalize_scene::<G2t16>();
+    let p8 = finalize_presents(&px8, &clip);
+    let p16 = finalize_presents(&px16, &clip);
+    for (name, a, b) in [("full", &p8[0], &p16[0]), ("damaged", &p8[1], &p16[1]), ("over", &p8[2], &p16[2])] {
+        let (mut low, mut high, mut differing) = (0i32, 0i32, 0usize);
+        for (&e, &w) in a.iter().zip(b.iter()) {
+            for sh in [24, 16, 8, 0] {
+                let d = ((w >> sh) & 0xFF) as i32 - ((e >> sh) & 0xFF) as i32;
+                low = low.min(d);
+                high = high.max(d);
+                differing += (d != 0) as usize;
+            }
+        }
+        std::eprintln!("present {name:<8} 16 − 8 in [{low:>2}, {high:>2}]  differing {:>6.2} %", 100. * differing as f64 / (4 * a.len()) as f64);
+        assert!(low >= -2 && high <= 3, "{name}: the 16-bit present sits in [{low}, {high}] around the 8-bit one");
+    }
+    assert_ne!(p16[2], p16[0], "the over finalize took the plain path");
+    check("finalize_g2t16_full", &p16[0], 0x5cda_03db_9ce9_cdbd);
+    check("finalize_g2t16_damaged", &p16[1], 0x2955_7ddc_6b0b_ab92);
+    check("finalize_g2t16_over", &p16[2], 0x5195_f6f9_f203_92e4);
 }
 
 /// Two layers of random pixels that keep the `dark ≤ α` invariant every buffer holds, 8-bit, from fixed seeds.

@@ -27,10 +27,13 @@ use crate::host::wake::NoopWakeSender;
 use crate::host::EventResponse;
 use crate::paint::{HitId, HIT_NONE};
 use crate::text::TextRenderer;
+use crate::paint::Finalize;
+use crate::pixel::{Argb8, Pixel};
 use alloc::sync::Arc;
 
 /// The Android equivalent of `DesktopShell`. Wraps a [`FluorApp`] with the surface + pipeline + input translation needed to drive it from Android's Choreographer + JNI.
-pub struct AndroidShell<A: FluorApp> {
+/// `P` is the app's pixel depth (8-bit unless the app implements `FluorApp<G2t16>`): the scratch is held at it and the present finalizes from it, dithered to the 8-bit window or straight into the 10-bit HDR surface ([`crate::paint::Finalize`]).
+pub struct AndroidShell<A: FluorApp<P>, P: Finalize = Argb8> {
     app: A,
     surface: Surface,
     text: Option<TextRenderer>,
@@ -40,7 +43,7 @@ pub struct AndroidShell<A: FluorApp> {
     cursor_y: Coord,
     modifiers: FModifiersState,
     /// Scratch buffer in α + darkness format that the app paints into via `app.render`.
-    scratch: Vec<u32>,
+    scratch: Vec<P>,
     /// Window-shape clip mask. Android has no rounded corners so this stays all-255 (fully visible). Resized to match scratch.
     clip_mask: Vec<u8>,
     /// Damage accumulator for the current frame.
@@ -63,7 +66,7 @@ pub struct AndroidShell<A: FluorApp> {
     frame_stat: (Option<Instant>, u32, u32, f32, f32, f32),
 }
 
-impl<A: FluorApp> AndroidShell<A> {
+impl<A: FluorApp<P>, P: Finalize> AndroidShell<A, P> {
     /// Construct the shell. Caller provides the surface dimensions Android opened the SurfaceView at (typically full-screen). The app's `set_event_proxy` is invoked with a [`NoopWakeSender`] (Android background tasks talk to the UI thread thru JNI callbacks, not the proxy) and then `init` runs once the shell has its viewport + text renderer ready — same host contract as `DesktopShell`.
     pub fn new(mut app: A, width: u32, height: u32) -> Self {
         // Android writes finalize output directly into an ANativeWindow_lock'd buffer that the SurfaceFlinger compositor consumes after unlockAndPost. Worker-thread writes to that buffer need to be visible to the compositor by the time unlockAndPost runs; rayon's join is a CPU memory barrier but not a guaranteed device-coherent flush across all worker cores. Forcing par_rows / par_chunks sequential keeps writes on the calling thread so unlockAndPost's cache flush covers everything in one shot — eliminates the "horizontal white band at a random row" tear we hit with parallel finalize.
@@ -82,7 +85,7 @@ impl<A: FluorApp> AndroidShell<A> {
             cursor_x: 0.0,
             cursor_y: 0.0,
             modifiers: FModifiersState::empty(),
-            scratch: alloc::vec![0u32; (width as usize) * (height as usize)],
+            scratch: alloc::vec![P::EMPTY; (width as usize) * (height as usize)],
             clip_mask: alloc::vec![255u8; (width as usize) * (height as usize)],
             pending_damage: Damage::new(),
             pointer: crate::host::pointer::PointerArbiter::new(),
@@ -106,7 +109,7 @@ impl<A: FluorApp> AndroidShell<A> {
         self.surface.resize(width, height);
         self.viewport = Viewport::new(width, height).with_ru(self.viewport.ru);
         let px = (width as usize) * (height as usize);
-        self.scratch.resize(px, 0);
+        self.scratch.resize(px, P::EMPTY);
         self.clip_mask.resize(px, 255);
         self.window.mark_dirty();
         self.with_context(|app, ctx| app.on_resize(width, height, ctx));
@@ -442,7 +445,7 @@ impl<A: FluorApp> AndroidShell<A> {
     fn with_context_render(
         &mut self,
         damage_clip: PixelRect,
-        f: impl FnOnce(&mut A, &mut [u32], &mut Context),
+        f: impl FnOnce(&mut A, &mut [P], &mut Context),
     ) {
         let text = self
             .text
@@ -471,7 +474,7 @@ impl<A: FluorApp> AndroidShell<A> {
 }
 
 /// Clear `scratch[y0..y1][x0..x1]` to α=0 + zero-darkness. Same shape as `DesktopShell::clear_scratch_rect`.
-fn clear_scratch_rect(scratch: &mut [u32], width: usize, rect: PixelRect) {
+fn clear_scratch_rect<P: Pixel>(scratch: &mut [P], width: usize, rect: PixelRect) {
     if rect.is_empty() || width == 0 {
         return;
     }
@@ -488,7 +491,7 @@ fn clear_scratch_rect(scratch: &mut [u32], width: usize, rect: PixelRect) {
             break;
         }
         for cell in &mut scratch[base..base + row_len] {
-            *cell = 0;
+            *cell = P::EMPTY;
         }
     }
 }

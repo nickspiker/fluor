@@ -6,6 +6,7 @@ use super::{
     DEBUG_SHOW_ALPHA, DEBUG_SHOW_ALPHA_FORCE_OPAQUE, DEBUG_SHOW_ALPHA_GRAYSCALE,
     DEBUG_SHOW_HITMASK, DEBUG_SHOW_OPAQUE_SCAN, DEBUG_SKIP_PREMULT,
 };
+use crate::pixel::{Argb8, G2t16, Pixel};
 
 /// Boundary step that finalizes the present buffer for the OS in a **single pass** per pixel — folds the darkness→visible flip, the window-shape clip-mask multiply, the RGB premultiply (every platform), and the pack into one go. Walks `pixels` and `clip_mask` in lockstep; both slices must be the same length.
 ///
@@ -260,8 +261,8 @@ pub fn scroll_copy_rect<T: Copy>(
 /// Pre-conditions: `rect_x + win_w ≤ scr_w` and `rect_y + win_h ≤ scr_h` (rect fits inside the screen). Caller is responsible for clearing the destination region (typically the whole screen buffer cleared to `0` so pixels outside `rect` stay α=0 and the OS compositor shows whatever's behind us).
 ///
 /// One pass over pixels — same cost per pixel as `finalize_for_os` plus one address calculation for the screen-buffer offset.
-pub fn finalize_into_screen(
-    scratch: &[u32],
+pub fn finalize_into_screen<P: Finalize>(
+    scratch: &[P],
     clip_mask: &[u8],
     win_w: usize,
     win_h: usize,
@@ -336,9 +337,9 @@ pub fn finalize_into_screen(
             let clip_chunk = &clip_mask[scratch_off..scratch_off + row_len];
             let dst_chunk = &mut screen_row[dst_x_min..dst_x_min + row_len];
             if over {
-                finalize_over_chunk(src_chunk, clip_chunk, dst_chunk);
+                P::finalize_over_run(src_chunk, clip_chunk, dst_chunk, dst_x_min, dst_y);
             } else {
-                finalize_into_chunk_dispatch(src_chunk, clip_chunk, dst_chunk, skip_premult);
+                P::finalize_run(src_chunk, clip_chunk, dst_chunk, dst_x_min, dst_y, skip_premult);
             }
             if opaque {
                 for px in dst_chunk.iter_mut() {
@@ -368,9 +369,9 @@ pub fn finalize_into_screen(
             let src_chunk = &src_row[l..l + len];
             let dst_chunk = &mut screen_row[dst_x_min + l..dst_x_min + l + len];
             if over {
-                finalize_over_chunk(src_chunk, clip_chunk, dst_chunk);
+                P::finalize_over_run(src_chunk, clip_chunk, dst_chunk, dst_x_min + l, dst_y);
             } else {
-                finalize_into_chunk_dispatch(src_chunk, clip_chunk, dst_chunk, skip_premult);
+                P::finalize_run(src_chunk, clip_chunk, dst_chunk, dst_x_min + l, dst_y, skip_premult);
             }
             if opaque {
                 for px in dst_chunk.iter_mut() {
@@ -519,8 +520,9 @@ pub fn finalize_into_f16(
 /// The 10-BIT extended-brightness finalize (HDR plan, Android: RGBA_1010102, BT.2020, γ2.2, extended range): the whole window from `scratch` into a 2:10:10:10 surface, `dst_stride` pixels per row, R in the low bits.
 /// Per pixel: final α = α × clip / 255; each channel one read of `table` (darkness flip + light ÷ declared ratio + γ2.2 in one); premultiplied ON CODES like the 8-bit path (Nick: blending stays on codes); α as 2 bits, or opaque when [`crate::paint::OPAQUE_BACKDROP`] is set.
 /// Channels go in stored order — byte 0 to bits 0–9 — which is R, G, B on Android. Returns the frame's brightest `g2t` code, as [`finalize_into_f16`] does.
-pub fn finalize_into_1010102(
-    scratch: &[u32],
+/// At 16 bits the table is [`Finalize::hdr10_table`]'s (with its 16-bit `wide` part) and each channel is dithered from its 6 bits of fraction to 10, as the 8-bit surfaces are ([`Finalize`]).
+pub fn finalize_into_1010102<P: Finalize>(
+    scratch: &[P],
     clip_mask: &[u8],
     win_w: usize,
     win_h: usize,
@@ -538,28 +540,32 @@ pub fn finalize_into_1010102(
     let min_dark = core::sync::atomic::AtomicU32::new(255);
     crate::par::par_rows(dst, dst_stride, 0, rows, |y, row| {
         let off = y * win_w;
-        let src = &scratch[off..off + w];
-        let clip = &clip_mask[off..off + w];
-        let mut m = 255u32;
-        for (i, out) in row[..w].iter_mut().enumerate() {
-            let px = src[i];
-            let a = (((px >> 24) & 0xFF) * clip[i] as u32 + 127) / 255;
-            if a == 0 {
-                *out = if opaque { 3 << 30 } else { 0 };
-                continue;
-            }
-            let (d0, d1, d2) = ((px & 0xFF) as usize, ((px >> 8) & 0xFF) as usize, ((px >> 16) & 0xFF) as usize);
-            m = m.min(d0 as u32).min(d1 as u32).min(d2 as u32);
-            let ch = |d: usize| {
-                let c = table.code[d] as u32;
-                if a == 255 { c } else { (c * a + 127) / 255 }
-            };
-            let a2 = if opaque { 3 } else { (a * 3 + 127) / 255 };
-            *out = ch(d0) | ch(d1) << 10 | ch(d2) << 20 | a2 << 30;
-        }
+        let m = P::finalize_1010102_run(&scratch[off..off + w], &clip_mask[off..off + w], &mut row[..w], 0, y, table, opaque);
         min_dark.fetch_min(m, core::sync::atomic::Ordering::Relaxed);
     });
     255 - min_dark.into_inner() as u8
+}
+
+/// One row of [`finalize_into_1010102`] from the 8-bit buffer; returns the row's smallest darkness under a visible pixel.
+fn finalize_1010102_row_8(src: &[u32], clip: &[u8], dst: &mut [u32], table: &crate::theme::Hdr10Table, opaque: bool) -> u32 {
+    let mut m = 255u32;
+    for (i, out) in dst.iter_mut().enumerate() {
+        let px = src[i];
+        let a = (((px >> 24) & 0xFF) * clip[i] as u32 + 127) / 255;
+        if a == 0 {
+            *out = if opaque { 3 << 30 } else { 0 };
+            continue;
+        }
+        let (d0, d1, d2) = ((px & 0xFF) as usize, ((px >> 8) & 0xFF) as usize, ((px >> 16) & 0xFF) as usize);
+        m = m.min(d0 as u32).min(d1 as u32).min(d2 as u32);
+        let ch = |d: usize| {
+            let c = table.code[d] as u32;
+            if a == 255 { c } else { (c * a + 127) / 255 }
+        };
+        let a2 = if opaque { 3 } else { (a * 3 + 127) / 255 };
+        *out = ch(d0) | ch(d1) << 10 | ch(d2) << 20 | a2 << 30;
+    }
+    m
 }
 
 /// One row of [`finalize_into_f16`]; returns the row's smallest darkness under a visible pixel.
@@ -590,8 +596,8 @@ fn finalize_f16_row(src: &[u32], clip: &[u8], dst: &mut [u64], t: &crate::theme:
 
 /// Debug-visualization fallback for [`finalize_into_screen`]: GRAYSCALE / FORCE_OPAQUE paths stay scalar (debug-toggle, off the hot path). Sequential — Rayon adds no value here.
 #[allow(clippy::too_many_arguments)]
-fn finalize_into_scalar_debug(
-    scratch: &[u32],
+fn finalize_into_scalar_debug<P: Finalize>(
+    scratch: &[P],
     clip_mask: &[u8],
     screen: &mut [u32],
     scr_w: usize,
@@ -612,7 +618,7 @@ fn finalize_into_scalar_debug(
             // sy < sy_max ≤ win_h and sx < sx_max ≤ win_w (the caller's clip), so the index is inside the window-sized scratch and clip mask.
             let scratch_idx = src_row + sx;
             let dst_idx = dst_row + (rect_x + sx as i32) as usize;
-            let v = crate::theme::to_sdr_visible(scratch[scratch_idx]);
+            let v = scratch[scratch_idx].to_sdr_visible_at(dst_idx - dst_row, dst_y);
             let m = clip_mask[scratch_idx] as u32;
             let inner_a = (v >> 24) & 0xFF;
             let final_a = (inner_a * m) >> 8;
@@ -620,6 +626,331 @@ fn finalize_into_scalar_debug(
                 screen[dst_idx] = 0xFF000000 | (final_a << 16) | (final_a << 8) | final_a;
             } else {
                 screen[dst_idx] = 0xFF000000 | (v & 0x00FFFFFF);
+            }
+        }
+    }
+}
+
+/// A pixel depth the OS surfaces can be presented from: the finalize kernels, run by run, onto the 8-bit visible premultiplied surface every desktop and the Android `ANativeWindow` take (`0xααRRGGBB`), and onto Android's 10-bit extended-range one.
+///
+/// [`Argb8`] is the present as it always was, bit for bit (the screen position is not read).
+/// [`G2t16`] maps each channel thru the same display curve from its 16-bit code ([`crate::theme::DARK16_TO_SDR_Q8`]: the SDR code with 8 bits of fraction), takes α × clip and the premultiply in 16 bits, and only then drops to 8 bits, adding an ordered dither threshold before the cut ([`DITHER`], the 8 × 8 Bayer matrix on the pixel's screen position) so a gradient finer than one 8-bit step shows as a fine, fixed pattern instead of a band.
+/// The same threshold goes on α and on the three channels of a pixel, which keeps every premultiplied channel at or below its α (the bound ULW_ALPHA and every compositor hold the surface to) and the colour free of dither noise between channels.
+/// Deterministic: a pixel's output is a function of its value and screen position alone.
+pub trait Finalize: Pixel {
+    /// `dst[i]` from `src[i]` and `clip[i]`: the display map, α × clip, the premultiply (left out under `skip_premult`, a debug toggle), packed `0xααRRGGBB`.
+    /// `(x, y)` is `dst[0]`'s place on the screen, which the dither reads.
+    fn finalize_run(src: &[Self], clip: &[u8], dst: &mut [u32], x: usize, y: usize, skip_premult: bool);
+    /// [`Finalize::finalize_run`] for a buffer laid OVER an under layer ([`finalize_into_screen`]'s `over`): a partly covering pixel's own colour, its darkness ÷ α, thru the display map.
+    fn finalize_over_run(src: &[Self], clip: &[u8], dst: &mut [u32], x: usize, y: usize);
+    /// One pixel's colour step at screen `(x, y)`: visible display RGB under its α, both 8-bit, not premultiplied, the clip not applied (the hover overlay and the debug views).
+    fn to_sdr_visible_at(self, x: usize, y: usize) -> u32;
+    /// One row of [`finalize_into_1010102`]: returns the row's smallest darkness under a visible pixel, in 8-bit steps (the buffer's brightest code is 255 less it, its 8-bit bucket at 16 bits).
+    fn finalize_1010102_run(src: &[Self], clip: &[u8], dst: &mut [u32], x: usize, y: usize, table: &crate::theme::Hdr10Table, opaque: bool) -> u32;
+    /// The 10-bit table this depth reads, for the declared ratio.
+    fn hdr10_table(declared: f32) -> crate::theme::Hdr10Table;
+}
+
+impl Finalize for Argb8 {
+    #[inline]
+    fn finalize_run(src: &[Self], clip: &[u8], dst: &mut [u32], _x: usize, _y: usize, skip_premult: bool) {
+        finalize_into_chunk_dispatch(src, clip, dst, skip_premult);
+    }
+    #[inline]
+    fn finalize_over_run(src: &[Self], clip: &[u8], dst: &mut [u32], _x: usize, _y: usize) {
+        finalize_over_chunk(src, clip, dst);
+    }
+    #[inline(always)]
+    fn to_sdr_visible_at(self, _x: usize, _y: usize) -> u32 {
+        crate::theme::to_sdr_visible(self)
+    }
+    #[inline]
+    fn finalize_1010102_run(src: &[Self], clip: &[u8], dst: &mut [u32], _x: usize, _y: usize, table: &crate::theme::Hdr10Table, opaque: bool) -> u32 {
+        finalize_1010102_row_8(src, clip, dst, table, opaque)
+    }
+    fn hdr10_table(declared: f32) -> crate::theme::Hdr10Table {
+        crate::theme::Hdr10Table::new(declared)
+    }
+}
+
+/// The 8 × 8 Bayer matrix (each level 0..64 once, every aligned 2ᵏ × 2ᵏ block spreading its share of levels evenly) as dither thresholds `4b + 2`: 2 to 254, mean 128, centred in the 2⁸ fraction a 16-bit value carries below an 8-bit step.
+/// A value `256q + r` dithers to `q + 1` at the share of a cell's 64 positions whose threshold reaches `256 − r`, which is `r / 256` to within half a level, so the cell's average is the value itself to 1/128 of a step.
+/// The 10-bit surface reads the same matrix as `b` (`DITHER >> 2`) against its 6 bits of fraction, where the average is exact.
+pub const DITHER: [[u32; 8]; 8] = {
+    const B: [[u32; 8]; 8] = [
+        [0, 32, 8, 40, 2, 34, 10, 42],
+        [48, 16, 56, 24, 50, 18, 58, 26],
+        [12, 44, 4, 36, 14, 46, 6, 38],
+        [60, 28, 52, 20, 62, 30, 54, 22],
+        [3, 35, 11, 43, 1, 33, 9, 41],
+        [51, 19, 59, 27, 49, 17, 57, 25],
+        [15, 47, 7, 39, 13, 45, 5, 37],
+        [63, 31, 55, 23, 61, 29, 53, 21],
+    ];
+    let mut t = [[0u32; 8]; 8];
+    let mut y = 0;
+    while y < 8 {
+        let mut x = 0;
+        while x < 8 {
+            t[y][x] = 4 * B[y][x] + 2;
+            x += 1;
+        }
+        y += 1;
+    }
+    t
+};
+
+/// A clip byte as a Q16 fraction of 255, rounded: `m × 2¹⁶ / 255`, so 255 is exactly 2¹⁶ and α × clip keeps a whole clip's α exactly.
+/// `α × CLIP_Q16[m]` fits a u32: at most `(2¹⁶ − 1) × 2¹⁶ < 2³²`.
+const CLIP_Q16: [u32; 256] = {
+    let mut t = [0u32; 256];
+    let mut m = 0;
+    while m < 256 {
+        t[m] = ((m as u32) * (1 << 16) + 127) / 255;
+        m += 1;
+    }
+    t
+};
+
+/// One 16-bit pixel's darkness and α onto the 8-bit SDR surface at dither threshold `t` (see [`Finalize`]).
+/// Every product fits a u32 (`α × CLIP_Q16 < 2³²`, `65280 × 65535 < 2³²`).
+/// Why no channel exceeds α: the premultiplied channel `⌊v × α / 2¹⁶⌋` with `v ≤ 255 × 2⁸` is at most `⌊α × 255 / 2⁸⌋`, the value α itself is cut from, and both take the same threshold before the same shift.
+#[inline(always)]
+fn sdr16(dark: [u32; 3], a16: u32, m: u32, t: u32, skip_premult: bool) -> u32 {
+    let fa = (a16 * CLIP_Q16[m as usize]) >> 16;
+    let fa8 = (((fa * 255) >> 8) + t) >> 8;
+    let ch = |d: u32| {
+        let v = crate::theme::DARK16_TO_SDR_Q8[d as usize] as u32;
+        let p = if skip_premult { v } else { (v * fa) >> 16 };
+        (p + t) >> 8
+    };
+    (fa8 << 24) | (ch(dark[0]) << 16) | (ch(dark[1]) << 8) | ch(dark[2])
+}
+
+impl Finalize for G2t16 {
+    fn finalize_run(src: &[Self], clip: &[u8], dst: &mut [u32], x: usize, y: usize, skip_premult: bool) {
+        let row = &DITHER[y & 7];
+        for i in 0..src.len() {
+            let p = src[i];
+            dst[i] = sdr16(p.channels(), p.alpha(), clip[i] as u32, row[(x + i) & 7], skip_premult);
+        }
+    }
+
+    /// The 8-bit over finalize's un-premultiply at 16 bits: each channel's darkness × ONE ÷ α, rounded.
+    fn finalize_over_run(src: &[Self], clip: &[u8], dst: &mut [u32], x: usize, y: usize) {
+        let row = &DITHER[y & 7];
+        for i in 0..src.len() {
+            let p = src[i];
+            let a = p.alpha();
+            let dark = if a == 0 || a == G2t16::ONE {
+                p.channels()
+            } else {
+                // WHY/PROOF: an app may write straight darkness with partial α (as at 8 bits, pack_argb's colour and α are apart), whose darkness exceeds α — un-premultiplied it would pass ONE and index past the 2¹⁶-entry display table.
+                p.channels().map(|d| (((d as u64 * G2t16::ONE as u64 + (a as u64 >> 1)) / a as u64) as u32).min(G2t16::ONE))
+            };
+            dst[i] = sdr16(dark, a, clip[i] as u32, row[(x + i) & 7], false);
+        }
+    }
+
+    /// α to 8 bits as finalize cuts it (`α × 255 / 2⁸`, then the threshold), each channel from the display table plus the same threshold.
+    #[inline]
+    fn to_sdr_visible_at(self, x: usize, y: usize) -> u32 {
+        let t = DITHER[y & 7][x & 7];
+        let a8 = (((self.alpha() * 255) >> 8) + t) >> 8;
+        let [r, g, b] = self.channels().map(|d| (crate::theme::DARK16_TO_SDR_Q8[d as usize] as u32 + t) >> 8);
+        (a8 << 24) | (r << 16) | (g << 8) | b
+    }
+
+    /// The 8-bit row's math at 16 bits: α × clip as [`sdr16`] takes it, each channel's 10-bit code × 2⁶ from the table's `wide` part, premultiplied in 16 bits (`v ≤ 1023 × 2⁶`, so `v × α < 2³²`), then the threshold `b` (0..64) and the cut to 10 bits, which stays at or below 1023.
+    fn finalize_1010102_run(src: &[Self], clip: &[u8], dst: &mut [u32], x: usize, y: usize, table: &crate::theme::Hdr10Table, opaque: bool) -> u32 {
+        let row = &DITHER[y & 7];
+        let mut m = G2t16::ONE;
+        for (i, out) in dst.iter_mut().enumerate() {
+            let p = src[i];
+            let c = clip[i] as u32;
+            let a = (p.alpha() * CLIP_Q16[c as usize]) >> 16;
+            if a == 0 {
+                *out = if opaque { 3 << 30 } else { 0 };
+                continue;
+            }
+            let d = p.channels();
+            m = m.min(d[0]).min(d[1]).min(d[2]);
+            let t = row[(x + i) & 7] >> 2;
+            let ch = |d: u32| {
+                let v = table.wide[d as usize] as u32;
+                let v = if a == G2t16::ONE { v } else { (v * a) >> 16 };
+                (v + t) >> 6
+            };
+            let a2 = if opaque { 3 } else { (a * 3 + (G2t16::ONE >> 1)) / G2t16::ONE };
+            // Stored order, the lowest field to bits 0–9, as the 8-bit row packs it: `channels` names them from the top (R, G, B on the desktop layout), so the last is first here.
+            *out = ch(d[2]) | ch(d[1]) << 10 | ch(d[0]) << 20 | a2 << 30;
+        }
+        m >> 8
+    }
+
+    fn hdr10_table(declared: f32) -> crate::theme::Hdr10Table {
+        crate::theme::Hdr10Table::new_wide(declared)
+    }
+}
+
+#[cfg(test)]
+mod g2t16_present_tests {
+    use super::*;
+
+    /// An 8-bit composite (darkness (top code − code) × α) at 16 bits: the same light and cover, `256·d + α` per channel and `α × 257`.
+    fn widen(a: u32, d: [u32; 3]) -> G2t16 {
+        G2t16::from_channels(a * 257, d.map(|d| d * 256 + a))
+    }
+
+    /// The exact SDR present of 16-bit pixel `p` under clip `m`, in 8-bit steps: (α × clip, and each channel's display code (its 16-bit code's light, atanh clipped at white) × α × clip).
+    fn exact(p: G2t16, m: u32) -> (f64, [f64; 3]) {
+        let fa = p.alpha() as f64 / 65535. * m as f64 / 255.;
+        let v = p.channels().map(|d| libm::atanh((65535 - d) as f64 / 65536.).min(1.) * 255. * fa);
+        (fa * 255., v)
+    }
+
+    /// Bytes of a finalized pixel: α, R, G, B.
+    fn bytes(o: u32) -> [u32; 4] {
+        [o >> 24, (o >> 16) & 0xFF, (o >> 8) & 0xFF, o & 0xFF]
+    }
+
+    /// One 8 × 8 dither cell of the same pixel, finalized at 16 bits (all 64 thresholds once each).
+    fn cell(p: G2t16, m: u8) -> [u32; 64] {
+        let mut out = [0u32; 64];
+        for y in 0..8 {
+            G2t16::finalize_run(&[p; 8], &[m; 8], &mut out[y * 8..y * 8 + 8], 0, y, false);
+        }
+        out
+    }
+
+    /// The 16-bit present is the exact present dithered: every pixel within one step of the exact value (the dither puts it on one of the two codes around it), each 8 × 8 cell's average within 1/64 of a step of it (the matrix resolves 64 levels), and no channel above its α.
+    /// Over every 8-bit composite (α, and darkness ≤ α in three different channels) at five clips, widened to 16 bits, plus a sweep of 16-bit values between the 8-bit steps.
+    #[test]
+    fn g2t16_present_is_the_exact_present_dithered() {
+        let mut pixels: Vec<G2t16> = Vec::new();
+        for a in 0..=255u32 {
+            for d in (0..=a).step_by(3) {
+                pixels.push(widen(a, [d, a - d, d / 2]));
+            }
+        }
+        let mut s = 0x7F4A_7C15u32;
+        for _ in 0..1 << 12 {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            let a = s >> 16;
+            pixels.push(G2t16::from_channels(a, [(s & 0xFFFF) * a >> 16, (s >> 3 & 0xFFFF) * a >> 16, (s >> 7 & 0xFFFF) * a >> 16]));
+        }
+        for m in [255u8, 200, 128, 1, 0] {
+            for &p in &pixels {
+                let (ea, ec) = exact(p, m as u32);
+                let want = [ea, ec[0], ec[1], ec[2]];
+                let out = cell(p, m);
+                let mut sum = [0f64; 4];
+                for &o in &out {
+                    let b = bytes(o);
+                    for k in 0..4 {
+                        assert!((b[k] as f64 - want[k]).abs() < 1., "{p:016x} clip {m}: byte {k} is {} for exact {}", b[k], want[k]);
+                        sum[k] += b[k] as f64;
+                    }
+                    assert!(b[1] <= b[0] && b[2] <= b[0] && b[3] <= b[0], "{p:016x} clip {m}: a channel above α in {o:08x}");
+                }
+                for k in 0..4 {
+                    assert!((sum[k] / 64. - want[k]).abs() <= 1. / 64., "{p:016x} clip {m}: byte {k} averages {} for exact {}", sum[k] / 64., want[k]);
+                }
+            }
+        }
+    }
+
+    /// The 16-bit present against the 8-bit one, the same composite at both depths: at or above it, never below, by up to 2 steps in α and 4 in a channel.
+    /// The 8-bit present takes `>> 8` for `÷ 255` twice and floors both (α × clip: `255 × 255 >> 8` shows a whole pixel as 254; then the premultiply), which leaves it below the exact value by up to 1.7 steps in α and 3.6 in a channel and never above it; the 16-bit present is within one step of the exact value either way ([`g2t16_present_is_the_exact_present_dithered`]).
+    /// The two together are the bound: the 8-bit floors plus the dither's one step.
+    #[test]
+    fn g2t16_present_tracks_argb8() {
+        for m in [255u8, 200, 128, 1, 0] {
+            for a in 0..=255u32 {
+                for d in 0..=a {
+                    let rgb = [d, a - d, d / 2];
+                    let mut p8 = [0u32; 1];
+                    Argb8::finalize_run(&[Argb8::from_channels(a, rgb)], &[m], &mut p8, 0, 0, false);
+                    let b8 = bytes(p8[0]);
+                    for o in cell(widen(a, rgb), m) {
+                        let b16 = bytes(o);
+                        for k in 0..4 {
+                            let diff = b16[k] as i32 - b8[k] as i32;
+                            let high = if k == 0 { 2 } else { 4 };
+                            assert!((0..=high).contains(&diff), "α {a} darkness {rgb:?} clip {m}: byte {k} 16-bit {} vs 8-bit {}", b16[k], b8[k]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The colour step alone (the hover overlay, the debug views) is the full present's at a whole clip with the premultiply left out, and the over finalize of an opaque or empty pixel is the plain one.
+    #[test]
+    fn g2t16_colour_step_and_over_agree_with_the_run() {
+        let mut s = 0x2545_F491u32;
+        for _ in 0..1 << 12 {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            let a = if s & 1 == 0 { G2t16::ONE } else { 0 };
+            let p = G2t16::from_channels(a, [s & 0xFFFF, (s >> 5) & 0xFFFF, (s >> 11) & 0xFFFF].map(|d| d * a / G2t16::ONE));
+            for (x, y) in [(0usize, 0usize), (3, 5), (13, 6), (7, 7)] {
+                let (mut plain, mut over, mut raw) = ([0u32; 1], [0u32; 1], [0u32; 1]);
+                G2t16::finalize_run(&[p], &[255], &mut plain, x, y, false);
+                G2t16::finalize_over_run(&[p], &[255], &mut over, x, y);
+                G2t16::finalize_run(&[p], &[255], &mut raw, x, y, true);
+                assert_eq!(over, plain, "{p:016x}");
+                assert_eq!(p.to_sdr_visible_at(x, y), raw[0], "{p:016x} at ({x}, {y})");
+            }
+        }
+    }
+
+    /// The 10-bit present from 16 bits: an opaque pixel's channel is its table code to the dither's step, white at 1023 / declared-ratio scale like the 8-bit table, a half-covered one premultiplied, a transparent one zero, and the peak the brightest visible code's 8-bit bucket.
+    #[test]
+    fn g2t16_ten_bit_present() {
+        let t = G2t16::hdr10_table(2.0);
+        let white = G2t16::from_g2t8(crate::theme::WHITE);
+        let glow = G2t16::from_g2t8(0xFF00_0000 | ((255 - 227) << 16) | ((255 - 227) << 8) | (255 - 227));
+        let scratch = [white, glow, white.with_alpha(G2t16::alpha_from8(128)), G2t16::EMPTY];
+        let mut dst = [0xDEAD_BEEFu32; 5];
+        let was = crate::paint::OPAQUE_BACKDROP.swap(false, core::sync::atomic::Ordering::Relaxed);
+        let peak = finalize_into_1010102(&scratch, &[255; 4], 4, 1, &mut dst, 5, &t);
+        crate::paint::OPAQUE_BACKDROP.store(was, core::sync::atomic::Ordering::Relaxed);
+        let ch = |p: u32, i: u32| (p >> (10 * i)) & 0x3FF;
+        let w8 = t.code[(crate::theme::WHITE & 0xFF) as usize] as u32;
+        assert!(ch(dst[0], 0).abs_diff(w8) <= 1, "white {} vs the 8-bit table's {w8}", ch(dst[0], 0));
+        assert_eq!(dst[0] >> 30, 3);
+        assert!(ch(dst[1], 0).abs_diff(t.code[255 - 227] as u32) <= 1);
+        assert!(ch(dst[2], 0).abs_diff((w8 + 1) / 2) <= 1, "half-covered white {}", ch(dst[2], 0));
+        assert_eq!(dst[2] >> 30, 2);
+        assert_eq!(dst[3], 0);
+        assert_eq!(dst[4], 0xDEAD_BEEF, "the stride gap is not written");
+        assert_eq!(peak, 227);
+    }
+
+    /// The dither matrix holds each of its 64 levels once and centres them in the step: thresholds 2 to 254, mean 128.
+    #[test]
+    fn dither_is_a_bayer_permutation() {
+        let mut seen = [false; 64];
+        let mut sum = 0;
+        for row in DITHER {
+            for t in row {
+                assert_eq!(t % 4, 2);
+                assert!(!seen[(t / 4) as usize]);
+                seen[(t / 4) as usize] = true;
+                sum += t;
+            }
+        }
+        assert_eq!(sum / 64, 128);
+        // Each aligned 2 × 2 block spreads its levels a quarter of the range apart, the Bayer property that keeps the pattern fine.
+        for y in (0..8).step_by(2) {
+            for x in (0..8).step_by(2) {
+                let mut b = [DITHER[y][x] / 4, DITHER[y][x + 1] / 4, DITHER[y + 1][x] / 4, DITHER[y + 1][x + 1] / 4];
+                b.sort();
+                assert_eq!([b[1] - b[0], b[2] - b[1], b[3] - b[2]], [16, 16, 16]);
             }
         }
     }

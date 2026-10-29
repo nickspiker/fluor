@@ -119,10 +119,10 @@ impl Surface {
     /// `dirty = true` means the caller painted new content into `scratch` this frame — we bump `content_version` so any other Android buffer still holding the previous content reads as stale and gets re-finalized when it next rotates in. `dirty = false` means the caller didn't repaint; we still run the lock/unlock cycle to drive Choreographer timing, but skip the finalize entirely when the magic pixel already matches.
     ///
     /// Returns `true` if pixels were actually written this frame, `false` if the cache hit and we short-circuited.
-    pub fn present(
+    pub fn present<P: crate::paint::Finalize>(
         &mut self,
         window: &NativeWindow,
-        scratch: &[u32],
+        scratch: &[P],
         clip_mask: &[u8],
         win_w: usize,
         win_h: usize,
@@ -134,7 +134,7 @@ impl Surface {
             let w = window.ptr().as_ptr();
             if !self.hdr.as_ref().is_some_and(|h| h.fits(w, win_w, win_h)) {
                 self.hdr = None;
-                self.hdr = super::hdr_surface::HdrSurface::new(w, win_w, win_h);
+                self.hdr = super::hdr_surface::HdrSurface::new::<P>(w, win_w, win_h);
                 self.hdr_refused = self.hdr.is_none();
             }
             if let Some(h) = self.hdr.as_mut() {
