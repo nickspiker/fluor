@@ -1,5 +1,6 @@
 //! The 8-bit-only helpers: the colour boundary into the authored palette, the theme-delta arithmetic, and the passes that work on the OS's finalized visible pixels (the hover overlay, the damage outline, the window-control glyphs).
-//! Each speaks bytes on purpose, so none of it is generic over [`crate::pixel::Pixel`]: [`pack_argb`] and [`unpack_argb`] make and read the 8-bit `g2t` colours every depth's kernels take (`Pixel::from_g2t8` widens them), the `wrap_*` deltas are byte arithmetic on theme constants, and the overlay, outline and glyphs write the 8-bit screen buffer after finalize.
+//! Each speaks bytes on purpose, so none of it draws at a buffer's depth ([`crate::pixel::Pixel`]): [`pack_argb`] and [`unpack_argb`] make and read the 8-bit `g2t` colours every depth's kernels take (`Pixel::from_g2t8` widens them), the `wrap_*` deltas are byte arithmetic on theme constants, and the overlay, outline and glyphs write the 8-bit screen buffer after finalize.
+//! The overlay alone reads the app's own buffer, at its depth, each pixel's colour step taken where the present took it ([`super::Finalize::to_sdr_visible_at`], dither included), so a restored pixel matches its neighbours.
 //! They lived in paint.rs and shape.rs until the rendering core went generic; the paths are unchanged (`crate::paint::pack_argb`, `crate::paint::glyph`, and so on, thru paint's re-export).
 
 use super::HitId;

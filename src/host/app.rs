@@ -600,7 +600,8 @@ pub use super::event_response::EventResponse;
 
 /// What a consumer implements to drive the desktop host.
 ///
-/// `P` is the pixel depth the app renders at, 8-bit unless named: the desktop, Android and the default ferros host run `FluorApp` (= `FluorApp<Argb8>`); a ferros app can implement `FluorApp<G2t16>` and run on the 16-bit shell.
+/// `P` is the pixel depth the app renders at, 8-bit unless named: an app implementing `FluorApp` (= `FluorApp<Argb8>`) renders at 8 bits on every host, one implementing `FluorApp<G2t16>` at 16 — the desktop and Android present it thru [`crate::paint::Finalize`] (dithered to the 8-bit surfaces, straight into Android's 10-bit one), ferros hands it to the display as drawn.
+/// The hosts take the depth from the app's impl.
 pub trait FluorApp<P: crate::pixel::Pixel = crate::pixel::Argb8> {
     /// Custom user-event payload for cross-thread wake-up. Background tasks (network, file I/O, async ceremonies) clone the `Arc<dyn WakeSender<Self::UserEvent>>` from [`Self::set_event_proxy`] and call `proxy.send(payload)` to wake the host; the host dispatches the payload back thru [`Self::on_user_event`] on the UI thread. Apps that don't need cross-thread wake-up declare `type UserEvent = ();` and skip the two methods.
     type UserEvent: 'static + Send;
@@ -854,6 +855,7 @@ pub trait FluorApp<P: crate::pixel::Pixel = crate::pixel::Argb8> {
 }
 
 /// Run the desktop host until the window closes. Builds an `EventLoop` typed on `A::UserEvent` so background-thread wake-ups via the WakeSender route thru [`FluorApp::on_user_event`]. The proxy is created up-front, wrapped in a [`winit_compat::WinitWakeSender`], and handed to the app via [`FluorApp::set_event_proxy`] BEFORE the event loop starts, so apps can clone-and-ship the Arc to background tasks during their own constructor or [`FluorApp::init`].
+/// The app renders at the depth its `FluorApp` impl names (`P`, inferred from it); the present takes it to the 8-bit window surfaces ([`crate::paint::Finalize`]).
 #[cfg(feature = "host-winit")]
 pub fn run_app<P: Finalize, A: FluorApp<P> + 'static>(app: A) -> Result<(), EventLoopError> {
     run_app_recoverable(app).1

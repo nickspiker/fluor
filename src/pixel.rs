@@ -126,7 +126,7 @@ pub trait Pixel: Blend + Copy + Eq + Send + Sync + core::fmt::Debug + 'static {
         a8 * (Self::ONE / 255)
     }
 
-    /// `dst[i] = dst[i].under(src[i], Normal)` over a run: the hook a depth's SIMD kernel takes over (Argb8 runs 8 lanes of `wide::u32x8` with the `simd` feature).
+    /// `dst[i] = dst[i].under(src[i], Normal)` over a run: the hook a depth's SIMD kernel takes over (with the `simd` feature Argb8 runs 8 lanes of `wide::u32x8`, G2t16 8 pixels as two `u32x8` halves).
     #[inline]
     fn under_chunk_normal(dst: &mut [Self], src: &[Self]) {
         for i in 0..dst.len() {
