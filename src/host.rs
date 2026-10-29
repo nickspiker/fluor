@@ -37,6 +37,10 @@ pub mod android;
 #[cfg(all(feature = "host-ferros", target_os = "ferros"))]
 pub mod ferros;
 
+// The ferros display's working values from either pixel depth: the present the ferros host runs, kept apart from its syscalls so it builds (and is tested) on every host.
+#[cfg(all(feature = "std", any(test, feature = "host-ferros")))]
+pub mod panel;
+
 // OS input-timing settings (double-click interval, …). Available on ANY host — the pointer gestures that consume it (multi-click word/all select) are host-agnostic; only the query backends are per-OS (Linux XSettings/gsettings; everywhere else the 400 ms default until a native query lands).
 #[cfg(any(feature = "host-winit", feature = "host-android", feature = "host-ferros"))]
 pub mod os_input;

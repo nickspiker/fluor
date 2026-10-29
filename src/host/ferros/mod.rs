@@ -2,7 +2,7 @@
 //!
 //! The process holds three capabilities the caller names by grant slot (`Caps`): the display endpoint, the touch endpoint, its own surface (a full screen of 64-bit pixels; ferros WINDOWS.md). The syscalls are inlined here (ferros_sys is not a published crate): `call`, `dma`, `sleep`, the counter.
 //!
-//! Pixels: fluor's `0xααRRGGBB` darkness buffer becomes the display's working values — gamma 2 encoded, white = 16384 (Q14), R, G, B in bits 0-15, 16-31, 32-47 of a u64 — through one 256-entry table: fluor's bytes are VSF `g2t` codes (theme.rs, since 2026-10-20: 194 diffuse white, 255 9.7× white), whose light is atanh(c/256)², so the display's gamma 2 (√light) is atanh(c/256), 255 landing at 3.1 of the surface's 4.0. Opacity composites over black. The whole frame is converted and shown each time the app drew; the damage rect narrows that later.
+//! Pixels: the shell renders at the app's depth (`FluorApp<P>`: 8-bit unless the app names `G2t16`) and [`crate::host::panel`] turns the scratch into the display's working values. At 8 bits: fluor's `0xααRRGGBB` darkness buffer becomes the display's working values — gamma 2 encoded, white = 16384 (Q14), R, G, B in bits 0-15, 16-31, 32-47 of a u64 — through one 256-entry table: fluor's bytes are VSF `g2t` codes (theme.rs, since 2026-10-20: 194 diffuse white, 255 9.7× white), whose light is atanh(c/256)², so the display's gamma 2 (√light) is atanh(c/256), 255 landing at 3.1 of the surface's 4.0. Opacity composites over black. The whole frame is converted and shown each time the app drew; the damage rect narrows that later.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -18,7 +18,9 @@ use crate::geom::Viewport;
 use crate::host::app::{Context, FluorApp};
 use crate::host::wake::{WakeError, WakeSender};
 use crate::host::{EventResponse, WindowHandle};
+use crate::host::panel::PanelPixel;
 use crate::paint::{HitId, HIT_NONE};
+use crate::pixel::Argb8;
 use crate::text::TextRenderer;
 
 /// The kernel, as a ferros process reaches it (KERNEL.md, process ABI).
@@ -139,8 +141,8 @@ pub struct Contact {
     pub y: u16,
 }
 
-/// The app and everything the host keeps for it between frames.
-pub struct FerrosShell<A: FluorApp> {
+/// The app and everything the host keeps for it between frames, at the app's pixel depth `P` (8-bit unless the app implements `FluorApp<G2t16>`).
+pub struct FerrosShell<A: FluorApp<P>, P: PanelPixel = Argb8> {
     app: A,
     text: TextRenderer,
     window: FerrosWindow,
@@ -148,7 +150,7 @@ pub struct FerrosShell<A: FluorApp> {
     cursor_x: Coord,
     cursor_y: Coord,
     modifiers: FModifiersState,
-    scratch: Vec<u32>,
+    scratch: Vec<P>,
     clip_mask: Vec<u8>,
     pending_damage: Damage,
     pointer: crate::host::pointer::PointerArbiter,
@@ -164,7 +166,7 @@ pub struct FerrosShell<A: FluorApp> {
     wake: Arc<FerrosWakeSender<A::UserEvent>>,
 }
 
-impl<A: FluorApp> FerrosShell<A> {
+impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
     pub fn new(mut app: A, width: u32, height: u32, ru: Coord) -> Self {
         let viewport = Viewport::new(width, height).with_ru(ru);
         let wake = Arc::new(FerrosWakeSender { queue: Mutex::new(Vec::new()) });
@@ -178,7 +180,7 @@ impl<A: FluorApp> FerrosShell<A> {
             cursor_x: 0.0,
             cursor_y: 0.0,
             modifiers: FModifiersState::empty(),
-            scratch: alloc::vec![0u32; px],
+            scratch: alloc::vec![P::EMPTY; px],
             clip_mask: alloc::vec![255u8; px],
             pending_damage: Damage::new(),
             pointer: crate::host::pointer::PointerArbiter::new(),
@@ -241,18 +243,11 @@ impl<A: FluorApp> FerrosShell<A> {
         true
     }
 
-    /// The scratch buffer as the display's working values, into the surface: a full screen at the panel's width `stride`, the frame at (`fx`, `fy`) on it (ferros WINDOWS.md: every app's surface is the whole screen).
+    /// The scratch buffer as the display's working values, into the surface: a full screen at the panel's width `stride`, the frame at (`fx`, `fy`) on it (ferros WINDOWS.md: every app's surface is the whole screen). The conversion is the depth's own ([`PanelPixel::to_panel`]).
     pub fn present(&self, surface: &mut [u64], stride: usize, fx: usize, fy: usize) {
-        let lut = g2t_table();
         let w = self.viewport.width_px as usize;
         for (y, src) in self.scratch.chunks_exact(w).enumerate() {
-            let row = &mut surface[(fy + y) * stride + fx..(fy + y) * stride + fx + w];
-            for (dst, &px) in row.iter_mut().zip(src.iter()) {
-                let a = px >> 24;
-                let (r, g, b) = (255 - ((px >> 16) & 255), 255 - ((px >> 8) & 255), 255 - (px & 255));
-                let (r, g, b) = ((r * a + 127) / 255, (g * a + 127) / 255, (b * a + 127) / 255);
-                *dst = lut[r as usize] as u64 | (lut[g as usize] as u64) << 16 | (lut[b as usize] as u64) << 32;
-            }
+            P::to_panel(src, &mut surface[(fy + y) * stride + fx..(fy + y) * stride + fx + w]);
         }
     }
 
@@ -383,7 +378,7 @@ impl<A: FluorApp> FerrosShell<A> {
         f(&mut self.app, &mut ctx)
     }
 
-    fn with_context_render(&mut self, damage_clip: PixelRect, f: impl FnOnce(&mut A, &mut [u32], &mut Context)) {
+    fn with_context_render(&mut self, damage_clip: PixelRect, f: impl FnOnce(&mut A, &mut [P], &mut Context)) {
         let mut ctx = Context {
             pressed_hit: self.pointer.held_id(),
             viewport: self.viewport,
@@ -403,7 +398,7 @@ impl<A: FluorApp> FerrosShell<A> {
 }
 
 /// Clear `scratch[y0..y1][x0..x1]` to α=0 + zero darkness (the desktop and Android shells do the same).
-fn clear_scratch_rect(scratch: &mut [u32], width: usize, rect: PixelRect) {
+fn clear_scratch_rect<P: PanelPixel>(scratch: &mut [P], width: usize, rect: PixelRect) {
     if rect.is_empty() || width == 0 {
         return;
     }
@@ -418,21 +413,9 @@ fn clear_scratch_rect(scratch: &mut [u32], width: usize, rect: PixelRect) {
             break;
         }
         for cell in &mut scratch[base..base + row_len] {
-            *cell = 0;
+            *cell = P::EMPTY;
         }
     }
-}
-
-/// fluor's `g2t` byte to the display's gamma-2 Q14 working value: `16384 × atanh(c / 256)`, VSF's decode at the bucket's bottom (vsf colour `linearize_gamma2tanh_u8`: light = atanh(c/256)², and gamma 2 is its root). It was `(c/255)^1.1` from when the bytes were gamma 2.2, which put diffuse white (194) at 0.55 of white and nothing above it (2026-10-29).
-fn g2t_table() -> &'static [u16; 256] {
-    static TABLE: std::sync::OnceLock<[u16; 256]> = std::sync::OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut t = [0u16; 256];
-        for (c, v) in t.iter_mut().enumerate() {
-            *v = (16384.0 * libm::atanhf(c as f32 / 256.0) + 0.5) as u16;
-        }
-        t
-    })
 }
 
 /// Whether a screen point is this window's (ferros display op 27): the frontmost window covering it, inside the circle an app lives in.
@@ -447,7 +430,8 @@ fn mine(display: u64, base: u64, x: u16, y: u16) -> bool {
 }
 
 /// Run `app` on the panel until it asks to close (an `EventResponse::Close`): frames at most 120 a second, touches polled between them. `ru` is the resolution unit for the viewport (what the device's density would set on Android; 1.0 is fluor's native scale). `size` is the app's frame, centred on the panel, or the whole panel — a 1344 × 2992 frame is 16 MiB of scratch alone, more than a small arc holds.
-pub fn run_app<A: FluorApp + 'static>(app: A, caps: Caps, ru: Coord, size: Option<(u32, u32)>) -> Result<(), String> {
+/// The depth is the app's: an app implementing `FluorApp` (8-bit) runs on the 8-bit shell as before, one implementing `FluorApp<G2t16>` on the 16-bit one, with the see-through bit wherever it drew nothing.
+pub fn run_app<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps, ru: Coord, size: Option<(u32, u32)>) -> Result<(), String> {
     let display = sys::cap(caps.display);
     let touch = sys::cap(caps.touch);
     let mut r = [0u8; 256];

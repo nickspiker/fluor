@@ -210,8 +210,8 @@ pub fn shift_screen_wrap(screen: &mut [u32], scr_w: usize, scr_h: usize, dx: i32
 ///
 /// Per row: one `copy_within` (lowers to `memmove`). Rows are copied in the order that never reads an already-overwritten source (bottom-up for a down-shift, top-down for an up-shift); source and destination rows are always distinct, so no single copy overlaps itself.
 #[allow(clippy::too_many_arguments)]
-pub fn scroll_copy_rect(
-    screen: &mut [u32],
+pub fn scroll_copy_rect<T: Copy>(
+    screen: &mut [T],
     scr_w: usize,
     scr_h: usize,
     x0: usize,
