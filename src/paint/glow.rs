@@ -33,6 +33,13 @@ fn compute_alphas<P: Pixel>(seed: u32, factor_256: u32) -> ([u32; 1024], usize) 
     (alphas, len)
 }
 
+/// The silhouette scan's "inside": α full to 8 bits.
+/// A squircle AA weight of `0xFF00` or more is a whole byte at 8 bits (α 255) and 99.6 % at 16; reading it as inside at every depth puts each ray's first pixel in the same place at both, so the glow's geometry does not depend on the depth (with `α == ONE` the 16-bit rays started a pixel further out wherever an edge weight sat in that last byte).
+#[inline(always)]
+fn interior<P: Pixel>(p: P) -> bool {
+    p.alpha() >> (P::DEPTH - 8) == (1 << 8) - 1
+}
+
 /// Same decay iteration as [`compute_alphas`] but returns only the length (`alpha_len`). Callers that need the per-ray pixel reach to pre-size damage rects (textbox focus glow padding, chrome shadow extent) use this so the geometry the host clears + finalizes matches *exactly* what the rasterizer will paint — no early cutoff at the bbox edge, no over-clearing past where rays actually decay to zero.
 pub fn ray_reach_px(seed: u32, factor_256: u32) -> usize {
     if seed == 0 || factor_256 == 0 || factor_256 >= 256 {
@@ -97,7 +104,7 @@ pub fn apply_textbox_glow_right<P: Pixel>(
         let row_base = y * buf_w;
         let mut opaque_x: Option<usize> = None;
         for x in (scan_left..scan_right).rev() {
-            if pixels[row_base + x].alpha() == P::ONE {
+            if interior(pixels[row_base + x]) {
                 opaque_x = Some(x);
                 break;
             }
@@ -163,7 +170,7 @@ pub fn apply_textbox_glow_left<P: Pixel>(
         let row_base = y * buf_w;
         let mut opaque_x: Option<usize> = None;
         for x in scan_left..scan_right {
-            if pixels[row_base + x].alpha() == P::ONE {
+            if interior(pixels[row_base + x]) {
                 opaque_x = Some(x);
                 break;
             }
@@ -236,7 +243,7 @@ pub fn apply_textbox_glow_top<P: Pixel>(
     for x in x0..x1 {
         let mut opaque_y: Option<usize> = None;
         for y in scan_top..scan_bot {
-            if pixels[y * buf_w + x].alpha() == P::ONE {
+            if interior(pixels[y * buf_w + x]) {
                 opaque_y = Some(y);
                 break;
             }
@@ -307,7 +314,7 @@ pub fn apply_textbox_glow_bottom<P: Pixel>(
     for x in x0..x1 {
         let mut opaque_y: Option<usize> = None;
         for y in (scan_top..scan_bot).rev() {
-            if pixels[y * buf_w + x].alpha() == P::ONE {
+            if interior(pixels[y * buf_w + x]) {
                 opaque_y = Some(y);
                 break;
             }

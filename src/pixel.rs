@@ -386,6 +386,18 @@ impl_under!(G2t16, 16);
 #[cfg(test)]
 pub(crate) fn narrow_to_8(p: G2t16) -> Argb8 {
     use vsf::colour::convert::{linearize_gamma2tanh_u16_f32, linearize_gamma2tanh_u8_f32};
+    // The 256 8-bit lights and the nearest 8-bit code for every 16-bit code, built once.
+    static NEAREST: std::sync::OnceLock<alloc::vec::Vec<u8>> = std::sync::OnceLock::new();
+    let nearest = NEAREST.get_or_init(|| {
+        let lights: alloc::vec::Vec<f64> = (0..=255u32).map(|c| linearize_gamma2tanh_u8_f32(c as u8) as f64).collect();
+        (0..=0xFFFFu32)
+            .map(|c16| {
+                let light = linearize_gamma2tanh_u16_f32(c16 as u16) as f64;
+                let up = lights.partition_point(|&l| l <= light).max(1) - 1;
+                if up < 255 && lights[up + 1] - light < light - lights[up] { (up + 1) as u8 } else { up as u8 }
+            })
+            .collect()
+    });
     let a16 = p.alpha();
     let a8 = (a16 + 128) / 257;
     if a16 == 0 {
@@ -396,18 +408,8 @@ pub(crate) fn narrow_to_8(p: G2t16) -> Argb8 {
         if d > a16 {
             return ((d - a16 / 257) + 128) >> 8;
         }
-        let code16 = 65535. - d as f64 * 65535. / a16 as f64;
-        let light = linearize_gamma2tanh_u16_f32(code16.round().clamp(0., 65535.) as u16) as f64;
-        let mut code8 = 0u32;
-        while code8 < 255 && (linearize_gamma2tanh_u8_f32(code8 as u8 + 1) as f64) <= light {
-            code8 += 1;
-        }
-        if code8 < 255 {
-            let (lo, hi) = (linearize_gamma2tanh_u8_f32(code8 as u8) as f64, linearize_gamma2tanh_u8_f32(code8 as u8 + 1) as f64);
-            if hi - light < light - lo {
-                code8 += 1;
-            }
-        }
+        let code16 = (65535. - d as f64 * 65535. / a16 as f64).round() as usize;
+        let code8 = nearest[code16] as u32;
         (((255 - code8) * a8) as f64 / 255.).round() as u32
     };
     Argb8::from_channels(a8, p.channels().map(channel))

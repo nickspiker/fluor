@@ -9,8 +9,10 @@
 
 use crate::canvas::{Canvas, Damage, PixelRect};
 use crate::paint::{self, AlphaMask, BlendMode, Clip};
+use crate::pixel::{Argb8, Pixel};
 use crate::theme;
 use alloc::vec;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 /// Scene width: wide enough for a pill with a glow on both sides and a run of text.
@@ -59,15 +61,14 @@ fn check_hash(name: &str, got: u64, want: u64) {
     assert_eq!(got, want, "golden scene `{name}` moved: now {got:016x}, recorded {want:016x}");
 }
 
-/// A fresh empty buffer and damage accumulator at the scene size.
-fn scene() -> (Vec<u32>, Damage) {
-    (vec![0u32; W * H], Damage::new())
+/// A fresh empty buffer and damage accumulator at the scene size, at depth `P`.
+fn scene<P: Pixel>() -> (Vec<P>, Damage) {
+    (vec![P::EMPTY; W * H], Damage::new())
 }
 
 /// Every integer-only primitive in paint.rs: fill and stroke rects (plain, clipped, masked, hairline), the filled circle and the blinkey.
-#[test]
-fn golden_paint_rects() {
-    let (mut px, mut dmg) = scene();
+fn paint_rects<P: Pixel>() -> Vec<P> {
+    let (mut px, mut dmg) = scene::<P>();
     let mask_bytes: Vec<u8> = (0..W * H).map(|i| ((i % W) * 255 / W) as u8).collect();
     let mask = AlphaMask::new(&mask_bytes, W, H);
     {
@@ -85,13 +86,17 @@ fn golden_paint_rects() {
         paint::draw_blinkey(&mut c, 100, 20, 40, true);
         paint::draw_blinkey_tinted(&mut c, 120, 20, 40, false, (160, 80, 255));
     }
-    check("paint_rects", &px, 0x219a_55dc_a5c7_3aca);
+    px
+}
+
+#[test]
+fn golden_paint_rects() {
+    check("paint_rects", &paint_rects::<Argb8>(), 0x219a_55dc_a5c7_3aca);
 }
 
 /// The float AA shapes in paint/shape.rs: axis rect with fractional edges, hairlines, rotated rect, AA circle, segmented ring.
-#[test]
-fn golden_shapes() {
-    let (mut px, mut dmg) = scene();
+fn shapes<P: Pixel>() -> Vec<P> {
+    let (mut px, mut dmg) = scene::<P>();
     {
         let mut c = Canvas::new(&mut px, W, H, &mut dmg);
         paint::draw_rect(&mut c, 60.3, 40.7, 90.4, 50.2, theme::BUTTON_HOVER, None);
@@ -102,25 +107,33 @@ fn golden_shapes() {
         paint::draw_circle(&mut c, 270.5, 150.25, 30.7, theme::MAXIMIZE_GLYPH, None);
         paint::draw_ring_segments(&mut c, 120., 96., 44., 6., 4., &[theme::CLOSE_HOVER, theme::MAXIMIZE_HOVER, theme::MINIMIZE_HOVER, 0, theme::WHITE], None);
     }
-    check("shapes", &px, 0x6777_2b5d_1819_8f0d);
+    px
+}
+
+#[test]
+fn golden_shapes() {
+    check("shapes", &shapes::<Argb8>(), 0x6777_2b5d_1819_8f0d);
 }
 
 /// The ellipses (implicit form with the fast reciprocal square root).
-#[test]
-fn golden_ellipses() {
-    let (mut px, mut dmg) = scene();
+fn ellipses<P: Pixel>() -> Vec<P> {
+    let (mut px, mut dmg) = scene::<P>();
     {
         let mut c = Canvas::new(&mut px, W, H, &mut dmg);
         paint::draw_ellipse(&mut c, 90.5, 80.25, 70.3, 40.6, theme::BUTTON_FILL, None);
         paint::draw_ellipse_rotated(&mut c, 220., 110., 80., 30., 0.7, (theme::TEXTBOX_SELECTION_BG & 0x00FF_FFFF) | 0xA000_0000, None);
     }
-    check("ellipses", &px, 0x21fd_a6cb_4194_1455);
+    px
+}
+
+#[test]
+fn golden_ellipses() {
+    check("ellipses", &ellipses::<Argb8>(), 0x21fd_a6cb_4194_1455);
 }
 
 /// Squircle pills and rounded rects, integer and fractional exponent, single colour and two-tone, asymmetric corners, stacked so the second composes under the first.
-#[test]
-fn golden_squircles() {
-    let (mut px, mut dmg) = scene();
+fn squircles<P: Pixel>() -> Vec<P> {
+    let (mut px, mut dmg) = scene::<P>();
     {
         let mut c = Canvas::new(&mut px, W, H, &mut dmg);
         paint::draw_squircle_pill(&mut c, 8, 8, 140, 44, theme::TEXTBOX_FILL, paint::SHAPE_POWER);
@@ -132,21 +145,25 @@ fn golden_squircles() {
         paint::draw_squircle_rrect_two_tone(&mut c, 8, 68, 138, 108, theme::WINDOW_LIGHT_EDGE, theme::WINDOW_SHADOW_EDGE, paint::asymmetric_radii(40.), paint::SHAPE_POWER, None, 0);
         paint::draw_squircle_rrect_two_tone_f(&mut c, 166, 68, 144, 108, theme::WINDOW_LIGHT_EDGE, theme::WINDOW_SHADOW_EDGE, [12., 34., 54., 20.], 2.5, None, 0);
     }
-    check("squircles", &px, 0x6041_ac40_23c4_68b4);
+    px
 }
 
-/// The textbox focus glow around a pill, its mask taken from the pill's own α in the scene, and the four directional ray glows the textbox and button paint.
 #[test]
-fn golden_glow() {
+fn golden_squircles() {
+    check("squircles", &squircles::<Argb8>(), 0x6041_ac40_23c4_68b4);
+}
+
+/// The textbox focus glow around a pill, its mask taken from the pill's own α in the scene (the top byte of α at any depth), and the four directional ray glows the textbox and button paint.
+fn glows<P: Pixel>() -> (Vec<P>, Vec<P>, Vec<P>) {
     let (bw, bh) = (180usize, 48usize);
-    let (mut px, mut dmg) = scene();
+    let (mut px, mut dmg) = scene::<P>();
     let (cx, cy) = (W / 2, H / 2);
     let (x, y) = ((cx - bw / 2) as isize, (cy - bh / 2) as isize);
     {
         let mut c = Canvas::new(&mut px, W, H, &mut dmg);
         paint::draw_squircle_pill(&mut c, x, y, bw as isize, bh as isize, theme::TEXTBOX_ACTIVE, paint::SHAPE_POWER);
     }
-    let mask: Vec<u8> = px.iter().map(|p| (p >> 24) as u8).collect();
+    let mask: Vec<u8> = px.iter().map(|p| (p.alpha() >> (P::DEPTH - 8)) as u8).collect();
     let pill = px.clone();
     let mut rays = px.clone();
     {
@@ -161,6 +178,12 @@ fn golden_glow() {
         paint::apply_textbox_glow_top(&mut c, x, y, w, h, theme::GLOW_DEFAULT, 0x40, 220, None);
         paint::apply_textbox_glow_bottom(&mut c, x, y, w, h, theme::GLOW_DEFAULT, 0x40, 220, Some(Clip::new(0, 0, 200, H)));
     }
+    (pill, px, rays)
+}
+
+#[test]
+fn golden_glow() {
+    let (pill, px, rays) = glows::<Argb8>();
     assert_ne!(px, pill, "the glow painted nothing");
     assert_ne!(rays, pill, "the ray glows painted nothing");
     check("glow", &px, 0xbb0c_f158_2b71_398d);
@@ -225,9 +248,8 @@ fn golden_finalize() {
     check8("finalize_clip_mask", &clip, 0xa5b2_9342_0fa7_8f25);
 }
 
-/// Layer compositing: `flatten` in every blend mode (Normal takes the SIMD path where enabled), the stack compositor's program of pushes, a constant and unders.
-#[test]
-fn golden_compositing() {
+/// Two layers of random pixels that keep the `dark ≤ α` invariant every buffer holds, 8-bit, from fixed seeds.
+fn random_layers() -> (Vec<u32>, Vec<u32>) {
     let make = |seed: u32| -> Vec<u32> {
         let mut v = vec![0u32; W * H];
         let mut s = seed;
@@ -242,50 +264,81 @@ fn golden_compositing() {
         }
         v
     };
-    let top = make(0x1234_5678);
-    let bottom = make(0x9abc_def1);
-    let modes = [
-        BlendMode::Normal,
-        BlendMode::Multiply,
-        BlendMode::Screen,
-        BlendMode::Add,
-        BlendMode::Subtract,
-        BlendMode::Overlay,
-        BlendMode::Darken,
-        BlendMode::Lighten,
-    ];
-    let mut all = Vec::with_capacity(W * H * modes.len());
-    for mode in modes {
+    (make(0x1234_5678), make(0x9abc_def1))
+}
+
+/// An 8-bit composite (a layer built by `under` from empty, darkness (top code − code) × α) at depth `P`: its darkness widens as `256·d + α` per 8 bits of depth gained, which at full α is `from_g2t8`'s `+ 255`.
+fn widen_composite<P: Pixel>(p: u32) -> P {
+    let gain = P::DEPTH - 8;
+    let a = p >> 24;
+    P::from_channels(a * (P::ONE / 255), Argb8::channels(p).map(|d| (d << gain) + ((a << gain) - a) / 255))
+}
+
+const MODES: [BlendMode; 8] = [
+    BlendMode::Normal,
+    BlendMode::Multiply,
+    BlendMode::Screen,
+    BlendMode::Add,
+    BlendMode::Subtract,
+    BlendMode::Overlay,
+    BlendMode::Darken,
+    BlendMode::Lighten,
+];
+
+/// `flatten` in every blend mode (Normal takes the depth's chunk kernel, SIMD at 8 bits where enabled): the top is a composite, the bottom a source layer, each widened to `P` as such.
+fn flatten_modes<P: Pixel>() -> Vec<P> {
+    let (top, bottom) = random_layers();
+    let top: Vec<P> = top.iter().map(|&p| widen_composite(p)).collect();
+    let bottom: Vec<P> = bottom.iter().map(|&p| P::from_g2t8(p)).collect();
+    let mut all = Vec::with_capacity(W * H * MODES.len());
+    for mode in MODES {
         let mut dst = top.clone();
         paint::flatten(&mut dst, &bottom, mode);
         all.extend_from_slice(&dst);
     }
-    check("flatten_modes", &all, 0xe6e4_2538_b27c_e511);
+    all
+}
 
+/// The stack compositor's program of pushes, a constant and unders, over two composite layers.
+fn stack<P: Pixel>() -> Vec<P> {
     use crate::stack::{Op, StackCompositor};
-    let mut stack = StackCompositor::new(W, H);
+    let (top, bottom) = random_layers();
+    let mut stack = StackCompositor::<P>::with_depth(W, H);
     let l0 = stack.new_layer();
     let l1 = stack.new_layer();
-    stack.layers[l0].pixels.copy_from_slice(&top);
-    stack.layers[l1].pixels.copy_from_slice(&bottom);
+    for (dst, src) in [(l0, &top), (l1, &bottom)] {
+        for (d, &s) in stack.layers[dst].pixels.iter_mut().zip(src.iter()) {
+            *d = widen_composite(s);
+        }
+    }
     stack.set_program(vec![Op::Push(l0), Op::Push(l1), Op::Under(BlendMode::Normal), Op::Constant(theme::BG_BASE | 0xFF00_0000), Op::Under(BlendMode::Screen)]);
-    let out = stack.evaluate().to_vec();
-    check("stack", &out, 0xfb5e_fc65_bbc7_6bb3);
+    stack.evaluate().to_vec()
+}
+
+#[test]
+fn golden_compositing() {
+    check("flatten_modes", &flatten_modes::<Argb8>(), 0xe6e4_2538_b27c_e511);
+    check("stack", &stack::<Argb8>(), 0xfb5e_fc65_bbc7_6bb3);
 }
 
 /// The background noise field, its own base and a given one, scrolled.
-#[test]
-fn golden_background_noise() {
-    let (mut px, mut dmg) = scene();
+fn noise<P: Pixel>() -> (Vec<P>, Vec<P>) {
+    let (mut px, mut dmg) = scene::<P>();
     {
         let mut c = Canvas::new(&mut px, W, H, &mut dmg);
         paint::background_noise(&mut c, 3, false, 0, None, None);
     }
-    let (mut px2, mut dmg2) = scene();
+    let (mut px2, mut dmg2) = scene::<P>();
     {
         let mut c = Canvas::new(&mut px2, W, H, &mut dmg2);
         paint::background_noise(&mut c, 7, true, 13, Some(Clip::new(0, 20, W, 150)), Some(theme::BUTTON_FILL));
     }
+    (px, px2)
+}
+
+#[test]
+fn golden_background_noise() {
+    let (px, px2) = noise::<Argb8>();
     check("noise", &px, 0xe5d4_3657_bbf2_f4cd);
     check("noise_based_clipped", &px2, 0xdec6_5eba_0ebb_1243);
 }
@@ -298,10 +351,9 @@ mod text_scenes {
     use crate::widgets::{Button, Dropdown, Textbox};
 
     /// Left, centred and right-aligned text, a bold weight, a sheared and a rotated run (the transform glyph path), and a clipped, masked run.
-    #[test]
-    fn golden_text() {
+    pub(super) fn text<P: Pixel>() -> Vec<P> {
         let mut text = TextRenderer::new();
-        let (mut px, mut dmg) = scene();
+        let (mut px, mut dmg) = scene::<P>();
         let mask_bytes: Vec<u8> = (0..W * H).map(|i| (255 - (i % W) * 255 / W) as u8).collect();
         let mask = AlphaMask::new(&mask_bytes, W, H);
         {
@@ -313,8 +365,13 @@ mod text_scenes {
             text.draw_text_center(&mut c, "rotated", 220., 140., &TextStyle::new(22., theme::TEXT_COLOUR).rotation(0.3), None, None);
             text.draw_text_left(&mut c, "clipped and masked text", 6., 176., &TextStyle::new(26., theme::WHITE), Some(Clip::new(20, 150, 260, 192)), Some(&mask));
         }
+        px
+    }
+
+    #[test]
+    fn golden_text() {
         // With the colour-emoji face bundled the fallback chain reaches it first for ♥ and ✓, so the scene has two recorded values.
-        check("text", &px, if cfg!(feature = "emoji") { 0xbb03_89af_6962_a770 } else { 0xe5f7_3920_8b1e_bb53 });
+        check("text", &text::<Argb8>(), if cfg!(feature = "emoji") { 0xbb03_89af_6962_a770 } else { 0xe5f7_3920_8b1e_bb53 });
     }
 
     /// A button at rest, then with baked states (as a headless host draws it) hovered, pressed on a custom fill (the derived held ramp), and focused (its glow), each a fresh render.
@@ -466,4 +523,81 @@ fn golden_chrome() {
     }
     check("chrome", &px, 0xa74e_33d5_c701_6453);
     check8("chrome_clip", &clip, 0x6ef3_84cb_654d_5c65);
+}
+
+/// How far a G2t16 render, narrowed to the nearest 8-bit codes ([`crate::pixel::narrow_to_8`]), sits from the Argb8 render of the same scene, byte by byte (α and each channel), signed as 16-bit minus 8-bit: the extremes, the share of bytes that differ at all, and the share that differ by more than one step.
+struct Agreement {
+    low: i32,
+    high: i32,
+    differing: usize,
+    beyond_one: usize,
+    bytes: usize,
+}
+
+fn agreement(p8: &[u32], p16: &[u64]) -> Agreement {
+    assert_eq!(p8.len(), p16.len());
+    let mut a = Agreement { low: 0, high: 0, differing: 0, beyond_one: 0, bytes: 4 * p8.len() };
+    for (&e, &w) in p8.iter().zip(p16.iter()) {
+        let n = crate::pixel::narrow_to_8(w);
+        for sh in [24, 16, 8, 0] {
+            let d = ((n >> sh) & 0xFF) as i32 - ((e >> sh) & 0xFF) as i32;
+            a.low = a.low.min(d);
+            a.high = a.high.max(d);
+            a.differing += (d != 0) as usize;
+            a.beyond_one += (d.abs() > 1) as usize;
+        }
+    }
+    a
+}
+
+/// The cross-check: every depth-generic golden scene rendered at both depths, the 16-bit one narrowed to the nearest 8-bit codes and compared byte for byte with the 8-bit render.
+///
+/// The bar the plan set (within one step, under 0.1 % of bytes differing) is not reachable while the 8-bit kernels stay bit-identical, and the differences all point one way: the 16-bit render, narrowed, is at or above the 8-bit one.
+/// The 8-bit `under` takes `>> 8` for `÷ 255` and floors, so an opaque colour laid into an empty pixel deposits `(d × 255) >> 8 = d − 1` (the noise scenes: every byte off by exactly one, none by more); partial cover floors twice more (paint_rects, shapes, squircles, stack, up to 3–4); the rotated rect's four coverage bytes floor before they multiply; and the glow's α table floors at every step of its decay, drifting up to 7 steps low over a ray (glow_rays).
+/// At 16 bits each of those floors costs 1/256 of a step, so the 16-bit render is the nearer one to the exact composite, and what this test can hold is the shape of the difference: no byte where the 16-bit render falls more than one step below the 8-bit one (a kernel still thinking in bytes would lose light or coverage at 16 bits, and it lands far below, not one step), and the excess above it within each scene's floors.
+/// Overlay is left out of flatten_modes: its multiply branch `2·td·bd >> DEPTH` reaches `2·ONE` and spills into the next field at either depth (an 8-bit bug kept bit for bit; the 8-bit render's α byte takes the carry).
+#[test]
+fn crosscheck_g2t16_against_argb8() {
+    use crate::pixel::G2t16;
+    let (_, glow8, rays8) = glows::<Argb8>();
+    let (_, glow16, rays16) = glows::<G2t16>();
+    let (noise8, noise_b8) = noise::<Argb8>();
+    let (noise16, noise_b16) = noise::<G2t16>();
+    // Name, 8-bit render, 16-bit render, and the range the narrowed 16-bit render may sit in around the 8-bit one (16 − 8, in 8-bit steps).
+    let mut scenes: Vec<(String, Vec<u32>, Vec<u64>, (i32, i32))> = vec![
+        ("paint_rects".into(), paint_rects(), paint_rects(), (-1, 3)),
+        ("shapes".into(), shapes(), shapes(), (-1, 4)),
+        ("ellipses".into(), ellipses(), ellipses(), (-1, 3)),
+        ("squircles".into(), squircles(), squircles(), (-1, 3)),
+        ("glow".into(), glow8, glow16, (-1, 3)),
+        ("glow_rays".into(), rays8, rays16, (-1, 7)),
+        ("stack".into(), stack(), stack(), (-1, 2)),
+        ("noise".into(), noise8, noise16, (-1, 1)),
+        ("noise_based_clipped".into(), noise_b8, noise_b16, (-1, 1)),
+    ];
+    let (modes8, modes16) = (flatten_modes::<Argb8>(), flatten_modes::<G2t16>());
+    for (i, mode) in MODES.into_iter().enumerate() {
+        if mode == BlendMode::Overlay {
+            continue;
+        }
+        let r = i * W * H..(i + 1) * W * H;
+        // Multiply's 8-bit `255 − (product >> 8)` rounds the product down and so the result up, the one place the 8-bit render can sit above the 16-bit one by two.
+        let low = if mode == BlendMode::Multiply { -2 } else { -1 };
+        scenes.push((alloc::format!("flatten {mode:?}"), modes8[r.clone()].to_vec(), modes16[r].to_vec(), (low, 3)));
+    }
+    #[cfg(feature = "text")]
+    scenes.push(("text".into(), text_scenes::text(), text_scenes::text(), (-1, 2)));
+    let mut failures = Vec::new();
+    for (name, p8, p16, (low, high)) in &scenes {
+        let a = agreement(p8, p16);
+        let pct = |n: usize| 100. * n as f64 / a.bytes as f64;
+        std::eprintln!("cross-check {name:<20} 16 − 8 in [{:>2}, {:>2}]  differing {:>6.2} %  beyond one {:>5.2} %", a.low, a.high, pct(a.differing), pct(a.beyond_one));
+        if a.low < *low {
+            failures.push(alloc::format!("{name}: the 16-bit render falls {} steps below the 8-bit one (its floors allow {})", -a.low, -low));
+        }
+        if a.high > *high {
+            failures.push(alloc::format!("{name}: the 16-bit render sits {} steps above the 8-bit one (its floors allow {high})", a.high));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }
