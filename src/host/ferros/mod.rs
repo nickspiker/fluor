@@ -508,14 +508,15 @@ pub fn run_app<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps, ru: 
         let t = sys::now();
         if shell.draw() {
             shell.present(surface, pw, fx, fy);
-            // The window (ferros WINDOWS.md): the frame's part of the screen, this surface, the app level.
-            let mut m = [0u8; 18];
+            // The window (ferros WINDOWS.md): the frame's part of the screen, this surface, the app level, and what its pixels are (`PanelPixel::FORMAT`: at 16 bits fluor's own, which the display decodes).
+            let mut m = [0u8; 19];
             m[0] = 22;
             m[1..3].copy_from_slice(&(fx as u16).to_le_bytes());
             m[3..5].copy_from_slice(&(fy as u16).to_le_bytes());
             m[5..7].copy_from_slice(&(w as u16).to_le_bytes());
             m[7..9].copy_from_slice(&(h as u16).to_le_bytes());
             m[9..17].copy_from_slice(&base.to_le_bytes());
+            m[18] = P::FORMAT;
             let mut rr = [0u8; 4];
             if sys::call(display, &m, &mut rr) == sys::ERR {
                 return Err(String::from("the display refused the frame"));
