@@ -104,6 +104,61 @@ mod x11_atomic {
         true
     }
 
+    /// Whether a compositing manager owns `_NET_WM_CM_S0` (EWMH). Without one (XFCE with compositing off) an ARGB window's α is ignored and every transparent pixel of our desktop-spanning surface shows as opaque black. `None` when the connection fails.
+    fn compositor_running() -> Option<bool> {
+        use x11rb::protocol::xproto::ConnectionExt as _;
+        let c = conn()?;
+        let atom = c.intern_atom(false, b"_NET_WM_CM_S0").ok()?.reply().ok()?.atom;
+        let owner = c.get_selection_owner(atom).ok()?.reply().ok()?.owner;
+        Some(owner != 0)
+    }
+
+    /// Clip the window's BOUNDING shape to the visible window rect (surface-local units) when no compositor runs, so the X server itself leaves everything outside the rect unpainted — the desktop shows thru instead of a black wall. With a compositor the bounding shape is reset to the whole window (α already does the job, and a hard shape would lose the soft edges). A zero `w` or `h` shapes the window to nothing. Returns `true` if the request was sent.
+    pub fn set_bounding_region(
+        window: &winit::window::Window,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+    ) -> bool {
+        use x11rb::protocol::shape::{ConnectionExt as _, SK, SO};
+        use x11rb::protocol::xproto::{ClipOrdering, Rectangle};
+
+        let Ok(handle) = window.window_handle() else {
+            return false;
+        };
+        let xid = match handle.as_raw() {
+            RawWindowHandle::Xcb(h) => h.window.get(),
+            RawWindowHandle::Xlib(h) => h.window as u32,
+            _ => return false,
+        };
+        let Some(conn) = conn() else {
+            return false;
+        };
+        let sent = if compositor_running() == Some(false) {
+            // WHY/PROOF: XShape rectangles carry i16 x/y and u16 width/height; an off-screen or giant window would wrap the cast into a wrong shape.
+            let rect = Rectangle {
+                x: x.max(0).min(i16::MAX as i32) as i16,
+                y: y.max(0).min(i16::MAX as i32) as i16,
+                width: w.min(u16::MAX as u32) as u16,
+                height: h.min(u16::MAX as u32) as u16,
+            };
+            let rects: &[Rectangle] = if w == 0 || h == 0 {
+                &[]
+            } else {
+                std::slice::from_ref(&rect)
+            };
+            conn.shape_rectangles(SO::SET, SK::BOUNDING, ClipOrdering::UNSORTED, xid, 0, 0, rects)
+                .is_ok()
+        } else {
+            // Pixmap NONE removes the bounding shape.
+            conn.shape_mask(SO::SET, SK::BOUNDING, xid, 0, 0, x11rb::NONE)
+                .is_ok()
+        };
+        let _ = conn.flush();
+        sent
+    }
+
     /// Tell the compositor to NEVER unredirect this window (`_NET_WM_BYPASS_COMPOSITOR = 2`). Mutter/KWin fast-path a window that exactly covers a monitor by bypassing compositing — and an unredirected window loses its alpha channel, so every transparent pixel of our monitor-sized surface renders OPAQUE BLACK (observed: the taskbar strip going black "on occasion"). The hint is advisory but honoured by both major compositors; set once per surface at creation.
     pub fn set_never_bypass_compositor(window: &winit::window::Window) -> bool {
         use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode};
@@ -1811,6 +1866,25 @@ impl<A: FluorApp> DesktopShell<A> {
         s.last_input_region = region;
         #[cfg(target_os = "linux")]
         x11_atomic::set_input_region(&s.window, region.0, region.1, region.2, region.3);
+        #[cfg(target_os = "linux")]
+        {
+            let r = &self.window_rect;
+            let bx0 = r.x.max(s.origin.0);
+            let by0 = r.y.max(s.origin.1);
+            let bx1 = (r.x + r.w as i32).min(s.origin.0 + s.size.0 as i32);
+            let by1 = (r.y + r.h as i32).min(s.origin.1 + s.size.1 as i32);
+            if bx0 < bx1 && by0 < by1 {
+                x11_atomic::set_bounding_region(
+                    &s.window,
+                    bx0 - s.origin.0,
+                    by0 - s.origin.1,
+                    (bx1 - bx0) as u32,
+                    (by1 - by0) as u32,
+                );
+            } else {
+                x11_atomic::set_bounding_region(&s.window, 0, 0, 0, 0);
+            }
+        }
         #[cfg(target_os = "macos")]
         {
             let empty = region.2 == 0 || region.3 == 0;
