@@ -665,6 +665,35 @@ pub fn draw_squircle_rrect_f<P: Pixel>(
     draw_squircle_rrect_kernel(canvas, x, y, w, h, radii, &curve, &|_, _| (rgb, solid), None, 0);
 }
 
+/// The squircle rounded rect FILLED FROM A SOURCE: `src(dx, dy)` gives the pixel at `(dx, dy)` inside the box, and the box takes the house shape — the same corner walk and anti-aliased curve as [`draw_squircle_rrect`], each edge pixel the source's colour at the curve's coverage — so a picture is trimmed exactly like a button or the window (Nick 2026-10-31: beam frames "trimmed in the shape of the button/OS too rather than rectangular with sharp corners").
+/// Every write composes UNDER the buffer; a source pixel left [`Pixel::EMPTY`] adds nothing, on the curve or inside it.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_squircle_rrect_from<P: Pixel>(
+    canvas: &mut Canvas<P>,
+    x: isize,
+    y: isize,
+    w: isize,
+    h: isize,
+    radii: CornerRadii,
+    squirdleyness: i32,
+    src: &dyn Fn(isize, isize) -> P,
+) {
+    let curve = |r: f32| squircle_crossings(r, squirdleyness);
+    draw_squircle_rrect_kernel(canvas, x, y, w, h, radii, &curve, &|dx, dy| {
+        let p = src(dx, dy);
+        (p.rgb(), p)
+    }, None, 0);
+}
+
+/// The window perimeter's corner set for a box `w × h` (chrome_widget's scheme): from the box's span (the harmonic mean 2wh/(w+h)), TL+BR at half the span and TR+BL at a quarter, traced at [`WINDOW_SHAPE_POWER`] — a picture framed this way has the window's own corners at its own size.
+pub fn window_radii(w: f32, h: f32) -> CornerRadii {
+    let span = 2. * w * h / (w + h);
+    asymmetric_radii(span * 0.5)
+}
+
+/// The window perimeter's squircle exponent (chrome.rs carves the window at it).
+pub const WINDOW_SHAPE_POWER: i32 = 24;
+
 /// The house asymmetric corner set from one radius: TL+BR at `big`, TR+BL at half of it — the window perimeter's split, now on textboxes and buttons too (Nick 2026-09-09).
 pub fn asymmetric_radii(big: f32) -> CornerRadii {
     [big, big * 0.5, big, big * 0.5]
@@ -799,8 +828,11 @@ fn draw_squircle_rrect_kernel<P: Pixel>(
                 let row_base = v_row as usize * buf_w;
                 let v_aa_col = if flip_x { x + w - 1 - inset_iso } else { x + inset_iso };
                 if v_aa_col >= 0 && v_aa_col < buf_w_i {
-                    let (rgb, _) = pick(v_aa_col - x, v_row - y);
-                    write_aa(pixels, row_base + v_aa_col as usize, rgb, h_u32);
+                    // An empty source pixel (a picture's unpainted block) puts nothing on the curve; every flat-colour caller's solid is opaque.
+                    let (rgb, solid) = pick(v_aa_col - x, v_row - y);
+                    if solid.alpha() != 0 {
+                        write_aa(pixels, row_base + v_aa_col as usize, rgb, h_u32);
+                    }
                 }
                 let (fx_start, fx_end) = if flip_x { (h_col, v_aa_col) } else { (v_aa_col + 1, h_col + 1) };
                 // WHY/PROOF: the run's ends follow the caller-placed pill past the buffer edge — negative would wrap the index, past the edge would write outside the row.
@@ -819,8 +851,10 @@ fn draw_squircle_rrect_kernel<P: Pixel>(
                 let col_us = h_col as usize;
                 let h_aa_row = if flip_y { y + h - 1 - inset_iso } else { y + inset_iso };
                 if h_aa_row >= 0 && h_aa_row < buf_h_i {
-                    let (rgb, _) = pick(h_col - x, h_aa_row - y);
-                    write_aa(pixels, h_aa_row as usize * buf_w + col_us, rgb, h_u32);
+                    let (rgb, solid) = pick(h_col - x, h_aa_row - y);
+                    if solid.alpha() != 0 {
+                        write_aa(pixels, h_aa_row as usize * buf_w + col_us, rgb, h_u32);
+                    }
                 }
                 let (fy_start, fy_end) = if flip_y { (v_row, h_aa_row) } else { (h_aa_row + 1, v_row + 1) };
                 // WHY/PROOF: the run's ends follow the caller-placed pill past the buffer edge — negative would wrap the index, past the edge would write outside the row.
@@ -858,5 +892,36 @@ fn draw_squircle_rrect_kernel<P: Pixel>(
                 hm[idx] = hit_id;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::canvas::Damage;
+    use crate::pixel::{Blend, G2t16};
+    use alloc::vec;
+
+    /// A picture trimmed to the window's shape: its corner pixel cut away, its middle the source exactly, the curve partly covered, and an empty source adding nothing anywhere.
+    #[test]
+    fn a_source_fill_takes_the_window_shape() {
+        let (w, h) = (64usize, 48usize);
+        let opaque = G2t16::from_g2t8(0xFF20_4060);
+        let mut px = vec![G2t16::EMPTY; w * h];
+        let mut dmg = Damage::new();
+        {
+            let mut c = Canvas::new(&mut px, w, h, &mut dmg);
+            draw_squircle_rrect_from(&mut c, 0, 0, w as isize, h as isize, window_radii(w as f32, h as f32), WINDOW_SHAPE_POWER, &|_, _| opaque);
+        }
+        assert_eq!(px[0], G2t16::EMPTY, "the top-left corner is cut");
+        assert_eq!(px[(h / 2) * w + w / 2], G2t16::EMPTY.under(opaque, BlendMode::Normal), "the middle is the source, composed like every fill");
+        let partial = px.iter().filter(|p| p.alpha() != 0 && p.alpha() != G2t16::ONE).count();
+        assert!(partial > 0, "the curve is anti-aliased");
+        let mut px = vec![G2t16::EMPTY; w * h];
+        {
+            let mut c = Canvas::new(&mut px, w, h, &mut dmg);
+            draw_squircle_rrect_from(&mut c, 0, 0, w as isize, h as isize, window_radii(w as f32, h as f32), WINDOW_SHAPE_POWER, &|_, _| G2t16::EMPTY);
+        }
+        assert!(px.iter().all(|p| *p == G2t16::EMPTY), "an empty source paints nothing, on the curve or inside it");
     }
 }
