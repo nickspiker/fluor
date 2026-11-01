@@ -146,14 +146,17 @@ struct Completion {
 }
 
 unsafe extern "C" fn on_complete(ctx: *mut c_void, stats: *mut c_void) {
-    let c = Box::from_raw(ctx as *mut Completion);
-    if let Some(prev) = c.prev {
-        let fd = (c.prev_release_fence)(stats, c.sc);
-        let old = prev.fence.swap(fd, Ordering::AcqRel);
-        if old >= 0 {
-            libc::close(old);
+    // SAFETY: `ctx` is the `Box<Completion>` leaked by `Box::into_raw` when the transaction registered this callback, and SurfaceFlinger fires OnComplete exactly once per transaction, so the box is reclaimed once; `stats` is the live stats handle for that call and `c.sc` the control the transaction set a buffer on.
+    unsafe {
+        let c = Box::from_raw(ctx as *mut Completion);
+        if let Some(prev) = c.prev {
+            let fd = (c.prev_release_fence)(stats, c.sc);
+            let old = prev.fence.swap(fd, Ordering::AcqRel);
+            if old >= 0 {
+                libc::close(old);
+            }
+            prev.released.store(true, Ordering::Release);
         }
-        prev.released.store(true, Ordering::Release);
     }
 }
 
@@ -320,10 +323,13 @@ unsafe fn alloc(width: usize, height: usize) -> Option<(*mut ndk_sys::AHardwareB
         rfu1: 0,
     };
     let mut hb: *mut ndk_sys::AHardwareBuffer = core::ptr::null_mut();
-    if ndk_sys::AHardwareBuffer_allocate(&desc, &mut hb) != 0 || hb.is_null() {
-        return None;
+    // SAFETY: `desc` and `hb` are live locals; `describe` runs only on the non-null buffer `allocate` just returned, and `AHardwareBuffer_Desc` is a plain C struct of integers, so all-zero is a valid value for it to overwrite.
+    unsafe {
+        if ndk_sys::AHardwareBuffer_allocate(&desc, &mut hb) != 0 || hb.is_null() {
+            return None;
+        }
+        let mut got: ndk_sys::AHardwareBuffer_Desc = core::mem::zeroed();
+        ndk_sys::AHardwareBuffer_describe(hb, &mut got);
+        Some((hb, got.stride as usize))
     }
-    let mut got: ndk_sys::AHardwareBuffer_Desc = core::mem::zeroed();
-    ndk_sys::AHardwareBuffer_describe(hb, &mut got);
-    Some((hb, got.stride as usize))
 }

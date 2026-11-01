@@ -968,6 +968,7 @@ struct MonitorSurface {
     /// Last input region pushed to the OS for this surface, in surface-local desktop units, `(0, 0, 0, 0)` meaning fully click-thru. Used by [`DesktopShell::push_input_region`] to dedupe the XShape call (and the macOS `set_cursor_hittest` equivalent).
     last_input_region: (i32, i32, u32, u32),
     /// Last BOUNDING shape sent for this surface (Linux, no compositor): the window's silhouette as row-run rectangles in surface-local backing pixels, read off the carved clip mask after each composite. `None` until the first send; deduped so an unchanged silhouette costs nothing.
+    #[cfg(target_os = "linux")]
     last_bounding: Option<Vec<(i32, i32, u32, u32)>>,
 }
 
@@ -1079,6 +1080,7 @@ struct DesktopShell<A: FluorApp<P>, P: Finalize> {
     /// The display is dark (macOS: asleep, or the session is not the active one — host/macos_screen.rs). Folded into `is_focused`: screen off reads as the app losing focus (Nick 2026-10-15).
     display_asleep: bool,
     /// The modifiers held as raw (X Input 2.2) key events report them, one bit each: Super left, Super right, Shift left, Shift right. Raw because the desktop's move-to-monitor chord is grabbed by the window manager, so the window's own key events never see it (see `raw_key`).
+    #[cfg(target_os = "linux")]
     raw_mods: u8,
 
     /// Live render-pipeline counters. Updated every `render_frame` call (composite-time EMA + frame counter); rendered to a bottom-of-window debug strip when [`paint::DEBUG_SHOW_FPS`] is set via the `[]f` chord.
@@ -1180,6 +1182,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             },
             is_focused: true,
             display_asleep: false,
+            #[cfg(target_os = "linux")]
             raw_mods: 0,
             debug_stats: crate::paint::DebugStats::default(),
             pending_damage: crate::canvas::Damage::new(),
@@ -1966,7 +1969,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
         // `span` overrides the monitor rect when one surface must cover MORE than its monitor —
         // the Linux desktop-spanning surface (see `resumed`). None = pin to this monitor exactly.
         #[cfg(not(target_os = "macos"))]
-        let (origin, mut size) = match span {
+        let (origin, size) = match span {
             Some((o, sz)) => (o, sz),
             None => (
                 // WHY/PROOF: winit reports 0×0 for a monitor mid-unplug — a zero-sized surface panics the buffer setup.
@@ -1975,11 +1978,9 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             ),
         };
         // Linux/X11: undersize the surface by ONE pixel row. An undecorated window EXACTLY monitor-sized gets auto-promoted to legacy FULLSCREEN by Mutter-family WMs (Muffin 6.4 verified live 2026-07-25: _NET_WM_STATE grew FULLSCREEN unrequested) — fullscreen-layer stacking sits ABOVE the panel, burying the taskbar (the "black taskbar" lockup; _NET_WM_BYPASS_COMPOSITOR=2 and the unredirect gsetting were both red herrings). h−1 defeats the exact-size match; the missing row is imperceptible — maximize targets the work area, and the bottom row usually sits over the panel anyway.
+        // WHY/PROOF: the size is the OS monitor's; one row shy, never below 1.
         #[cfg(target_os = "linux")]
-        {
-            // WHY/PROOF: the size is the OS monitor's; one row shy, never below 1.
-            size.1 = size.1.max(2) - 1;
-        }
+        let size = (size.0, size.1.max(2) - 1);
         #[cfg(target_os = "macos")]
         let pixel_ratio = scale;
         #[cfg(not(target_os = "macos"))]
@@ -2099,6 +2100,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             needs_full_blit: false,
             // Sentinel that can never equal a computed region (x is never negative there), so the first push always reaches the OS.
             last_input_region: (i32::MIN, i32::MIN, 0, 0),
+            #[cfg(target_os = "linux")]
             last_bounding: None,
         }
     }
@@ -2334,9 +2336,9 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             // CoreGraphics, display-level: CGDisplayHideCursor does not care which window is key or whether the surface is click-thru — NSCursor.hide turned out to be as conditional as winit's cursor rect on this compositor (field 2026-09-20, the arrow stayed). Counted like NSCursor's, so the flag keeps it balanced.
             if hide != self.os_cursor_hidden {
                 if hide {
-                    unsafe { objc2_core_graphics::CGDisplayHideCursor(0) };
+                    objc2_core_graphics::CGDisplayHideCursor(0);
                 } else {
-                    unsafe { objc2_core_graphics::CGDisplayShowCursor(0) };
+                    objc2_core_graphics::CGDisplayShowCursor(0);
                 }
                 self.os_cursor_hidden = hide;
             }

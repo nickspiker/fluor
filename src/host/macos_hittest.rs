@@ -18,8 +18,6 @@ pub(super) struct HittestMonitor {
     pub win_y: Arc<AtomicI32>,
     pub win_w: Arc<AtomicU32>,
     pub win_h: Arc<AtomicU32>,
-    /// PRIMARY screen height in POINTS for the Y-flip (NSEvent uses a bottom-left origin whose reference is the primary screen frame).
-    pub screen_h: Arc<AtomicU32>,
     /// The home window to wake on the entry edge — armed by the host when it flips hittest off (the home can change across monitors, so it is re-armed every time). `try_lock` in the callback: a contended lock just defers the wake to the next global move, it never blocks the run loop.
     wake: Arc<Mutex<Option<Arc<Window>>>>,
     _monitor: *mut objc2::runtime::AnyObject,
@@ -43,7 +41,6 @@ impl HittestMonitor {
         let wy = Arc::new(AtomicI32::new(0));
         let ww = Arc::new(AtomicU32::new(0));
         let wh = Arc::new(AtomicU32::new(0));
-        let sh = Arc::new(AtomicU32::new(screen_h));
         let wake: Arc<Mutex<Option<Arc<Window>>>> = Arc::new(Mutex::new(None));
 
         let flag = reenter_flag.clone();
@@ -51,7 +48,6 @@ impl HittestMonitor {
         let wy2 = wy.clone();
         let ww2 = ww.clone();
         let wh2 = wh.clone();
-        let sh2 = sh.clone();
         let wake2 = wake.clone();
 
         let mask = NSEventMask::MouseMoved
@@ -62,7 +58,7 @@ impl HittestMonitor {
         let on_move = std::rc::Rc::new(move || {
             let loc: NSPoint = NSEvent::mouseLocation();
             // NSEvent mouseLocation: bottom-left origin. Flip Y to top-left.
-            let screen_h = sh2.load(Ordering::Relaxed) as f64;
+            let screen_h = screen_h as f64;
             let cx = loc.x as i32;
             let cy = (screen_h - loc.y) as i32;
 
@@ -108,7 +104,6 @@ impl HittestMonitor {
                 win_y: wy,
                 win_w: ww,
                 win_h: wh,
-                screen_h: sh,
                 wake,
                 _monitor: raw as *mut AnyObject,
                 _local: local.map_or(std::ptr::null_mut(), |l| Retained::into_raw(l) as *mut AnyObject),

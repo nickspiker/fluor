@@ -9,6 +9,7 @@
 //! serves every item (it reads `sender.tag()`), kept alive for the process in a static.
 
 extern crate alloc;
+#[cfg(not(target_os = "macos"))]
 use alloc::vec::Vec;
 
 // ─────────────────────────────────────────── non-macOS: no menu bar yet ───────────────────────
@@ -61,7 +62,7 @@ mod imp {
             /// The action for every fluor menu item. `sender.tag()` carries the app-assigned id.
             #[unsafe(method(fluorMenuFired:))]
             fn fired(&self, sender: &NSMenuItem) {
-                let tag = unsafe { sender.tag() };
+                let tag = sender.tag();
                 if tag >= 0 {
                     QUEUE.lock().unwrap().push(tag as u32);
                 }
@@ -93,27 +94,23 @@ mod imp {
         match spec {
             MenuItem::Action { id, label } => {
                 let it = make_action(mtm, target, label, *id);
-                unsafe { parent.addItem(&it) };
+                parent.addItem(&it);
             }
             MenuItem::Sub { label, items } => {
                 // A menu-bar submenu is an NSMenuItem whose submenu is a titled NSMenu.
                 let holder = NSMenuItem::new(mtm);
                 let sub = NSMenu::new(mtm);
-                unsafe {
-                    holder.setTitle(&NSString::from_str(label));
-                    sub.setTitle(&NSString::from_str(label));
-                }
+                holder.setTitle(&NSString::from_str(label));
+                sub.setTitle(&NSString::from_str(label));
                 for child in items {
                     add(mtm, target, &sub, child);
                 }
-                unsafe {
-                    holder.setSubmenu(Some(&sub));
-                    parent.addItem(&holder);
-                }
+                holder.setSubmenu(Some(&sub));
+                parent.addItem(&holder);
             }
             MenuItem::Separator => {
                 let sep = NSMenuItem::separatorItem(mtm);
-                unsafe { parent.addItem(&sep) };
+                parent.addItem(&sep);
             }
         }
     }
