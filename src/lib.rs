@@ -15,6 +15,7 @@ pub mod event;
 pub mod geom;
 pub mod group;
 pub mod host;
+pub mod layout;
 pub(crate) mod math;
 pub mod paint;
 pub(crate) mod par;
