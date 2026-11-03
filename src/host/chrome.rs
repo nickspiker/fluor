@@ -13,6 +13,7 @@ use crate::text::TextStyle;
 use crate::host::icon::Icon;
 use crate::math;
 use crate::paint::Clip;
+use crate::paint::edge::{walk_window_edges, EdgeSide};
 use crate::pixel::{Argb8, BlendMode, Pixel};
 use crate::text::TextRenderer;
 use crate::theme;
@@ -101,219 +102,20 @@ pub fn draw_window_edges_and_mask<P: Pixel>(
     let h = height as usize;
     // The bevel colours are authored 8-bit, widened once to the layer's depth; the crossings' AA weights are Q16, the inner pixel's α their complement at the depth's own precision and the clip mask their top byte.
     let (light, shadow) = (P::from_g2t8(light), P::from_g2t8(shadow));
-
-    // Per-corner cap = how far the corner curve reaches inward from its corner. The TL+BR diagonal uses the big table, TR+BL the small one — an asymmetric rounded rect built from one curve at two scales. Each corner is now independent, so the symmetric single-table x↔y walk is replaced by an explicit per-corner walk; the squircle is still self-symmetric within each corner (its own row-walk and col-walk share that corner's table), which is what keeps each corner's curvature continuous.
-    let cap_big = start_big + crossings_big.len();
-    let cap_small = start_small + crossings_small.len();
-
-    // Degenerate-window guard: below two corner caps per axis the per-corner walks underflow usize (`w - cap` panics) and index out of bounds.
-    // Fall back to a plain 1-px rectangular hairline with the mask left fully visible, so extreme shrinks stay panic-free instead of crashing the app.
-    if w < cap_big + cap_small + 2 || h < cap_big + cap_small + 2 {
-        if w == 0 || h == 0 {
-            return;
-        }
-        for x in 0..w {
-            pixels[x] = pixels[x].under(light, BlendMode::Normal);
-            let idx = (h - 1) * w + x;
-            pixels[idx] = pixels[idx].under(shadow, BlendMode::Normal);
-        }
-        for y in 0..h {
-            let l = y * w;
-            pixels[l] = pixels[l].under(light, BlendMode::Normal);
-            let r = y * w + (w - 1);
-            pixels[r] = pixels[r].under(shadow, BlendMode::Normal);
-        }
-        return;
-    }
-
-    // Straight edges — opaque chrome composed via Under. Each edge spans between the caps of its two end corners, which now differ: e.g. the top edge runs from the TL big cap to the TR small cap. Clip mask along these edges stays at the host's 255 default (fully visible).
-    let top_lo = cap_big; // TL
-    let top_hi = w - cap_small; // TR
-    for x in top_lo..top_hi {
-        pixels[x] = pixels[x].under(light, BlendMode::Normal); // top row
-    }
-    let bot_lo = cap_small; // BL
-    let bot_hi = w - cap_big; // BR
-    for x in bot_lo..bot_hi {
-        let idx = (h - 1) * w + x;
-        pixels[idx] = pixels[idx].under(shadow, BlendMode::Normal); // bottom row
-    }
-    let left_lo = cap_big; // TL
-    let left_hi = h - cap_small; // BL
-    for y in left_lo..left_hi {
-        let lidx = y * w;
-        pixels[lidx] = pixels[lidx].under(light, BlendMode::Normal); // left col
-    }
-    let right_lo = cap_small; // TR
-    let right_hi = h - cap_big; // BR
-    for y in right_lo..right_hi {
-        let ridx = y * w + (w - 1);
-        pixels[ridx] = pixels[ridx].under(shadow, BlendMode::Normal); // right col
-    }
-
-    // Corner-of-corner cutout (start × start at each corner): the small outer square that the curve never reaches. Each corner uses its OWN start (big corners a larger square, small corners a smaller one).
-    for r in 0..start_big {
-        for c in 0..start_big {
-            clip_mask[r * w + c] = 0; // TL
-        }
-    }
-    for r in 0..start_small {
-        for c in (w - start_small)..w {
-            clip_mask[r * w + c] = 0; // TR
-        }
-    }
-    for r in (h - start_small)..h {
-        for c in 0..start_small {
-            clip_mask[r * w + c] = 0; // BL
-        }
-    }
-    for r in (h - start_big)..h {
-        for c in (w - start_big)..w {
-            clip_mask[r * w + c] = 0; // BR
-        }
-    }
-
-    let tr_colour =
-        |row: usize, col: usize| -> P { if row < (w - 1 - col) { light } else { shadow } };
-    let bl_colour =
-        |row: usize, col: usize| -> P { if col < (h - 1 - row) { light } else { shadow } };
-
-    // Two-sided AA convention (unchanged from the symmetric version). OUTER pixel = on the curve, partially outside the window: clip_mask = h_cov trims against the OS bg; chrome stays opaque. INNER pixel = one step inside: clip_mask = 255; chrome's α-byte carries the hairline-vs-bg AA = 255 − h_cov.
-
-    // TL corner (big). Row-walk: near-vertical segment; col-walk: near-horizontal segment. Both use the big table.
-    for (i, &(inset_raw, _l, h_cov)) in crossings_big.iter().enumerate() {
-        let inset = inset_raw as usize;
-        if inset >= cap_big {
-            continue;
-        }
-        let inner_alpha = 0xFFFF - h_cov as u32;
-        let light_inner = P::from_cov(light, inner_alpha);
-        let row_top = start_big + i;
-        let col_left = start_big + i;
-
-        for c in 0..inset {
-            clip_mask[row_top * w + c] = 0;
-        }
-        let idx = row_top * w + inset;
-        pixels[idx] = pixels[idx].under(light, BlendMode::Normal);
-        clip_mask[idx] = (h_cov >> 8) as u8;
-        let idx = row_top * w + inset + 1;
-        pixels[idx] = pixels[idx].under(light_inner, BlendMode::Normal);
-        clip_mask[idx] = 255;
-
-        for r in 0..inset {
-            clip_mask[r * w + col_left] = 0;
-        }
-        let idx = inset * w + col_left;
-        pixels[idx] = pixels[idx].under(light, BlendMode::Normal);
-        clip_mask[idx] = (h_cov >> 8) as u8;
-        let idx = (inset + 1) * w + col_left;
-        pixels[idx] = pixels[idx].under(light_inner, BlendMode::Normal);
-        clip_mask[idx] = 255;
-    }
-
-    // BR corner (big). The shadow diagonal — both adjacent edges are shadow, so the corner is uniform.
-    for (i, &(inset_raw, _l, h_cov)) in crossings_big.iter().enumerate() {
-        let inset = inset_raw as usize;
-        if inset >= cap_big {
-            continue;
-        }
-        let inner_alpha = 0xFFFF - h_cov as u32;
-        let shadow_inner = P::from_cov(shadow, inner_alpha);
-        let row_bot = h - 1 - start_big - i;
-        let col_right = w - 1 - start_big - i;
-
-        for c in (w - inset)..w {
-            clip_mask[row_bot * w + c] = 0;
-        }
-        let idx = row_bot * w + (w - 1 - inset);
-        pixels[idx] = pixels[idx].under(shadow, BlendMode::Normal);
-        clip_mask[idx] = (h_cov >> 8) as u8;
-        let idx = row_bot * w + (w - 2 - inset);
-        pixels[idx] = pixels[idx].under(shadow_inner, BlendMode::Normal);
-        clip_mask[idx] = 255;
-
-        for r in (h - inset)..h {
-            clip_mask[r * w + col_right] = 0;
-        }
-        let idx = (h - 1 - inset) * w + col_right;
-        pixels[idx] = pixels[idx].under(shadow, BlendMode::Normal);
-        clip_mask[idx] = (h_cov >> 8) as u8;
-        let idx = (h - 2 - inset) * w + col_right;
-        pixels[idx] = pixels[idx].under(shadow_inner, BlendMode::Normal);
-        clip_mask[idx] = 255;
-    }
-
-    // TR corner (small). Light↔shadow transition along the curve via tr_colour.
-    for (i, &(inset_raw, _l, h_cov)) in crossings_small.iter().enumerate() {
-        let inset = inset_raw as usize;
-        if inset >= cap_small {
-            continue;
-        }
-        let inner_alpha = 0xFFFF - h_cov as u32;
-        let row_top = start_small + i;
-        let col_right = w - 1 - start_small - i;
-
-        for c in (w - inset)..w {
-            clip_mask[row_top * w + c] = 0;
-        }
-        let tr_out_col = w - 1 - inset;
-        let tr_in_col = w - 2 - inset;
-        let idx = row_top * w + tr_out_col;
-        pixels[idx] = pixels[idx].under(tr_colour(row_top, tr_out_col), BlendMode::Normal);
-        clip_mask[idx] = (h_cov >> 8) as u8;
-        let idx = row_top * w + tr_in_col;
-        let layer = P::from_cov(tr_colour(row_top, tr_in_col), inner_alpha);
+    // The geometry is `paint::edge`'s walk (shared with ferros's screen edge since 2026-11-02); this paints what it reports. Top and left are light, bottom and right shadow; the TR and BL corners cross from one to the other along their diagonal, pixel by pixel. An opaque hairline pixel takes the colour as authored (its own α); a partial one the coverage's complement as α.
+    let mut clip = |idx: usize, cov: u32| clip_mask[idx] = (cov >> 8) as u8;
+    let mut hair = |idx: usize, side: EdgeSide, alpha: u32| {
+        let (row, col) = (idx / w, idx % w);
+        let colour = match side {
+            EdgeSide::Top | EdgeSide::Left | EdgeSide::TopLeft => light,
+            EdgeSide::Bottom | EdgeSide::Right | EdgeSide::BottomRight => shadow,
+            EdgeSide::TopRight => if row < (w - 1 - col) { light } else { shadow },
+            EdgeSide::BottomLeft => if col < (h - 1 - row) { light } else { shadow },
+        };
+        let layer = if alpha == 0xFFFF { colour } else { P::from_cov(colour, alpha) };
         pixels[idx] = pixels[idx].under(layer, BlendMode::Normal);
-        clip_mask[idx] = 255;
-
-        for r in 0..inset {
-            clip_mask[r * w + col_right] = 0;
-        }
-        let idx = inset * w + col_right;
-        pixels[idx] = pixels[idx].under(tr_colour(inset, col_right), BlendMode::Normal);
-        clip_mask[idx] = (h_cov >> 8) as u8;
-        let idx = (inset + 1) * w + col_right;
-        let layer = P::from_cov(tr_colour(inset + 1, col_right), inner_alpha);
-        pixels[idx] = pixels[idx].under(layer, BlendMode::Normal);
-        clip_mask[idx] = 255;
-    }
-
-    // BL corner (small). Light↔shadow transition along the curve via bl_colour.
-    for (i, &(inset_raw, _l, h_cov)) in crossings_small.iter().enumerate() {
-        let inset = inset_raw as usize;
-        if inset >= cap_small {
-            continue;
-        }
-        let inner_alpha = 0xFFFF - h_cov as u32;
-        let row_bot = h - 1 - start_small - i;
-        let col_left = start_small + i;
-
-        for c in 0..inset {
-            clip_mask[row_bot * w + c] = 0;
-        }
-        let idx = row_bot * w + inset;
-        pixels[idx] = pixels[idx].under(bl_colour(row_bot, inset), BlendMode::Normal);
-        clip_mask[idx] = (h_cov >> 8) as u8;
-        let idx = row_bot * w + inset + 1;
-        let layer = P::from_cov(bl_colour(row_bot, inset + 1), inner_alpha);
-        pixels[idx] = pixels[idx].under(layer, BlendMode::Normal);
-        clip_mask[idx] = 255;
-
-        for r in (h - inset)..h {
-            clip_mask[r * w + col_left] = 0;
-        }
-        let bl_out_row = h - 1 - inset;
-        let bl_in_row = h - 2 - inset;
-        let idx = bl_out_row * w + col_left;
-        pixels[idx] = pixels[idx].under(bl_colour(bl_out_row, col_left), BlendMode::Normal);
-        clip_mask[idx] = (h_cov >> 8) as u8;
-        let idx = bl_in_row * w + col_left;
-        let layer = P::from_cov(bl_colour(bl_in_row, col_left), inner_alpha);
-        pixels[idx] = pixels[idx].under(layer, BlendMode::Normal);
-        clip_mask[idx] = 255;
-    }
-
+    };
+    walk_window_edges(width, height, start_big, crossings_big, start_small, crossings_small, &mut clip, &mut hair);
     let _ = hit_test_map;
 }
 

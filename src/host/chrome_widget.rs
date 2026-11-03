@@ -993,61 +993,8 @@ impl<P: Pixel> Container for DefaultChrome<P> {
     }
 }
 
-/// The glass-mode corner geometry `(r_small, r_big, exponent)`: the superellipse `((R−x)/R)^n + ((R−y)/R)^n = 1` sits INSIDE a circular glass arc of radius `g` iff it cuts at least as deep at the diagonal, where the two curves are closest — the circle cuts `g·(1 − 1/√2)` ≈ 0.293 g in from the corner, the superellipse `R·(1 − 2^(−1/n))` — so the small radius is `R = 0.293 g / (1 − 2^(−1/n))` (a hair more for the AA), and the big TL/BR diagonal is twice it, the desktop's 2:1. At the desktop's exponent 24 that is ~10.3 g — a 68 px glass wants a 700 px small corner and a 1400 px big one, more than a phone's width holds beside each other (the top edge carries one of each). So the exponent is the LARGEST n ≤ 24 whose corners fit: `r_small + r_big ≤ 0.9·min(w,h)`, i.e. `1 − 2^(−1/n) ≥ 3·0.293 g / (0.9·min(w,h))`; a 1008 px portrait phone with 68 px glass lands at n = 10 (297 / 594 px). Never below 3: at 2 the corner is a plain circle and reads as a lozenge.
-pub(crate) fn glass_corner_params(g: Coord, w: Coord, h: Coord) -> (Coord, Coord, i32) {
-    // ONE AND A HALF glass insets at the diagonal, exponent 6 (Nick 2026-09-17: "exponent 6 and 1.5", after 2× at exponent 4 read as a soft blob): the small corner cuts half a glass-inset deeper than the arc, the big one three insets, and the squarer superellipse is what makes the corner read tight rather than round.
-    let cut = 1.5 * (g * (1.0 - core::f32::consts::FRAC_1_SQRT_2) + 1.0);
-    // FIT is the renderer's own topology, not a radius sum: an edge splits into straight run + two corner CAPS (the rows where the curve is at least a pixel off the edge — near r itself for a high exponent), and `draw_window_edges_and_mask` falls back to a plain rectangle when the two caps on one edge don't fit. So the exponent is the largest n ≤ 24 whose two caps fit the short edge with a tenth to spare. A doubled inset at high n wants caps wider than a phone (n 9 → 553 + 1106 px on a 1008 px edge), so the phone lands lower (n 4 at 68 px glass: 252 + 504); the desktop keeps 24.
-    let short = w.min(h) * 0.9;
-    let mut n = 6;
-    while n > 3 {
-        let r = cut / (1.0 - crate::math::powf(2.0, -1.0 / n as Coord));
-        let (s1, c1) = compute_squircle_crossings(r, n);
-        let (s2, c2) = compute_squircle_crossings(r * 2.0, n);
-        if ((s1 + c1.len() + s2 + c2.len()) as Coord) <= short {
-            break;
-        }
-        n -= 1;
-    }
-    // Nine tenths of the fitted size (Nick 2026-09-17, "let's try making both radius on Android 0.9 what they are now (slightly smaller)") — a smaller corner at the same exponent always fits, so the trim is applied after the search.
-    let r_small = cut / (1.0 - crate::math::powf(2.0, -1.0 / n as Coord)) * 0.9;
-    (r_small, r_small * 2.0, n)
-}
-
-/// Compute squircle crossings table for a corner with the given `radius` and `squirdleyness`. Returns `(start, crossings)` where `start` is the distance from the corner-of-corner inward to the curve's first integer-row crossing, and `crossings` is the rev'd table indexed by `i in 0..count` such that at row offset `start + i` the curve is at column `inset_i` with AA values `h_cov_i` and `l_i`. Used for both the window perimeter (radius = span/4) and the controls-strip BL curve (radius = button_size).
-/// The AA values are Q16 (`√frac × 2¹⁶` and `√(1 − frac) × 2¹⁶`, each cast to u16, a whole pixel saturating at `0xFFFF`), as [`crate::paint::squircle_crossings`] gives them: a 16-bit layer takes the whole weight as its α ([`crate::pixel::Pixel::from_cov`]), an 8-bit layer and the clip mask the top byte, which is bit for bit the `× 256` byte this table held before.
-pub(crate) fn compute_squircle_crossings(
-    radius: Coord,
-    squirdleyness: i32,
-) -> (usize, Vec<(u16, u16, u16)>) {
-    let mut crossings: Vec<(u16, u16, u16)> = Vec::new();
-    if radius <= 0.0 {
-        return (0, crossings);
-    }
-    let mut y = 1f32;
-    loop {
-        let y_norm = y / radius;
-        // For y_norm > 1, the squircle equation gives a negative inner term — clamp to 0 so the (1/p) root is well-defined. This makes x = 0 → x < y → break, preventing the loop from spinning forever on tiny radii.
-        let inner = (1.0 - crate::math::powi(y_norm, squirdleyness)).max(0.0);
-        let x_norm = crate::math::powf(inner, 1.0 / squirdleyness as Coord);
-        let x = x_norm * radius;
-        let inset = radius - x;
-        if inset > 0.0 {
-            crossings.push((
-                inset as u16,
-                (crate::math::sqrt(crate::math::fract(inset)) * 65536.) as u16,
-                (crate::math::sqrt(1.0 - crate::math::fract(inset)) * 65536.) as u16,
-            ));
-        }
-        if x < y {
-            break;
-        }
-        y += 1.0;
-    }
-    let start = (radius - y) as usize;
-    let crossings: Vec<(u16, u16, u16)> = crossings.into_iter().rev().collect();
-    (start, crossings)
-}
+/// The glass corners and the corner crossings live in [`crate::paint::edge`] since 2026-11-02, shared with ferros's display server; re-exported here for the chrome's tests and callers.
+pub(crate) use crate::paint::edge::{compute_squircle_crossings, glass_corner_params};
 
 #[cfg(test)]
 mod tests {
