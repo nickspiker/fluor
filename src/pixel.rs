@@ -66,6 +66,30 @@ pub enum BlendMode {
     Lighten,
 }
 
+impl BlendMode {
+    /// The modes in wire order: a window's mode byte on ferros carries the index in bits 0-2 (WINDOWS.md, "The layer stack").
+    pub const ALL: [BlendMode; 8] = [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen, BlendMode::Add, BlendMode::Subtract, BlendMode::Overlay, BlendMode::Darken, BlendMode::Lighten];
+
+    /// The mode at a wire byte's low three bits.
+    pub fn from_byte(b: u8) -> BlendMode {
+        Self::ALL[(b & 7) as usize]
+    }
+
+    /// The mode's value on VISIBLE operands, light codes from 0 (black) to `one` (white): what the layer beneath contributes, given the composite above it `a` and itself `b`. Normal is `b`; Multiply `a·b`; Screen `1 − (1 − a)(1 − b)`; Add `a + b` (the caller's field saturates, as [`Blend::under`]'s Add saturates at its one); Subtract `a − b` at least 0; Overlay multiplies where the bottom is dark and screens where it is light, pivot at half; Darken the smaller, Lighten the larger. The darkness kernels in [`Blend::under`] are these same functions through the darkness flip; a compositor holding light codes (ferros's display server, its working values at Q14) folds with this directly. Operands past `one` (a canvas brighter than white) are taken as the math gives.
+    pub fn visible(self, a: i64, b: i64, one: i64) -> i64 {
+        match self {
+            BlendMode::Normal => b,
+            BlendMode::Multiply => a * b / one,
+            BlendMode::Screen => one - (one - a) * (one - b) / one,
+            BlendMode::Add => a + b,
+            BlendMode::Subtract => if a > b { a - b } else { 0 },
+            BlendMode::Overlay => if b < one / 2 { 2 * a * b / one } else { one - 2 * (one - a) * (one - b) / one },
+            BlendMode::Darken => if a < b { a } else { b },
+            BlendMode::Lighten => if a > b { a } else { b },
+        }
+    }
+}
+
 /// The single compositing operation in fluor. Front-to-back source-under with selectable blend mode.
 pub trait Blend {
     /// Compose `bottom` *underneath* `self` (the partial composite from layers above). `self`'s α-byte is the accumulated opacity; `self`'s RGB is the accumulated darkness (canonical empty value `0x00000000` = "nothing yet").
@@ -809,5 +833,26 @@ mod tests {
         let result = top.under(bottom, BlendMode::Normal);
         let new_a = result >> 24;
         assert_eq!(new_a, 192);
+    }
+}
+
+#[cfg(test)]
+mod visible_tests {
+    use super::BlendMode;
+
+    /// The visible-space modes at a few known points, with white at 256: Multiply of white and grey is grey, Screen of black and grey is grey, Add stacks, Subtract floors at black, Overlay is multiply below the pivot and screen above, Darken and Lighten pick.
+    #[test]
+    fn visible_modes() {
+        let one = 256;
+        assert_eq!(BlendMode::Normal.visible(10, 77, one), 77);
+        assert_eq!(BlendMode::Multiply.visible(256, 128, one), 128);
+        assert_eq!(BlendMode::Screen.visible(0, 128, one), 128);
+        assert_eq!(BlendMode::Add.visible(200, 100, one), 300);
+        assert_eq!(BlendMode::Subtract.visible(100, 200, one), 0);
+        assert_eq!(BlendMode::Overlay.visible(128, 64, one), 64);
+        assert_eq!(BlendMode::Overlay.visible(128, 192, one), 192);
+        assert_eq!(BlendMode::Darken.visible(30, 40, one), 30);
+        assert_eq!(BlendMode::Lighten.visible(30, 40, one), 40);
+        assert_eq!(BlendMode::from_byte(0x0A), BlendMode::Screen);
     }
 }
