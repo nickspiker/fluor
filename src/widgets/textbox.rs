@@ -498,6 +498,8 @@ impl<P: Pixel> Textbox<P> {
         if self.cursor == 0 {
             return;
         }
+        // An anchor equal to the caret is no selection, but it must not outlive the edit: left behind, it stood one past the shortened text and the next key drained past the end (the compose crash, 2026-11-06).
+        self.selection_anchor = None;
         self.cursor -= 1;
         self.chars.remove(self.cursor);
         self.recalc_widths(text);
@@ -512,6 +514,8 @@ impl<P: Pixel> Textbox<P> {
         if self.cursor >= self.chars.len() {
             return;
         }
+        // The same stale-anchor rule as backspace.
+        self.selection_anchor = None;
         self.chars.remove(self.cursor);
         self.recalc_widths(text);
         self.update_scroll();
@@ -600,10 +604,11 @@ impl<P: Pixel> Textbox<P> {
         if let Some((start, end)) = self.selection_range() {
             self.chars.drain(start..end);
             self.cursor = start;
-            self.selection_anchor = None;
             self.recalc_widths(text);
             self.update_scroll();
         }
+        // Unconditional, as in the multi-line box: an anchor equal to the caret is no selection, and kept thru an insert it would turn the typed char into a phantom selection.
+        self.selection_anchor = None;
     }
 
     /// Get selected text as a String.

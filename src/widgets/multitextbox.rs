@@ -592,6 +592,8 @@ impl<P: Pixel> MultiTextbox<P> {
             self.widths.remove(self.cursor);
             self.spans_on_delete(self.cursor, self.cursor + 1);
         }
+        // An anchor equal to the caret is no selection, but it must not outlive the edit: left behind, it stood one past the shortened text, the next key read it as a selection and drained past the end (the compose crash, 2026-11-06).
+        self.selection_anchor = None;
         self.goal_x = None;
         self.rewrap();
         self.ensure_cursor_visible();
@@ -612,6 +614,8 @@ impl<P: Pixel> MultiTextbox<P> {
             self.widths.remove(self.cursor);
             self.spans_on_delete(self.cursor, self.cursor + 1);
         }
+        // The same stale-anchor rule as backspace.
+        self.selection_anchor = None;
         self.goal_x = None;
         self.rewrap();
         self.ensure_cursor_visible();
@@ -1513,5 +1517,92 @@ mod span_tests {
         assert_eq!(tb.cursor, 5);
         assert!(tb.selection_range().is_none() && !tb.relabel_pending());
         assert_eq!(tb.spans()[0].dest.as_deref(), Some("https://x.org/"));
+    }
+
+    /// THE COMPOSE CRASH (2026-11-06): a click that moves the pointer a hair arms the anchor at the caret, and two backspaces must delete two chars, not drain a selection past the end.
+    #[test]
+    fn backspace_after_a_jittered_click_never_selects_past_the_text() {
+        let mut text = TextRenderer::new();
+        let mut tb = boxed();
+        tb.set_layout(200.0, 400.0, 300.0, 300.0, &mut text);
+        tb.set_text("hello", &mut text);
+        tb.cursor = 5;
+        tb.selection_anchor = Some(5);
+        tb.backspace(&mut text);
+        assert_eq!(tb.selection_anchor, None, "the empty anchor dies with the edit");
+        tb.backspace(&mut text);
+        assert_eq!(typed(&tb), "hel");
+    }
+
+    /// Random edit sequences, every public edit: the caret, the anchor, the widths and the line table never pass the text (it found the stale anchor behind the 2026-11-06 compose crash in its 36th round).
+    #[test]
+    fn random_edits_keep_the_caret_inside_the_text() {
+        let mut text = TextRenderer::new();
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move |n: usize| -> usize {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % (n.max(1) as u64)) as usize
+        };
+        for round in 0..20_000usize {
+            let mut tb = boxed();
+            tb.set_layout(200.0, 400.0, 120.0 + next(200) as Coord, 300.0, &mut text);
+            let mut trail: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+            for _ in 0..40 {
+                let n = tb.chars.len();
+                let op = next(24);
+                let words = ["hi", "hello!", "a b c", "https://x.org/", "\n", "abc\ndef", ""];
+                let w = words[next(words.len())];
+                trail.push(alloc::format!("op {} n {} caret {} anchor {:?} w {:?}", op, n, tb.cursor, tb.selection_anchor, w));
+                match op {
+                    0 => tb.insert_char(['a', ' ', '\n', 'Z'][next(4)], &mut text),
+                    1 | 2 => tb.backspace(&mut text),
+                    3 => tb.delete_forward(&mut text),
+                    4 => tb.select_all(),
+                    5 => tb.cursor_left(),
+                    6 => tb.cursor_right(),
+                    7 => tb.cursor_home(),
+                    8 => tb.cursor_end(),
+                    9 => tb.cursor_vertical(next(2) == 0),
+                    10 => tb.pointer_press(next(400) as Coord, next(800) as Coord),
+                    11 => tb.pointer_drag(next(400) as Coord, next(800) as Coord),
+                    12 => tb.set_text(w, &mut text),
+                    13 => tb.clear(),
+                    14 => tb.insert_str(w, &mut text),
+                    15 => tb.replace_char_range(next(n + 3), next(n + 3), w, &mut text),
+                    16 => tb.select_word_at(next(n + 3)),
+                    17 => tb.tag_link(next(n + 3), next(n + 3), "https://y".into(), 1),
+                    18 => {
+                        let (a, b) = (next(n + 1), next(n + 1));
+                        tb.relabel_span(a.min(b), a.max(b), "lab", "https://z".into(), 1, &mut text)
+                    }
+                    19 => tb.accept_relabel(),
+                    20 => tb.revert_relabel(&mut text),
+                    21 => tb.delete_selection(&mut text),
+                    22 => tb.set_layout(200.0, 400.0, 60.0 + next(300) as Coord, 300.0, &mut text),
+                    _ => {
+                        let _ = tb.scroll_by(next(200) as Coord - 100.0);
+                    }
+                }
+                let n = tb.chars.len();
+                let bad = tb.cursor > n
+                    || tb.selection_anchor.is_some_and(|a| a > n)
+                    || tb.widths.len() != n
+                    || tb.line_starts.iter().any(|&s| s > n);
+                if bad {
+                    panic!(
+                        "round {}: n {} caret {} anchor {:?} widths {} lines {:?}\n{}",
+                        round,
+                        n,
+                        tb.cursor,
+                        tb.selection_anchor,
+                        tb.widths.len(),
+                        tb.line_starts,
+                        trail.join("\n")
+                    );
+                }
+            }
+        }
     }
 }
