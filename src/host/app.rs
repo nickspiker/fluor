@@ -1626,7 +1626,13 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
         } else {
             self.window_rect
         };
-        let rect = self.clamp_rect_to_monitors(want);
+        // A MAXIMIZED window stays maximized across a layout change (Nick 2026-11-07: a resolution change on a maximized window left it at the old screen's size, now a third of the new one): it refills its monitor's new work area, and the rect saved for restore is kept.
+        // Any other window keeps its own size, clamped onto the monitors that remain.
+        let rect = if self.saved_rect_for_maximize.is_some() {
+            self.maximized_rect()
+        } else {
+            self.clamp_rect_to_monitors(want)
+        };
         self.pending_full_repaint = true;
         self.apply_window_rect(rect);
     }
@@ -3200,6 +3206,17 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
         };
 
         self.apply_window_rect(new_rect);
+    }
+
+    /// The rect a maximized window fills, as `toggle_maximized` computes it: its monitor's work area, the full monitor when the OS reports none.
+    fn maximized_rect(&self) -> WindowRect {
+        let mon = self.window_monitor();
+        let (wx, wy, ww, wh) = mon.work_area;
+        if ww > 1 && wh > 1 {
+            WindowRect { x: wx, y: wy, w: ww, h: wh }
+        } else {
+            WindowRect { x: mon.origin.0, y: mon.origin.1, w: mon.size.0, h: mon.size.1 }
+        }
     }
 
     /// Adopt an explicit desktop-unit `window_rect` thru the FULL machinery — home re-election, scale settle, viewport/scratch/clip rebuild, consumer `on_resize`, input region, repaint. The one path every programmatic placement shares (maximize/restore, the geometry-restore setting); raw OS-window calls are meaningless here (the OS window is the fullscreen surface — moving IT was the 2026-08-16 vanish + dead-click field failure).
