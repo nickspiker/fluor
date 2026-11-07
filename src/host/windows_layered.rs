@@ -39,6 +39,9 @@ pub fn release_mouse() {
 /// Latched present-failure state so the failure EDGE logs once per streak instead of per-frame spam.
 static PRESENT_FAILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The layered style was found stripped and restored at least once this run: the log says so the first time, not every frame.
+static LAYERED_STRIPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Pull the Win32 `HWND` out of a winit window. Returns `None` if the window isn't a Win32 window (shouldn't happen on this target, but the present path no-ops rather than panicking if so).
 fn hwnd(window: &Window) -> Option<HWND> {
     match window.window_handle().ok()?.as_raw() {
@@ -68,6 +71,17 @@ pub fn present(window: &Arc<Window>, persistent_screen: &[u32], screen_w: u32, s
     }
 
     unsafe {
+        // The layered bit, checked on every present: winit rewrites GWL_EXSTYLE from its own flags on EVERY state change (set_visible, set_minimized, set_window_level — window_state.rs apply_diff), and its flags never carry WS_EX_LAYERED.
+        // So the show path's own calls stripped the bit right after make_layered set it, and every present after a hide→show failed "The parameter is incorrect" into an invisible, click-thru window (a Windows tester, 2026-11-07: blank on reopen from the tray).
+        // One read per frame; the set only when something stripped it.
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        if ex & WS_EX_LAYERED.0 as isize == 0 {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED.0 as isize);
+            if !LAYERED_STRIPPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::info!("FLUOR-WIN: the layered style was stripped (a winit state change) — restored before the present");
+            }
+        }
+
         // Screen DC (for the layered blend source) + a memory DC holding our DIB.
         let screen_dc: HDC = GetDC(HWND(std::ptr::null_mut()));
         if screen_dc.is_invalid() {

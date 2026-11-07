@@ -2991,7 +2991,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
                 // Surface a hidden resident window: un-hide EVERY monitor surface (hide-on-close hid them all), focus the home one, and repaint everything — the surface content is stale (or never-painted, on a start_hidden boot). Dormant surfaces stay all-zero, so showing them is invisible.
                 log::info!("FLUOR: ShowWindow — surfacing (home ready={})", self.surfaces.get(self.home).is_some_and(|s| s.surface_ready));
                 for s in self.surfaces.iter() {
-                    // Windows: a layered window whose style bit got dropped anywhere in the hide/show shuffle presents into the void — re-asserting is a no-op when it's still set.
+                    // Windows: a layered window whose style bit got dropped presents into the void. The calls below strip it again (winit rewrites the extended style on every state change), so the real guard is the per-frame check in windows_layered::present; this one only covers a present racing the show.
                     #[cfg(target_os = "windows")]
                     super::windows_layered::make_layered(&s.window);
                     s.window.set_visible(true);
