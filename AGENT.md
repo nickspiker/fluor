@@ -160,6 +160,20 @@ If you can compute `d(pixel)/d(parameter)` symbolically and there's an `if`, an 
 - **Bump** `exp(-1/x)` for x>0, 0 otherwise: C∞ at every order at x=0 because all derivatives of `exp(-1/x)` vanish there.
 - **Algebraic sigmoid** `x/√(1+x²)`: C∞, no transcendentals.
 
+## Compositing: Front to Back, `under` Only — No Porter-Duff Over
+
+**Every layer composites front to back through `Blend::under`. The painter's algorithm and the Porter-Duff "over" (`out = src · α + dst · (1 − α)`) are FORBIDDEN, everywhere: fluor, Photon, the ferros display server, any tool.**
+
+- **The order is front to back.** The frontmost layer goes into an empty accumulator first; each layer behind lands *under* what is already there. "Drawn later" means "behind". Something that sits on top of everything (the console, a tooltip, a cursor) is composited *first*, never last.
+- **The storage is α + darkness** (fluor's `Argb8` / `G2t16`): opacity and darkness both accumulate from zero by plain addition, and brightness comes back once at the panel boundary. The `1 − α` term and every `255 − x` in a blend are the cost of doing it backwards; if one appears in a compositing path, it is wrong.
+- **One kernel.** fluor's `Blend::under` (or the display server's `fold`, the same operator on its working values). No second blend path, no hand-rolled `a·(1−c) + b·c` mixing of layers, no "lay this over that" helper.
+- **A glow or a shadow is a layer of its own colour with its own α**, composed under like any other. A glow is light (low darkness) at a falling α, never opacity with no colour in it.
+- **Opaque stops the walk.** Where the accumulator is opaque, nothing behind is read.
+
+**Why:** compositing is filter stacking: densities add and opacities accumulate, nothing subtracts. Over is the same operator run in the wrong coordinates and the wrong direction. It costs a subtraction per channel per layer, forecloses the opaque early-out, and invites a painter's mix of layers that should have been one stack (2026-11-07: the ferros console circles were painted over the home screen with Porter-Duff and a colourless "darkness glow", and the owner's glow vanished). fluor's README, "Front to back compositing", has the full argument.
+
+**If you find yourself writing `* (1.0 - a)` between two layers, STOP. Put the front layer in first and `under` the rest.**
+
 ## When Unsure
 
 **ASK.** Don't add "defensive" checks. If you're not sure whether a bounds check is needed:
