@@ -3194,14 +3194,8 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             Some(prev) => self.clamp_rect_to_surfaces(prev),
             None => {
                 self.saved_rect_for_maximize = Some(self.window_rect);
-                // Maximize to the WINDOW'S MONITOR work area (monitor minus panels), not the raw screen — and emphatically not the surface, which on Linux spans every monitor. Falls back to the full monitor if the work area was never resolved. Both are GLOBAL desktop-unit rects.
-                let (wx, wy, ww, wh) = mon.work_area;
-                if ww > 1 && wh > 1 {
-                    WindowRect { x: wx, y: wy, w: ww, h: wh }
-                } else {
-                    let o = mon.origin;
-                    WindowRect { x: o.0, y: o.1, w: scr_w, h: scr_h }
-                }
+                // Maximize to the WINDOW'S MONITOR work area (monitor minus panels), not the raw screen, and emphatically not the surface, which on Linux spans every monitor.
+                self.maximized_rect()
             }
         };
 
