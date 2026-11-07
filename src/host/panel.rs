@@ -1,6 +1,6 @@
 //! The ferros display's working values from a fluor scratch buffer: the present the ferros host runs, at either pixel depth.
 //! The display composes 16-bit surfaces (`Px` u64: R, G, B in bits 0, 16 and 32 as gamma 2 with white at 2¹⁴; bit 63 = see-through), so every depth's present ends in the same place: each channel's `g2t` code to `16384 × atanh(code / 2ⁿ)`, VSF's decode at the bucket's bottom (light = atanh(code / 2ⁿ)², and gamma 2 is its root).
-//! A pixel's α composites it the way the 8-bit present always has: the visible code `(top − darkness)`, scaled by α.
+//! A pixel's α composites it over black in darkness space: fluor's darkness is premultiplied (`under` deposits darkness × α, so darkness ≤ α), what is still transparent is white until something is put under it, and black under it adds darkness `top − α`; so the visible code is `α − darkness`. (Until 2026-11-07 the darkness was taken as straight, `(top − darkness) × α`, right only where α is whole: every translucent edge came out too bright.)
 //! At 16 bits the display reads the pixels as fluor drew them (owner, 2026-10-29: fluor the one compositor, passed straight through): the window is shown with format `G2T16` (op 22's last byte) and the display decodes each pixel itself (ferros payloads/display `working`, the composite and table below), so the 16-bit present is a copy. The 8-bit present still converts here.
 
 use crate::pixel::{Argb8, G2t16, Pixel};
@@ -30,12 +30,12 @@ fn q14_from_g2t8() -> &'static [u16; 256] {
 
 impl PanelPixel for Argb8 {
     const FORMAT: u8 = 0;
-    /// The 8-bit present as it was: the visible code over the pixel's α (rounded), thru the 256-entry table. A transparent pixel is black, as before (no see-through bit at this depth: the 8-bit shell keeps its present unchanged).
+    /// The 8-bit present: the visible code over black, `α − darkness` (no subtraction can underflow: fluor's own buffer, where `under` keeps darkness ≤ α), thru the 256-entry table. A transparent pixel is black (no see-through bit at this depth).
     fn to_panel(src: &[Self], dst: &mut [u64]) {
         let lut = q14_from_g2t8();
         for (d, &px) in dst.iter_mut().zip(src.iter()) {
             let a = px.alpha();
-            let [r, g, b] = px.channels().map(|c| ((Argb8::ONE - c) * a + 127) / 255);
+            let [r, g, b] = px.channels().map(|c| a - c);
             *d = lut[r as usize] as u64 | (lut[g as usize] as u64) << 16 | (lut[b as usize] as u64) << 32;
         }
     }
@@ -68,13 +68,13 @@ mod tests {
         })
     }
 
-    /// The display's decode of a G2t16 pixel (ferros payloads/display `working`), the contract a G2T16 window is shown under: each channel's visible code (the top code less its darkness) scaled by α, thru the table, and α 0 see-through.
+    /// The display's decode of a G2t16 pixel (ferros payloads/display `working`), the contract a G2T16 window is shown under: each channel's visible code over black, α less its (premultiplied) darkness, thru the table, and α 0 see-through.
     fn display_working(p: G2t16) -> u64 {
         let (lut, a) = (q14_from_g2t16(), p.alpha());
         if a == 0 {
             return SEE_THROUGH;
         }
-        let [r, g, b] = p.channels().map(|c| ((G2t16::ONE - c) * a + (G2t16::ONE >> 1)) / G2t16::ONE);
+        let [r, g, b] = p.channels().map(|c| a - c);
         lut[r as usize] as u64 | (lut[g as usize] as u64) << 16 | (lut[b as usize] as u64) << 32
     }
 
@@ -91,6 +91,17 @@ mod tests {
         // Diffuse white (light 1) is code 194.97 of 256: its bucket's bottom decodes to atanh(194/256) = 0.9915, just under 2¹⁴, at both depths, and the 16-bit code for light 1 itself (tanh(1) × 2¹⁶ = 49912) is 2¹⁴ to the step.
         assert_eq!(t16[194 << 8], t8[194]);
         assert!(t16[49912].abs_diff(16384) <= 1, "{}", t16[49912]);
+    }
+
+    /// A translucent pixel decodes as its light over black: black laid at half α by `under` stays black (the straight-darkness decode showed it as a grey of code 2¹⁴), and white at half α is half of white's code.
+    #[test]
+    fn translucent_decodes_over_black() {
+        use crate::pixel::{Blend, BlendMode};
+        let half = 1 << 15;
+        let black = G2t16::EMPTY.under(u64::MAX.with_alpha(half), BlendMode::Normal);
+        assert_eq!(display_working(black) & 0xFFFF, q14_from_g2t16()[1] as u64);
+        let white = G2t16::EMPTY.under(G2t16::OPAQUE.with_alpha(half), BlendMode::Normal);
+        assert_eq!(display_working(white) & 0xFFFF, q14_from_g2t16()[half as usize] as u64);
     }
 
     /// The same opaque colour reaches the display alike at both depths (the 8-bit present against the display's 16-bit decode), and an empty 16-bit pixel is see-through.
