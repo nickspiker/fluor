@@ -221,7 +221,7 @@ pub const fn q16_to_half(v: u32) -> u16 {
     ((exp << 10) | mant) as u16
 }
 
-/// The extended-range finalize table (HDR plan, Android first): for every stored DARKNESS byte, the light the surface gets in its own linear extended range (1.0 = SDR white), as half bits for the opaque fast path and as Q16 for partly-covered pixels (premultiplied by α in integers, then packed).
+/// The extended-range finalize table (HDR plan, Android first): for every stored DARKNESS byte, the light the surface gets in its own linear extended range (1.0 = SDR white), as half bits for the opaque fast path and as Q16 for partly-covered pixels (read at the pixel's darkness over black, so α is in it, scaled by the clip in integers, then packed).
 /// Built for the headroom the display GRANTED and the frame's brightest light; rebuilt only when either changes. 512 + 1024 bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HdrTable {
@@ -316,6 +316,15 @@ pub const ALPHA_HALF: [u16; 256] = {
 #[inline(always)]
 pub const fn to_sdr_visible(px: u32) -> u32 {
     (px & 0xFF00_0000) | ((DARK_TO_SDR[((px >> 16) & 0xFF) as usize] as u32) << 16) | ((DARK_TO_SDR[((px >> 8) & 0xFF) as usize] as u32) << 8) | DARK_TO_SDR[(px & 0xFF) as usize] as u32
+}
+
+/// A stored α + darkness pixel over black → visible SDR display RGB (γ2, white at 255), α passing thru: the present's colour step, the pixel's light already scaled by its α.
+/// fluor's darkness is premultiplied (`under` deposits darkness × α), so what is still transparent is white until something is put under it; black under it adds darkness `255 − α` to every channel, and the table reads that darkness, whose code is `α − darkness`.
+/// The sum stays within the table while darkness ≤ α, which `under` keeps; a pixel past it (straight darkness written around `under`) indexes past the table and panics, the bug upstream showing itself.
+#[inline(always)]
+pub const fn to_sdr_over_black(px: u32) -> u32 {
+    let k = 255 - (px >> 24);
+    (px & 0xFF00_0000) | ((DARK_TO_SDR[(((px >> 16) & 0xFF) + k) as usize] as u32) << 16) | ((DARK_TO_SDR[(((px >> 8) & 0xFF) + k) as usize] as u32) << 8) | DARK_TO_SDR[((px & 0xFF) + k) as usize] as u32
 }
 
 /// γ2 code (÷255, white at 255) → the `g2t` code of the same light by VSF's rule: for pixels that arrive γ2-encoded (decoded images, avatars, emoji bitmaps, video frames, hand-written darkness constants) on their way into the `g2t` buffer.

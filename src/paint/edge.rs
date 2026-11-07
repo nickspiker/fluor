@@ -141,15 +141,15 @@ pub fn walk_window_edges(
         }
     }
 
-    // Two-sided AA convention. OUTER pixel = on the curve, partially outside the window: clip = coverage trims against the OS bg; the hairline stays opaque. INNER pixel = one step inside: clip = full; the hairline's α carries the hairline-vs-bg AA = full − coverage.
+    // Two-sided AA convention. OUTER pixel = on the curve, partially outside the window: clip = the inside weight (√(1 − frac)) trims against the OS bg; the hairline stays opaque. INNER pixel = one step inside: clip = full; the hairline's α is the outside weight (√frac), the part of the line the outer pixel's clip took off. The weights are roots of areas, so in light (their squares) the two pixels carry 1 − frac and frac of the line: one pixel of light at every phase of the curve. (Until 2026-11-07 the inner pixel took full − the inside weight, 1 − √(1 − frac), and the line's light swung between about 0.57 and 0.9 of a pixel along the curve: a brighter, jagged ripple.)
 
     // TL corner (big). Row-walk: near-vertical segment; col-walk: near-horizontal segment. Both use the big table.
-    for (i, &(inset_raw, _l, h_cov)) in crossings_big.iter().enumerate() {
+    for (i, &(inset_raw, l_cov, h_cov)) in crossings_big.iter().enumerate() {
         let inset = inset_raw as usize;
         if inset >= cap_big {
             continue;
         }
-        let inner_alpha = 0xFFFF - h_cov as u32;
+        let inner_alpha = l_cov as u32;
         let row_top = start_big + i;
         let col_left = start_big + i;
 
@@ -175,12 +175,12 @@ pub fn walk_window_edges(
     }
 
     // BR corner (big).
-    for (i, &(inset_raw, _l, h_cov)) in crossings_big.iter().enumerate() {
+    for (i, &(inset_raw, l_cov, h_cov)) in crossings_big.iter().enumerate() {
         let inset = inset_raw as usize;
         if inset >= cap_big {
             continue;
         }
-        let inner_alpha = 0xFFFF - h_cov as u32;
+        let inner_alpha = l_cov as u32;
         let row_bot = h - 1 - start_big - i;
         let col_right = w - 1 - start_big - i;
 
@@ -206,12 +206,12 @@ pub fn walk_window_edges(
     }
 
     // TR corner (small).
-    for (i, &(inset_raw, _l, h_cov)) in crossings_small.iter().enumerate() {
+    for (i, &(inset_raw, l_cov, h_cov)) in crossings_small.iter().enumerate() {
         let inset = inset_raw as usize;
         if inset >= cap_small {
             continue;
         }
-        let inner_alpha = 0xFFFF - h_cov as u32;
+        let inner_alpha = l_cov as u32;
         let row_top = start_small + i;
         let col_right = w - 1 - start_small - i;
 
@@ -237,12 +237,12 @@ pub fn walk_window_edges(
     }
 
     // BL corner (small).
-    for (i, &(inset_raw, _l, h_cov)) in crossings_small.iter().enumerate() {
+    for (i, &(inset_raw, l_cov, h_cov)) in crossings_small.iter().enumerate() {
         let inset = inset_raw as usize;
         if inset >= cap_small {
             continue;
         }
-        let inner_alpha = 0xFFFF - h_cov as u32;
+        let inner_alpha = l_cov as u32;
         let row_bot = h - 1 - start_small - i;
         let col_left = start_small + i;
 

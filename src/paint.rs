@@ -319,6 +319,25 @@ pub(crate) fn flatten_premult_chunk<P: Pixel>(dst: &mut [P], src: &[P]) {
     }
 }
 
+/// [`flatten_premult`] in any blend mode: `src` a composite (its darkness premultiplied by its α) composed under `dst` thru [`Blend::under_premult`](crate::pixel::Blend::under_premult), the same operator as [`flatten`]'s with the bottom's α kept inside its darkness. Normal takes [`flatten_premult`]'s kernel (the same arithmetic); the other modes run per pixel with Rayon chunking, as [`flatten`]'s do.
+pub fn flatten_premult_mode<P: Pixel>(dst: &mut [P], src: &[P], mode: BlendMode) {
+    if mode == BlendMode::Normal {
+        return flatten_premult(dst, src);
+    }
+    let n = dst.len();
+    if n == 0 {
+        return;
+    }
+    const CHUNK: usize = 4096;
+    let src = &src[..n];
+    crate::par::par_chunks(&mut dst[..n], CHUNK, |off, chunk| {
+        let src_chunk = &src[off..off + chunk.len()];
+        for i in 0..chunk.len() {
+            chunk[i] = chunk[i].under_premult(src_chunk[i], mode);
+        }
+    });
+}
+
 pub use crate::pixel::BlendMode;
 use crate::pixel::{Argb8, Pixel};
 
@@ -830,20 +849,35 @@ pub const DEBUG_STRIP_H: usize = 24;
 
 
 
+/// The blinkey (the text caret): a vertical wave of white light at column `bx`, `height` tall from row `by`, brightest toward its top (`top_bright`) or its bottom, smeared seven pixels either side at half the light per step.
+/// Bounds contract: `bx ≥ 7`, `bx + 7 < canvas.width` and `by + height ≤ canvas.height`, which every caller checks; the smear indexes the buffer directly.
 pub fn draw_blinkey<P: Pixel>(canvas: &mut Canvas<P>, bx: usize, by: usize, height: usize, top_bright: bool) {
     draw_blinkey_tinted(canvas, bx, by, height, top_bright, (255, 255, 255));
 }
 
+// PROOF that the caret's α stays within ONE: its peak light, (8/9)(16/9) × CURSOR_BRIGHTNESS of 255, is under the code of white's brightest channel, and α is that light ÷ that code.
+const _: () = {
+    let w = crate::theme::WHITE;
+    let (r, g, b) = ((w >> 16) & 0xFF, (w >> 8) & 0xFF, w & 0xFF);
+    let least = if r < g && r < b { r } else if g < b { g } else { b };
+    assert!(crate::theme::CURSOR_BRIGHTNESS * (128. / 81.) < (255 - least) as f32);
+};
+
 /// The blinkey in a COLOUR: the same brightness wave, scaled per channel by `tint` (255 = the full wave, 0 = that channel stays dark). White tint = the plain blinkey; a link-purple caret is (160, 80, 255). Same bounds contract as [`draw_blinkey`].
+///
+/// The caret is a layer of light in FRONT of what is drawn: a glow of white's colour (the theme's WHITE, channel by channel) at a falling α, `α = light ÷ the code of white's brightest channel` (so over black that channel shows exactly `light`, and over white the caret shows white), each channel's light `α × its white code ÷ ONE × tint ÷ 255`.
+/// It is drawn after the text it sits in (the callers paint the field, then the caret), so it cannot go into the accumulator first; it goes in front of the finished pixels instead, `caret.under_premult(pixel)`, which is the same composite as the caret laid first and the field under it, since `under` is associative over premultiplied operands.
+/// Until 2026-11-07 the caret subtracted its light from the finished darkness (drawn last, painter's order), floored at white: a pixel already brighter than white kept its light, and on a translucent pixel the caret added no coverage of its own.
 pub fn draw_blinkey_tinted<P: Pixel>(canvas: &mut Canvas<P>, bx: usize, by: usize, height: usize, top_bright: bool, tint: (u8, u8, u8)) {
     let buf_w = canvas.width;
     // Damage: ±7 horizontal spread × `height` vertical band. Caller's bounds invariant (bx ≥ 7, bx < buf_w-7) guarantees this stays in-buffer.
     canvas.damage.add_bounds(bx - 7, by, bx + 8, by + height);
     let pixels: &mut [P] = canvas.pixels;
     let half = height / 2;
-    // The white stop in this depth's darkness, per channel.
-    let white = P::from_g2t8(crate::theme::WHITE).channels();
-    // The wave is authored on the 8-bit scale (CURSOR_BRIGHTNESS); ONE / 255 is exactly 1 at 8 bits and carries the wave's fraction to 16.
+    // White's codes (light) in this depth, channel by channel: the caret's colour at full light; its α is measured on the brightest.
+    let white_code = P::from_g2t8(crate::theme::WHITE).channels().map(|d| P::ONE - d);
+    let brightest = white_code[0].max(white_code[1]).max(white_code[2]);
+    // The wave is authored on the 8-bit scale (CURSOR_BRIGHTNESS); ONE / 255 is exactly 1 at 8 bits and carries the wave's fraction to 16. Each row's light is rounded to the nearest code (truncated, the 8-bit caret came out up to two steps darker than the 16-bit one once its α floored too).
     let to_depth = P::ONE as f32 / 255.;
     for y in by..by + height {
         let idx = y * buf_w + bx;
@@ -853,16 +887,16 @@ pub fn draw_blinkey_tinted<P: Pixel>(canvas: &mut Canvas<P>, bx: usize, by: usiz
         } else {
             (1.0 - t * t) * (1.0 + t) * (1.0 + t) * crate::theme::CURSOR_BRIGHTNESS
         };
-        let w = (wave * to_depth) as u32;
+        let w = (wave * to_depth + 0.5) as u32;
         for dx in -7i32..=7 {
-            // The cursor is a BRIGHT wave. In the α + darkness convention (RGB bytes are darkness, `0 = white`), brightening means REDUCING darkness — a per-channel subtract (signed, floored by the white stop below), NOT the add the visible-RGB original used. (Photon's buffer was visible-space, so it added; the port kept the `+=` which silently darkened the cursor into invisibility against a dark field.) α is preserved.
             let k = w >> dx.unsigned_abs();
-            let ks = [k * tint.0 as u32 / 255, k * tint.1 as u32 / 255, k * tint.2 as u32 / 255];
+            // α = light ÷ the brightest white code, rounded, at most ONE by the const PROOF above; each channel's light is α's share of its white code × tint, rounded once (u64: the product passes 2³² at 16 bits), at most α, so its darkness α − light stays in 0..=α.
+            let a = (k * P::ONE + (brightest >> 1)) / brightest;
+            let tints = [tint.0, tint.1, tint.2];
+            let light: [u32; 3] = core::array::from_fn(|c| ((a as u64 * white_code[c] as u64 * tints[c] as u64 + (P::ONE as u64 * 255 >> 1)) / (P::ONE as u64 * 255)) as u32);
+            let caret = P::from_channels(a, light.map(|l| a - l));
             let p = &mut pixels[(idx as isize + dx as isize) as usize];
-            // Brightening stops at diffuse white (theme::WHITE), never darkness 0: past white is a 9.7× glow on an HDR surface, and SDR clipped it to white anyway. A pixel already brighter than white keeps its own light.
-            let d = p.channels();
-            let lifted: [u32; 3] = core::array::from_fn(|c| (d[c] as i32 - ks[c] as i32).max(d[c].min(white[c]) as i32) as u32);
-            *p = P::from_channels(p.alpha(), lifted);
+            *p = caret.under_premult(*p, BlendMode::Normal);
         }
     }
 }
@@ -995,6 +1029,34 @@ mod tests {
         assert_eq!(result, top);
         let (r, g, b, _) = unpack_argb(result);
         assert_eq!((r, g, b), (50, 80, 110));
+    }
+
+    /// The blinkey is light in front of what is drawn, at both depths: over opaque black it brightens and stays opaque, over white it stays white (to a code), and over an empty buffer it lands as a layer of its own, white at its α. Until 2026-11-07 it subtracted from the darkness already there: an empty buffer stayed empty.
+    #[test]
+    fn blinkey_is_light_in_front() {
+        fn run<P: Pixel>() {
+            let (w, h) = (24usize, 16usize);
+            let white = P::from_g2t8(crate::theme::WHITE);
+            let white_dark = white.channels();
+            for (fill, name) in [(P::from_channels(P::ONE, [P::ONE; 3]), "black"), (white, "white"), (P::EMPTY, "empty")] {
+                let mut buf = vec![fill; w * h];
+                let mut damage = crate::canvas::Damage::new();
+                draw_blinkey(&mut crate::canvas::Canvas::new(&mut buf, w, h, &mut damage), 12, 0, h, true);
+                assert!(buf.iter().any(|&p| p != fill), "{name}: the caret drew nothing");
+                for p in buf {
+                    let (a, d) = (p.alpha(), p.channels());
+                    assert!(d.iter().all(|&c| c <= a), "{name}: {p:?} darkness past α");
+                    match name {
+                        "black" => assert_eq!(a, P::ONE, "{name}: {p:?}"),
+                        "white" => assert!(a == P::ONE && (0..3).all(|c| d[c].abs_diff(white_dark[c]) <= 1), "{name}: {p:?}"),
+                        // The caret's own colour, white, premultiplied: darkness = α × white's darkness ÷ ONE, to a code.
+                        _ => assert!((0..3).all(|c| d[c].abs_diff(a * white_dark[c] / P::ONE) <= 1), "{name}: {p:?}"),
+                    }
+                }
+            }
+        }
+        run::<Argb8>();
+        run::<crate::pixel::G2t16>();
     }
 
     #[test]

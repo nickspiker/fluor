@@ -2,7 +2,7 @@
 //!
 //! "Stack Notation" describes the mechanism directly: data flows thru a stack in execution order, operators are stack transformations. No precedence tables, no ambiguity. (Often called "RPN" in calculator history; that name carries decades of irrelevant baggage and the geographic branding of its inventor — neither describes what it actually does. Contrast with "Infix Notation" — the broken sibling whose arbitrary operator placement creates all the precedence/associativity problems Stack Notation sidesteps.)
 //!
-//! `Push` loads a layer's pixel buffer onto the evaluation stack; `Under(mode)` pops two operands (the second-from-top is the partial composite from layers above, the top is the new layer going behind) and folds them via [`crate::pixel::Blend::under`] with the chosen [`BlendMode`]. The same evaluator handles simple ordered stacks (`Push top, Push next_behind, Under(Normal)`) and complex expressions (`Push 0, Push 1, Under(Multiply), Push 2, Under(Add)`).
+//! `Push` loads a layer's pixel buffer onto the evaluation stack; `Under(mode)` pops two operands (the second-from-top is the partial composite from layers above, the top is the new layer going behind) and folds them via [`crate::pixel::Blend::under_premult`] (`under` for an operand that is itself a composite) with the chosen [`BlendMode`]. The same evaluator handles simple ordered stacks (`Push top, Push next_behind, Under(Normal)`) and complex expressions (`Push 0, Push 1, Under(Multiply), Push 2, Under(Add)`).
 //!
 //! Re-execution policy: a per-layer `dirty` flag gates expensive rasterization upstream of the Stack (text shaping, glyph rendering, squircle math). The Stack itself caches the *final* composite from the last `evaluate()`; if no layer is dirty, that cache returns directly without re-running the program. If anything is dirty, the entire program re-runs — no per-instruction snapshot cache. Under-blend's per-pixel early-out (`dst >= 0xFF000000`, i.e. α=0xFF opaque) makes the per-pixel work cheap, and the typical program is short enough (3-5 ops) that running it whole is faster than maintaining intermediate state.
 
@@ -14,9 +14,9 @@ use alloc::vec::Vec;
 pub enum Op {
     /// Push layer `idx` onto the evaluation stack.
     Push(usize),
-    /// Push a solid-colour buffer (all pixels same value): an authored 8-bit `g2t` colour, widened to the compositor's depth.
+    /// Push a solid-colour buffer (all pixels same value): an authored 8-bit `g2t` colour, widened to the compositor's depth and premultiplied like every other operand.
     Constant(Argb8),
-    /// Pop two operands; the second-from-top is `top` (partial composite from above), the top-of-stack is `bottom` (new layer going behind). Apply `top.under(bottom, mode)` per pixel and push the result. The single compositing primitive — every blend mode flows thru here.
+    /// Pop two operands; the second-from-top is `top` (partial composite from above), the top-of-stack is `bottom` (new layer going behind). Apply `top.under_premult(bottom, mode)` per pixel (bottom is a composite, its darkness already premultiplied) and push the result. The single compositing primitive — every blend mode flows thru here.
     Under(BlendMode),
 }
 
@@ -167,18 +167,17 @@ impl<P: Pixel> StackCompositor<P> {
                 }
                 Op::Constant(colour) => {
                     let mut buf = self.acquire_buf();
-                    buf.fill(P::from_g2t8(colour));
+                    // An authored colour is straight (its darkness and α apart) and every operand here is a composite, so it is premultiplied once on the way in: darkness × α ÷ ONE, rounded, which leaves an opaque colour exactly as authored.
+                    let c = P::from_g2t8(colour);
+                    let a = c.alpha();
+                    buf.fill(P::from_channels(a, c.channels().map(|d| (d * a + (P::ONE >> 1)) / P::ONE)));
                     self.stack.push(buf);
                 }
                 Op::Under(mode) => {
                     let b = self.stack.pop().expect("Stack underflow on Under");
                     let a = self.stack.last_mut().expect("Stack underflow on Under");
-                    // Full-buffer compose. Every operand here is a layer built by `under()` from empty (or an earlier composite), so its darkness is ALREADY attenuated by its α: Normal takes the premultiplied blit (`flatten` would apply the bottom's α a second time and dim every anti-aliased pixel). Other modes keep the per-pixel kernel.
-                    if mode == BlendMode::Normal {
-                        crate::paint::flatten_premult(a, &b);
-                    } else {
-                        crate::paint::flatten(a, &b, mode);
-                    }
+                    // Full-buffer compose. Every operand here is a layer built by `under()` from empty (or an earlier composite), so its darkness is ALREADY attenuated by its α: every mode takes the premultiplied compose (`flatten` would apply the bottom's α a second time and dim every anti-aliased pixel, in every mode; until 2026-11-07 the modes other than Normal did).
+                    crate::paint::flatten_premult_mode(a, &b, mode);
                     self.release_buf(b);
                 }
             }

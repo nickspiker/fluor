@@ -91,7 +91,7 @@ fn paint_rects<P: Pixel>() -> Vec<P> {
 
 #[test]
 fn golden_paint_rects() {
-    check("paint_rects", &paint_rects::<Argb8>(), 0x219a_55dc_a5c7_3aca);
+    check("paint_rects", &paint_rects::<Argb8>(), 0xa787_df13_d2cc_1437);
 }
 
 /// The float AA shapes in paint/shape.rs: axis rect with fractional edges, hairlines, rotated rect, AA circle, segmented ring.
@@ -206,7 +206,7 @@ fn golden_shadow() {
     let (rx, ry) = (40i32, 20i32);
     paint::finalize_into_screen(&win, &clip, ww, wh, &mut screen, sw, rx, ry, PixelRect::new(0, 0, ww, wh), true, false);
     paint::paint_shadow(&mut screen, sw, 240, 0x80, (rx, ry, ww as i32, wh as i32));
-    check("shadow", &screen, 0x4c5b_f4f6_0458_97bb);
+    check("shadow", &screen, 0xdece_f0d6_34b2_812f);
 }
 
 /// The present boundary's scene at depth `P`: a fill, a two-tone pill, a translucent band and a translucent white pill, with a clip mask that is opaque in the middle, empty at the very edge and ramps in between, so every finalize branch (full, partial, cut) sees pixels.
@@ -249,9 +249,9 @@ fn golden_finalize() {
     paint::finalize_for_os(&mut in_place, &clip);
     let [full, damaged, over] = finalize_presents(&px, &clip);
 
-    check("finalize_in_place", &in_place, 0x3d1a_9c93_0655_c607);
-    check("finalize_into_full", &full, 0x90a8_55b0_fc87_b707);
-    check("finalize_into_damaged", &damaged, 0x62bb_dade_acd6_ce07);
+    check("finalize_in_place", &in_place, 0xc43a_0227_bbf2_bffd);
+    check("finalize_into_full", &full, 0xb4f4_5df2_67bb_6dfd);
+    check("finalize_into_damaged", &damaged, 0x5450_b0fa_2cb2_eb49);
     assert_ne!(over, full, "the over finalize took the plain path");
     check("finalize_into_over", &over, 0xb183_73ac_ecee_80ca);
     check8("finalize_clip_mask", &clip, 0xa5b2_9342_0fa7_8f25);
@@ -280,8 +280,8 @@ fn golden_finalize_g2t16() {
         assert!(low >= -2 && high <= 3, "{name}: the 16-bit present sits in [{low}, {high}] around the 8-bit one");
     }
     assert_ne!(p16[2], p16[0], "the over finalize took the plain path");
-    check("finalize_g2t16_full", &p16[0], 0x5cda_03db_9ce9_cdbd);
-    check("finalize_g2t16_damaged", &p16[1], 0x2955_7ddc_6b0b_ab92);
+    check("finalize_g2t16_full", &p16[0], 0x5af6_188b_d863_c17a);
+    check("finalize_g2t16_damaged", &p16[1], 0x9499_603e_d2d7_6208);
     check("finalize_g2t16_over", &p16[2], 0x5195_f6f9_f203_92e4);
 }
 
@@ -355,7 +355,7 @@ fn stack<P: Pixel>() -> Vec<P> {
 #[test]
 fn golden_compositing() {
     check("flatten_modes", &flatten_modes::<Argb8>(), 0xab87_5179_3d8c_183c);
-    check("stack", &stack::<Argb8>(), 0xfb5e_fc65_bbc7_6bb3);
+    check("stack", &stack::<Argb8>(), 0x7877_7aae_c493_5bff);
 }
 
 /// The background noise field, its own base and a given one, scrolled.

@@ -211,7 +211,7 @@ impl TextRenderer {
                     // Draw the glyph bitmap
                     let glyph_width = image.placement.width as usize;
                     let glyph_height = image.placement.height as usize;
-                    // This LEGACY path composites in VISIBLE-RGB byte space (raw channel bytes over-blended with the visible tint `colour[c]`), NOT the u32 α+darkness domain of `render_buffer_u32`. So the Color branch here writes the source's visible sRGB channels DIRECTLY (no darkness complement) — the buffer isn't XOR-flipped at finalize. Colour glyph = `Content::Color` RGBA (4 bytes/pixel); Mask glyph = 1-byte coverage.
+                    // This LEGACY path composites in VISIBLE-RGB byte space (raw channel bytes, each glyph composed under what is there with the visible tint `colour[c]`), NOT the u32 α+darkness domain of `render_buffer_u32`. So the Color branch here writes the source's visible sRGB channels DIRECTLY (no darkness complement) — the buffer isn't XOR-flipped at finalize. Colour glyph = `Content::Color` RGBA (4 bytes/pixel); Mask glyph = 1-byte coverage.
                     let is_colour = image.content == swash::scale::image::Content::Color;
 
                     for cy in 0..glyph_height {
@@ -254,7 +254,13 @@ impl TextRenderer {
                                     * channels;
 
                                 let alpha_u16 = alpha as u16;
-                                let inv_alpha = 256 - alpha_u16;
+                                // Front to back: the glyph goes UNDER what the buffer already holds, each byte read as the coverage laid so far, so the glyph fills only what is still open, `v + (256 − v) × glyph >> 8` with the glyph its colour × coverage (`under`'s α accumulation on one byte). Into an empty buffer, which is how every caller starts one, that is the glyph as it always was; only a pixel two glyphs share differs from the over-blend this was until 2026-11-07, and a later draw no longer covers an earlier one (it lands behind it).
+                                let under = |v: u8, src: u16| -> u8 {
+                                    let v = v as u16;
+                                    let g = (src * alpha_u16) >> 8;
+                                    // Each term stays in a byte: g ≤ 254 (255 × 255 >> 8), so v + (256 − v) × g >> 8 < 256, and (256 − v) × g < 2¹⁶.
+                                    (v + (((256 - v) * g) >> 8)) as u8
+                                };
 
                                 if is_colour {
                                     // Composite the glyph's OWN visible sRGB, ignoring the style `colour`. Map source r,g,b onto the first three channels; any 4th (alpha) channel keeps the mask-path behaviour of tinting toward `colour[3]`.
@@ -265,17 +271,11 @@ impl TextRenderer {
                                         } else {
                                             colour[c] as u16
                                         };
-                                        pixels[offset + c] = ((pixels[offset + c] as u16 * inv_alpha
-                                            + src * alpha_u16)
-                                            >> 8)
-                                            as u8;
+                                        pixels[offset + c] = under(pixels[offset + c], src);
                                     }
                                 } else {
                                     for c in 0..channels {
-                                        pixels[offset + c] = ((pixels[offset + c] as u16 * inv_alpha
-                                            + colour[c] as u16 * alpha_u16)
-                                            >> 8)
-                                            as u8;
+                                        pixels[offset + c] = under(pixels[offset + c], colour[c] as u16);
                                     }
                                 }
                             }

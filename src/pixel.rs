@@ -105,6 +105,12 @@ pub trait Blend {
     /// The operands are `Self` so the same kernel name serves every pixel depth: [`Pixel`] has `Blend` as a supertrait, which is how generic code reaches `under` thru a `P: Pixel` bound.
     /// At 16 bits every 8, 255 and 256 above is the depth's own (16, 65535, 65536), and the floor proof carries over word for word.
     fn under(self, bottom: Self, mode: BlendMode) -> Self;
+
+    /// [`Blend::under`] for a `bottom` that is itself a composite (a layer built by `under` from empty, a Stack operand, a Group's buffer): its darkness is already premultiplied by its α, so `under` would apply that α a second time and dim every partly covered pixel.
+    /// The same operator with the bottom's α kept inside its darkness: each mode is `under`'s kernel scaled by the bottom's α, `m · bot_α`, written on the premultiplied darkness `bd' = bd · bot_α` so no division recovers `bd` (Normal `bd'`; Multiply `bot_α − (1 − td)(bot_α − bd')`; Screen `td · bd'`; Add `(td · bot_α + bd' − bot_α)⁺`; Subtract `bot_α − (bd' − td · bot_α)⁺`; Overlay on `2 · bd' > bot_α` for `bd > ½`; Darken and Lighten the larger and smaller of `td · bot_α` and `bd'`), and it lands scaled by the opacity still open above, `(ONE + 1 − top_α) >> DEPTH`.
+    /// Each `m · bot_α` stays within `0..=bot_α` while `bd' ≤ bot_α` (every composite holds it), so the deposit is at most what `bot_α` adds to α, and `under`'s floor proof carries over: darkness ≤ α ≤ ONE, plain `+`.
+    /// Normal is [`crate::paint::flatten_premult`]'s kernel, bit for bit.
+    fn under_premult(self, bottom: Self, mode: BlendMode) -> Self;
 }
 
 /// A pixel depth fluor can render at.
@@ -513,6 +519,48 @@ macro_rules! impl_under {
 
                 (na << (3 * D)) | (nr << (2 * D)) | (ng << D) | nb
             }
+
+            #[inline]
+            fn under_premult(self, bottom: $t, mode: BlendMode) -> $t {
+                const D: u32 = $d;
+                let one: $t = (1 << D) - 1;
+                if self >= one << (3 * D) {
+                    return self;
+                } // top opaque — top wins, bottom invisible.
+                let top_a = self >> (3 * D);
+                let ba = bottom >> (3 * D);
+                let open = one + 1 - top_a;
+
+                let td = [(self >> (2 * D)) & one, (self >> D) & one, self & one];
+                let bd = [(bottom >> (2 * D)) & one, (bottom >> D) & one, bottom & one];
+
+                // `under`'s mode kernel times the bottom's α, on its premultiplied darkness (see the trait): `tb` is the top's darkness at the bottom's coverage, the `td · bot_α` the visible-space formulas pair with `bd'`.
+                let pivot: $t = 1 << (D - 1);
+                let m = |td: $t, bd: $t| -> $t {
+                    let tb = (td * ba) >> D;
+                    match mode {
+                        BlendMode::Normal => bd,
+                        BlendMode::Multiply => ba - (((one - td) * (ba - bd)) >> D),
+                        BlendMode::Screen => (td * bd) >> D,
+                        // WHY/PROOF: as in `under`, the saturation IS the Add and Subtract blend (light past white stays white, darkness past black stays black), not a guard.
+                        BlendMode::Add => (tb + bd).saturating_sub(ba),
+                        BlendMode::Subtract => ba - bd.saturating_sub(tb),
+                        // `under`'s pivot `bd > pivot` on the straight darkness is `bd' · ONE > pivot · bot_α` here, the same split exactly at a whole α; each branch stays within `bot_α` on its own side of it, as `under`'s stays within ONE.
+                        BlendMode::Overlay => {
+                            if bd * one > pivot * ba { ba - ((2 * (one - td) * (ba - bd)) >> D) } else { (2 * td * bd) >> D }
+                        }
+                        BlendMode::Darken => tb.max(bd),
+                        BlendMode::Lighten => tb.min(bd),
+                    }
+                };
+
+                let nr = td[0] + ((m(td[0], bd[0]) * open) >> D);
+                let ng = td[1] + ((m(td[1], bd[1]) * open) >> D);
+                let nb = td[2] + ((m(td[2], bd[2]) * open) >> D);
+                let na = top_a + ((ba * open) >> D);
+
+                (na << (3 * D)) | (nr << (2 * D)) | (ng << D) | nb
+            }
         }
     };
 }
@@ -833,6 +881,36 @@ mod tests {
         let result = top.under(bottom, BlendMode::Normal);
         let new_a = result >> 24;
         assert_eq!(new_a, 192);
+    }
+
+    /// `under_premult` is `under` for a bottom whose darkness is already premultiplied, in every mode, at both depths: a straight layer `b` under `under` and the same layer premultiplied (darkness × α ÷ ONE, rounded) under `under_premult` land within 3 codes of each other (the two floors and the rounded premultiply), every result keeps darkness ≤ α, and Normal is `flatten_premult`'s kernel bit for bit.
+    #[test]
+    fn under_premult_is_under_for_a_composite_bottom() {
+        fn check<P: Pixel>(top: P, b: P, worst: &mut u32) {
+            let a = b.alpha();
+            let pre = P::from_channels(a, b.channels().map(|d| (d * a + (P::ONE >> 1)) / P::ONE));
+            for mode in BlendMode::ALL {
+                let (want, got) = (top.under(b, mode), top.under_premult(pre, mode));
+                assert!(got.alpha() >= want.alpha() && got.alpha() - want.alpha() <= 1, "{mode:?} {top:?} under {b:?}: α {} vs {}", got.alpha(), want.alpha());
+                for (g, w) in got.channels().into_iter().zip(want.channels()) {
+                    *worst = (*worst).max(g.abs_diff(w));
+                    assert!(g <= got.alpha(), "{mode:?} {top:?} under {pre:?}: darkness {g} past α {}", got.alpha());
+                }
+            }
+            let mut flat = [top];
+            crate::paint::flatten_premult_chunk(&mut flat, &[pre]);
+            assert_eq!(flat[0], top.under_premult(pre, BlendMode::Normal));
+        }
+        let (mut s, mut worst8, mut worst16) = (0x9E37_79B9u32, 0, 0);
+        for _ in 0..1 << 16 {
+            let top = invariant_pixel(&mut s);
+            let b = invariant_pixel(&mut s);
+            // A straight bottom: its own darkness at any α.
+            let b = (b & 0xFF00_0000) | ((s >> 8) & 0x00FF_FFFF);
+            check::<Argb8>(top, b, &mut worst8);
+            check::<G2t16>(G2t16::from_channels(top.alpha() * 257, top.channels().map(|d| (d << 8) + top.alpha())), G2t16::from_g2t8(b), &mut worst16);
+        }
+        assert!(worst8 <= 3 && worst16 <= 3, "under_premult strays {worst8} (8-bit), {worst16} (16-bit) from under");
     }
 }
 

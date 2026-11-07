@@ -1142,43 +1142,16 @@ impl<P: Pixel> Textbox<P> {
             );
         }
 
-        // Blinkey wave — per-channel saturating_sub from the RGB darkness bytes (preserves α, no inter-byte carry corruption). In α + darkness convention, subtracting from darkness brightens the visible result; that's the cursor effect. Scratch's textbox pixels already have α=0xFF + FILL darkness, so the carry-safe per-byte write is what we need (`+= 0x010101 × w` would carry across bytes and trash the α). Polynomial wave + 7-pixel horizontal spread matches `paint::draw_blinkey`'s shape.
+        // The blinkey: THE canonical painter (paint::draw_blinkey), a layer of light composed in front of the field just drawn. Until 2026-11-07 this was a hand-rolled copy that subtracted the wave from the finished darkness, painter's order.
         if self.focused && !self.has_selection() && self.blinkey_visible {
             let buf_w = canvas.width;
             let buf_h = canvas.height;
-            let cpx_v = self.cursor_pixel_x();
-            let blinkey_x_v = cpx_v as isize;
-            let blinkey_x = (blinkey_x_v - offset_x as isize) as usize;
+            let blinkey_x = (self.cursor_pixel_x() as isize - offset_x as isize) as usize;
             let blinkey_y = ((self.center_y - self.font_size * 0.5) - offset_y) as usize;
             let blinkey_h = self.font_size as usize;
             // WHY/PROOF: the caret follows the scroll and the app's layout, so its 15-px smear can hang past the buffer's edge — the smear would index outside it.
             if blinkey_x >= 7 && blinkey_x + 7 < buf_w && blinkey_y + blinkey_h <= buf_h {
-                let half = blinkey_h / 2;
-                let top_bright = self.blinkey_wave_top;
-                let cursor_brightness = theme::CURSOR_BRIGHTNESS;
-                let pixels = &mut *canvas.pixels;
-                for y in blinkey_y..blinkey_y + blinkey_h {
-                    let row_base = y * buf_w;
-                    let t = (y as isize - blinkey_y as isize - half as isize) as f32 / half as f32;
-                    let wave = if top_bright {
-                        (1.0 - t * t) * (1.0 - t) * (1.0 - t) * cursor_brightness
-                    } else {
-                        (1.0 - t * t) * (1.0 + t) * (1.0 + t) * cursor_brightness
-                    };
-                    let w_base = wave as u32;
-                    for dx in -7i32..=7 {
-                        let w = w_base >> (dx.unsigned_abs() as u32);
-                        if w == 0 {
-                            continue;
-                        }
-                        // The wave peaks at (8/9)(16/9) × CURSOR_BRIGHTNESS (100) ≈ 158, a byte's worth; ONE / 255 (1 at 8 bits, 257 at 16) puts it in the depth's darkness.
-                        let w = w * (P::ONE / 255);
-                        let idx = (row_base as isize + blinkey_x as isize + dx as isize) as usize;
-                        let p = pixels[idx];
-                        // WHY/PROOF: not a guard — brightening a darkness channel stops at 0 (white); a plain subtract would wrap a near-white pixel to near-black.
-                        pixels[idx] = P::from_channels(p.alpha(), p.channels().map(|c| c.saturating_sub(w)));
-                    }
-                }
+                paint::draw_blinkey(canvas, blinkey_x, blinkey_y, blinkey_h, self.blinkey_wave_top);
             }
         }
 
@@ -1186,7 +1159,7 @@ impl<P: Pixel> Textbox<P> {
         self.record_painted(canvas.width, canvas.height);
     }
 
-    /// Render only the blinkey wave cursor into a buffer (typically a sub-viewport `cursor_group` buffer). `(offset_x, offset_y)` is the buffer's top-left in viewport coords. The buffer should be zeroed before calling — blinkey writes non-zero pixels for additive composition.
+    /// Render only the blinkey wave cursor into a buffer (typically a sub-viewport `cursor_group` buffer). `(offset_x, offset_y)` is the buffer's top-left in viewport coords. The buffer should be cleared to empty before calling: the blinkey lands there as a layer of its own (white light at a falling α, premultiplied), to go in front of the field by `flatten_premult` or `under`. (Until 2026-11-07 the caret subtracted from darkness already there, so on an empty buffer it drew nothing.)
     pub fn render_blinkey_into(
         &self,
         canvas: &mut crate::canvas::Canvas<P>,

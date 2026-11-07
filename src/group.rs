@@ -175,7 +175,7 @@ impl<P: Pixel> Group<P> {
     }
 }
 
-/// Composite a region-sized premultiplied buffer under `target` at the region's origin, clipped to the target and to `clip`. Normal takes the premultiplied blit (the buffer's darkness is already attenuated by its α); other modes the per-pixel kernel.
+/// Composite a region-sized premultiplied buffer under `target` at the region's origin, clipped to the target and to `clip`, in every mode thru the premultiplied compose (the buffer's darkness is already attenuated by its α; until 2026-11-07 the modes other than Normal took `flatten`, which applied it a second time).
 fn blit_region<P: Pixel>(
     src: &[P],
     region: Region,
@@ -225,11 +225,7 @@ fn blit_region<P: Pixel>(
 
         let src_slice = &src[src_row_start + src_clip_left..src_row_start + src_clip_left + count];
         let dst_slice = &mut target[dst_row_start + dst_x_start..dst_row_start + dst_x_end];
-        if blend == BlendMode::Normal {
-            paint::flatten_premult(dst_slice, src_slice);
-        } else {
-            paint::flatten(dst_slice, src_slice, blend);
-        }
+        paint::flatten_premult_mode(dst_slice, src_slice, blend);
     }
 }
 
