@@ -51,9 +51,9 @@ mod sys {
         (p as *const u8 as u64).wrapping_sub(arc_base())
     }
 
-    /// The grants page is arc offset 0: a u32 count, then 32-byte tokens; slot 0 is the console.
+    /// The grants page is arc offset 0: the handle table in its first 512 bytes, then a u32 count at G#200 and the 32-byte tokens after it (ferros SANDBOX.md, "Handles", since 2026-11-03); slot 0 is the console.
     pub fn cap(slot: u64) -> u64 {
-        4 + 32 * slot
+        0x204 + 32 * slot
     }
 
     pub fn call(cap: u64, msg: &[u8], reply: &mut [u8]) -> u64 {
@@ -196,6 +196,16 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         shell.with_context(|app, ctx| app.init(ctx));
         shell.with_context(|app, ctx| app.on_resize(width, height, ctx));
         shell
+    }
+
+    /// The app, for a caller that reads input the shell does not (an input hook of [`run_app_with`]).
+    pub fn app(&mut self) -> &mut A {
+        &mut self.app
+    }
+
+    /// Draw again at the next pass (what an input hook changed in the app shows).
+    pub fn request_redraw(&self) {
+        self.window.mark_dirty();
     }
 
     /// Tick the app and, when anything is dirty, render into the scratch buffer. True when a frame was drawn.
@@ -432,6 +442,15 @@ fn mine(display: u64, base: u64, x: u16, y: u16) -> bool {
 /// Run `app` on the panel until it asks to close (an `EventResponse::Close`): frames at most 120 a second, touches polled between them. `ru` is the resolution unit for the viewport (what the device's density would set on Android; 1.0 is fluor's native scale). `size` is the app's frame, centred on the panel, or the whole panel — a 1344 × 2992 frame is 16 MiB of scratch alone, more than a small arc holds.
 /// The depth is the app's: an app implementing `FluorApp` (8-bit) runs on the 8-bit shell as before, one implementing `FluorApp<G2t16>` on the 16-bit one, with the see-through bit wherever it drew nothing.
 pub fn run_app<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps, ru: Coord, size: Option<(u32, u32)>) -> Result<(), String> {
+    run_app_with(app, caps, ru, size, |shell: &mut FerrosShell<A, P>, contacts: &[Contact]| {
+        if !contacts.is_empty() {
+            shell.on_contacts(contacts);
+        }
+    })
+}
+
+/// [`run_app`] with the input in the caller's hands: `input` runs once every pass of the loop, before the frame, with the contacts that pass brought which are the app's (inside its frame, not landed on another window; in frame pixels), often none. An app with gestures of its own (two fingers on a map) reads them all, and hands the shell the ones that are its pointer ([`FerrosShell::on_contacts`]); a pass with none is the place to take in what the app's own threads brought (a fix from the GPS).
+pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps, ru: Coord, size: Option<(u32, u32)>, mut input: impl FnMut(&mut FerrosShell<A, P>, &[Contact])) -> Result<(), String> {
     let display = sys::cap(caps.display);
     let touch = sys::cap(caps.touch);
     let mut r = [0u8; 256];
@@ -494,10 +513,8 @@ pub fn run_app<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps, ru: 
                 contacts.push(Contact { id: rec[0], phase: rec[1], x: x as u16, y: y as u16 });
             }
         }
-        if !contacts.is_empty() {
-            touched += contacts.len() as u64;
-            shell.on_contacts(&contacts);
-        }
+        touched += contacts.len() as u64;
+        input(&mut shell, &contacts);
         if shell.close {
             let mut m = [0u8; 9];
             m[0] = 23;
