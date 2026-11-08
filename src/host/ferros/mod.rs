@@ -153,6 +153,8 @@ pub struct FerrosShell<A: FluorApp<P>, P: PanelPixel = Argb8> {
     scratch: Vec<P>,
     clip_mask: Vec<u8>,
     pending_damage: Damage,
+    /// What the last draw changed in the scratch: the damage it repainted and, on a memmove frame, the rect the memmove moved. The present converts only this.
+    changed: PixelRect,
     pointer: crate::host::pointer::PointerArbiter,
     touch_down: bool,
     touch_last_x: Coord,
@@ -183,6 +185,7 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             scratch: alloc::vec![P::EMPTY; px],
             clip_mask: alloc::vec![255u8; px],
             pending_damage: Damage::new(),
+            changed: PixelRect::new(0, 0, width as usize, height as usize),
             pointer: crate::host::pointer::PointerArbiter::new(),
             touch_down: false,
             touch_last_x: 0.0,
@@ -242,9 +245,11 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             return false;
         }
         self.frames += 1;
+        self.changed = damage_clip;
         if damage_clip != viewport_rect {
             if let Some((rect, dy)) = self.app.scroll_hint(self.viewport) {
                 crate::paint::scroll_copy_rect(&mut self.scratch, win_w, win_h, rect.x0, rect.y0, rect.x1, rect.y1, dy);
+                self.changed = damage_clip.union(rect);
             }
         }
         clear_scratch_rect(&mut self.scratch, win_w, damage_clip);
@@ -254,11 +259,18 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
     }
 
     /// The scratch buffer as the display's working values, into the surface: a full screen at the panel's width `stride`, the frame at (`fx`, `fy`) on it (ferros WINDOWS.md: every app's surface is the whole screen). The conversion is the depth's own ([`PanelPixel::to_panel`]).
+    /// Only what the last draw changed is converted (the surface keeps the rest from the frames before), its rows split across the worker cores in one dispatch.
     pub fn present(&self, surface: &mut [u64], stride: usize, fx: usize, fy: usize) {
-        let w = self.viewport.width_px as usize;
-        for (y, src) in self.scratch.chunks_exact(w).enumerate() {
-            P::to_panel(src, &mut surface[(fy + y) * stride + fx..(fy + y) * stride + fx + w]);
+        use rayon::prelude::*;
+        let (w, h) = (self.viewport.width_px as usize, self.viewport.height_px as usize);
+        // WHY/PROOF: `changed` is the app's damage and scroll rects, which an app may hand over overhanging its frame (fluor's own primitives cut theirs at the buffer the same way, `Clip::resolve`); the slices below index the scratch and the surface up to its far edges.
+        let c = self.changed;
+        let (x0, y0, x1, y1) = (c.x0.min(w), c.y0.min(h), c.x1.min(w), c.y1.min(h));
+        if x0 >= x1 || y0 >= y1 {
+            return;
         }
+        let dst = &mut surface[(fy + y0) * stride..(fy + y1) * stride];
+        dst.par_chunks_mut(stride).zip(self.scratch[y0 * w..y1 * w].par_chunks(w)).for_each(|(d, s)| P::to_panel(&s[x0..x1], &mut d[fx + x0..fx + x1]));
     }
 
     /// Contact records in, pointer events out: the first finger down is the pointer; a second finger is ignored for now (pinch comes with the input work).
@@ -482,11 +494,16 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
     // Contacts that entered on another window or a corner: not this app's until they leave (a bit per contact id).
     let mut foreign = 0u16;
     let (mut shown, mut touched, mut last_line) = (0u64, 0u64, sys::now());
+    // Where the frames of the last ten seconds went, in counter ticks: the draw (the app's tick and render), the present (the conversion into the surface), the show (op 22): sums and the longest, and how many frames.
+    let (mut t_draw, mut t_present, mut t_show, mut t_max, mut n_frames) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let us = |ticks: u64| ticks * 1_000_000 / sys::freq();
     loop {
-        // A line every ten seconds while there is no window system to look at: frames shown, contacts seen.
+        // A line every ten seconds while there is no window system to look at: frames shown, contacts seen, and the frames' time by stage (mean µs, then the longest whole frame).
         if sys::now().wrapping_sub(last_line) > sys::freq() * 10 {
             last_line = sys::now();
-            println!("fluor: {shown} frames shown, {} drawn, {touched} contacts", shell.frames);
+            let mean = |t: u64| if n_frames == 0 { 0 } else { us(t) / n_frames };
+            println!("fluor: {shown} frames shown, {} drawn, {touched} contacts; the last {n_frames} frames: draw {} us, present {} us, show {} us a frame, longest {} us", shell.frames, mean(t_draw), mean(t_present), mean(t_show), us(t_max));
+            (t_draw, t_present, t_show, t_max, n_frames) = (0, 0, 0, 0, 0);
         }
         let n = sys::call(touch, &[0], &mut r) as usize;
         contacts.clear();
@@ -515,16 +532,15 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
         }
         touched += contacts.len() as u64;
         input(&mut shell, &contacts);
+        // Closed: back to the app, which ends; nothing is closed on the way out (ferros, owner 2026-11-08: every end is one shot dead), the display drops the window of a process that ended.
         if shell.close {
-            let mut m = [0u8; 9];
-            m[0] = 23;
-            m[1..9].copy_from_slice(&base.to_le_bytes());
-            sys::call(display, &m[..9], &mut [0u8; 4]);
             return Ok(());
         }
         let t = sys::now();
         if shell.draw() {
+            let t_drawn = sys::now();
             shell.present(surface, pw, fx, fy);
+            let t_presented = sys::now();
             // The window (ferros WINDOWS.md): the frame's part of the screen, this surface, the app level, and what its pixels are (`PanelPixel::FORMAT`: at 16 bits fluor's own, which the display decodes).
             let mut m = [0u8; 19];
             m[0] = 22;
@@ -538,6 +554,12 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             if sys::call(display, &m, &mut rr) == sys::ERR {
                 return Err(String::from("the display refused the frame"));
             }
+            let t_shown = sys::now();
+            t_draw += t_drawn - t;
+            t_present += t_presented - t_drawn;
+            t_show += t_shown - t_presented;
+            t_max = t_max.max(t_shown - t);
+            n_frames += 1;
             shown += 1;
             if shown == 1 {
                 println!("fluor: the first frame is on the panel");
