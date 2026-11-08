@@ -158,6 +158,8 @@ pub struct DefaultChrome<P: Pixel = Argb8> {
     pub group: Group<P>,
     /// Per-pixel button-id map. `HIT_NONE` (0) for pixels outside any chrome button; otherwise the dense `HitId` of whichever button the pixel belongs to (min / max / close / app-icon — each id is allocated at chrome construction time via [`super::widget::next_id`]). Sized to `width * height` pixels of the current viewport.
     pub hit_test_map: Vec<HitId>,
+    /// Where the chrome layer holds anything (the bounding box of its non-empty pixels), found by one scan after each re-raster and kept until the next: the per-frame flatten covers only this, not the whole viewport (2026-11-08: on a phone the chrome is an orb in a corner, and the full-frame blit of its empty rest cost a pass over every pixel each frame). None until scanned.
+    chrome_bbox: Option<crate::canvas::PixelRect>,
     /// Window title rendered into the chrome layer (left-aligned in the controls strip). Empty string = skip text rendering.
     pub title: String,
     /// Optional bottom status bar. `None` = no bar, panes/bg fill all the way to the squircle bottom (default behaviour). `Some(text)` = paint a `button_size / 2`-tall band at the bottom with the given text left-aligned. Mutate via [`set_status_text`](Self::set_status_text) to mark the chrome layer dirty automatically.
@@ -197,6 +199,20 @@ pub struct DefaultChrome<P: Pixel = Argb8> {
 /// The app-icon orb's `(cx, cy, radius)` for a chrome `button_size`: diameter 9/4 of the unit (1.5× the 2026-07-17 badge, grown again 2026-09-13 — Nick: the orb itself 1.5× larger, the text beside it unchanged), centre a constant `button_size/2` in from the top-left corner so the tuck into the TL squircle survives the growth. The disk now stands 3/4 of a unit proud of the 2-unit strip; the title stays level with its centre.
 /// The orb's place: its radius is 9/8 of a button, and its centre sits `inset` in from the corner on both axes (Nick 2026-09-17, "the orb needs moved down and right in whatever height the controls / status bar is") — the controls strip's height on desktop, the status bar's on a phone, handed in by the host thru [`DefaultChrome::orb_inset_px`].
 /// THE MAX RULE (Nick 2026-09-29): on each axis the centre sits at the orb's OWN offset — two thirds of the old desktop place (radius + half a button + the 2-button strip), "slightly higher and to the left" — or TANGENT to the host's bar on that side (a phone's status bar above, a side cutout / nav bar to the left: the bar's extent plus the radius), whichever is further in; never the orb's offset added to the bar. As the zoom grows the orb's own offset wins; below that it rests against the bar.
+/// The bounding box of a `w × h` layer's non-empty pixels (an empty rect when it holds nothing): the rows with anything in them, and across those the leftmost first and rightmost last pixel.
+fn content_bbox<P: Pixel>(pixels: &[P], w: usize, h: usize) -> crate::canvas::PixelRect {
+    let mut b = crate::canvas::PixelRect::empty();
+    if w == 0 {
+        return b;
+    }
+    for (y, row) in pixels.chunks_exact(w).take(h).enumerate() {
+        if let (Some(x0), Some(x1)) = (row.iter().position(|&p| p != P::EMPTY), row.iter().rposition(|&p| p != P::EMPTY)) {
+            b = b.union(crate::canvas::PixelRect::new(x0, y, x1 + 1, y + 1));
+        }
+    }
+    b
+}
+
 fn orb_layout(button_size: usize, inset_top: isize, inset_left: isize) -> (isize, isize, isize) {
     let b = button_size as isize;
     let orb_radius = (b * 9) / 8;
@@ -254,6 +270,7 @@ impl<P: Pixel> DefaultChrome<P> {
         Self {
             group,
             hit_test_map: alloc::vec![HIT_NONE; map_len],
+            chrome_bbox: None,
             title: title.into(),
             status_text,
             app_icon,
@@ -492,6 +509,7 @@ impl<P: Pixel> DefaultChrome<P> {
         if !chrome_dirty {
             return;
         }
+        self.chrome_bbox = None;
         crate::paint::RASTERIZE_OPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
         // clip_mask is owned + carved by `rasterize_perimeter` (runs before content, every frame). This pass only READS it (button hit-scan walls below, silhouette restriction post-pass). hit_test_map is still owned here — wiped on each dirty cycle before re-stamping the buttons.
@@ -805,7 +823,13 @@ impl<P: Pixel> DefaultChrome<P> {
         target_h: usize,
         clip: Option<crate::paint::Clip>,
     ) {
-        self.group.flatten_layer_into(self.layer_chrome, target, target_w, target_h, clip);
+        // Only where the layer holds anything: the rest of it is empty, and an empty pixel under anything leaves it as it was.
+        let (w, h) = self.dims();
+        let bbox = *self.chrome_bbox.get_or_insert_with(|| content_bbox(&self.group.rpn.layers[self.layer_chrome].pixels, w, h));
+        let c = crate::paint::Clip::resolve(clip, target_w, target_h);
+        // The clip and the box intersected; an empty intersection comes out with its start at or past its end, which the blit draws nothing for (and the layer is still settled).
+        let clip = crate::paint::Clip::new(c.x_start.max(bbox.x0), c.y_start.max(bbox.y0), c.x_end.min(bbox.x1), c.y_end.min(bbox.y1));
+        self.group.flatten_layer_into(self.layer_chrome, target, target_w, target_h, Some(clip));
     }
 
     /// Flatten ONLY the bg layer (panes + background noise) into `target`: the LAST paint of the frame, under all content. See [`Self::flatten_chrome_into`].
@@ -966,6 +990,11 @@ impl<P: Pixel> DefaultChrome<P> {
         self.group.rpn.layers[self.layer_bg].dirty = true;
     }
 
+    /// Mark the bg layer clean without painting or flattening it: for an app whose screen puts nothing in the layer, which then neither keeps it current nor flattens it (and invalidates it before it is used again). Saves the full-frame clear and blit of an empty layer.
+    pub fn settle_bg(&mut self) {
+        self.group.rpn.settle_layer(self.layer_bg);
+    }
+
     /// Mark the chrome layer dirty (consumer calls when title changes; chrome is otherwise stable across a viewport size).
     pub fn invalidate_chrome(&mut self) {
         self.group.rpn.layers[self.layer_chrome].dirty = true;
@@ -1054,5 +1083,26 @@ mod tests {
         // Group::resize marks all layers dirty.
         assert!(chrome.group.rpn.layers[chrome.layer_bg].dirty);
         assert!(chrome.group.rpn.layers[chrome.layer_chrome].dirty);
+    }
+
+    /// The chrome flatten over its content box lands the same pixels as a blit of the whole layer, and settles the layer.
+    #[test]
+    fn chrome_flatten_covers_only_its_content() {
+        let mut counter: HitId = HIT_NONE;
+        let (w, h) = (120, 90);
+        let mut chrome = DefaultChrome::new(Viewport::new(w as u32, h as u32), "title", None, None, &mut counter);
+        let mut text = TextRenderer::new();
+        let mut clip_mask = alloc::vec![255u8; w * h];
+        chrome.rasterize_chrome(&mut crate::canvas::Damage::new(), &mut text, &mut clip_mask);
+        let layer = chrome.group.rpn.layers[chrome.layer_chrome].pixels.clone();
+        assert!(layer.iter().any(|&p| p != 0), "the chrome drew nothing to test against");
+        let mut whole = alloc::vec![0u32; w * h];
+        crate::paint::flatten_premult(&mut whole, &layer);
+        let mut boxed = alloc::vec![0u32; w * h];
+        chrome.flatten_chrome_into(&mut boxed, w, h, None);
+        assert_eq!(whole, boxed);
+        assert!(!chrome.group.rpn.layers[chrome.layer_chrome].dirty);
+        let bbox = chrome.chrome_bbox.unwrap();
+        assert!(bbox.x1 - bbox.x0 < w || bbox.y1 - bbox.y0 < h, "the box is the whole frame: {bbox:?}");
     }
 }

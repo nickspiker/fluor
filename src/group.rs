@@ -176,6 +176,7 @@ impl<P: Pixel> Group<P> {
 }
 
 /// Composite a region-sized premultiplied buffer under `target` at the region's origin, clipped to the target and to `clip`, in every mode thru the premultiplied compose (the buffer's darkness is already attenuated by its α; until 2026-11-07 the modes other than Normal took `flatten`, which applied it a second time).
+/// The rows go to the workers in one dispatch ([`crate::par::par_rows`]), each composed sequentially: until 2026-11-08 every row was its own parallel call, and on ferros a full-screen layer paid a cross-thread handoff per row (32 ms for 2992 rows on the device's A715s against 10 ms for the same pixels in one call).
 fn blit_region<P: Pixel>(
     src: &[P],
     region: Region,
@@ -196,37 +197,33 @@ fn blit_region<P: Pixel>(
     let clip_rect = paint::Clip::resolve(clip, target_w, target_h);
 
     // WHY/PROOF: the region's origin is the caller's layout position, which sits partly or wholly off the target whenever content scrolls or a window shrinks — without these row and column clips the slices below would index outside the target buffer.
-    for row in 0..gh {
-        let ty = gy + row as isize;
-        if ty < 0 || (ty as usize) >= target_h {
-            continue;
-        }
-        let ty_us = ty as usize;
-        if ty_us < clip_rect.y_start || ty_us >= clip_rect.y_end {
-            continue;
-        }
-        let src_row_start = row * gw;
-        let dst_row_start = ty_us * target_w;
-
-        // Horizontal clip: intersect [gx, gx+gw) with [0, target_w) with clip [x_start, x_end).
-        let raw_start = gx.max(0) as usize;
-        let raw_end_isize = (gx + gw as isize).min(target_w as isize);
-        if raw_end_isize <= raw_start as isize {
-            continue;
-        }
-        let raw_end = raw_end_isize as usize;
-        let dst_x_start = raw_start.max(clip_rect.x_start);
-        let dst_x_end = raw_end.min(clip_rect.x_end);
-        if dst_x_end <= dst_x_start {
-            continue;
-        }
-        let src_clip_left = (dst_x_start as isize - gx) as usize;
-        let count = dst_x_end - dst_x_start;
-
-        let src_slice = &src[src_row_start + src_clip_left..src_row_start + src_clip_left + count];
-        let dst_slice = &mut target[dst_row_start + dst_x_start..dst_row_start + dst_x_end];
-        paint::flatten_premult_mode(dst_slice, src_slice, blend);
+    // The rows: the region's [gy, gy + gh) inside the target and the clip.
+    let row_start = gy.max(0).max(clip_rect.y_start as isize);
+    let row_end = (gy + gh as isize).min(target_h as isize).min(clip_rect.y_end as isize);
+    if row_end <= row_start {
+        return;
     }
+    // The columns, the same for every row: [gx, gx + gw) inside the target and the clip.
+    let dst_x_start = gx.max(0).max(clip_rect.x_start as isize);
+    let dst_x_end = (gx + gw as isize).min(target_w as isize).min(clip_rect.x_end as isize);
+    if dst_x_end <= dst_x_start {
+        return;
+    }
+    let (dst_x_start, dst_x_end) = (dst_x_start as usize, dst_x_end as usize);
+    let src_clip_left = (dst_x_start as isize - gx) as usize;
+    let count = dst_x_end - dst_x_start;
+    crate::par::par_rows(target, target_w, row_start as usize, row_end as usize, |ty, row| {
+        let src_row_start = (ty as isize - gy) as usize * gw + src_clip_left;
+        let src_slice = &src[src_row_start..src_row_start + count];
+        let dst_slice = &mut row[dst_x_start..dst_x_end];
+        if blend == BlendMode::Normal {
+            paint::flatten_premult_chunk(dst_slice, src_slice);
+        } else {
+            for (d, &s) in dst_slice.iter_mut().zip(src_slice) {
+                *d = d.under_premult(s, blend);
+            }
+        }
+    });
 }
 
 #[cfg(test)]
