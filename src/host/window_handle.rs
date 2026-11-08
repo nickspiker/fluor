@@ -14,6 +14,10 @@ pub trait WindowHandle {
 
     /// Put text on the system clipboard — the one call every app's copy button makes (Nick 2026-10-26). On a desktop it goes to the OS clipboard through one handle kept for the life of the process (an X11 or Wayland clipboard is served by its owner, and a handle made for each copy and dropped lost most copies, photon 2026-09-02); on Android the shell holds it for the activity's clipboard manager ([`crate::host::android::AndroidShell::take_clipboard`]). Default is a no-op, for a host with no clipboard.
     fn set_clipboard(&self, _text: &str) {}
+
+    /// Swap the OS window icon at runtime — the taskbar button, alt-tab and title bar, where the OS reads it from the window: straight (not premultiplied) RGBA rows, `width * height * 4` bytes, or `None` to hand the icon back to the OS default (the executable's, the `.desktop` file's).
+    /// Reach is winit's `set_window_icon`: Windows and X11; on Wayland and macOS the OS reads the icon from packaging, not the window, so this does nothing there. Default is a no-op, for hosts with no OS window icon.
+    fn set_icon(&self, _icon: Option<(&[u8], u32, u32)>) {}
 }
 
 #[cfg(feature = "host-winit")]
@@ -28,5 +32,17 @@ impl WindowHandle for winit::window::Window {
 
     fn set_clipboard(&self, text: &str) {
         crate::host::clipboard::set_text(text);
+    }
+
+    fn set_icon(&self, icon: Option<(&[u8], u32, u32)>) {
+        let icon = match icon {
+            None => None,
+            // winit refuses only a byte count that disagrees with the size, the caller's bug; the window keeps the icon it had.
+            Some((rgba, w, h)) => match winit::window::Icon::from_rgba(rgba.to_vec(), w, h) {
+                Ok(icon) => Some(icon),
+                Err(_) => return,
+            },
+        };
+        winit::window::Window::set_window_icon(self, icon);
     }
 }
