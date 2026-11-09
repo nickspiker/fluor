@@ -443,15 +443,15 @@ impl<P: Pixel> Button<P> {
             {
                 let mut cache_canvas =
                     crate::canvas::Canvas::new(&mut self.pill_cache, cw, ch, &mut cache_damage);
-                // Bevel direction is INVERTED relative to Textbox: shadow on the top/left (where light would normally hit a sunken edge), light on the bottom/right. Reads visually as "raised" — the button protrudes toward the viewer — whereas a textbox with the canonical orientation reads as "inset / carved into the surface." Single argument swap, zero extra render cost, classic UI lighting convention preserved.
+                // Lit from the top left (the ferros owner, 2026-11-09: "TL should be brightish like the keymap and the bottom right should be darker"): light above the anti-diagonal, shadow below, as the honeycomb's keys and the textbox. The swap that put the shadow on top as "raised" read sunken on the glass.
                 paint::draw_squircle_rrect_two_tone_f(
                     &mut cache_canvas,
                     0,
                     0,
                     pill_w,
                     pill_h,
-                    theme::TEXTBOX_SHADOW_EDGE,
                     theme::TEXTBOX_LIGHT_EDGE,
+                    theme::TEXTBOX_SHADOW_EDGE,
                     paint::asymmetric_radii(pill_h as f32 * 0.5),
                     squirdleyness,
                     None,
@@ -672,15 +672,15 @@ impl<P: Pixel> Button<P> {
                 paint::SHAPE_POWER as f32,
             );
         }
-        // Two-tone raised edge — shadow top/left, light bottom/right (protrudes toward the viewer).
+        // Two-tone edge lit from the top left: light top/left, shadow bottom/right (ferros owner, 2026-11-09).
         paint::draw_squircle_rrect_two_tone_f(
             canvas,
             x0,
             y0,
             w,
             h,
-            theme::TEXTBOX_SHADOW_EDGE,
             theme::TEXTBOX_LIGHT_EDGE,
+            theme::TEXTBOX_SHADOW_EDGE,
             paint::asymmetric_radii(h as f32 * 0.5),
             paint::SHAPE_POWER as f32,
             None,

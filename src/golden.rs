@@ -447,7 +447,7 @@ mod text_scenes {
         for i in 1..frames.len() {
             assert_ne!(frames[i], frames[i - 1], "button frame {i} repeats the one before it");
         }
-        check("button", &frames.concat(), 0x8dab_682d_768a_5774);
+        check("button", &frames.concat(), 0x3229_eb3a_da1c_bc4c);
     }
 
     /// A textbox with text, unfocused, then focused with a selection (glow, selection band), then its blinkey.
