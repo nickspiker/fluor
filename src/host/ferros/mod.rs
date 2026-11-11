@@ -2,18 +2,20 @@
 //!
 //! The process holds three capabilities the caller names by grant slot (`Caps`): the display endpoint, the touch endpoint, its own surface (a full screen of 64-bit pixels; ferros WINDOWS.md). The syscalls are inlined here (ferros_sys is not a published crate): `call`, `dma`, `sleep`, the counter.
 //!
+//! Front, behind and keys (ferros WINDOWS.md "The helm", owner 2026-11-11: "Home backgrounds the kist so depending on how it was designed, like Photon, it doesn't die but it stops rendering everything and stops playing anything except for notifications", "back should signal escape to the app and go up one page"): a thread of the shell's own holds the display's op 62, answered when the display puts this window behind, brings it to the front or hands it a key. Behind, the frame loop draws nothing and reads no touches: it sleeps until the display or the app's own threads ring (`Bell`), taking in the app's user events and its tick as they come, and the app hears it lost focus (`Event::Focused(false)`, `on_focus_changed(false)`). In front again: focus back, `on_window_shown`, and the next frame drawn whole. Back's Escape arrives as a key press and release, as from a keyboard.
+//!
 //! Pixels: the shell renders at the app's depth (`FluorApp<P>`: 8-bit unless the app names `G2t16`) and [`crate::host::panel`] turns the scratch into the display's working values. At 8 bits: fluor's `0xααRRGGBB` darkness buffer becomes the display's working values — gamma 2 encoded, white = 16384 (Q14), R, G, B in bits 0-15, 16-31, 32-47 of a u64 — through one 256-entry table: fluor's bytes are VSF `g2t` codes (theme.rs, since 2026-10-20: 194 diffuse white, 255 9.7× white), whose light is atanh(c/256)², so the display's gamma 2 (√light) is atanh(c/256), 255 landing at 3.1 of the surface's 4.0. Opacity composites over black. The whole frame is converted and shown each time the app drew; the damage rect narrows that later.
 
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::Instant;
 
 use crate::canvas::{Damage, PixelRect};
 use crate::coord::Coord;
-use crate::event::{ElementState, Event as FEvent, ModifiersState as FModifiersState, MouseButton, MouseScrollDelta};
+use crate::event::{ElementState, Event as FEvent, Key, KeyEvent, ModifiersState as FModifiersState, MouseButton, MouseScrollDelta, NamedKey};
 use crate::geom::Viewport;
 use crate::host::app::{Context, FluorApp};
 use crate::host::wake::{WakeError, WakeSender};
@@ -121,15 +123,111 @@ impl WindowHandle for FerrosWindow {
     }
 }
 
-/// The wake sender an app's background threads hold on ferros: events queue here and the host drains them at the top of each frame, waking the app — there is no event loop to post to, the frame loop is the loop.
+/// The wake sender an app's background threads hold on ferros: events queue here and the host drains them at the top of each frame, waking the app — there is no event loop to post to, the frame loop is the loop. Each send rings the window's bell, so a loop asleep behind wakes to take it in.
 pub struct FerrosWakeSender<E> {
     queue: Mutex<Vec<E>>,
+    bell: Arc<Bell>,
 }
 
 impl<E: Send + 'static> WakeSender<E> for FerrosWakeSender<E> {
     fn send(&self, event: E) -> Result<(), WakeError> {
         self.queue.lock().unwrap().push(event);
+        self.bell.ring(|_| {});
         Ok(())
+    }
+}
+
+/// The ferros display's op 62 and the events in its reply (ferros_sys::window): how many it holds a window, and the kinds.
+const EVENTS: usize = 1 << 4;
+const EV_KEY: u8 = 3;
+/// Escape by its USB HID usage: back's tap.
+const KEY_ESCAPE: u8 = 0x29;
+
+/// The window's bell: what the display last said of this window (behind or in front, the keys it handed over) and whether anything rang since the frame loop last looked, the app's own threads' sends included. The frame loop sleeps on it while behind; nothing polls.
+pub struct Bell {
+    state: Mutex<BellState>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct BellState {
+    behind: bool,
+    /// Keys the display handed this window, by USB HID usage, oldest first.
+    keys: Vec<u8>,
+    rung: bool,
+}
+
+impl Bell {
+    fn new() -> Self {
+        Self { state: Mutex::new(BellState::default()), cv: Condvar::new() }
+    }
+
+    fn ring(&self, f: impl FnOnce(&mut BellState)) {
+        let mut s = self.state.lock().unwrap();
+        f(&mut s);
+        s.rung = true;
+        self.cv.notify_all();
+    }
+
+    /// Whether the window is behind, and the keys since the last take.
+    fn take(&self) -> (bool, Vec<u8>) {
+        let mut s = self.state.lock().unwrap();
+        s.rung = false;
+        (s.behind, core::mem::take(&mut s.keys))
+    }
+
+    /// Asleep until anything rings since the last take, or until `at` (the app's own deadline, when it has one ahead).
+    fn sleep(&self, at: Option<Instant>) {
+        let mut s = self.state.lock().unwrap();
+        while !s.rung {
+            match at {
+                Some(t) => {
+                    let now = Instant::now();
+                    if t <= now {
+                        return;
+                    }
+                    s = self.cv.wait_timeout(s, t - now).unwrap().0;
+                }
+                None => s = self.cv.wait(s).unwrap(),
+            }
+        }
+    }
+}
+
+/// The window's events (ferros display op 62, a held call: answered only when the display puts the window behind, brings it to the front or hands it a key), rung into `bell`. On a thread of its own: the call waits. Ends when the display has no such op (an older display answers at once with one byte), or when two calls in a row fail (a token that is no display's); a display that ended holding the call fails it once, and the next call waits for the display that comes after it.
+fn watch(display: u64, base: u64, bell: Arc<Bell>) {
+    let mut seen = 0u32;
+    let mut failed = false;
+    let mut r = [0u8; 7 + 2 * EVENTS];
+    loop {
+        let mut m = [0u8; 13];
+        m[0] = 62;
+        m[1..9].copy_from_slice(&base.to_le_bytes());
+        m[9..13].copy_from_slice(&seen.to_le_bytes());
+        let n = sys::call(display, &m, &mut r);
+        if n == sys::ERR {
+            if failed {
+                return;
+            }
+            failed = true;
+            continue;
+        }
+        failed = false;
+        if n < 7 || r[0] != 0 {
+            return;
+        }
+        seen = u32::from_le_bytes([r[1], r[2], r[3], r[4]]);
+        let behind = r[5] & 1 == 1;
+        // WHY the bounds: the count byte and the length are the display's (another process's word), and a reply longer than the buffer is cut at it; only whole events that landed in the buffer are read.
+        let k = (r[6] as usize).min(((n as usize).min(r.len()) - 7) / 2);
+        bell.ring(|s| {
+            s.behind = behind;
+            for i in 0..k {
+                if r[7 + 2 * i + 1] == EV_KEY {
+                    s.keys.push(r[7 + 2 * i]);
+                }
+            }
+        });
     }
 }
 
@@ -166,12 +264,17 @@ pub struct FerrosShell<A: FluorApp<P>, P: PanelPixel = Argb8> {
     /// Frames drawn, for the first-frame rule and the console line.
     pub frames: u64,
     wake: Arc<FerrosWakeSender<A::UserEvent>>,
+    /// The window's bell (`Bell`): the display's events and the app's own sends.
+    bell: Arc<Bell>,
+    /// Back in front: the next frame is drawn whole, whatever the app says is dirty.
+    full_next: bool,
 }
 
 impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
     pub fn new(mut app: A, width: u32, height: u32, ru: Coord) -> Self {
         let viewport = Viewport::new(width, height).with_ru(ru);
-        let wake = Arc::new(FerrosWakeSender { queue: Mutex::new(Vec::new()) });
+        let bell = Arc::new(Bell::new());
+        let wake = Arc::new(FerrosWakeSender { queue: Mutex::new(Vec::new()), bell: bell.clone() });
         app.set_event_proxy(wake.clone());
         let px = (width as usize) * (height as usize);
         let mut shell = Self {
@@ -195,6 +298,8 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             close: false,
             frames: 0,
             wake,
+            bell,
+            full_next: false,
         };
         shell.with_context(|app, ctx| app.init(ctx));
         shell.with_context(|app, ctx| app.on_resize(width, height, ctx));
@@ -211,9 +316,8 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         self.window.mark_dirty();
     }
 
-    /// Tick the app and, when anything is dirty, render into the scratch buffer. True when a frame was drawn.
-    pub fn draw(&mut self) -> bool {
-        // What the background threads sent since the last frame, delivered first.
+    /// What the background threads sent since the last frame, delivered; a zoom the app asked for applied; the app ticked.
+    fn take_events(&mut self) {
         let events: Vec<A::UserEvent> = core::mem::take(&mut *self.wake.queue.lock().unwrap());
         for e in events {
             if self.with_context(|app, ctx| app.on_user_event(e, ctx)) == EventResponse::Close {
@@ -229,6 +333,48 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         if self.with_context(|app, ctx| app.tick(ctx)) {
             self.window.mark_dirty();
         }
+    }
+
+    /// Behind: the app's own threads' sends and its tick taken in, nothing drawn (a message still arrives and is kept, a notification still raised); what changed is drawn when the window is in front again.
+    pub fn events_only(&mut self) {
+        self.take_events();
+    }
+
+    /// Behind or in front again (the display's op 62). Behind: the finger let go (no touch reaches this window until it is back), and the app told it lost focus (`Focused(false)`, `on_focus_changed(false)`: draw nothing, play nothing but notifications). In front: focus back, `on_window_shown`, and the next frame drawn whole.
+    pub fn set_behind(&mut self, behind: bool) {
+        if behind && self.finger.take().is_some() {
+            self.on_pointer(&[FEvent::CursorLeft]);
+        }
+        if self.dispatch(&FEvent::Focused(!behind)) == EventResponse::Close {
+            self.close = true;
+        }
+        self.app.on_focus_changed(!behind);
+        if !behind {
+            self.app.on_window_shown();
+            self.full_next = true;
+            self.window.mark_dirty();
+        }
+    }
+
+    /// A key the display handed this window, by its USB HID usage (ferros display op 61): Escape (back's tap, "up one page") as a press and its release, as from a keyboard. A usage with no key here is passed over.
+    pub fn on_key(&mut self, usage: u8) {
+        let logical_key = match usage {
+            KEY_ESCAPE => Key::Named(NamedKey::Escape),
+            _ => return,
+        };
+        for state in [ElementState::Pressed, ElementState::Released] {
+            let ev = FEvent::KeyboardInput { event: KeyEvent { logical_key: logical_key.clone(), state, repeat: false, text: None, physical_key: usage as u16 } };
+            if self.dispatch(&ev) == EventResponse::Close {
+                self.close = true;
+            }
+        }
+        self.window.mark_dirty();
+    }
+
+    /// Tick the app and, when anything is dirty, render into the scratch buffer. True when a frame was drawn.
+    pub fn draw(&mut self) -> bool {
+        // What the background threads sent since the last frame, delivered first.
+        self.take_events();
         if let Some(at) = self.app.wake_at() {
             if at <= Instant::now() {
                 self.window.mark_dirty();
@@ -239,8 +385,8 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         }
         let (win_w, win_h) = (self.viewport.width_px as usize, self.viewport.height_px as usize);
         let viewport_rect = PixelRect::new(0, 0, win_w, win_h);
-        // The first frame is the whole frame, whatever the app says is dirty: nothing has been shown yet.
-        let damage_clip = if self.frames == 0 { viewport_rect } else { self.app.damage_rect(self.viewport).unwrap_or(viewport_rect) };
+        // The first frame is the whole frame, whatever the app says is dirty: nothing has been shown yet. So is the first back in front: what changed while behind was never drawn.
+        let damage_clip = if self.frames == 0 || core::mem::take(&mut self.full_next) { viewport_rect } else { self.app.damage_rect(self.viewport).unwrap_or(viewport_rect) };
         if damage_clip.is_empty() {
             return false;
         }
@@ -451,7 +597,7 @@ fn mine(display: u64, base: u64, x: u16, y: u16) -> bool {
     sys::call(display, &m, &mut r) >= 1 && r[0] == 1
 }
 
-/// Run `app` on the panel until it asks to close (an `EventResponse::Close`): frames at most 120 a second, touches polled between them. `ru` is the resolution unit for the viewport (what the device's density would set on Android; 1.0 is fluor's native scale). `size` is the app's frame, centred on the panel, or the whole panel — a 1344 × 2992 frame is 16 MiB of scratch alone, more than a small arc holds.
+/// Run `app` on the panel until it asks to close (an `EventResponse::Close`): frames at most 120 a second, touches polled between them while the window is in front; behind (the person went home or flipped to another kist), asleep until the display or the app's own threads ring (`Bell`). `ru` is the resolution unit for the viewport (what the device's density would set on Android; 1.0 is fluor's native scale). `size` is the app's frame, centred on the panel, or the whole panel — a 1344 × 2992 frame is 16 MiB of scratch alone, more than a small arc holds.
 /// The depth is the app's: an app implementing `FluorApp` (8-bit) runs on the 8-bit shell as before, one implementing `FluorApp<G2t16>` on the 16-bit one, with the see-through bit wherever it drew nothing.
 pub fn run_app<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps, ru: Coord, size: Option<(u32, u32)>) -> Result<(), String> {
     run_app_with(app, caps, ru, size, |shell: &mut FerrosShell<A, P>, contacts: &[Contact]| {
@@ -489,6 +635,13 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
     };
     println!("fluor: ferros host up, a {w} x {h} frame at ({fx}, {fy}) on a {pw} x {ph} panel");
     let mut shell = FerrosShell::new(app, w as u32, h as u32, ru);
+    // The window's events (behind, in front, keys) on a thread of their own, the display's op 62 held there. None spawned: the window never hears them, and runs as before.
+    let bell = shell.bell.clone();
+    {
+        let bell = bell.clone();
+        let _ = std::thread::Builder::new().name(String::from("fluor-window")).stack_size(1 << 16).spawn(move || watch(display, base, bell));
+    }
+    let mut behind = false;
     let frame = sys::freq() / 120;
     let mut contacts: Vec<Contact> = Vec::with_capacity(16);
     // Contacts that entered on another window or a corner: not this app's until they leave (a bit per contact id).
@@ -504,6 +657,30 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             let mean = |t: u64| if n_frames == 0 { 0 } else { us(t) / n_frames };
             println!("fluor: {shown} frames shown, {} drawn, {touched} contacts; the last {n_frames} frames: draw {} us, present {} us, show {} us a frame, longest {} us", shell.frames, mean(t_draw), mean(t_present), mean(t_show), us(t_max));
             (t_draw, t_present, t_show, t_max, n_frames) = (0, 0, 0, 0, 0);
+        }
+        // What the display said of this window since the last pass (`watch`): behind or in front, and the keys it handed over.
+        let (now_behind, keys) = bell.take();
+        if now_behind != behind {
+            behind = now_behind;
+            println!("fluor: {}", if behind { "behind (home, or another kist in front): nothing drawn until it is back" } else { "in front again" });
+            shell.set_behind(behind);
+            if !behind {
+                // The touches queued while it was behind were made on another window (the map, another kist): dropped, never replayed into this one.
+                let _ = sys::call(touch, &[0], &mut r);
+                foreign = 0;
+            }
+        }
+        if behind {
+            // Behind: no touch read, no frame drawn or shown; the app's own sends and its tick taken in as they come, then asleep until the display or the app's threads ring, or the app's own deadline ahead (one already past is a frame it wants, which waits until it is in front).
+            shell.events_only();
+            if shell.close {
+                return Ok(());
+            }
+            bell.sleep(shell.app.wake_at().filter(|at| *at > Instant::now()));
+            continue;
+        }
+        for k in keys {
+            shell.on_key(k);
         }
         let n = sys::call(touch, &[0], &mut r) as usize;
         contacts.clear();
