@@ -680,6 +680,8 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             continue;
         }
         for k in keys {
+            // Said, so back's tap can be followed on the console whatever the app does with it.
+            println!("fluor: key G#{k:02X} from the display");
             shell.on_key(k);
         }
         let n = sys::call(touch, &[0], &mut r) as usize;
