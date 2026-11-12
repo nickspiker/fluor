@@ -140,6 +140,26 @@ impl<E: Send + 'static> WakeSender<E> for FerrosWakeSender<E> {
 /// The ferros display's op 62 and the events in its reply (ferros_sys::window): how many it holds a window, and the kinds.
 const EVENTS: usize = 1 << 4;
 const EV_KEY: u8 = 3;
+/// The display's bake changed (a brightness change): the window is made again with the new one, every pixel.
+const EV_BAKE: u8 = 4;
+
+/// The display's bake now (op 65; ferros COMPOSITOR.md "Baked"), for the frames an app makes itself (a GPU kernel's, `FluorApp::own_baked`): the parameters its last frame should be made with, None from a display that does not bake. Set by the frame loop at start and at every `EV_BAKE`.
+static BAKE: Mutex<Option<Arc<crate::host::panel::Bake>>> = Mutex::new(None);
+
+/// The display's bake now, as the frame loop last asked it (`BAKE`).
+pub fn bake() -> Option<Arc<crate::host::panel::Bake>> {
+    BAKE.lock().ok().and_then(|b| b.clone())
+}
+
+/// Ask the display for its bake (op 65) and keep it (`BAKE`): None from a display without the op, which answers with a status of its own.
+fn ask_bake(display: u64) -> Option<Arc<crate::host::panel::Bake>> {
+    let mut r = [0u8; 49];
+    let b = (sys::call(display, &[65], &mut r) == 49).then(|| crate::host::panel::Bake::from_reply(&r)).flatten().map(Arc::new);
+    if let Ok(mut g) = BAKE.lock() {
+        *g = b.clone();
+    }
+    b
+}
 /// Escape by its USB HID usage: back's tap.
 const KEY_ESCAPE: u8 = 0x29;
 /// The most records one reply of the touch server's op 0 carries (ferros payloads/touch, CHANGES); it holds up to 64 waiting.
@@ -156,6 +176,8 @@ struct BellState {
     behind: bool,
     /// Keys the display handed this window, by USB HID usage, oldest first.
     keys: Vec<u8>,
+    /// The display's bake changed since the last take (`EV_BAKE`).
+    bake: bool,
     rung: bool,
 }
 
@@ -171,11 +193,11 @@ impl Bell {
         self.cv.notify_all();
     }
 
-    /// Whether the window is behind, and the keys since the last take.
-    fn take(&self) -> (bool, Vec<u8>) {
+    /// Whether the window is behind, the keys since the last take, and whether the display's bake changed since.
+    fn take(&self) -> (bool, Vec<u8>, bool) {
         let mut s = self.state.lock().unwrap();
         s.rung = false;
-        (s.behind, core::mem::take(&mut s.keys))
+        (s.behind, core::mem::take(&mut s.keys), core::mem::take(&mut s.bake))
     }
 
     /// Asleep until anything rings since the last take, or until `at` (the app's own deadline, when it has one ahead).
@@ -225,8 +247,10 @@ fn watch(display: u64, base: u64, bell: Arc<Bell>) {
         bell.ring(|s| {
             s.behind = behind;
             for i in 0..k {
-                if r[7 + 2 * i + 1] == EV_KEY {
-                    s.keys.push(r[7 + 2 * i]);
+                match r[7 + 2 * i + 1] {
+                    EV_KEY => s.keys.push(r[7 + 2 * i]),
+                    EV_BAKE => s.bake = true,
+                    _ => {}
                 }
             }
         });
@@ -417,9 +441,9 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         true
     }
 
-    /// The scratch buffer as the display's working values, into the surface: a full screen at the panel's width `stride`, the frame at (`fx`, `fy`) on it (ferros WINDOWS.md: every app's surface is the whole screen). The conversion is the depth's own ([`PanelPixel::to_panel`]).
+    /// The scratch buffer as the display's pixels, into the surface: a full screen at the panel's width `stride`, the frame at (`fx`, `fy`) on it (ferros WINDOWS.md: every app's surface is the whole screen). With the display's `bake` (op 65) the pixels are baked here ([`PanelPixel::to_baked`]: the display then only dithers them, ferros COMPOSITOR.md "Baked"), else converted as the depth's own format ([`PanelPixel::to_panel`]).
     /// Only what the last draw changed is converted (the surface keeps the rest from the frames before), its rows split across the worker cores in one dispatch.
-    pub fn present(&self, surface: &mut [u64], stride: usize, fx: usize, fy: usize) {
+    pub fn present(&self, surface: &mut [u64], stride: usize, fx: usize, fy: usize, bake: Option<&crate::host::panel::Bake>) {
         use rayon::prelude::*;
         let (w, h) = (self.viewport.width_px as usize, self.viewport.height_px as usize);
         // WHY/PROOF: `changed` is the app's damage and scroll rects, which an app may hand over overhanging its frame (fluor's own primitives cut theirs at the buffer the same way, `Clip::resolve`); the slices below index the scratch and the surface up to its far edges.
@@ -435,7 +459,10 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             (false, _) => &self.scratch,
         };
         let dst = &mut surface[(fy + y0) * stride..(fy + y1) * stride];
-        dst.par_chunks_mut(stride).zip(src[y0 * w..y1 * w].par_chunks(w)).for_each(|(d, s)| P::to_panel(&s[x0..x1], &mut d[fx + x0..fx + x1]));
+        match bake {
+            Some(b) => dst.par_chunks_mut(stride).zip(src[y0 * w..y1 * w].par_chunks(w)).for_each(|(d, s)| P::to_baked(&s[x0..x1], &mut d[fx + x0..fx + x1], b)),
+            None => dst.par_chunks_mut(stride).zip(src[y0 * w..y1 * w].par_chunks(w)).for_each(|(d, s)| P::to_panel(&s[x0..x1], &mut d[fx + x0..fx + x1])),
+        }
     }
 
     /// Contact records in, pointer events out: the first finger down is the pointer; a second finger is ignored for now (pinch comes with the input work).
@@ -661,6 +688,12 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
         let _ = std::thread::Builder::new().name(String::from("fluor-window")).stack_size(1 << 16).spawn(move || watch(display, base, bell));
     }
     let mut behind = false;
+    // The display's bake (op 65): with it every frame is baked here and shown `BAKED`; a display without it gets the depth's own format, as before.
+    let mut bake = ask_bake(display);
+    match &bake {
+        Some(b) => println!("fluor: the display bakes (generation {}): frames baked here, shown as the panel's codes", b.generation),
+        None => println!("fluor: the display does not bake: frames in this depth's own format"),
+    }
     let frame = sys::freq() / 120;
     let mut contacts: Vec<Contact> = Vec::with_capacity(16);
     // Contacts that entered on another window or a corner: not this app's until they leave (a bit per contact id).
@@ -677,8 +710,13 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             println!("fluor: {shown} frames shown, {} drawn, {touched} contacts; the last {n_frames} frames: draw {} us, present {} us, show {} us a frame, longest {} us", shell.frames, mean(t_draw), mean(t_present), mean(t_show), us(t_max));
             (t_draw, t_present, t_show, t_max, n_frames) = (0, 0, 0, 0, 0);
         }
-        // What the display said of this window since the last pass (`watch`): behind or in front, and the keys it handed over.
-        let (now_behind, keys) = bell.take();
+        // What the display said of this window since the last pass (`watch`): behind or in front, the keys it handed over, and whether its bake changed (a brightness change: the bake asked again, and the next frame drawn and baked whole).
+        let (now_behind, keys, rebake) = bell.take();
+        if rebake {
+            bake = ask_bake(display);
+            shell.full_next = true;
+            shell.window.mark_dirty();
+        }
         if now_behind != behind {
             behind = now_behind;
             println!("fluor: {}", if behind { "behind (home, or another kist in front): nothing drawn until it is back" } else { "in front again" });
@@ -742,7 +780,7 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
         let t = sys::now();
         if shell.draw() {
             let t_drawn = sys::now();
-            shell.present(surface, pw, fx, fy);
+            shell.present(surface, pw, fx, fy, bake.as_deref());
             let t_presented = sys::now();
             // The window (ferros WINDOWS.md): the frame's part of the screen, this surface, the app level, and what its pixels are (`PanelPixel::FORMAT`: at 16 bits fluor's own, which the display decodes).
             // An opaque app (`FluorApp::opaque`) says so in the 28-byte form, with the frame as what changed: the display then never reads what the window covers (ferros_sys `window::show_full`, mode bit 3).
@@ -753,7 +791,9 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             m[5..7].copy_from_slice(&(w as u16).to_le_bytes());
             m[7..9].copy_from_slice(&(h as u16).to_le_bytes());
             m[9..17].copy_from_slice(&base.to_le_bytes());
-            m[18] = P::FORMAT;
+            // Baked when this host baked the frame (`present` with the display's bake), or the app made its own frame in the surface baked itself (`FluorApp::own_baked`); else the depth's own format.
+            let own_in_surface = shell.own && shell.app.own_frame().is_none();
+            m[18] = if (bake.is_some() && !own_in_surface) || (own_in_surface && shell.app.own_baked()) { crate::host::panel::BAKED } else { P::FORMAT };
             let opaque = shell.app.opaque();
             // An app that drew into a buffer of its own (`FluorApp::own_surface`) says which, in the 36-byte form: the display shows that buffer and answers once it has taken it (ferros GPU-KISTS.md 1.4, the mailbox).
             let own = if shell.own { shell.app.own_surface() } else { None };

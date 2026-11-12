@@ -738,6 +738,11 @@ pub trait FluorApp<P: crate::pixel::Pixel = crate::pixel::Argb8> {
         None
     }
 
+    /// The frame [`Self::render_own`] put in a surface itself is already in the ferros display's own codes (`BAKED`: the host's [`crate::host::panel::Bake`], which the ferros host hands out as `host::ferros::bake`), so the window is shown that way and the display only dithers it. False (the default): the frame is in the host's pixel depth's own format.
+    fn own_baked(&self) -> bool {
+        false
+    }
+
     /// No pixel of the app's frame is see-through: a host that composes windows (ferros's display) never reads what the window covers. False (the default).
     fn opaque(&self) -> bool {
         false
