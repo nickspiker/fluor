@@ -733,6 +733,11 @@ pub trait FluorApp<P: crate::pixel::Pixel = crate::pixel::Argb8> {
         None
     }
 
+    /// Where [`Self::render_own`]'s frame is when the app drew it into a surface of its own rather than the host's (ferros: the other buffer of a mailbox, GPU-KISTS.md 1.4, the base of that surface as the app's own `dma` of it): the host shows that buffer, and the show answers once the display has taken it, so the buffer shown before it is the app's to draw into again. `None` (the default): the host's own surface, as always.
+    fn own_surface(&self) -> Option<u64> {
+        None
+    }
+
     /// No pixel of the app's frame is see-through: a host that composes windows (ferros's display) never reads what the window covers. False (the default).
     fn opaque(&self) -> bool {
         false

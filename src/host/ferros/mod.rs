@@ -739,7 +739,7 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             let t_presented = sys::now();
             // The window (ferros WINDOWS.md): the frame's part of the screen, this surface, the app level, and what its pixels are (`PanelPixel::FORMAT`: at 16 bits fluor's own, which the display decodes).
             // An opaque app (`FluorApp::opaque`) says so in the 28-byte form, with the frame as what changed: the display then never reads what the window covers (ferros_sys `window::show_full`, mode bit 3).
-            let mut m = [0u8; 28];
+            let mut m = [0u8; 36];
             m[0] = 22;
             m[1..3].copy_from_slice(&(fx as u16).to_le_bytes());
             m[3..5].copy_from_slice(&(fy as u16).to_le_bytes());
@@ -748,15 +748,21 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             m[9..17].copy_from_slice(&base.to_le_bytes());
             m[18] = P::FORMAT;
             let opaque = shell.app.opaque();
-            if opaque {
+            // An app that drew into a buffer of its own (`FluorApp::own_surface`) says which, in the 36-byte form: the display shows that buffer and answers once it has taken it (ferros GPU-KISTS.md 1.4, the mailbox).
+            let own = if shell.own { shell.app.own_surface() } else { None };
+            if opaque || own.is_some() {
                 m[19..21].copy_from_slice(&(fx as u16).to_le_bytes());
                 m[21..23].copy_from_slice(&(fy as u16).to_le_bytes());
                 m[23..25].copy_from_slice(&(w as u16).to_le_bytes());
                 m[25..27].copy_from_slice(&(h as u16).to_le_bytes());
-                m[27] = 8;
+                m[27] = if opaque { 8 } else { 0 };
             }
+            if let Some(b) = own {
+                m[28..36].copy_from_slice(&b.to_le_bytes());
+            }
+            let len = if own.is_some() { 36 } else if opaque { 28 } else { 19 };
             let mut rr = [0u8; 4];
-            if sys::call(display, &m[..if opaque { 28 } else { 19 }], &mut rr) == sys::ERR {
+            if sys::call(display, &m[..len], &mut rr) == sys::ERR {
                 return Err(String::from("the display refused the frame"));
             }
             let t_shown = sys::now();
