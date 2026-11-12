@@ -142,6 +142,8 @@ const EVENTS: usize = 1 << 4;
 const EV_KEY: u8 = 3;
 /// Escape by its USB HID usage: back's tap.
 const KEY_ESCAPE: u8 = 0x29;
+/// The most records one reply of the touch server's op 0 carries (ferros payloads/touch, CHANGES); it holds up to 64 waiting.
+const TOUCH_BATCH: usize = 1 << 4;
 
 /// The window's bell: what the display last said of this window (behind or in front, the keys it handed over) and whether anything rang since the frame loop last looked, the app's own threads' sends included. The frame loop sleeps on it while behind; nothing polls.
 pub struct Bell {
@@ -682,8 +684,13 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             println!("fluor: {}", if behind { "behind (home, or another kist in front): nothing drawn until it is back" } else { "in front again" });
             shell.set_behind(behind);
             if !behind {
-                // The touches queued while it was behind were made on another window (the map, another kist): dropped, never replayed into this one.
-                let _ = sys::call(touch, &[0], &mut r);
+                // The touches queued while it was behind were made on another window (the map, another kist): dropped, never replayed into this one. Read until a reply carries less than a full batch: one read took at most `TOUCH_BATCH` of the up to 64 the server holds, and the rest were then taken as this app's. A failed call (no touch server) ends it too: its count byte would be the last reply's, and a full one would never end.
+                loop {
+                    let n = sys::call(touch, &[0], &mut r);
+                    if n == 0 || n == sys::ERR || (r[0] as usize) < TOUCH_BATCH {
+                        break;
+                    }
+                }
                 foreign = 0;
             }
         }
