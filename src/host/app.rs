@@ -864,6 +864,11 @@ pub trait FluorApp<P: crate::pixel::Pixel = crate::pixel::Argb8> {
         None
     }
 
+    /// The soft keyboard's place changed: `rows` of the app's frame, counted up from its bottom, are under the keyboard now (0: no keyboard). The frame never resizes for it; an app keeps what is being typed into above those rows (scrolls the focused field into view, lifts a bottom-anchored compose bar). Told by the ferros host as the system keyboard comes, moves and goes (ferros WINDOWS.md "The keyboard"). Default: ignored.
+    fn on_keyboard_inset(&mut self, rows: u32) {
+        let _ = rows;
+    }
+
     /// HONEST IME EDITOR, read half: the focused textbox's full text + cursor (in CHARS — the host converts to UTF-16). The Android host mirrors this to the InputConnection so `getTextBeforeCursor`-style queries answer TRUTHFULLY — Google voice typing reads the field back continuously and aborts mid-sentence against an editor that claims to be empty. Default: no editor (`None`).
     fn ime_editor_state(&mut self) -> Option<(alloc::string::String, usize)> {
         None

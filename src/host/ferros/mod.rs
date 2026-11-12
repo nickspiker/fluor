@@ -4,6 +4,8 @@
 //!
 //! Front, behind and keys (ferros WINDOWS.md "The helm", owner 2026-11-11: "Home backgrounds the kist so depending on how it was designed, like Photon, it doesn't die but it stops rendering everything and stops playing anything except for notifications", "back should signal escape to the app and go up one page"): a thread of the shell's own holds the display's op 62, answered when the display puts this window behind, brings it to the front or hands it a key. Behind, the frame loop draws nothing and reads no touches: it sleeps until the display or the app's own threads ring (`Bell`), taking in the app's user events and its tick as they come, and the app hears it lost focus (`Event::Focused(false)`, `on_focus_changed(false)`). In front again: focus back, `on_window_shown`, and the next frame drawn whole. Back's Escape arrives as a key press and release, as from a keyboard.
 //!
+//! The keyboard (ferros WINDOWS.md "The keyboard"): when the app's focused widget wants the soft keyboard (`FluorApp::wants_keyboard`, as on Android) the host asks the display for it (op 68), and lets it go when focus leaves the field. The system keyboard then types into this window thru the display: its text arrives on the same held op 62 as an IME commit (`Event::Ime(Ime::Commit)`), its enter and delete as key presses and releases, in the order they were typed, and the rows it covers as `FluorApp::on_keyboard_inset`, so the app keeps its field above them. The text itself never goes to the console.
+//!
 //! Pixels: the shell renders at the app's depth (`FluorApp<P>`: 8-bit unless the app names `G2t16`) and [`crate::host::panel`] turns the scratch into the display's working values. At 8 bits: fluor's `0xααRRGGBB` darkness buffer becomes the display's working values — gamma 2 encoded, white = 16384 (Q14), R, G, B in bits 0-15, 16-31, 32-47 of a u64 — through one 256-entry table: fluor's bytes are VSF `g2t` codes (theme.rs, since 2026-10-20: 194 diffuse white, 255 9.7× white), whose light is atanh(c/256)², so the display's gamma 2 (√light) is atanh(c/256), 255 landing at 3.1 of the surface's 4.0. Opacity composites over black. The whole frame is converted and shown each time the app drew; the damage rect narrows that later.
 
 use alloc::string::String;
@@ -15,7 +17,7 @@ use std::time::Instant;
 
 use crate::canvas::{Damage, PixelRect};
 use crate::coord::Coord;
-use crate::event::{ElementState, Event as FEvent, Key, KeyEvent, ModifiersState as FModifiersState, MouseButton, MouseScrollDelta, NamedKey};
+use crate::event::{ElementState, Event as FEvent, Ime, Key, KeyEvent, ModifiersState as FModifiersState, MouseButton, MouseScrollDelta, NamedKey};
 use crate::geom::Viewport;
 use crate::host::app::{Context, FluorApp};
 use crate::host::wake::{WakeError, WakeSender};
@@ -142,6 +144,21 @@ const EVENTS: usize = 1 << 4;
 const EV_KEY: u8 = 3;
 /// The display's bake changed (a brightness change): the window is made again with the new one, every pixel.
 const EV_BAKE: u8 = 4;
+/// Text the system keyboard typed for this window (ferros WINDOWS.md "The keyboard"): UTF-8, its length in the low byte, its bytes in the reply's payloads.
+const EV_TEXT: u8 = 6;
+/// The keyboard's place: its payload two bytes, little-endian, the panel's rows it covers from the bottom up (0: gone).
+const EV_INSET: u8 = 7;
+/// Kinds from this one up carry a payload, its length in the low byte; the payloads follow the reply's events, in their order.
+const PAYLOAD_KINDS: u8 = 6;
+/// The most bytes one payload holds, and so the longest reply: the head, the events, every payload at its longest.
+const PIECE: usize = 1 << 6;
+const EVENTS_REPLY: usize = 7 + 2 * EVENTS + EVENTS * PIECE;
+
+/// What the keyboard typed, in the order it was typed: a key by its USB HID usage (back's Escape too), or text.
+enum Typed {
+    Key(u8),
+    Text(String),
+}
 
 /// The display's bake now (op 65; ferros COMPOSITOR.md "Baked"), for the frames an app makes itself (a GPU kernel's, `FluorApp::own_baked`): the parameters its last frame should be made with, None from a display that does not bake. Set by the frame loop at start and at every `EV_BAKE`.
 static BAKE: Mutex<Option<Arc<crate::host::panel::Bake>>> = Mutex::new(None);
@@ -160,8 +177,16 @@ fn ask_bake(display: u64) -> Option<Arc<crate::host::panel::Bake>> {
     }
     b
 }
-/// Escape by its USB HID usage: back's tap.
+/// Keys by their USB HID usages (keyboard page): back's tap is Escape, the system keyboard sends Enter and Backspace.
+const KEY_ENTER: u8 = 0x28;
 const KEY_ESCAPE: u8 = 0x29;
+const KEY_BACKSPACE: u8 = 0x2A;
+const KEY_TAB: u8 = 0x2B;
+const KEY_DELETE: u8 = 0x4C;
+const KEY_RIGHT: u8 = 0x4F;
+const KEY_LEFT: u8 = 0x50;
+const KEY_DOWN: u8 = 0x51;
+const KEY_UP: u8 = 0x52;
 /// The most records one reply of the touch server's op 0 carries (ferros payloads/touch, CHANGES); it holds up to 64 waiting.
 const TOUCH_BATCH: usize = 1 << 4;
 
@@ -174,11 +199,21 @@ pub struct Bell {
 #[derive(Default)]
 struct BellState {
     behind: bool,
-    /// Keys the display handed this window, by USB HID usage, oldest first.
-    keys: Vec<u8>,
+    /// Keys and text the display handed this window (back's Escape, the system keyboard's strokes), oldest first.
+    typed: Vec<Typed>,
+    /// The keyboard's place, the panel's rows it covers from the bottom, when it changed since the last take (`EV_INSET`).
+    inset: Option<u16>,
     /// The display's bake changed since the last take (`EV_BAKE`).
     bake: bool,
     rung: bool,
+}
+
+/// What rang since the frame loop last looked (`Bell::take`).
+struct Rung {
+    behind: bool,
+    typed: Vec<Typed>,
+    inset: Option<u16>,
+    bake: bool,
 }
 
 impl Bell {
@@ -193,11 +228,11 @@ impl Bell {
         self.cv.notify_all();
     }
 
-    /// Whether the window is behind, the keys since the last take, and whether the display's bake changed since.
-    fn take(&self) -> (bool, Vec<u8>, bool) {
+    /// Whether the window is behind, the keys and text since the last take, the keyboard's place if it moved since, and whether the display's bake changed since.
+    fn take(&self) -> Rung {
         let mut s = self.state.lock().unwrap();
         s.rung = false;
-        (s.behind, core::mem::take(&mut s.keys), core::mem::take(&mut s.bake))
+        Rung { behind: s.behind, typed: core::mem::take(&mut s.typed), inset: s.inset.take(), bake: core::mem::take(&mut s.bake) }
     }
 
     /// Asleep until anything rings since the last take, or until `at` (the app's own deadline, when it has one ahead).
@@ -222,7 +257,7 @@ impl Bell {
 fn watch(display: u64, base: u64, bell: Arc<Bell>) {
     let mut seen = 0u32;
     let mut failed = false;
-    let mut r = [0u8; 7 + 2 * EVENTS];
+    let mut r = [0u8; EVENTS_REPLY];
     loop {
         let mut m = [0u8; 13];
         m[0] = 62;
@@ -242,14 +277,32 @@ fn watch(display: u64, base: u64, bell: Arc<Bell>) {
         }
         seen = u32::from_le_bytes([r[1], r[2], r[3], r[4]]);
         let behind = r[5] & 1 == 1;
-        // WHY the bounds: the count byte and the length are the display's (another process's word), and a reply longer than the buffer is cut at it; only whole events that landed in the buffer are read.
-        let k = (r[6] as usize).min(((n as usize).min(r.len()) - 7) / 2);
+        // WHY the bounds: the count byte and the length are the display's (another process's word), and a reply longer than the buffer is cut at it; only whole events that landed in the buffer are read, and of the payloads after them only bytes that landed.
+        let n = (n as usize).min(r.len());
+        let k = (r[6] as usize).min((n - 7) / 2);
+        let mut p = 7 + 2 * k;
         bell.ring(|s| {
             s.behind = behind;
             for i in 0..k {
-                match r[7 + 2 * i + 1] {
-                    EV_KEY => s.keys.push(r[7 + 2 * i]),
-                    EV_BAKE => s.bake = true,
+                let (low, kind) = (r[7 + 2 * i], r[7 + 2 * i + 1]);
+                // A payload's bytes, stepped over whatever the kind (one this host does not know is passed over by its length); None for one the reply was cut inside.
+                let payload = if kind >= PAYLOAD_KINDS {
+                    let from = p;
+                    p += low as usize;
+                    r.get(from..p.min(n)).filter(|b| b.len() == low as usize)
+                } else {
+                    None
+                };
+                match (kind, payload) {
+                    (EV_KEY, _) => s.typed.push(Typed::Key(low)),
+                    (EV_BAKE, _) => s.bake = true,
+                    // Text that is not UTF-8 is no text: dropped, never repaired into something the keyboard did not type.
+                    (EV_TEXT, Some(b)) => {
+                        if let Ok(t) = core::str::from_utf8(b) {
+                            s.typed.push(Typed::Text(String::from(t)));
+                        }
+                    }
+                    (EV_INSET, Some(&[a, b])) => s.inset = Some(u16::from_le_bytes([a, b])),
                     _ => {}
                 }
             }
@@ -385,10 +438,18 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         }
     }
 
-    /// A key the display handed this window, by its USB HID usage (ferros display op 61): Escape (back's tap, "up one page") as a press and its release, as from a keyboard. A usage with no key here is passed over.
+    /// A key the display handed this window, by its USB HID usage (ferros display ops 61 and 70): Escape (back's tap, "up one page"), the system keyboard's Enter and Backspace, and the other editing keys, each as a press and its release, as from a keyboard. A usage with no key here is passed over.
     pub fn on_key(&mut self, usage: u8) {
         let logical_key = match usage {
             KEY_ESCAPE => Key::Named(NamedKey::Escape),
+            KEY_ENTER => Key::Named(NamedKey::Enter),
+            KEY_BACKSPACE => Key::Named(NamedKey::Backspace),
+            KEY_TAB => Key::Named(NamedKey::Tab),
+            KEY_DELETE => Key::Named(NamedKey::Delete),
+            KEY_RIGHT => Key::Named(NamedKey::ArrowRight),
+            KEY_LEFT => Key::Named(NamedKey::ArrowLeft),
+            KEY_DOWN => Key::Named(NamedKey::ArrowDown),
+            KEY_UP => Key::Named(NamedKey::ArrowUp),
             _ => return,
         };
         for state in [ElementState::Pressed, ElementState::Released] {
@@ -398,6 +459,28 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             }
         }
         self.window.mark_dirty();
+    }
+
+    /// Text the system keyboard typed for this window (ferros display op 70, `EV_TEXT`): an IME commit, as Android's soft keyboard commits text (`Event::Ime(Ime::Commit)`), to whatever field has focus.
+    pub fn on_text(&mut self, text: String) {
+        if self.dispatch(&FEvent::Ime(Ime::Commit(text))) == EventResponse::Close {
+            self.close = true;
+        }
+        self.window.mark_dirty();
+    }
+
+    /// The keyboard's place (`EV_INSET`): `rows` of the panel from its bottom, as rows of the app's frame from the frame's bottom (the frame sits `fy` rows down a panel `ph` tall), told to the app (`FluorApp::on_keyboard_inset`).
+    pub fn on_keyboard_inset(&mut self, rows: u16, fy: usize, ph: usize) {
+        let h = self.viewport.height_px as i64;
+        // WHY the bounds: `rows` is the display's word (another process's), and the frame may sit anywhere on the panel: the keyboard's top, as a row of the frame, is above the frame's top (the whole frame covered) or below its bottom (none of it).
+        let top = (ph as i64 - rows as i64 - fy as i64).clamp(0, h);
+        self.app.on_keyboard_inset((h - top) as u32);
+        self.window.mark_dirty();
+    }
+
+    /// The app's keyboard wish since the last ask (`FluorApp::wants_keyboard`: a text field gained or lost focus), when it has one.
+    fn keyboard_wish(&mut self) -> Option<bool> {
+        self.app.wants_keyboard()
     }
 
     /// Tick the app and, when anything is dirty, render into the scratch buffer. True when a frame was drawn.
@@ -688,6 +771,8 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
         let _ = std::thread::Builder::new().name(String::from("fluor-window")).stack_size(1 << 16).spawn(move || watch(display, base, bell));
     }
     let mut behind = false;
+    // The app's keyboard wish not yet sent to the display (`keyboard_wish`, op 68).
+    let mut wish: Option<bool> = None;
     // The display's bake (op 65): with it every frame is baked here and shown `BAKED`; a display without it gets the depth's own format, as before.
     let mut bake = ask_bake(display);
     match &bake {
@@ -710,8 +795,13 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             println!("fluor: {shown} frames shown, {} drawn, {touched} contacts; the last {n_frames} frames: draw {} us, present {} us, show {} us a frame, longest {} us", shell.frames, mean(t_draw), mean(t_present), mean(t_show), us(t_max));
             (t_draw, t_present, t_show, t_max, n_frames) = (0, 0, 0, 0, 0);
         }
-        // What the display said of this window since the last pass (`watch`): behind or in front, the keys it handed over, and whether its bake changed (a brightness change: the bake asked again, and the next frame drawn and baked whole).
-        let (now_behind, keys, rebake) = bell.take();
+        // What the display said of this window since the last pass (`watch`): behind or in front, the keys and text it handed over, the keyboard's place, and whether its bake changed (a brightness change: the bake asked again, and the next frame drawn and baked whole).
+        let Rung { behind: now_behind, typed, inset, bake: rebake } = bell.take();
+        // The keyboard's place, behind or not: going behind takes the keyboard away, and the app hears it then.
+        if let Some(rows) = inset {
+            println!("fluor: the keyboard covers {rows} rows of the panel");
+            shell.on_keyboard_inset(rows, fy, ph);
+        }
         if rebake {
             bake = ask_bake(display);
             shell.full_next = true;
@@ -741,10 +831,19 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             bell.sleep(shell.app.wake_at().filter(|at| *at > Instant::now()));
             continue;
         }
-        for k in keys {
-            // Said, so back's tap can be followed on the console whatever the app does with it.
-            println!("fluor: key G#{k:02X} from the display");
-            shell.on_key(k);
+        for t in typed {
+            match t {
+                Typed::Key(k) => {
+                    // Said, so back's tap and the keyboard's keys can be followed on the console whatever the app does with them.
+                    println!("fluor: key G#{k:02X} from the display");
+                    shell.on_key(k);
+                }
+                // The text itself is not said: it is the person's (a handle, a message), and the console is not theirs.
+                Typed::Text(s) => {
+                    println!("fluor: {} bytes typed from the display", s.len());
+                    shell.on_text(s);
+                }
+            }
         }
         let n = sys::call(touch, &[0], &mut r) as usize;
         contacts.clear();
@@ -822,6 +921,21 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             if shown == 1 {
                 println!("fluor: the first frame is on the panel");
             }
+        }
+        // The keyboard (ferros WINDOWS.md "The keyboard"): a text field that gained focus asks the display for it, one that lost it lets it go (op 68). Asked after the frame's show, so a field focused on the first frame asks once the window is the app in front (the display gives the keyboard to that window alone); a wish made before any frame waits for the first.
+        if let Some(on) = shell.keyboard_wish() {
+            wish = Some(on);
+        }
+        if let (Some(on), true) = (wish, shown > 0) {
+            wish = None;
+            let mut m = [0u8; 10];
+            m[0] = 68;
+            m[1..9].copy_from_slice(&base.to_le_bytes());
+            m[9] = on as u8;
+            let mut rr = [0u8; 4];
+            let n = sys::call(display, &m, &mut rr);
+            let took = n != sys::ERR && n >= 1 && rr[0] == 0;
+            println!("fluor: the keyboard {} ({})", if on { "asked for" } else { "let go" }, if took { "the display took it" } else { "the display did not: this window is not the app in front, or the display has no keyboard" });
         }
         sys::sleep_until(t + frame);
     }
