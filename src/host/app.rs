@@ -723,6 +723,21 @@ pub trait FluorApp<P: crate::pixel::Pixel = crate::pixel::Argb8> {
     /// Per-frame paint into the host's CPU present buffer. Flatten owned Groups onto `target`. The damage clip computed pre-render is in `ctx.damage_clip`; thread it thru every flatten / blit / glow call to skip pixels outside the dirty region.
     fn render(&mut self, target: &mut [P], ctx: &mut Context);
 
+    /// A frame the app made itself, whole, in place of `render` (ferros: a layer its GPU kernel drew, chrome included, in the layer arena): true when it did, and [`Self::own_frame`] then holds it until the next call. A host that knows the hook (ferros's) then neither clears nor renders the scratch, and presents the own frame instead. False (the default): `render` as always.
+    fn render_own(&mut self, _ctx: &mut Context) -> bool {
+        false
+    }
+
+    /// The frame [`Self::render_own`] made, a whole viewport in the host's own pixels, which the host presents; `None` (the default) when the app put it where the host would have (ferros: a GPU kernel wrote the app's surface itself), and the host presents nothing.
+    fn own_frame(&self) -> Option<&[P]> {
+        None
+    }
+
+    /// No pixel of the app's frame is see-through: a host that composes windows (ferros's display) never reads what the window covers. False (the default).
+    fn opaque(&self) -> bool {
+        false
+    }
+
     /// Draw on fluor's GPU (macOS always presents thru wgpu; Linux with fluor's `gpu` feature): `Some` asks for a device with these features and limits, made once, on the adapter that presents to the window, before [`Self::init`]. `None` (the default) keeps Linux on softbuffer and gives macOS a plain device.
     #[cfg(fluor_gpu)]
     fn gpu_request(&self, _adapter: &wgpu::Adapter) -> Option<super::gpu::GpuRequest> {

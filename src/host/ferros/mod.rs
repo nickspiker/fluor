@@ -268,6 +268,8 @@ pub struct FerrosShell<A: FluorApp<P>, P: PanelPixel = Argb8> {
     bell: Arc<Bell>,
     /// Back in front: the next frame is drawn whole, whatever the app says is dirty.
     full_next: bool,
+    /// The last draw was the app's own frame (`FluorApp::render_own`), not the scratch.
+    own: bool,
 }
 
 impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
@@ -300,6 +302,7 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             wake,
             bell,
             full_next: false,
+            own: false,
         };
         shell.with_context(|app, ctx| app.init(ctx));
         shell.with_context(|app, ctx| app.on_resize(width, height, ctx));
@@ -398,8 +401,16 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
                 self.changed = damage_clip.union(rect);
             }
         }
-        clear_scratch_rect(&mut self.scratch, win_w, damage_clip);
         self.pending_damage.clear();
+        // A frame the app made itself (its GPU's layer): the scratch is neither cleared nor drawn, and the present takes the app's frame whole.
+        let mut own = false;
+        self.with_context_render(damage_clip, |app, _, ctx| own = app.render_own(ctx));
+        self.own = own;
+        if own {
+            self.changed = viewport_rect;
+            return true;
+        }
+        clear_scratch_rect(&mut self.scratch, win_w, damage_clip);
         self.with_context_render(damage_clip, |app, scratch, ctx| app.render(scratch, ctx));
         true
     }
@@ -415,8 +426,14 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         if x0 >= x1 || y0 >= y1 {
             return;
         }
+        // The app's own frame when it made one (`render_own`), else the scratch; nothing when it put its frame in the surface itself.
+        let src = match (self.own, self.app.own_frame()) {
+            (true, None) => return,
+            (true, Some(f)) => f,
+            (false, _) => &self.scratch,
+        };
         let dst = &mut surface[(fy + y0) * stride..(fy + y1) * stride];
-        dst.par_chunks_mut(stride).zip(self.scratch[y0 * w..y1 * w].par_chunks(w)).for_each(|(d, s)| P::to_panel(&s[x0..x1], &mut d[fx + x0..fx + x1]));
+        dst.par_chunks_mut(stride).zip(src[y0 * w..y1 * w].par_chunks(w)).for_each(|(d, s)| P::to_panel(&s[x0..x1], &mut d[fx + x0..fx + x1]));
     }
 
     /// Contact records in, pointer events out: the first finger down is the pointer; a second finger is ignored for now (pinch comes with the input work).
@@ -721,7 +738,8 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             shell.present(surface, pw, fx, fy);
             let t_presented = sys::now();
             // The window (ferros WINDOWS.md): the frame's part of the screen, this surface, the app level, and what its pixels are (`PanelPixel::FORMAT`: at 16 bits fluor's own, which the display decodes).
-            let mut m = [0u8; 19];
+            // An opaque app (`FluorApp::opaque`) says so in the 28-byte form, with the frame as what changed: the display then never reads what the window covers (ferros_sys `window::show_full`, mode bit 3).
+            let mut m = [0u8; 28];
             m[0] = 22;
             m[1..3].copy_from_slice(&(fx as u16).to_le_bytes());
             m[3..5].copy_from_slice(&(fy as u16).to_le_bytes());
@@ -729,8 +747,16 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             m[7..9].copy_from_slice(&(h as u16).to_le_bytes());
             m[9..17].copy_from_slice(&base.to_le_bytes());
             m[18] = P::FORMAT;
+            let opaque = shell.app.opaque();
+            if opaque {
+                m[19..21].copy_from_slice(&(fx as u16).to_le_bytes());
+                m[21..23].copy_from_slice(&(fy as u16).to_le_bytes());
+                m[23..25].copy_from_slice(&(w as u16).to_le_bytes());
+                m[25..27].copy_from_slice(&(h as u16).to_le_bytes());
+                m[27] = 8;
+            }
             let mut rr = [0u8; 4];
-            if sys::call(display, &m, &mut rr) == sys::ERR {
+            if sys::call(display, &m[..if opaque { 28 } else { 19 }], &mut rr) == sys::ERR {
                 return Err(String::from("the display refused the frame"));
             }
             let t_shown = sys::now();
