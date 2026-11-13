@@ -883,7 +883,7 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             let t_presented = sys::now();
             // The window (ferros WINDOWS.md): the frame's part of the screen, this surface, the app level, and what its pixels are (`PanelPixel::FORMAT`: at 16 bits fluor's own, which the display decodes).
             // An opaque app (`FluorApp::opaque`) says so in the 28-byte form, with the frame as what changed: the display then never reads what the window covers (ferros_sys `window::show_full`, mode bit 3).
-            let mut m = [0u8; 36];
+            let mut m = [0u8; 40];
             m[0] = 22;
             m[1..3].copy_from_slice(&(fx as u16).to_le_bytes());
             m[3..5].copy_from_slice(&(fy as u16).to_le_bytes());
@@ -894,19 +894,20 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             let own_in_surface = shell.own && shell.app.own_frame().is_none();
             m[18] = if (bake.is_some() && !own_in_surface) || (own_in_surface && shell.app.own_baked()) { crate::host::panel::BAKED } else { P::FORMAT };
             let opaque = shell.app.opaque();
-            // An app that drew into a buffer of its own (`FluorApp::own_surface`) says which, in the 36-byte form: the display shows that buffer and answers once it has taken it (ferros GPU-KISTS.md 1.4, the mailbox).
+            // An app that drew into a buffer of its own (`FluorApp::own_surface`) says which, in the 36-byte form: the display shows that buffer and answers once it has taken it (ferros GPU-KISTS.md 1.4, the mailbox). None: 0 there, the window's own surface, answered at once.
             let own = if shell.own { shell.app.own_surface() } else { None };
-            if opaque || own.is_some() {
-                m[19..21].copy_from_slice(&(fx as u16).to_le_bytes());
-                m[21..23].copy_from_slice(&(fy as u16).to_le_bytes());
-                m[23..25].copy_from_slice(&(w as u16).to_le_bytes());
-                m[25..27].copy_from_slice(&(h as u16).to_le_bytes());
-                m[27] = if opaque { 8 } else { 0 };
-            }
+            m[19..21].copy_from_slice(&(fx as u16).to_le_bytes());
+            m[21..23].copy_from_slice(&(fy as u16).to_le_bytes());
+            m[23..25].copy_from_slice(&(w as u16).to_le_bytes());
+            m[25..27].copy_from_slice(&(h as u16).to_le_bytes());
+            m[27] = if opaque { 8 } else { 0 };
             if let Some(b) = own {
                 m[28..36].copy_from_slice(&b.to_le_bytes());
             }
-            let len = if own.is_some() { 36 } else if opaque { 28 } else { 19 };
+            // The 40-byte form, always (ferros display op 22, 2026-11-13): this frame's time here, its draw and its present in µs, for the display's frame counter (op 72; owner: "can we get a fps counter?"). A display from before it reads the first 36 bytes as ever.
+            let made = us(t_presented - t);
+            m[36..40].copy_from_slice(&(made as u32).to_le_bytes());
+            let len = 40;
             let mut rr = [0u8; 4];
             if sys::call(display, &m[..len], &mut rr) == sys::ERR {
                 return Err(String::from("the display refused the frame"));
