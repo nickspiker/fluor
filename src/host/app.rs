@@ -568,6 +568,31 @@ fn monitor_work_area(origin: (i32, i32), size: (u32, u32)) -> (i32, i32, u32, u3
     }
 }
 
+/// Where nothing of the system's covers the app's frame ([`FluorApp::on_safe_area`]; ferros WINDOWS.md "Drawn under the controls", owner 2026-11-12: "Should we draw under the controls?", then "Agreed. Build it!"): a circle, in pixels of the app's frame, and which halves of the frame outside it the system holds.
+/// On ferros the frame fills the glass and the system's controls float in front of its corners: the console's circles at the top (gone in full screen) and the helm's wedges at the bottom (always touched there, drawn or not), so the circle is the app's room for its own buttons and text, and the corners show its pixels under the controls.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SafeArea {
+    /// The circle's centre, pixels of the app's frame from its top-left corner (the centre may lie past the frame's middle, and the circle past its sides).
+    pub cx: Coord,
+    pub cy: Coord,
+    /// The circle's radius, pixels.
+    pub r: Coord,
+    /// The frame outside the circle above its centre is the system's.
+    pub top: bool,
+    /// The frame outside the circle below its centre is the system's.
+    pub bottom: bool,
+}
+
+impl SafeArea {
+    /// Whether the frame's point (x, y) is the app's to put a control at: inside the circle, or outside it on a half the system leaves alone.
+    pub fn contains(&self, x: Coord, y: Coord) -> bool {
+        let (dx, dy) = (x - self.cx, y - self.cy);
+        let held = if y < self.cy { self.top } else { self.bottom };
+        dx * dx + dy * dy <= self.r * self.r || !held
+    }
+}
+
+
 /// Per-callback access to host-owned shared resources. Re-borrowed for each call into the trait — the consumer can keep references for the duration of the call but not across calls.
 pub struct Context<'a> {
     /// Current viewport in physical pixels.
@@ -867,6 +892,11 @@ pub trait FluorApp<P: crate::pixel::Pixel = crate::pixel::Argb8> {
     /// The soft keyboard's place changed: `rows` of the app's frame, counted up from its bottom, are under the keyboard now (0: no keyboard). The frame never resizes for it; an app keeps what is being typed into above those rows (scrolls the focused field into view, lifts a bottom-anchored compose bar). Told by the ferros host as the system keyboard comes, moves and goes (ferros WINDOWS.md "The keyboard"). Default: ignored.
     fn on_keyboard_inset(&mut self, rows: u32) {
         let _ = rows;
+    }
+
+    /// The frame's safe area changed: where nothing of the system's covers the app (a [`SafeArea`]), so it keeps its own buttons and text there. The frame reaches the glass's edge and the system's controls float in front of its corners; the rest of the frame is still drawn, under them. Told by the ferros host when the window first shows and as its full screen turns (ferros WINDOWS.md "Drawn under the controls"); the keyboard is [`Self::on_keyboard_inset`]'s, apart from it. Other hosts never call it: there the whole frame is the app's. Default: ignored.
+    fn on_safe_area(&mut self, area: SafeArea) {
+        let _ = area;
     }
 
     /// HONEST IME EDITOR, read half: the focused textbox's full text + cursor (in CHARS — the host converts to UTF-16). The Android host mirrors this to the InputConnection so `getTextBeforeCursor`-style queries answer TRUTHFULLY — Google voice typing reads the field back continuously and aborts mid-sentence against an editor that claims to be empty. Default: no editor (`None`).
@@ -4450,5 +4480,25 @@ mod silhouette_tests {
         clip[w] = 128;
         let rects = silhouette_rects(&clip, w, h, 0, 0);
         assert_eq!(rects, vec![(0, 1, 4, 2)]);
+    }
+}
+
+#[cfg(test)]
+mod safe_area_tests {
+    use super::SafeArea;
+
+    /// The 8a's circle (ferros_sys `active_circle` on a 1080 × 2400 panel, the cutout's bottom at row 101.83): every corner is the system's with the controls up, the top two the app's in full screen, the bottom two never.
+    #[test]
+    fn corners_follow_the_halves() {
+        let r = (2400. - 101.83) * 0.5;
+        let up = SafeArea { cx: 540., cy: 101.83 + r, r, top: true, bottom: true };
+        let full = SafeArea { top: false, ..up };
+        let corners = [(4., 4.), (1076., 4.), (4., 2396.), (1076., 2396.)];
+        assert_eq!(corners.map(|(x, y)| up.contains(x, y)), [false; 4]);
+        assert_eq!(corners.map(|(x, y)| full.contains(x, y)), [true, true, false, false]);
+        // The middle of the frame and the circle's own bottom are the app's either way.
+        assert!(up.contains(540., 1200.) && up.contains(540., 2398.));
+        // Above the cutout's bottom, on the middle column: outside the circle, the console's while it shows.
+        assert!(!up.contains(540., 50.) && full.contains(540., 50.));
     }
 }

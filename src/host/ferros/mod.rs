@@ -6,6 +6,8 @@
 //!
 //! The keyboard (ferros WINDOWS.md "The keyboard"): when the app's focused widget wants the soft keyboard (`FluorApp::wants_keyboard`, as on Android) the host asks the display for it (op 68), and lets it go when focus leaves the field. The system keyboard then types into this window thru the display: its text arrives on the same held op 62 as an IME commit (`Event::Ime(Ime::Commit)`), its enter and delete as key presses and releases, in the order they were typed, and the rows it covers as `FluorApp::on_keyboard_inset`, so the app keeps its field above them. The text itself never goes to the console.
 //!
+//! The safe area (ferros WINDOWS.md "Drawn under the controls", owner 2026-11-12: "Should we draw under the controls?", then "Agreed. Build it!"): the window fills the glass and the system's controls float in front of its corners, so the display tells the window where they are not (`EV_SAFE`, on the same held op 62): the app's circle and which halves outside it the system holds, at the window's first show and as its full screen turns. The host hands it to the app as `FluorApp::on_safe_area` ([`SafeArea`]), so it keeps its own buttons and text inside.
+//!
 //! Pixels: the shell renders at the app's depth (`FluorApp<P>`: 8-bit unless the app names `G2t16`) and [`crate::host::panel`] turns the scratch into the display's working values. At 8 bits: fluor's `0xααRRGGBB` darkness buffer becomes the display's working values — gamma 2 encoded, white = 16384 (Q14), R, G, B in bits 0-15, 16-31, 32-47 of a u64 — through one 256-entry table: fluor's bytes are VSF `g2t` codes (theme.rs, since 2026-10-20: 194 diffuse white, 255 9.7× white), whose light is atanh(c/256)², so the display's gamma 2 (√light) is atanh(c/256), 255 landing at 3.1 of the surface's 4.0. Opacity composites over black. The whole frame is converted and shown each time the app drew; the damage rect narrows that later.
 
 use alloc::string::String;
@@ -19,7 +21,7 @@ use crate::canvas::{Damage, PixelRect};
 use crate::coord::Coord;
 use crate::event::{ElementState, Event as FEvent, Ime, Key, KeyEvent, ModifiersState as FModifiersState, MouseButton, MouseScrollDelta, NamedKey};
 use crate::geom::Viewport;
-use crate::host::app::{Context, FluorApp};
+use crate::host::app::{Context, FluorApp, SafeArea};
 use crate::host::wake::{WakeError, WakeSender};
 use crate::host::{EventResponse, WindowHandle};
 use crate::host::panel::PanelPixel;
@@ -148,6 +150,9 @@ const EV_BAKE: u8 = 4;
 const EV_TEXT: u8 = 6;
 /// The keyboard's place: its payload two bytes, little-endian, the panel's rows it covers from the bottom up (0: gone).
 const EV_INSET: u8 = 7;
+/// The window's safe area (ferros WINDOWS.md "Drawn under the controls"): its payload `SAFE_BYTES`, the app's circle in the window's own pixels (centre x and y as i32, the radius as u32, each in 256ths of a pixel, little-endian), then a byte: bit 0 the glass outside the circle above its centre is the system's, bit 1 below it.
+const EV_SAFE: u8 = 8;
+const SAFE_BYTES: usize = 13;
 /// Kinds from this one up carry a payload, its length in the low byte; the payloads follow the reply's events, in their order.
 const PAYLOAD_KINDS: u8 = 6;
 /// The most bytes one payload holds, and so the longest reply: the head, the events, every payload at its longest.
@@ -203,6 +208,8 @@ struct BellState {
     typed: Vec<Typed>,
     /// The keyboard's place, the panel's rows it covers from the bottom, when it changed since the last take (`EV_INSET`).
     inset: Option<u16>,
+    /// The window's safe area, when the display told it since the last take (`EV_SAFE`).
+    safe: Option<SafeArea>,
     /// The display's bake changed since the last take (`EV_BAKE`).
     bake: bool,
     rung: bool,
@@ -213,7 +220,21 @@ struct Rung {
     behind: bool,
     typed: Vec<Typed>,
     inset: Option<u16>,
+    safe: Option<SafeArea>,
     bake: bool,
+}
+
+/// `EV_SAFE`'s payload as a [`SafeArea`] of the window's own pixels (the window is the app's frame).
+fn safe_area(p: &[u8; SAFE_BYTES]) -> SafeArea {
+    let word = |i: usize| [p[i], p[i + 1], p[i + 2], p[i + 3]];
+    let q8 = 1. / (1 << 8) as Coord;
+    SafeArea {
+        cx: i32::from_le_bytes(word(0)) as Coord * q8,
+        cy: i32::from_le_bytes(word(4)) as Coord * q8,
+        r: u32::from_le_bytes(word(8)) as Coord * q8,
+        top: p[12] & 1 != 0,
+        bottom: p[12] & 2 != 0,
+    }
 }
 
 impl Bell {
@@ -232,7 +253,7 @@ impl Bell {
     fn take(&self) -> Rung {
         let mut s = self.state.lock().unwrap();
         s.rung = false;
-        Rung { behind: s.behind, typed: core::mem::take(&mut s.typed), inset: s.inset.take(), bake: core::mem::take(&mut s.bake) }
+        Rung { behind: s.behind, typed: core::mem::take(&mut s.typed), inset: s.inset.take(), safe: s.safe.take(), bake: core::mem::take(&mut s.bake) }
     }
 
     /// Asleep until anything rings since the last take, or until `at` (the app's own deadline, when it has one ahead).
@@ -303,6 +324,11 @@ fn watch(display: u64, base: u64, bell: Arc<Bell>) {
                         }
                     }
                     (EV_INSET, Some(&[a, b])) => s.inset = Some(u16::from_le_bytes([a, b])),
+                    (EV_SAFE, Some(b)) => {
+                        if let Ok(p) = <&[u8; SAFE_BYTES]>::try_from(b) {
+                            s.safe = Some(safe_area(p));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -475,6 +501,12 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         // WHY the bounds: `rows` is the display's word (another process's), and the frame may sit anywhere on the panel: the keyboard's top, as a row of the frame, is above the frame's top (the whole frame covered) or below its bottom (none of it).
         let top = (ph as i64 - rows as i64 - fy as i64).clamp(0, h);
         self.app.on_keyboard_inset((h - top) as u32);
+        self.window.mark_dirty();
+    }
+
+    /// The window's safe area (`EV_SAFE`), in the window's own pixels, which are the frame's: told to the app (`FluorApp::on_safe_area`), and the frame drawn again.
+    pub fn on_safe_area(&mut self, area: SafeArea) {
+        self.app.on_safe_area(area);
         self.window.mark_dirty();
     }
 
@@ -796,7 +828,12 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             (t_draw, t_present, t_show, t_max, n_frames) = (0, 0, 0, 0, 0);
         }
         // What the display said of this window since the last pass (`watch`): behind or in front, the keys and text it handed over, the keyboard's place, and whether its bake changed (a brightness change: the bake asked again, and the next frame drawn and baked whole).
-        let Rung { behind: now_behind, typed, inset, bake: rebake } = bell.take();
+        let Rung { behind: now_behind, typed, inset, safe, bake: rebake } = bell.take();
+        // The safe area (the display's word at the window's first show and as its full screen turns): where the app keeps its own controls, the system's in front of the corners.
+        if let Some(a) = safe {
+            println!("fluor: the safe area is the circle at ({}, {}) radius {}, the system holding {}", a.cx, a.cy, a.r, match (a.top, a.bottom) { (true, true) => "both halves outside it", (false, true) => "the bottom half outside it", (true, false) => "the top half outside it", (false, false) => "nothing" });
+            shell.on_safe_area(a);
+        }
         // The keyboard's place, behind or not: going behind takes the keyboard away, and the app hears it then.
         if let Some(rows) = inset {
             println!("fluor: the keyboard covers {rows} rows of the panel");
