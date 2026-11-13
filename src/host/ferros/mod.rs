@@ -715,6 +715,16 @@ fn clear_scratch_rect<P: PanelPixel>(scratch: &mut [P], width: usize, rect: Pixe
     }
 }
 
+/// Every touch record the touch server holds for this app, read and dropped: until a reply carries less than a full batch (one read takes at most `TOUCH_BATCH` of the up to 64 the server holds, and the rest would then be taken as this app's). A failed call (no touch server) ends it too: its count byte would be the last reply's, and a full one would never end.
+fn drain_touches(touch: u64, r: &mut [u8]) {
+    loop {
+        let n = sys::call(touch, &[0], r);
+        if n == 0 || n == sys::ERR || (r[0] as usize) < TOUCH_BATCH {
+            break;
+        }
+    }
+}
+
 /// Whether a screen point is this window's (ferros display op 27): the frontmost window covering it, inside the circle an app lives in.
 fn mine(display: u64, base: u64, x: u16, y: u16) -> bool {
     let mut m = [0u8; 13];
@@ -770,6 +780,8 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
         let bell = bell.clone();
         let _ = std::thread::Builder::new().name(String::from("fluor-window")).stack_size(1 << 16).spawn(move || watch(display, base, bell));
     }
+    // The touches queued before this window was made were another window's: the tap on the map that launched this app among them, which the app took as its own first touch (ferros, 2026-11-12: Mahere opened from the map with an info card where its circle was tapped).
+    drain_touches(touch, &mut r);
     let mut behind = false;
     // The app's keyboard wish not yet sent to the display (`keyboard_wish`, op 68).
     let mut wish: Option<bool> = None;
@@ -812,13 +824,8 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             println!("fluor: {}", if behind { "behind (home, or another kist in front): nothing drawn until it is back" } else { "in front again" });
             shell.set_behind(behind);
             if !behind {
-                // The touches queued while it was behind were made on another window (the map, another kist): dropped, never replayed into this one. Read until a reply carries less than a full batch: one read took at most `TOUCH_BATCH` of the up to 64 the server holds, and the rest were then taken as this app's. A failed call (no touch server) ends it too: its count byte would be the last reply's, and a full one would never end.
-                loop {
-                    let n = sys::call(touch, &[0], &mut r);
-                    if n == 0 || n == sys::ERR || (r[0] as usize) < TOUCH_BATCH {
-                        break;
-                    }
-                }
+                // The touches queued while it was behind were made on another window (the map, another kist): dropped, never replayed into this one.
+                drain_touches(touch, &mut r);
                 foreign = 0;
             }
         }
