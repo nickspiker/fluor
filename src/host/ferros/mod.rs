@@ -350,6 +350,12 @@ pub struct FerrosShell<A: FluorApp<P>, P: PanelPixel = Argb8> {
     close: bool,
     /// Frames drawn, for the first-frame rule and the console line.
     pub frames: u64,
+    /// Frames drawn since the last console line that moved the scratch by the app's scroll hint (`scroll_hint`, a memmove and the band drawn), and the pixels every frame since then drew (its damage) and converted at present (`changed`): what a scroll frame costs, said in the ten-second line.
+    pub hinted: u64,
+    /// The last draw's scroll (`scroll_hint`'s rect and rows) for the present to move the surface by too, so only the damage is converted (2026-11-17, the Pro: a scroll frame converted the whole moved pane, 15 ms of the bake a frame); None when the frame is converted where it changed.
+    shift: Option<(PixelRect, i32)>,
+    pub drawn_px: u64,
+    pub changed_px: u64,
     wake: Arc<FerrosWakeSender<A::UserEvent>>,
     /// The window's bell (`Bell`): the display's events and the app's own sends.
     bell: Arc<Bell>,
@@ -390,6 +396,10 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             pinch_scaled: false,
             close: false,
             frames: 0,
+            hinted: 0,
+            shift: None,
+            drawn_px: 0,
+            changed_px: 0,
             wake,
             bell,
             full_next: false,
@@ -522,10 +532,19 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         }
         self.frames += 1;
         self.changed = damage_clip;
+        // The surface holds the last frame converted from the scratch unless that frame was the app's own (`render_own`): only then can it be moved as the scratch is.
+        let surface_is_scratch = !self.own;
+        self.shift = None;
         if damage_clip != viewport_rect {
             if let Some((rect, dy)) = self.app.scroll_hint(self.viewport) {
                 crate::paint::scroll_copy_rect(&mut self.scratch, win_w, win_h, rect.x0, rect.y0, rect.x1, rect.y1, dy);
-                self.changed = damage_clip.union(rect);
+                // A scroll that moves the whole pane out (nothing of it survives the move) is converted whole, as before; otherwise the surface is moved the same rows and only the damage converted.
+                if surface_is_scratch && (dy.unsigned_abs() as usize) < rect.height() {
+                    self.shift = Some((rect, dy));
+                } else {
+                    self.changed = damage_clip.union(rect);
+                }
+                self.hinted += 1;
             }
         }
         self.pending_damage.clear();
@@ -535,10 +554,13 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         self.own = own;
         if own {
             self.changed = viewport_rect;
+            self.shift = None;
             return true;
         }
         clear_scratch_rect(&mut self.scratch, win_w, damage_clip);
         self.with_context_render(damage_clip, |app, scratch, ctx| app.render(scratch, ctx));
+        self.drawn_px += (damage_clip.width() * damage_clip.height()) as u64;
+        self.changed_px += (self.changed.width() * self.changed.height()) as u64;
         true
     }
 
@@ -548,6 +570,11 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         use rayon::prelude::*;
         let (w, h) = (self.viewport.width_px as usize, self.viewport.height_px as usize);
         // WHY/PROOF: `changed` is the app's damage and scroll rects, which an app may hand over overhanging its frame (fluor's own primitives cut theirs at the buffer the same way, `Clip::resolve`); the slices below index the scratch and the surface up to its far edges.
+        // A scroll frame: the surface's copy of the pane moved by the same rows as the scratch was (`draw`), so what is converted is the damage alone. The rect cut at the frame first, as below, so the move never reaches another part of the screen.
+        if let Some((r, dy)) = self.shift {
+            let (sx0, sy0, sx1, sy1) = (r.x0.min(w), r.y0.min(h), r.x1.min(w), r.y1.min(h));
+            crate::paint::scroll_copy_rect(surface, stride, surface.len() / stride, fx + sx0, fy + sy0, fx + sx1, fy + sy1, dy);
+        }
         let c = self.changed;
         let (x0, y0, x1, y1) = (c.x0.min(w), c.y0.min(h), c.x1.min(w), c.y1.min(h));
         if x0 >= x1 || y0 >= y1 {
@@ -884,6 +911,12 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             last_line = sys::now();
             let mean = |t: u64| if n_frames == 0 { 0 } else { us(t) / n_frames };
             println!("fluor: {shown} frames shown, {} drawn, {touched} contacts; the last {n_frames} frames: draw {} us, present {} us, show {} us a frame, longest {} us", shell.frames, mean(t_draw), mean(t_present), mean(t_show), us(t_max));
+            // WHY: a ten-second window with no frame drawn would divide by zero; it has nothing to say.
+            if n_frames != 0 {
+                let px = (w as u64) * (h as u64);
+                println!("fluor: of those frames A#{} moved by a scroll hint; drawn A#{} % of the frame a frame, converted at present A#{} %", shell.hinted, shell.drawn_px * 100 / (px * n_frames), shell.changed_px * 100 / (px * n_frames));
+            }
+            (shell.hinted, shell.drawn_px, shell.changed_px) = (0, 0, 0);
             (t_draw, t_present, t_show, t_max, n_frames) = (0, 0, 0, 0, 0);
         }
         // What the display said of this window since the last pass (`watch`): behind or in front, the keys and text it handed over, the keyboard's place, and whether its bake changed (a brightness change: the bake asked again, and the next frame drawn and baked whole).
