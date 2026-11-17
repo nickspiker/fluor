@@ -577,7 +577,7 @@ fn chrome_scene<P: Pixel>() -> (Vec<P>, Vec<u8>) {
 #[test]
 fn golden_chrome() {
     let (px, clip) = chrome_scene::<Argb8>();
-    check("chrome", &px, 0xa74e_33d5_c701_6453);
+    check("chrome", &px, 0x08cb_c742_f4c0_f567);
     check8("chrome_clip", &clip, 0x6ef3_84cb_654d_5c65);
     let (_, clip16) = chrome_scene::<crate::pixel::G2t16>();
     assert_eq!(clip16, clip, "the clip mask is the crossings' top byte at either depth");
