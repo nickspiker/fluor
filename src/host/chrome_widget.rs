@@ -213,6 +213,25 @@ fn content_bbox<P: Pixel>(pixels: &[P], w: usize, h: usize) -> crate::canvas::Pi
     b
 }
 
+/// [`content_bbox`] of the part of a `w`-wide layer inside `r` (the layer empty outside it).
+fn region_bbox<P: Pixel>(pixels: &[P], w: usize, r: crate::canvas::PixelRect) -> crate::canvas::PixelRect {
+    let mut b = crate::canvas::PixelRect::empty();
+    for y in r.y0..r.y1 {
+        let row = &pixels[y * w + r.x0..y * w + r.x1];
+        if let (Some(x0), Some(x1)) = (row.iter().position(|&p| p != P::EMPTY), row.iter().rposition(|&p| p != P::EMPTY)) {
+            b = b.union(crate::canvas::PixelRect::new(r.x0 + x0, y, r.x0 + x1 + 1, y + 1));
+        }
+    }
+    b
+}
+
+/// `buf[y][x] = v` over `r` of a `w`-wide buffer (`r` inside it).
+fn fill_rect<T: Copy>(buf: &mut [T], w: usize, r: crate::canvas::PixelRect, v: T) {
+    for y in r.y0..r.y1 {
+        buf[y * w + r.x0..y * w + r.x1].fill(v);
+    }
+}
+
 fn orb_layout(button_size: usize, inset_top: isize, inset_left: isize) -> (isize, isize, isize) {
     let b = button_size as isize;
     let orb_radius = (b * 9) / 8;
@@ -304,6 +323,8 @@ impl<P: Pixel> DefaultChrome<P> {
         let map_len = viewport.width_px as usize * viewport.height_px as usize;
         self.hit_test_map.resize(map_len, HIT_NONE);
         self.viewport = viewport;
+        // What the layer held is of the old size (its buffer kept and read at the new width): unknown, so its next re-raster clears and damages all of it.
+        self.chrome_bbox = None;
     }
 
     /// Buffer dimensions (full viewport).
@@ -499,21 +520,38 @@ impl<P: Pixel> DefaultChrome<P> {
         text: &mut TextRenderer,
         clip_mask: &mut [u8],
     ) {
-        let (buf_w, buf_h) = self.dims();
-        let vp_w = buf_w as u32;
-        let vp_h = buf_h as u32;
-
         let chrome_dirty = self.group.rpn.layers[self.layer_chrome].dirty;
 
         // Hover is no longer baked into chrome_buf — it lives entirely in the host's post-finalize overlay pass via `current_overlay_deltas` + `apply_overlay_diff`. chrome_buf stays tint-free; hit_test_map is the only thing chrome owes the overlay.
         if !chrome_dirty {
             return;
         }
-        self.chrome_bbox = None;
+        // What this re-raster may touch (`chrome_region`, the same rect `damage_rect` named for this frame): the layer and the hit map are cleared over it alone, so an app's own hit stamps outside it stay (Photon stamps its rows into this map and restamps only inside the frame's damage), and the layer outside it is already empty.
+        let region = self.chrome_region();
+        self.rasterize_chrome_in(region, damage, text, clip_mask);
+        // What the layer holds now, found inside the region alone (nothing is drawn outside it); in debug builds the whole layer is scanned and must agree, which holds `chrome_reach` to every raster.
+        let (w, h) = self.dims();
+        let pixels = &self.group.rpn.layers[self.layer_chrome].pixels;
+        let held = region_bbox(pixels, w, region);
+        debug_assert_eq!(held, content_bbox(pixels, w, h), "the chrome drew outside its reach");
+        self.chrome_bbox = Some(held);
+    }
+
+    /// The re-raster itself, the layer and the hit map cleared over `region` first.
+    fn rasterize_chrome_in(
+        &mut self,
+        region: crate::canvas::PixelRect,
+        damage: &mut crate::canvas::Damage,
+        text: &mut TextRenderer,
+        clip_mask: &mut [u8],
+    ) {
+        let (buf_w, buf_h) = self.dims();
+        let vp_w = buf_w as u32;
+        let vp_h = buf_h as u32;
         crate::paint::RASTERIZE_OPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
-        // clip_mask is owned + carved by `rasterize_perimeter` (runs before content, every frame). This pass only READS it (button hit-scan walls below, silhouette restriction post-pass). hit_test_map is still owned here — wiped on each dirty cycle before re-stamping the buttons.
-        self.hit_test_map.fill(HIT_NONE);
+        // clip_mask is owned + carved by `rasterize_perimeter` (runs before content, every frame). This pass only READS it (button hit-scan walls below, silhouette restriction post-pass). hit_test_map is still owned here — wiped over the region on each dirty cycle before re-stamping the buttons.
+        fill_rect(&mut self.hit_test_map, buf_w, region, HIT_NONE);
 
         // Compute span + button size shared by controls and squircle. Use the viewport's `effective_span` (= `span * ru`) so chrome scales with the user's zoom — Ctrl+/Ctrl-/Ctrl+scroll zoom the chrome together with content.
         let span = self.viewport.effective_span();
@@ -524,7 +562,7 @@ impl<P: Pixel> DefaultChrome<P> {
 
         let chrome_buf = &mut self.group.rpn.layers[self.layer_chrome].pixels;
         // α + darkness: transparent init (α=0, dark=0) so the bg shows thru everywhere except the hairline + AA pixels.
-        chrome_buf.fill(P::EMPTY);
+        fill_rect(chrome_buf, buf_w, region, P::EMPTY);
 
         if vp_w < 2 || vp_h < 2 {
             return;
@@ -795,9 +833,12 @@ impl<P: Pixel> DefaultChrome<P> {
         // Hover paint moved to the host overlay path; chrome_buf is intentionally tint-free here.
 
         // Silhouette restriction post-pass — photon-style. Any pixel the perimeter dropped below full coverage (clip_mask < 255 = corner cutouts, AA fringes) gets HIT_NONE so a non-strip rasterizer (currently the app icon at the top-left) can't leave a stale hit_id at a pixel that's geometrically outside the silhouette.
-        for i in 0..clip_mask.len() {
-            if clip_mask[i] < 255 {
-                self.hit_test_map[i] = HIT_NONE;
+        // Over the region alone: the buttons and the orb stamp nothing outside it, and an app's own stamps outside it are the app's.
+        for y in region.y0..region.y1 {
+            for i in y * buf_w + region.x0..y * buf_w + region.x1 {
+                if clip_mask[i] < 255 {
+                    self.hit_test_map[i] = HIT_NONE;
+                }
             }
         }
     }
@@ -857,22 +898,64 @@ impl<P: Pixel> DefaultChrome<P> {
         }
     }
 
-    /// Damage region this chrome contributes to the host's per-frame clip rect. Returns `Some(viewport)` when bg or chrome layer needs a fresh rasterize (resize, focus change, debug toggle, scroll-driven bg); `None` otherwise. Hover is NOT damage anymore — it's an overlay operation against persistent_screen via `hit_test_map`, not a scratch repaint.
+    /// Damage region this chrome contributes to the host's per-frame clip rect: the whole viewport when the bg layer needs a fresh rasterize (resize, debug toggle, scroll-driven bg); when only the chrome layer does (a title, the orb's tint or press, focus), what the chrome held before the re-raster and all it can hold after it ([`Self::chrome_region`]); `None` otherwise. Hover is NOT damage anymore — it's an overlay operation against persistent_screen via `hit_test_map`, not a scratch repaint.
+    /// Until 2026-11-17 a chrome change was the whole viewport too: on the Pro, every flip of Photon's orb tint with a contact's presence redrew and baked the whole frame (about 60 ms) for an orb in a corner.
     pub fn damage_rect(&self) -> Option<crate::canvas::PixelRect> {
         let (w, h) = self.dims();
-        let bg_dirty = self.group.rpn.layers[self.layer_bg].dirty;
-        let chrome_dirty = self.group.rpn.layers[self.layer_chrome].dirty;
-        if bg_dirty || chrome_dirty {
+        if self.group.rpn.layers[self.layer_bg].dirty {
             Some(crate::canvas::PixelRect::new(0, 0, w, h))
         } else {
-            None
+            self.chrome_damage_rect()
         }
     }
 
-    /// [`Self::damage_rect`] for an app that never flattens the bg layer — its picture goes under the chrome some other way (the GPU present's under layer): only the chrome layer's own repaint is damage, since the bg layer's dirty flag, never settled by a flatten, would otherwise make every frame a whole-window repaint.
+    /// [`Self::damage_rect`] for an app that never flattens the bg layer — its picture goes under the chrome some other way (the GPU present's under layer): only the chrome layer's own repaint is damage ([`Self::chrome_region`]), since the bg layer's dirty flag, never settled by a flatten, would otherwise make every frame a whole-window repaint.
     pub fn chrome_damage_rect(&self) -> Option<crate::canvas::PixelRect> {
+        self.group.rpn.layers[self.layer_chrome].dirty.then(|| self.chrome_region())
+    }
+
+    /// What a re-raster of the chrome layer can change: the bounding box of what it holds now (the last raster's, `chrome_bbox`; a shrinking title's old glyphs) and of everything it can hold after ([`Self::chrome_reach`]). The whole viewport while what it holds is unknown (before the first raster, after a resize).
+    /// The re-raster clears the layer and the hit map over exactly this, so taps outside it (an app's rows stamped into the map) stay live, and the frame's damage covers every pixel the re-raster touched.
+    fn chrome_region(&self) -> crate::canvas::PixelRect {
         let (w, h) = self.dims();
-        self.group.rpn.layers[self.layer_chrome].dirty.then(|| crate::canvas::PixelRect::new(0, 0, w, h))
+        match self.chrome_bbox {
+            Some(old) => old.union(self.chrome_reach()),
+            None => crate::canvas::PixelRect::new(0, 0, w, h),
+        }
+    }
+
+    /// Everything `rasterize_chrome` can draw at the current geometry, from the same layout it draws with: the orb with its ring and press glow (twice its radius), the title's band (the text block stays inside the two-button strip round the orb's row; a button's height either side is room for its glyphs' overhang), the controls strip unless it is skipped, and the status bar. Cut to the viewport. A test holds every raster's content inside it.
+    fn chrome_reach(&self) -> crate::canvas::PixelRect {
+        use crate::canvas::PixelRect;
+        let (w, h) = self.dims();
+        let span = self.viewport.effective_span();
+        let button_size = crate::math::ceil(span / 32.0) as usize;
+        let b = button_size as isize;
+        let ctl = button_size * 2;
+        // WHY/PROOF: as in `rasterize_chrome`, the window can be narrower than the controls strip; w − strip width would underflow.
+        let strip_x = w.saturating_sub(ctl * 7 / 2);
+        // Signed corners cut to the viewport: the orb's glow and the title's band can hang off its edges, and the casts would wrap.
+        let rect = |x0: isize, y0: isize, x1: isize, y1: isize| PixelRect::new(x0.clamp(0, w as isize) as usize, y0.clamp(0, h as isize) as usize, x1.clamp(0, w as isize) as usize, y1.clamp(0, h as isize) as usize);
+        let mut r = PixelRect::empty();
+        let orb = self.orb_geometry();
+        let title_cy = match orb {
+            Some((cx, cy, rad)) => {
+                let reach = 2 * rad + 2;
+                r = r.union(rect(cx - reach, cy - reach, cx + reach + 1, cy + reach + 1));
+                cy
+            }
+            None => b / 2,
+        };
+        if !self.title.is_empty() {
+            r = r.union(rect(0, title_cy - 2 * b, strip_x as isize, title_cy + 2 * b + 1));
+        }
+        if !crate::paint::DEBUG_SKIP_CONTROLS.load(std::sync::atomic::Ordering::Relaxed) {
+            r = r.union(rect(strip_x as isize, 0, w as isize, ctl as isize + 1));
+        }
+        if self.status_text.as_deref().is_some_and(|t| !t.is_empty()) {
+            r = r.union(rect(0, h as isize - b / 2 - 2, w as isize, h as isize));
+        }
+        r
     }
 
     /// Read-only accessor so the host overlay pass can walk the hit-test map without taking ownership.
@@ -1028,6 +1111,64 @@ pub(crate) use crate::paint::edge::{compute_squircle_crossings, glass_corner_par
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A chrome settled with `title` and an orb, the bg layer settled too, on a `w × h` frame; the frame as the host shows it (the chrome flattened whole).
+    fn settled(w: usize, h: usize, title: &str, text: &mut TextRenderer, clip_mask: &mut [u8], counter: &mut HitId) -> (DefaultChrome, Vec<u32>) {
+        let mut chrome = DefaultChrome::new(Viewport::new(w as u32, h as u32), title, None, None, counter);
+        chrome.set_orb_tint(chrome::OrbTint::Custom { ring: 0xFF20_4060, brighten: false });
+        chrome.rasterize_chrome(&mut crate::canvas::Damage::new(), text, clip_mask);
+        let mut frame = alloc::vec![0u32; w * h];
+        chrome.flatten_chrome_into(&mut frame, w, h, None);
+        chrome.settle_bg();
+        (chrome, frame)
+    }
+
+    /// A chrome change is damage over what the chrome held and what it holds after, not the whole frame: a title that shrinks leaves none of its old glyphs when the host clears and redraws only that damage, and the frame equals one drawn whole.
+    #[test]
+    fn a_shrinking_title_leaves_no_glyphs() {
+        let (w, h) = (900, 700);
+        let (mut text, mut clip_mask, mut counter) = (TextRenderer::new(), alloc::vec![255u8; w * h], HIT_NONE);
+        let (mut chrome, mut frame) = settled(w, h, "A rather long title of many words", &mut text, &mut clip_mask, &mut counter);
+        let old = chrome.chrome_bbox.unwrap();
+        let drawn_long = chrome.group.rpn.layers[chrome.layer_chrome].pixels.iter().filter(|&&p| p != 0).count();
+        assert!(!old.is_empty());
+        assert!(chrome.damage_rect().is_none(), "a settled chrome is no damage");
+        chrome.set_title("Hi");
+        let dmg = chrome.damage_rect().expect("a new title is damage");
+        assert_ne!(dmg, crate::canvas::PixelRect::new(0, 0, w, h), "a title is not the whole frame");
+        assert_eq!(dmg.union(old), dmg, "the old title is inside the damage");
+        // The host's frame: the damage cleared and the chrome flattened over it alone.
+        for y in dmg.y0..dmg.y1 {
+            frame[y * w + dmg.x0..y * w + dmg.x1].fill(0);
+        }
+        chrome.rasterize_chrome(&mut crate::canvas::Damage::new(), &mut text, &mut clip_mask);
+        let new = chrome.chrome_bbox.unwrap();
+        let drawn = chrome.group.rpn.layers[chrome.layer_chrome].pixels.iter().filter(|&&p| p != 0).count();
+        assert!(drawn < drawn_long, "the short title drew fewer pixels than the long one ({drawn} against {drawn_long})");
+        assert_eq!(dmg.union(new), dmg, "the new chrome is inside the damage");
+        chrome.flatten_chrome_into(&mut frame, w, h, Some(crate::paint::Clip::new(dmg.x0, dmg.y0, dmg.x1, dmg.y1)));
+        let mut whole = alloc::vec![0u32; w * h];
+        crate::paint::flatten_premult(&mut whole, &chrome.group.rpn.layers[chrome.layer_chrome].pixels);
+        assert!(frame == whole, "the frame keeps pixels of the old title");
+    }
+
+    /// A chrome re-raster wipes the hit map over its own region alone: an app's stamps outside it (contact rows, which the app restamps only inside the frame's damage) still hit.
+    #[test]
+    fn taps_outside_the_chrome_damage_still_hit() {
+        let (w, h) = (900, 700);
+        let (mut text, mut clip_mask, mut counter) = (TextRenderer::new(), alloc::vec![255u8; w * h], HIT_NONE);
+        let (mut chrome, _) = settled(w, h, "Peers 3", &mut text, &mut clip_mask, &mut counter);
+        let row = widget::next_id(&mut counter);
+        let (x, y) = (w / 2, h - 40);
+        chrome.hit_test_map[y * w + x] = row;
+        chrome.set_orb_tint(chrome::OrbTint::Custom { ring: 0xFF60_4020, brighten: true });
+        let dmg = chrome.damage_rect().unwrap();
+        assert!(!(dmg.x0..dmg.x1).contains(&x) || !(dmg.y0..dmg.y1).contains(&y), "the row is outside the damage {dmg:?}");
+        chrome.rasterize_chrome(&mut crate::canvas::Damage::new(), &mut text, &mut clip_mask);
+        assert_eq!(chrome.hit_at(x as Coord, y as Coord), row);
+        let (cx, cy, _) = chrome.orb_geometry().unwrap();
+        assert_eq!(chrome.hit_at(cx as Coord, cy as Coord), chrome.app_icon_btn.id(), "the orb is stamped again");
+    }
 
     #[test]
     fn new_allocates_full_viewport_buffers() {
