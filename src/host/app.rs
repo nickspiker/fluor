@@ -1128,6 +1128,9 @@ struct DesktopShell<A: FluorApp<P>, P: Finalize> {
     span_pushed_back: Option<(u32, u32)>,
     /// The position the window manager last imposed on Linux's spanning surface, and when fluor moved it back. Muffin puts the desktop-wide surface at the origin of the monitor it decides the window lives on — at launch the one under the pointer, and again later at moments of its own — so the app drew one monitor-width off, its controls and close button off-screen (2026-11-04). Every such move is answered by moving back; only the same position imposed again within a second is adopted, so an insistent WM cannot start a loop.
     span_moved_back: Option<((i32, i32), std::time::Instant)>,
+    /// When the host started, and when the visible window last changed monitor — what tells a window manager's move of the spanning surface apart from a request: one in the first moments is its placement of a new window, one right after fluor's own move-to-monitor is the WM acting on the same Super+Shift+Arrow ([`Self::handle_surface_moved`]).
+    started: std::time::Instant,
+    last_monitor_move: Option<std::time::Instant>,
     /// macOS: whether WE hid the OS pointer with `NSCursor.hide` (counted, so it must be balanced by exactly one `unhide`). winit's `set_cursor_visible(false)` is a cursor RECT with an invisible cursor, which AppKit only honours on a key window whose rects it consults — on this click-thru, multi-surface compositor the arrow simply stayed (field 2026-09-20: "a normal teeny tiny one" beside the painted shape). Hiding the pointer process-wide is what a viewer painting the host's cursor actually wants, and it is undone the moment the app asks for any other icon or the pointer leaves.
     #[cfg(target_os = "macos")]
     os_cursor_hidden: bool,
@@ -1223,6 +1226,8 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             #[cfg(target_os = "linux")]
             span_pushed_back: None,
             span_moved_back: None,
+            started: std::time::Instant::now(),
+            last_monitor_move: None,
             #[cfg(target_os = "macos")]
             os_cursor_hidden: false,
             wake_pump: 0,
@@ -2145,25 +2150,46 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
         }
     }
 
-    /// Surface `si`'s OS window moved. Linux's one spanning surface is placed by fluor alone at the desktop's origin — every blit is `window_rect − surface.origin` — so any other position is the window manager's placement policy, and the app would draw displaced by the difference. Move it back every time; a WM that imposes the same position again within a second has its position adopted as the surface's origin, so the blit at least follows where the surface really is.
+    /// Surface `si`'s OS window moved. Linux's one spanning surface is placed by fluor alone at the desktop's origin — every blit is `window_rect − surface.origin` — so any other position is the window manager's doing, and the app would draw displaced by the difference. Move it back every time; a WM that imposes the same position again within a second has its position adopted as the surface's origin, so the blit at least follows where the surface really is.
+    /// A move is also how the WM carries out the user's own "move to monitor" — its window menu, the taskbar's, the Super+Shift+Arrow shortcut — on what it takes for an ordinary window, so it is read as that request too: the visible window goes to the monitor the WM sent the surface to (the monitor whose origin is nearest the new position). The WM only knows the surface, which sits on the monitor at the desktop's origin; when the visible window is already where the WM sent it, the user is asking for the WM's starting monitor, so with two monitors a request always toggles. Not a request: a move in the host's first two seconds (the WM placing a new window) or within half a second of fluor's own move-to-monitor (the WM acting on the same shortcut fluor already answered from its raw keys).
     #[cfg(target_os = "linux")]
     fn handle_surface_moved(&mut self, si: usize, pos: (i32, i32)) {
         if si != 0 || pos == self.surfaces[0].origin {
             return;
         }
         let insists = self.span_moved_back.is_some_and(|(p, t)| p == pos && t.elapsed() < std::time::Duration::from_secs(1));
-        if !insists {
-            let origin = self.surfaces[0].origin;
-            log::info!("FLUOR-MON: the window manager moved the spanning surface to {pos:?} (ours is at {origin:?}) — putting it back");
-            self.span_moved_back = Some((pos, std::time::Instant::now()));
-            self.surfaces[0].window.set_outer_position(winit::dpi::PhysicalPosition::new(origin.0, origin.1));
+        if insists {
+            log::info!("FLUOR-MON: the window manager insists on {pos:?} for the spanning surface — adopting it");
+            self.surfaces[0].origin = pos;
+            self.push_input_region(0);
+            self.pending_full_repaint = true;
+            self.surfaces[0].window.request_redraw();
             return;
         }
-        log::info!("FLUOR-MON: the window manager insists on {pos:?} for the spanning surface — adopting it");
-        self.surfaces[0].origin = pos;
-        self.push_input_region(0);
-        self.pending_full_repaint = true;
-        self.surfaces[0].window.request_redraw();
+        let origin = self.surfaces[0].origin;
+        log::info!("FLUOR-MON: the window manager moved the spanning surface to {pos:?} (ours is at {origin:?}) — putting it back");
+        self.span_moved_back = Some((pos, std::time::Instant::now()));
+        self.surfaces[0].window.set_outer_position(winit::dpi::PhysicalPosition::new(origin.0, origin.1));
+        let placing = self.started.elapsed() < std::time::Duration::from_secs(2);
+        let answered = self.last_monitor_move.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(500));
+        if placing || answered || self.monitors.len() < 2 {
+            return;
+        }
+        let nearest = |p: (i32, i32)| {
+            self.monitors.iter().copied().min_by_key(|m| {
+                let (dx, dy) = ((m.origin.0 - p.0) as i64, (m.origin.1 - p.1) as i64);
+                dx * dx + dy * dy
+            })
+        };
+        let here = self.window_monitor();
+        let (Some(sent), Some(from)) = (nearest(pos), nearest(origin)) else {
+            return;
+        };
+        let there = if sent.origin != here.origin { sent } else { from };
+        if there.origin != here.origin {
+            log::info!("FLUOR-MON: window-manager move-to-monitor {:?} → {:?}", here.origin, there.origin);
+            self.move_window_to(here, there);
+        }
     }
 
     /// Surface `si`'s OS window resized. In the fullscreen-compositor architecture the OS surface is the whole monitor — `size` is that surface's size, not the consumer-visible viewport. WMs commonly fire Resized multiple times during fullscreen activation (default-window-size → animating → final fullscreen); each tick we resize the surface buffers to match, re-centre the visible window inside the new bounds (when it lives on this surface), and re-issue the input region. Suppresses the "chrome appears in the top-left of a growing window" artefact during WM fullscreen animations.
@@ -3164,6 +3190,10 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             116 => (0, 1),
             _ => return,
         };
+        // The WM's own move of the surface for this same chord can land first; it was answered there (handle_surface_moved), so this one would be a second step.
+        if self.last_monitor_move.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(500)) {
+            return;
+        }
         self.move_to_monitor_dir(dx, dy);
     }
 
@@ -3191,11 +3221,18 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
         let Some((_, there)) = best else {
             return;
         };
+        log::info!("FLUOR-MON: move-to-monitor ({dx}, {dy}) {:?} → {:?}", here.origin, there.origin);
+        self.move_window_to(here, there);
+    }
+
+    /// Carry the visible window from monitor `here` to monitor `there`: its size and its place relative to the work area kept, clamped onto the new one; a maximized window stays maximized there, its restore rect travelling with it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn move_window_to(&mut self, here: MonitorRect, there: MonitorRect) {
+        self.last_monitor_move = Some(std::time::Instant::now());
         let area = |m: &MonitorRect| if m.work_area.2 > 1 && m.work_area.3 > 1 { m.work_area } else { (m.origin.0, m.origin.1, m.size.0, m.size.1) };
         let (fx, fy, _, _) = area(&here);
         let (tx, ty, tw, th) = area(&there);
         let carry = |r: WindowRect| WindowRect { x: r.x - fx + tx, y: r.y - fy + ty, w: r.w, h: r.h };
-        log::info!("FLUOR-MON: move-to-monitor ({dx}, {dy}) {:?} → {:?}", here.origin, there.origin);
         let rect = match self.saved_rect_for_maximize {
             Some(prev) => {
                 self.saved_rect_for_maximize = Some(self.clamp_rect_to_monitors(carry(prev)));
