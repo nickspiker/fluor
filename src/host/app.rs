@@ -667,6 +667,11 @@ pub trait FluorApp<P: crate::pixel::Pixel = crate::pixel::Argb8> {
         let _ = (factor, anchor_x, anchor_y, ctx);
     }
 
+    /// A pinch that zoomed has ended (its fingers lifted): the edge to keep the zoom on, as the desktop's modifier release is for its chords. Called by the ferros host (2026-11-16); Android's pinch end still reaches an app thru its own JNI (photon's `take_scale_ended`) until its host calls this too. Default: nothing.
+    fn on_zoom_end(&mut self, ctx: &mut Context) {
+        let _ = ctx;
+    }
+
     /// Does the app claim the zoom gesture for itself right now (a fullscreen image viewer scaling its content)? When true the host leaves the viewport's `ru` untouched and still delivers `on_zoom` with the raw gesture factor — the app owns the whole transform, so a pinch or Ctrl+wheel zooms the picture and never the UI under it. Default: false — zoom changes the viewport.
     fn owns_zoom_gesture(&self) -> bool {
         false

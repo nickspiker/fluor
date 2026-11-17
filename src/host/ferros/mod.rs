@@ -339,6 +339,14 @@ pub struct FerrosShell<A: FluorApp<P>, P: PanelPixel = Argb8> {
     touch_travel: Coord,
     /// The contact the pointer follows: the first finger down, until it leaves.
     finger: Option<u8>,
+    /// The two fingers of a pinch (id, x, y), the first the pointer's finger; a slot is None once its finger lifted. Set when a second finger lands while the first is down.
+    pinch: [Option<(u8, Coord, Coord)>; 2],
+    /// The pointer is silent until every finger has lifted: a second finger cancelled it (as Android's host does on a second finger's CANCEL), so the pinch's end never reads as a tap or a drag.
+    pinch_muted: bool,
+    /// The pinch fingers' distance at the last move, the denominator of the next move's scale factor.
+    pinch_d: Coord,
+    /// This pinch scaled at least once: its end is told to the app (`FluorApp::on_zoom_end`) when its first finger lifts.
+    pinch_scaled: bool,
     close: bool,
     /// Frames drawn, for the first-frame rule and the console line.
     pub frames: u64,
@@ -376,6 +384,10 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             touch_last_y: 0.0,
             touch_travel: 0.0,
             finger: None,
+            pinch: [None, None],
+            pinch_muted: false,
+            pinch_d: 0.0,
+            pinch_scaled: false,
             close: false,
             frames: 0,
             wake,
@@ -409,7 +421,8 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         }
         if let Some(ru) = self.app.take_zoom_request() {
             if ru.is_finite() && ru > 0.0 {
-                self.set_zoom_and_relayout(ru);
+                let (w, h) = (self.viewport.width_px as Coord, self.viewport.height_px as Coord);
+                self.set_zoom_and_relayout(ru, w / 2.0, h / 2.0);
             }
         }
         if self.with_context(|app, ctx| app.tick(ctx)) {
@@ -424,8 +437,13 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
 
     /// Behind or in front again (the display's op 62). Behind: the finger let go (no touch reaches this window until it is back), and the app told it lost focus (`Focused(false)`, `on_focus_changed(false)`: draw nothing, play nothing but notifications). In front: focus back, `on_window_shown`, and the next frame drawn whole.
     pub fn set_behind(&mut self, behind: bool) {
-        if behind && self.finger.take().is_some() {
+        if behind && self.finger.take().is_some() && !self.pinch_muted {
             self.on_pointer(&[FEvent::CursorLeft]);
+        }
+        if behind {
+            self.pinch = [None, None];
+            self.pinch_muted = false;
+            self.pinch_scaled = false;
         }
         if self.dispatch(&FEvent::Focused(!behind)) == EventResponse::Close {
             self.close = true;
@@ -548,22 +566,95 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         }
     }
 
-    /// Contact records in, pointer events out: the first finger down is the pointer; a second finger is ignored for now (pinch comes with the input work).
+    /// Contact records in, pointer events out: the first finger down is the pointer.
+    /// A second finger while the first is down is a pinch (ferros, 2026-11-16, the owner: pinch did nothing in Photon): the pointer is cancelled (`CursorLeft`, as Android's host gets a CANCEL on a second finger) and stays silent until every finger has lifted, and each move scales by the ratio of the two fingers' distance to its last, anchored at their midpoint (`on_scale`, Android's `on_scale`). A third finger is not followed.
     pub fn on_contacts(&mut self, contacts: &[Contact]) {
         for c in contacts {
+            let (x, y) = (c.x as Coord, c.y as Coord);
             match (c.phase, self.finger) {
-                (0, None) => {
+                (0, None) if !self.pinch_muted => {
                     self.finger = Some(c.id);
-                    self.on_pointer(&[FEvent::CursorMoved { x: c.x as Coord, y: c.y as Coord }, FEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left }]);
+                    self.pinch[0] = Some((c.id, x, y));
+                    self.on_pointer(&[FEvent::CursorMoved { x, y }, FEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left }]);
                 }
-                (1, Some(id)) if id == c.id => self.on_pointer(&[FEvent::CursorMoved { x: c.x as Coord, y: c.y as Coord }]),
+                (0, Some(_)) if !self.pinch_muted => {
+                    self.pinch[1] = Some((c.id, x, y));
+                    self.pinch_muted = true;
+                    self.on_pointer(&[FEvent::CursorLeft]);
+                    self.pinch_d = self.pinch_distance();
+                }
+                (1, _) if self.pinch_muted => {
+                    for (id, px, py) in self.pinch.iter_mut().flatten() {
+                        if *id == c.id {
+                            (*px, *py) = (x, y);
+                        }
+                    }
+                    let d = self.pinch_distance();
+                    // WHY: the contacts are the touch controller's report, external input: two fingers reported at one point give a distance of 0, and a ratio against it is infinite or NaN. A pinch with a finger lifted gives 0 too (`pinch_distance`), and scales nothing.
+                    if d > 0.0 && self.pinch_d > 0.0 {
+                        let (ax, ay) = self.pinch_mid();
+                        self.on_scale(d / self.pinch_d, ax, ay);
+                        self.pinch_scaled = true;
+                    }
+                    self.pinch_d = d;
+                }
+                (1, Some(id)) if id == c.id => {
+                    self.pinch[0] = Some((c.id, x, y));
+                    self.on_pointer(&[FEvent::CursorMoved { x, y }]);
+                }
+                (2, _) if self.pinch_muted => {
+                    for slot in self.pinch.iter_mut() {
+                        if slot.is_some_and(|(id, _, _)| id == c.id) {
+                            *slot = None;
+                        }
+                    }
+                    if self.finger == Some(c.id) {
+                        self.finger = None;
+                    }
+                    self.pinch_d = 0.0;
+                    if self.pinch_scaled {
+                        self.pinch_scaled = false;
+                        self.with_context(|app, ctx| app.on_zoom_end(ctx));
+                    }
+                    if self.pinch == [None, None] {
+                        self.pinch_muted = false;
+                        self.finger = None;
+                    }
+                }
                 (2, Some(id)) if id == c.id => {
                     self.finger = None;
+                    self.pinch[0] = None;
                     self.on_pointer(&[FEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left }]);
                 }
                 _ => {}
             }
         }
+    }
+
+    /// The pinch fingers' distance in frame pixels; 0 while either has lifted.
+    fn pinch_distance(&self) -> Coord {
+        match self.pinch {
+            [Some((_, ax, ay)), Some((_, bx, by))] => ((bx - ax) * (bx - ax) + (by - ay) * (by - ay)).sqrt(),
+            _ => 0.0,
+        }
+    }
+
+    /// The pinch fingers' midpoint, the zoom's anchor.
+    fn pinch_mid(&self) -> (Coord, Coord) {
+        match self.pinch {
+            [Some((_, ax, ay)), Some((_, bx, by))] => ((ax + bx) / 2.0, (ay + by) / 2.0),
+            _ => (self.viewport.width_px as Coord / 2.0, self.viewport.height_px as Coord / 2.0),
+        }
+    }
+
+    /// One step of a pinch, as the Android host's `on_scale`: an app that owns the gesture (a picture viewer) gets the factor and the anchor, the viewport untouched; otherwise the viewport's `ru` is scaled and the layout run again.
+    fn on_scale(&mut self, factor: f32, ax: Coord, ay: Coord) {
+        if self.app.owns_zoom_gesture() {
+            self.window.mark_dirty();
+            self.with_context(|app, ctx| app.on_zoom(factor, ax, ay, ctx));
+            return;
+        }
+        self.set_zoom_and_relayout(self.viewport.ru * factor, ax, ay);
     }
 
     fn on_pointer(&mut self, evs: &[FEvent]) {
@@ -642,13 +733,13 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         self.with_context(|app, ctx| app.on_event(ev, ctx))
     }
 
-    fn set_zoom_and_relayout(&mut self, new_ru: f32) {
+    /// The viewport's `ru` set (thru `set_zoom`, the production clamp) and the layout run again; `on_zoom` told the applied ratio at the anchor (a pinch's midpoint, else the frame's centre).
+    fn set_zoom_and_relayout(&mut self, new_ru: f32, ax: Coord, ay: Coord) {
         let ru_before = self.viewport.ru;
         self.viewport.set_zoom(new_ru);
         self.window.mark_dirty();
         let (w, h) = (self.viewport.width_px, self.viewport.height_px);
         let factor = self.viewport.ru / ru_before;
-        let (ax, ay) = (w as Coord / 2.0, h as Coord / 2.0);
         self.with_context(|app, ctx| {
             if factor != 1.0 {
                 app.on_zoom(factor, ax, ay, ctx);

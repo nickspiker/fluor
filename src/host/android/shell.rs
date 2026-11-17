@@ -383,6 +383,11 @@ impl<A: FluorApp<P>, P: Finalize> AndroidShell<A, P> {
         self.set_zoom_and_relayout(self.viewport.ru * scale_factor);
     }
 
+    /// The pinch ended (the platform's scale-end, Kotlin's `onScaleEnd`): the app told once (`FluorApp::on_zoom_end`), the edge to keep the zoom on, as the ferros host tells it when a pinch's fingers lift.
+    pub fn on_scale_end(&mut self) {
+        self.with_context(|app, ctx| app.on_zoom_end(ctx));
+    }
+
     /// Set the viewport's `ru` to an absolute value and re-run layout — the pinch's tail, and the one-shot restore of the persisted per-device zoom (`FluorApp::take_zoom_request`, drained at the top of `draw`). Until 2026-09-13 only the winit host drained that request: Android logged "restoring device zoom" and never applied it (Brittany's Samsung, "the scale didn't remember").
     fn set_zoom_and_relayout(&mut self, new_ru: f32) {
         let ru_before = self.viewport.ru;
