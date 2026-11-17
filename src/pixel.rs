@@ -180,6 +180,11 @@ pub trait Pixel: Blend + Copy + Eq + Send + Sync + core::fmt::Debug + 'static {
             dst[i] = dst[i].under(src, BlendMode::Normal);
         }
     }
+    /// A run of 16-bit pixels as this depth's own when this depth is [`G2t16`], None at any other: lets generic code read a cache kept at 16 bits (the noise field, widened once: [`crate::paint::NoiseField`]) without a copy.
+    #[inline(always)]
+    fn of_g2t16(_run: &[G2t16]) -> Option<&[Self]> {
+        None
+    }
 }
 
 impl Pixel for Argb8 {
@@ -322,6 +327,10 @@ impl Pixel for G2t16 {
     /// `g2t` decodes a code at its bucket bottom, `atanh(code / 2ⁿ)²`, so 8-bit code `c` and 16-bit code `c × 2⁸` are the same encoded value and the same light, and VSF's settled encoder sends that light back to exactly `c × 2⁸` (held to vsf's codec by a test over all 256 codes).
     /// In darkness that is `65535 − 256·(255 − d) = 256·d + 255`.
     /// α is a fraction of full, not a code: `α × 257` takes 255 to 65535 and every byte to the same fraction.
+    #[inline(always)]
+    fn of_g2t16(run: &[G2t16]) -> Option<&[Self]> {
+        Some(run)
+    }
     #[inline(always)]
     fn from_g2t8(c: u32) -> Self {
         let wide = |d: u32| (d << 8) | ((1 << 8) - 1);
