@@ -104,6 +104,14 @@ impl<P: Pixel> StackCompositor<P> {
 
     /// Resize all layers and invalidate caches.
     pub fn resize(&mut self, width: usize, height: usize) {
+        // The same size (a zoom changes the relative unit, not the window): every layer marked dirty, nothing reallocated or zero-filled (2026-11-17, the Pro: 32 MB a layer filled on every pinch step, about 25 ms of the UI thread a step). Every layer's raster clears it before drawing on its dirty cycle (DefaultChrome's bg and chrome; Photon builds no Group of its own, photon-02, 2026-11-17).
+        if width * height == self.size {
+            for layer in &mut self.layers {
+                layer.dirty = true;
+            }
+            self.composite.clear();
+            return;
+        }
         self.size = width * height;
         for layer in &mut self.layers {
             layer.resize(self.size);
