@@ -17,6 +17,13 @@ fn force_sequential() -> bool {
     FORCE_SEQUENTIAL.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether a pass that dispatches to the workers by hand (not thru [`par_rows`] or [`par_chunks`]) must run on the caller's thread instead: [`FORCE_SEQUENTIAL`].
+#[inline]
+#[cfg(feature = "rayon")]
+pub(crate) fn sequential() -> bool {
+    force_sequential()
+}
+
 /// Iterate `pixels` row-by-row over `row_start..row_end`, calling `f(row_index, &mut row_slice)` for each row. Each `row_slice` is exactly `width` elements (`u32` pixels, or the F16 surface's `u64`). With `rayon` enabled and [`FORCE_SEQUENTIAL`] clear, rows are dispatched in parallel; otherwise sequentially.
 ///
 /// Pre-conditions: `pixels.len() >= row_end * width` and `row_start <= row_end`. No internal clamping — the caller (a clipped rasterizer or a boundary pass) is responsible for shaping the range to fit the buffer.

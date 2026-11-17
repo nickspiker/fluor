@@ -222,9 +222,10 @@ pub fn shift_screen_wrap(screen: &mut [u32], scr_w: usize, scr_h: usize, dx: i32
 ///
 /// Sign: `dy > 0` moves content DOWN (band exposed at the TOP of the rect); `dy < 0` moves content UP (band exposed at the BOTTOM). `|dy| ≥ rect height` is a no-op — nothing survives the shift, so the caller should just repaint the whole rect (a full repaint, not a scroll-copy). All bounds are clamped to the buffer, so out-of-range input is safe (no panic, no-op on a degenerate rect).
 ///
-/// Per row: one `copy_within` (lowers to `memmove`). Rows are copied in the order that never reads an already-overwritten source (bottom-up for a down-shift, top-down for an up-shift); source and destination rows are always distinct, so no single copy overlaps itself.
+/// Per row: one copy of the row's span (lowers to `memcpy`: a row's source and destination are distinct rows, so no copy overlaps itself). Rows are copied in the order that never reads an already-overwritten source (bottom-up for a down-shift, top-down for an up-shift).
+/// A move of at least [`PAR_MOVE`] pixels is split into column stripes across the worker cores (2026-11-17, the Pro: a scroll frame moved Photon's 30 MB pane on one A715, in the scratch and again in the surface): a stripe's rows depend only on that stripe's own rows above or below, so the stripes run in any order and never touch one another's pixels, where bands of rows would read rows another band writes.
 #[allow(clippy::too_many_arguments)]
-pub fn scroll_copy_rect<T: Copy>(
+pub fn scroll_copy_rect<T: Copy + Send + Sync>(
     screen: &mut [T],
     scr_w: usize,
     scr_h: usize,
@@ -247,6 +248,37 @@ pub fn scroll_copy_rect<T: Copy>(
     if n >= rows {
         return; // Shifted entirely out — nothing survives; caller repaints the whole rect.
     }
+    #[cfg(feature = "rayon")]
+    if (x1 - x0) * (rows - n) >= PAR_MOVE && !crate::par::sequential() {
+        use rayon::prelude::*;
+        // The rect is inside the buffer (cut above): rows y0..y1 of scr_w pixels must be in it, or the raw copies below would run past it.
+        assert!(y1 * scr_w <= screen.len(), "a {} pixel screen is short of {} rows of {}", screen.len(), y1, scr_w);
+        // Stripe edges on whole cache lines of the buffer (64 bytes: 8 pixels of 8 bytes, 16 of 4), so no two cores write one line; two stripes a worker, so a core busy elsewhere leaves its share to the others.
+        let line = (64 / core::mem::size_of::<T>()).next_power_of_two();
+        let first = x0 & !(line - 1);
+        let step = ((x1 - first).div_ceil(2 * rayon::current_num_threads()) + line - 1) & !(line - 1);
+        let stripes = (x1 - first).div_ceil(step);
+        let base = SendPtr(screen.as_mut_ptr());
+        (0..stripes).into_par_iter().for_each(|i| {
+            // The stripe's columns: its share of the line-aligned span; the first starts at x0 (not the line before it), and the last ends at x1. These are the span's pieces, not clamps.
+            let a = if i == 0 { x0 } else { first + i * step };
+            let b = if i + 1 == stripes { x1 } else { first + (i + 1) * step };
+            let p = base.get();
+            // SAFETY: rows y0..y1 and columns a..b (a < b ≤ x1 ≤ scr_w) are inside `screen` (the assert above); a stripe reads and writes only its own columns, which no other stripe holds, and `screen` is borrowed mutably for the whole call, so nothing else touches it meanwhile; a source row and a destination row differ (n ≥ 1), so no copy's ranges overlap.
+            unsafe {
+                if dy > 0 {
+                    for dst in (y0 + n..y1).rev() {
+                        core::ptr::copy_nonoverlapping(p.add((dst - n) * scr_w + a), p.add(dst * scr_w + a), b - a);
+                    }
+                } else {
+                    for dst in y0..y1 - n {
+                        core::ptr::copy_nonoverlapping(p.add((dst + n) * scr_w + a), p.add(dst * scr_w + a), b - a);
+                    }
+                }
+            }
+        });
+        return;
+    }
     let span = x1 - x0;
     if dy > 0 {
         // Content moves DOWN: dst row (y0+n .. y1) ← src row (y0 .. y1−n). Walk bottom-up so a source row is copied before a lower destination overwrites it.
@@ -267,7 +299,26 @@ pub fn scroll_copy_rect<T: Copy>(
     }
 }
 
-/// Combined finalize + blit: same per-pixel math as [`finalize_for_os`] (the pixel over black thru the display map, clip_mask multiplied into α and the colour) but reads from a `(win_w × win_h)` scratch buffer and writes into a `(scr_w × scr_h)` screen buffer at the offset `(rect_x, rect_y)`. Used by the fullscreen-compositor host path: the consumer renders into the scratch (window-space, contiguous), this function reads scratch + clip_mask once per pixel and writes the OS-ready ARGB into the screen buffer's sub-rect. The scratch buffer is **not mutated** — its α + darkness convention is preserved so a future incremental-rendering path can reuse it across frames without forcing a full re-render.
+/// The fewest pixels [`scroll_copy_rect`] splits across the workers: 2¹⁶, about 50 rows of a phone's width; one core moves fewer in about what a dispatch costs.
+pub const PAR_MOVE: usize = 1 << 16;
+
+/// A buffer's base handed to the worker cores of one [`scroll_copy_rect`], each of which writes only columns no other touches. `get` makes a closure capture the wrapper, not its raw field.
+#[cfg(feature = "rayon")]
+#[derive(Clone, Copy)]
+struct SendPtr<T>(*mut T);
+#[cfg(feature = "rayon")]
+impl<T> SendPtr<T> {
+    fn get(self) -> *mut T {
+        self.0
+    }
+}
+// SAFETY: made only by `scroll_copy_rect`, from a buffer it holds mutably for the whole dispatch, whose stripes write disjoint columns (see there).
+#[cfg(feature = "rayon")]
+unsafe impl<T: Send> Send for SendPtr<T> {}
+#[cfg(feature = "rayon")]
+unsafe impl<T: Send> Sync for SendPtr<T> {}
+
+/// Combined finalize + blit:same per-pixel math as [`finalize_for_os`] (the pixel over black thru the display map, clip_mask multiplied into α and the colour) but reads from a `(win_w × win_h)` scratch buffer and writes into a `(scr_w × scr_h)` screen buffer at the offset `(rect_x, rect_y)`. Used by the fullscreen-compositor host path: the consumer renders into the scratch (window-space, contiguous), this function reads scratch + clip_mask once per pixel and writes the OS-ready ARGB into the screen buffer's sub-rect. The scratch buffer is **not mutated** — its α + darkness convention is preserved so a future incremental-rendering path can reuse it across frames without forcing a full re-render.
 ///
 /// `over`: the scratch goes over an under layer the GPU present lays beneath it — partly covering pixels are finalized as their own colour mapped first and premultiplied on display codes (see [`finalize_over_chunk`]), not as the pixel over black in `g2t` codes.
 ///
@@ -1140,5 +1191,37 @@ mod over_black_tests {
         let mut df = [0u64; 2];
         finalize_into_f16(&[black8, white8], &[255; 2], 2, 1, &mut df, 2, &tf);
         assert_eq!(((df[0] & 0xFFFF) as u16, (df[1] & 0xFFFF) as u16), (tf.half[e8(black8)], tf.half[e8(white8)]));
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+
+    /// The row-by-row move, one row at a time in the safe order: what the striped one must equal.
+    fn reference(screen: &mut [u64], w: usize, x0: usize, y0: usize, x1: usize, y1: usize, dy: i32) {
+        let n = dy.unsigned_abs() as usize;
+        let rows: alloc::vec::Vec<usize> = if dy > 0 { (y0 + n..y1).rev().collect() } else { (y0..y1 - n).collect() };
+        for d in rows {
+            let s = if dy > 0 { d - n } else { d + n };
+            screen.copy_within(s * w + x0..s * w + x1, d * w + x0);
+        }
+    }
+
+    /// Moves big enough to go to the workers (striped by columns) equal the row-by-row move, both ways, at rects whose edges are and are not on cache lines, and leave everything outside the rect alone.
+    #[test]
+    fn the_striped_move_is_the_row_move() {
+        let (w, h) = (1344, 300);
+        let start: alloc::vec::Vec<u64> = (0..(w * h) as u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        for &(x0, x1) in &[(0, w), (3, w - 5), (17, 700), (640, 1344)] {
+            for &dy in &[1i32, -1, 37, -37, 255, -296] {
+                let (y0, y1) = (2, h - 1);
+                let mut a = start.clone();
+                let mut b = start.clone();
+                scroll_copy_rect(&mut a, w, h, x0, y0, x1, y1, dy);
+                reference(&mut b, w, x0, y0, x1, y1, dy);
+                assert!(a == b, "rect {x0}..{x1}, dy {dy}");
+            }
+        }
     }
 }
