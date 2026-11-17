@@ -580,6 +580,8 @@ pub struct Context<'a> {
     pub damage: &'a mut crate::canvas::Damage,
     /// The damage clip the host computed for THIS frame, derived from `app.damage_rect(...)` before render. Consumers should thread this thru every flatten / blit / glow call as the `clip` parameter so they only touch pixels inside the dirty region. Defaults to the full viewport (legacy apps that don't override `FluorApp::damage_rect` get the current full-redraw behavior).
     pub damage_clip: crate::canvas::PixelRect,
+    /// The frame's damage as the rects the host cleared and will present (`damage_clip` is their bounding box): what the app may draw this frame, and nothing outside them ([`FluorApp::damage_rects`]). Read it thru [`Context::damage_rects`]: empty here means `damage_clip` alone. Several only when the app named several and the host takes them apart (ferros and Android do; the desktop host takes their bounding box as the one rect).
+    pub damage_rects: crate::canvas::DamageRects,
     /// App-facing window handle. `WindowHandle` is intentionally minimal — only `request_redraw` lives there because it's the only window operation real apps invoke from the trait surface. Cursor / drag / maximize / minimize flow thru [`EventResponse`] variants instead, so the host's window state stays the single source of truth.
     pub window: &'a dyn WindowHandle,
     /// Latest tracked modifier state (shift / ctrl / alt / super) in fluor-native form. Hosts translate from platform input (winit `ModifiersState`, Android JNI mod-key flags) before constructing this.
@@ -593,6 +595,23 @@ pub struct Context<'a> {
     pub window_origin: (i32, i32),
     /// The hit id currently held DOWN under the pointer and eligible to fire on release — the host's [`crate::host::pointer::PointerArbiter`] state, surfaced so the app can paint that element in its "held" colour (see [`crate::theme::BUTTON_HELD`]). `HIT_NONE` when nothing is pressed, or when a press has been dragged off its target. Consult it in `render` for custom hit-stamped elements; widget trees get it applied automatically via [`crate::host::widget::apply_pressed`].
     pub pressed_hit: crate::paint::HitId,
+}
+
+/// The app's damage this frame ([`FluorApp::damage_rects`]): None when it changed nothing (its count 0), else its rects, the empty ones left out.
+pub fn app_damage<P: crate::pixel::Pixel, A: FluorApp<P> + ?Sized>(app: &mut A, viewport: Viewport) -> Option<crate::canvas::DamageRects> {
+    let mut out = [crate::canvas::PixelRect::empty(); crate::canvas::DAMAGE_RECTS];
+    let n = app.damage_rects(viewport, &mut out);
+    (n != 0).then(|| crate::canvas::DamageRects::from_slice(&out[..n]))
+}
+
+impl Context<'_> {
+    /// The rects the app may draw this frame: `damage_rects`, or `damage_clip` alone where the host named none (every context made outside a render).
+    pub fn damage_rects(&self) -> &[crate::canvas::PixelRect] {
+        match self.damage_rects.as_slice() {
+            [] => core::slice::from_ref(&self.damage_clip),
+            r => r,
+        }
+    }
 }
 
 pub use super::event_response::EventResponse;
@@ -714,6 +733,23 @@ pub trait FluorApp<P: crate::pixel::Pixel = crate::pixel::Argb8> {
         let w = viewport.width_px as usize;
         let h = viewport.height_px as usize;
         Some(crate::canvas::PixelRect::new(0, 0, w, h))
+    }
+
+    /// [`Self::damage_rect`] as up to [`crate::canvas::DAMAGE_RECTS`] disjoint rects in `out`, how many returned (0: nothing changed, as `damage_rect`'s `None`). The host clears each, hands them to `render` in `ctx.damage_rects` (with their bounding box as `ctx.damage_clip`) and presents each; an app that names several draws inside them alone, since a host that takes them apart neither clears nor presents what lies between them (2026-11-17, the Pro: a scroll's exposed band and the orb's overlay at the pane's other end made one box of 16 % of the frame for a 20-row move).
+    /// The default is `damage_rect`'s one rect, and every app that names one is unchanged.
+    fn damage_rects(&mut self, viewport: Viewport, out: &mut [crate::canvas::PixelRect; crate::canvas::DAMAGE_RECTS]) -> usize {
+        match self.damage_rect(viewport) {
+            Some(r) => {
+                out[0] = r;
+                1
+            }
+            None => 0,
+        }
+    }
+
+    /// Nothing of the scratch outside the frame's damage is ever read by this app, its render included (it draws only inside the damage, never reading a pixel to compose with outside it), so a host whose present keeps its own copy of the frame (ferros: the surface, moved by the scroll hint itself) may leave the scratch outside the damage stale: a scroll frame's move of the scratch is then skipped (ferros, 2026-11-17: one of the two 30 MB moves of Photon's scroll frame on the Pro, 7 to 8 ms). False (the default): the scratch is moved as always.
+    fn scratch_unread_outside_damage(&self) -> bool {
+        false
     }
 
     /// Optional scroll-copy hint for THIS frame: `(rect, dy)` declaring that the contents of `rect` (viewport pixels) translated RIGIDLY by `dy` viewport pixels since the last frame — positive `dy` = moved down. When present and this is NOT a full repaint, the host `memmove`s that region of `persistent_screen` by `dy` (scaled to backing pixels) BEFORE finalize, so the only pixels that get redrawn are the freshly-exposed band the app reports through [`Self::damage_rect`] — a scroll becomes a copy plus a sliver instead of a whole-pane redraw.
@@ -1731,6 +1767,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
         if let (Some(window), Some(text)) = (self.home_window(), self.text.as_mut()) {
             let mut ctx = Context {
                 pressed_hit: self.pointer.held_id(),
+                damage_rects: crate::canvas::DamageRects::EMPTY,
                 viewport: self.viewport,
                 text,
                 clip_mask: &mut self.clip_mask,
@@ -1846,6 +1883,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             {
                 let mut ctx = Context {
                     pressed_hit: self.pointer.held_id(),
+                    damage_rects: crate::canvas::DamageRects::EMPTY,
                     viewport: vp,
                     text: &mut *text,
                     clip_mask: clip_mask.as_mut_slice(),
@@ -1863,6 +1901,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             {
                 let mut ctx = Context {
                     pressed_hit: self.pointer.held_id(),
+                    damage_rects: crate::canvas::DamageRects::EMPTY,
                     viewport: vp,
                     text: &mut *text,
                     clip_mask: clip_mask.as_mut_slice(),
@@ -1885,6 +1924,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
         if let Some(text) = self.text.as_mut() {
             let mut ctx = Context {
                 pressed_hit: self.pointer.held_id(),
+                damage_rects: crate::canvas::DamageRects::EMPTY,
                 viewport: self.viewport,
                 text,
                 clip_mask: &mut self.clip_mask,
@@ -2389,6 +2429,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
                 if let (Some(window), Some(text)) = (self.home_window(), self.text.as_mut()) {
                     let mut ctx = Context {
                         pressed_hit: self.pointer.held_id(),
+                        damage_rects: crate::canvas::DamageRects::EMPTY,
                         viewport: self.viewport,
                         text,
                         clip_mask: &mut self.clip_mask,
@@ -2525,9 +2566,8 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
         let damage_clip = if full_repaint {
             viewport_rect
         } else {
-            self.app
-                .damage_rect(self.viewport)
-                .unwrap_or(crate::canvas::PixelRect::empty())
+            // The app's rects as their bounding box, cleared, drawn and finalized whole: this host keeps one damage rect (the render's context names that box as its one rect, so an app that named several draws all of it).
+            app_damage(&mut self.app, self.viewport).map_or(crate::canvas::PixelRect::empty(), |d| d.bbox())
         };
         // Strip is painted in a clobber pass AFTER finalize + overlay — it does NOT contribute to damage_clip and does NOT bump damage_pct.
 
@@ -2556,6 +2596,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
 
         let mut ctx = Context {
             pressed_hit: self.pointer.held_id(),
+            damage_rects: crate::canvas::DamageRects::EMPTY,
             viewport: self.viewport,
             text,
             clip_mask: &mut self.clip_mask,
@@ -3343,6 +3384,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             if let Some(text) = self.text.as_mut() {
                 let mut ctx = Context {
                     pressed_hit: self.pointer.held_id(),
+                    damage_rects: crate::canvas::DamageRects::EMPTY,
                     viewport: self.viewport,
                     text,
                     clip_mask: &mut self.clip_mask,
@@ -3522,6 +3564,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             if let Some(text) = self.text.as_mut() {
                 let mut ctx = Context {
                     pressed_hit: self.pointer.held_id(),
+                    damage_rects: crate::canvas::DamageRects::EMPTY,
                     viewport: self.viewport,
                     text,
                     clip_mask: &mut self.clip_mask,
@@ -3706,6 +3749,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> ApplicationHandler<A::UserEvent> for
             let text = self.text.as_mut().expect("text renderer initialized");
             let mut ctx = Context {
                 pressed_hit: self.pointer.held_id(),
+                damage_rects: crate::canvas::DamageRects::EMPTY,
                 viewport: self.viewport,
                 text,
                 clip_mask: &mut self.clip_mask,
@@ -3795,6 +3839,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> ApplicationHandler<A::UserEvent> for
             if let (Some(window), Some(text)) = (self.home_window(), self.text.as_mut()) {
                 let mut ctx = Context {
                     pressed_hit: self.pointer.held_id(),
+                    damage_rects: crate::canvas::DamageRects::EMPTY,
                     viewport: self.viewport,
                     text,
                     clip_mask: &mut self.clip_mask,
@@ -3831,6 +3876,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> ApplicationHandler<A::UserEvent> for
         {
             let mut ctx = Context {
                 pressed_hit: self.pointer.held_id(),
+                damage_rects: crate::canvas::DamageRects::EMPTY,
                 viewport: self.viewport,
                 text,
                 clip_mask: &mut self.clip_mask,
@@ -3974,6 +4020,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> ApplicationHandler<A::UserEvent> for
                 {
                     let mut ctx = Context {
                         pressed_hit: self.pointer.held_id(),
+                        damage_rects: crate::canvas::DamageRects::EMPTY,
                         viewport: self.viewport,
                         text,
                         clip_mask: &mut self.clip_mask,
@@ -4240,6 +4287,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> ApplicationHandler<A::UserEvent> for
         };
         let mut ctx = Context {
             pressed_hit: self.pointer.held_id(),
+            damage_rects: crate::canvas::DamageRects::EMPTY,
             viewport: self.viewport,
             text,
             clip_mask: &mut self.clip_mask,
@@ -4298,6 +4346,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> DesktopShell<A, P> {
             if let (Some(window), Some(text)) = (self.home_window(), self.text.as_mut()) {
                 let mut ctx = Context {
                     pressed_hit: self.pointer.held_id(),
+                    damage_rects: crate::canvas::DamageRects::EMPTY,
                     viewport: self.viewport,
                     text,
                     clip_mask: &mut self.clip_mask,
@@ -4338,6 +4387,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> DesktopShell<A, P> {
         if let (Some(window), Some(text)) = (self.home_window(), self.text.as_mut()) {
             let mut ctx = Context {
                 pressed_hit: self.pointer.held_id(),
+                damage_rects: crate::canvas::DamageRects::EMPTY,
                 viewport: self.viewport,
                 text,
                 clip_mask: &mut self.clip_mask,
@@ -4393,6 +4443,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> DesktopShell<A, P> {
             let mods = winit_compat::from_winit_mods(self.modifiers);
             let mut ctx = Context {
                 pressed_hit: crate::paint::HIT_NONE,
+                damage_rects: crate::canvas::DamageRects::EMPTY,
                 viewport: self.viewport,
                 text,
                 clip_mask: &mut self.clip_mask,
@@ -4422,6 +4473,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> DesktopShell<A, P> {
         if let (Some(window), Some(text)) = (self.home_window(), self.text.as_mut()) {
             let mut ctx = Context {
                 pressed_hit: self.pointer.held_id(),
+                damage_rects: crate::canvas::DamageRects::EMPTY,
                 viewport: self.viewport,
                 text,
                 clip_mask: &mut self.clip_mask,

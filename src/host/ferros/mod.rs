@@ -363,8 +363,8 @@ pub struct FerrosShell<A: FluorApp<P>, P: PanelPixel = Argb8> {
     scratch: Vec<P>,
     clip_mask: Vec<u8>,
     pending_damage: Damage,
-    /// What the last draw changed in the scratch: the damage it repainted and, on a memmove frame, the rect the memmove moved. The present converts only this.
-    changed: PixelRect,
+    /// What the last draw changed in the scratch: the damage's rects it repainted and, on a memmove frame whose surface is not moved with it, the rect the memmove moved (with the damage as one box). The present converts only these.
+    changed: crate::canvas::DamageRects,
     pointer: crate::host::pointer::PointerArbiter,
     touch_down: bool,
     touch_last_x: Coord,
@@ -427,7 +427,7 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             scratch: alloc::vec![P::EMPTY; px],
             clip_mask: alloc::vec![255u8; px],
             pending_damage: Damage::new(),
-            changed: PixelRect::new(0, 0, width as usize, height as usize),
+            changed: crate::canvas::DamageRects::one(PixelRect::new(0, 0, width as usize, height as usize)),
             pointer: crate::host::pointer::PointerArbiter::new(),
             touch_down: false,
             touch_last_x: 0.0,
@@ -577,7 +577,10 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         let viewport_rect = PixelRect::new(0, 0, win_w, win_h);
         // The first frame is the whole frame, whatever the app says is dirty: nothing has been shown yet. So is the first back in front: what changed while behind was never drawn.
         let forced = self.frames == 0 || core::mem::take(&mut self.full_next);
-        let damage_clip = if forced { viewport_rect } else { self.app.damage_rect(self.viewport).unwrap_or(viewport_rect) };
+        // The app's damage as the rects it named, cut at the frame (None from the app is the whole frame, as before); their bounding box is the render's clip.
+        let whole = crate::canvas::DamageRects::one(viewport_rect);
+        let rects = if forced { whole } else { crate::host::app::app_damage(&mut self.app, self.viewport).map_or(whole, |d| d.cut(win_w, win_h)) };
+        let damage_clip = rects.bbox();
         if forced {
             self.forced_whole += 1;
         } else if damage_clip == viewport_rect {
@@ -587,7 +590,7 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             return false;
         }
         self.frames += 1;
-        self.changed = damage_clip;
+        self.changed = rects;
         // The surface holds the last frame converted from the scratch unless that frame was the app's own (`render_own`): only then can it be moved as the scratch is.
         let surface_is_scratch = !self.own;
         self.shift = None;
@@ -596,12 +599,16 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         if damage_clip != viewport_rect {
             if let Some((rect, dy)) = self.app.scroll_hint(self.viewport) {
                 self.bucket = 0;
-                crate::paint::scroll_copy_rect(&mut self.scratch, win_w, win_h, rect.x0, rect.y0, rect.x1, rect.y1, dy);
                 // A scroll that moves the whole pane out (nothing of it survives the move) is converted whole, as before; otherwise the surface is moved the same rows and only the damage converted.
                 if surface_is_scratch && (dy.unsigned_abs() as usize) < rect.height() {
                     self.shift = Some((rect, dy));
+                    // The scratch is moved too unless the app never reads it outside the damage (`FluorApp::scratch_unread_outside_damage`): then only the surface, which the present converts the damage into, needs the moved pane.
+                    if !self.app.scratch_unread_outside_damage() {
+                        crate::paint::scroll_copy_rect(&mut self.scratch, win_w, win_h, rect.x0, rect.y0, rect.x1, rect.y1, dy);
+                    }
                 } else {
-                    self.changed = damage_clip.union(rect);
+                    crate::paint::scroll_copy_rect(&mut self.scratch, win_w, win_h, rect.x0, rect.y0, rect.x1, rect.y1, dy);
+                    self.changed = crate::canvas::DamageRects::one(damage_clip.union(rect));
                 }
                 self.hinted += 1;
             }
@@ -610,19 +617,21 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         self.pending_damage.clear();
         // A frame the app made itself (its GPU's layer): the scratch is neither cleared nor drawn, and the present takes the app's frame whole.
         let mut own = false;
-        self.with_context_render(damage_clip, |app, _, ctx| own = app.render_own(ctx));
+        self.with_context_render(rects, |app, _, ctx| own = app.render_own(ctx));
         self.own = own;
         if own {
-            self.changed = viewport_rect;
+            self.changed = whole;
             self.shift = None;
             return true;
         }
-        clear_scratch_rect(&mut self.scratch, win_w, damage_clip);
+        for &r in rects.as_slice() {
+            clear_scratch_rect(&mut self.scratch, win_w, r);
+        }
         let t_cleared = sys::now();
-        self.with_context_render(damage_clip, |app, scratch, ctx| app.render(scratch, ctx));
+        self.with_context_render(rects, |app, scratch, ctx| app.render(scratch, ctx));
         let t_rendered = sys::now();
-        let drawn = (damage_clip.width() * damage_clip.height()) as u64;
-        let converted = (self.changed.width() * self.changed.height()) as u64;
+        let drawn = rects.area() as u64;
+        let converted = self.changed.cut(win_w, win_h).area() as u64;
         self.drawn_px += drawn;
         self.changed_px += converted;
         let s = &mut self.stages[self.bucket];
@@ -660,22 +669,24 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             self.shown = PixelRect::new(sx0, sy0, sx1, sy1);
         }
         self.t_moved = sys::now();
-        let c = self.changed;
-        let (x0, y0, x1, y1) = (c.x0.min(w), c.y0.min(h), c.x1.min(w), c.y1.min(h));
-        if x0 >= x1 || y0 >= y1 {
+        // Each changed rect cut at the frame (`DamageRects::cut`), converted in a dispatch of its rows to the workers.
+        let changed = self.changed.cut(w, h);
+        if changed.as_slice().is_empty() {
             return;
         }
-        self.shown = self.shown.union(PixelRect::new(x0, y0, x1, y1));
+        self.shown = self.shown.union(changed.bbox());
         // The app's own frame when it made one (`render_own`), else the scratch; nothing when it put its frame in the surface itself.
         let src = match (self.own, self.app.own_frame()) {
             (true, None) => return,
             (true, Some(f)) => f,
             (false, _) => &self.scratch,
         };
-        let dst = &mut surface[(fy + y0) * stride..(fy + y1) * stride];
-        match bake {
-            Some(b) => dst.par_chunks_mut(stride).zip(src[y0 * w..y1 * w].par_chunks(w)).for_each(|(d, s)| P::to_baked(&s[x0..x1], &mut d[fx + x0..fx + x1], b)),
-            None => dst.par_chunks_mut(stride).zip(src[y0 * w..y1 * w].par_chunks(w)).for_each(|(d, s)| P::to_panel(&s[x0..x1], &mut d[fx + x0..fx + x1])),
+        for &PixelRect { x0, y0, x1, y1 } in changed.as_slice() {
+            let dst = &mut surface[(fy + y0) * stride..(fy + y1) * stride];
+            match bake {
+                Some(b) => dst.par_chunks_mut(stride).zip(src[y0 * w..y1 * w].par_chunks(w)).for_each(|(d, s)| P::to_baked(&s[x0..x1], &mut d[fx + x0..fx + x1], b)),
+                None => dst.par_chunks_mut(stride).zip(src[y0 * w..y1 * w].par_chunks(w)).for_each(|(d, s)| P::to_panel(&s[x0..x1], &mut d[fx + x0..fx + x1])),
+            }
         }
     }
 
@@ -864,6 +875,7 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
     fn with_context<R>(&mut self, f: impl FnOnce(&mut A, &mut Context) -> R) -> R {
         let mut ctx = Context {
             pressed_hit: self.pointer.held_id(),
+            damage_rects: crate::canvas::DamageRects::EMPTY,
             viewport: self.viewport,
             text: &mut self.text,
             clip_mask: &mut self.clip_mask,
@@ -879,9 +891,11 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         f(&mut self.app, &mut ctx)
     }
 
-    fn with_context_render(&mut self, damage_clip: PixelRect, f: impl FnOnce(&mut A, &mut [P], &mut Context)) {
+    fn with_context_render(&mut self, damage_rects: crate::canvas::DamageRects, f: impl FnOnce(&mut A, &mut [P], &mut Context)) {
+        let damage_clip = damage_rects.bbox();
         let mut ctx = Context {
             pressed_hit: self.pointer.held_id(),
+            damage_rects,
             viewport: self.viewport,
             text: &mut self.text,
             clip_mask: &mut self.clip_mask,

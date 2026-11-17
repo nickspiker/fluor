@@ -138,10 +138,9 @@ impl<A: FluorApp<P>, P: Finalize> AndroidShell<A, P> {
         let t0 = Instant::now();
 
         if was_dirty {
-            let damage_clip = self
-                .app
-                .damage_rect(self.viewport)
-                .unwrap_or(viewport_rect);
+            // The app's damage, as the rects it named (each cleared and handed to the render; the present below finalizes the whole frame from the scratch, so what lies between them stays as it was); None from the app is the whole frame, as before.
+            let rects = crate::host::app::app_damage(&mut self.app, self.viewport).map_or(crate::canvas::DamageRects::one(viewport_rect), |d| d.cut(win_w, win_h));
+            let damage_clip = rects.bbox();
             if !damage_clip.is_empty() {
                 // SCROLL AS A MEMMOVE (photon 2026-10-06): the app's rigid-shift hint moves the scratch rows BEFORE the damage clear (the clear would otherwise zero the memmove's source band) — the same step the desktop host takes in `render_frame`; Android has no persistent screen, so scratch is the only buffer to shift and the present finalizes it whole or by damage as it always did.
                 if damage_clip != viewport_rect {
@@ -149,9 +148,11 @@ impl<A: FluorApp<P>, P: Finalize> AndroidShell<A, P> {
                         crate::paint::scroll_copy_rect(&mut self.scratch, win_w, win_h, rect.x0, rect.y0, rect.x1, rect.y1, dy);
                     }
                 }
-                clear_scratch_rect(&mut self.scratch, win_w, damage_clip);
+                for &r in rects.as_slice() {
+                    clear_scratch_rect(&mut self.scratch, win_w, r);
+                }
                 self.pending_damage.clear();
-                self.with_context_render(damage_clip, |app, scratch, ctx| {
+                self.with_context_render(rects, |app, scratch, ctx| {
                     app.render(scratch, ctx);
                 });
             }
@@ -427,6 +428,7 @@ impl<A: FluorApp<P>, P: Finalize> AndroidShell<A, P> {
             .expect("TextRenderer must be initialized in AndroidShell::new");
         let mut ctx = Context {
             pressed_hit: self.pointer.held_id(),
+            damage_rects: crate::canvas::DamageRects::EMPTY,
             viewport: self.viewport,
             text,
             clip_mask: &mut self.clip_mask,
@@ -449,7 +451,7 @@ impl<A: FluorApp<P>, P: Finalize> AndroidShell<A, P> {
 
     fn with_context_render(
         &mut self,
-        damage_clip: PixelRect,
+        damage_rects: crate::canvas::DamageRects,
         f: impl FnOnce(&mut A, &mut [P], &mut Context),
     ) {
         let text = self
@@ -458,6 +460,7 @@ impl<A: FluorApp<P>, P: Finalize> AndroidShell<A, P> {
             .expect("TextRenderer must be initialized in AndroidShell::new");
         let mut ctx = Context {
             pressed_hit: self.pointer.held_id(),
+            damage_rects,
             viewport: self.viewport,
             text,
             clip_mask: &mut self.clip_mask,
@@ -468,7 +471,7 @@ impl<A: FluorApp<P>, P: Finalize> AndroidShell<A, P> {
             cursor_y: self.cursor_y,
             is_maximized: false,
             window_origin: (0, 0),
-            damage_clip,
+            damage_clip: damage_rects.bbox(),
         };
         f(&mut self.app, &mut self.scratch, &mut ctx);
     }
