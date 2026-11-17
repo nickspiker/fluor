@@ -907,16 +907,9 @@ fn clear_scratch_rect<P: PanelPixel>(scratch: &mut [P], width: usize, rect: Pixe
     if rect.x0 >= x1 {
         return;
     }
-    let row_len = x1 - rect.x0;
-    for y in rect.y0..rect.y1 {
-        let base = y * width + rect.x0;
-        if base + row_len > scratch.len() {
-            break;
-        }
-        for cell in &mut scratch[base..base + row_len] {
-            *cell = P::EMPTY;
-        }
-    }
+    // The rows the scratch holds of the rect (a rect past its bottom is cut there, as before), split across the workers: a whole frame's clear is 32 MB at 16 bits.
+    let (x0, y1) = (rect.x0, rect.y1.min(scratch.len() / width));
+    crate::par::par_rows(scratch, width, rect.y0.min(y1), y1, |_, row| row[x0..x1].fill(P::EMPTY));
 }
 
 /// Whether a screen point is this window's (ferros display op 27): the frontmost window covering it, inside the circle an app lives in.
@@ -1099,7 +1092,7 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             shell.present(surface, pw, fx, fy, bake.as_deref());
             let t_presented = sys::now();
             // The window (ferros WINDOWS.md): the frame's part of the screen, this surface, the app level, and what its pixels are (`PanelPixel::FORMAT`: at 16 bits fluor's own, which the display decodes).
-            // An opaque app (`FluorApp::opaque`) says so in the 28-byte form, with the frame as what changed: the display then never reads what the window covers (ferros_sys `window::show_full`, mode bit 3).
+            // An opaque app (`FluorApp::opaque`) says so in the mode byte: the display then never reads what the window covers (ferros_sys `window::show_full`, mode bit 3).
             let mut m = [0u8; 36];
             m[0] = 22;
             m[1..3].copy_from_slice(&(fx as u16).to_le_bytes());
@@ -1110,20 +1103,20 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             // Baked when this host baked the frame (`present` with the display's bake), or the app made its own frame in the surface baked itself (`FluorApp::own_baked`); else the depth's own format.
             let own_in_surface = shell.own && shell.app.own_frame().is_none();
             m[18] = if (bake.is_some() && !own_in_surface) || (own_in_surface && shell.app.own_baked()) { crate::host::panel::BAKED } else { P::FORMAT };
+            // Every show is the 28-byte form, naming what changed (ferros_sys `show_changed`): the part of the surface this present wrote (`FerrosShell::shown`: the converted damage, and on a scroll frame the moved pane), or the whole frame for the app's own frame. The display publishes only that and owes it to its other phases (2026-11-17: until then a caret's blink or a hover was a whole screen's publish).
             let opaque = shell.app.opaque();
             // An app that drew into a buffer of its own (`FluorApp::own_surface`) says which, in the 36-byte form: the display shows that buffer and answers once it has taken it (ferros GPU-KISTS.md 1.4, the mailbox).
             let own = if shell.own { shell.app.own_surface() } else { None };
-            if opaque || own.is_some() {
-                m[19..21].copy_from_slice(&(fx as u16).to_le_bytes());
-                m[21..23].copy_from_slice(&(fy as u16).to_le_bytes());
-                m[23..25].copy_from_slice(&(w as u16).to_le_bytes());
-                m[25..27].copy_from_slice(&(h as u16).to_le_bytes());
-                m[27] = if opaque { 8 } else { 0 };
-            }
+            let c = if shell.own { PixelRect::new(0, 0, w, h) } else { shell.shown };
+            m[19..21].copy_from_slice(&((fx + c.x0) as u16).to_le_bytes());
+            m[21..23].copy_from_slice(&((fy + c.y0) as u16).to_le_bytes());
+            m[23..25].copy_from_slice(&(c.width() as u16).to_le_bytes());
+            m[25..27].copy_from_slice(&(c.height() as u16).to_le_bytes());
+            m[27] = if opaque { 8 } else { 0 };
             if let Some(b) = own {
                 m[28..36].copy_from_slice(&b.to_le_bytes());
             }
-            let len = if own.is_some() { 36 } else if opaque { 28 } else { 19 };
+            let len = if own.is_some() { 36 } else { 28 };
             let mut rr = [0u8; 4];
             if sys::call(display, &m[..len], &mut rr) == sys::ERR {
                 return Err(String::from("the display refused the frame"));
