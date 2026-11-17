@@ -352,8 +352,17 @@ pub struct FerrosShell<A: FluorApp<P>, P: PanelPixel = Argb8> {
     pub frames: u64,
     /// Frames drawn since the last console line that moved the scratch by the app's scroll hint (`scroll_hint`, a memmove and the band drawn), and the pixels every frame since then drew (its damage) and converted at present (`changed`): what a scroll frame costs, said in the ten-second line.
     pub hinted: u64,
+    /// Frames since the last console line drawn whole by the host's own choice (the first, back in front, a new bake, a pinch applied), and those the app's damage named the whole frame: a full frame refuses the scroll hint (photon render.rs drops it).
+    pub forced_whole: u64,
+    pub app_whole: u64,
     /// The last draw's scroll (`scroll_hint`'s rect and rows) for the present to move the surface by too, so only the damage is converted (2026-11-17, the Pro: a scroll frame converted the whole moved pane, 15 ms of the bake a frame); None when the frame is converted where it changed.
     shift: Option<(PixelRect, i32)>,
+    /// A pinch's preview (owner, 2026-11-17: "zoom is real bad"; every step re-laid the app out, redrew and baked the whole frame, about 100 ms a step).
+    /// While two fingers move, the frame last shown is resampled about the midpoint by the pinch's whole scale so far (`preview`: that scale, unclamped, and the anchor), with no layout and no bake; the real zoom is applied once when the pinch ends.
+    /// `preview_src` holds the shown frame's surface rows, copied at the pinch's first preview frame (`preview_taken`).
+    preview: Option<(f32, Coord, Coord)>,
+    preview_src: Vec<u64>,
+    preview_taken: bool,
     pub drawn_px: u64,
     pub changed_px: u64,
     wake: Arc<FerrosWakeSender<A::UserEvent>>,
@@ -397,7 +406,12 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             close: false,
             frames: 0,
             hinted: 0,
+            forced_whole: 0,
+            app_whole: 0,
             shift: None,
+            preview: None,
+            preview_src: Vec::new(),
+            preview_taken: false,
             drawn_px: 0,
             changed_px: 0,
             wake,
@@ -454,6 +468,9 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             self.pinch = [None, None];
             self.pinch_muted = false;
             self.pinch_scaled = false;
+            // A pinch cut short by going behind is dropped, its preview with it: the frame drawn in front again is the app's own, at the zoom it had.
+            self.preview = None;
+            self.preview_taken = false;
         }
         if self.dispatch(&FEvent::Focused(!behind)) == EventResponse::Close {
             self.close = true;
@@ -525,8 +542,21 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         }
         let (win_w, win_h) = (self.viewport.width_px as usize, self.viewport.height_px as usize);
         let viewport_rect = PixelRect::new(0, 0, win_w, win_h);
+        // A pinch's preview frame: the app neither lays out nor draws; the present resamples the shown frame (`present`).
+        if self.preview.is_some() {
+            self.frames += 1;
+            self.shift = None;
+            self.changed = viewport_rect;
+            return true;
+        }
         // The first frame is the whole frame, whatever the app says is dirty: nothing has been shown yet. So is the first back in front: what changed while behind was never drawn.
-        let damage_clip = if self.frames == 0 || core::mem::take(&mut self.full_next) { viewport_rect } else { self.app.damage_rect(self.viewport).unwrap_or(viewport_rect) };
+        let forced = self.frames == 0 || core::mem::take(&mut self.full_next);
+        let damage_clip = if forced { viewport_rect } else { self.app.damage_rect(self.viewport).unwrap_or(viewport_rect) };
+        if forced {
+            self.forced_whole += 1;
+        } else if damage_clip == viewport_rect {
+            self.app_whole += 1;
+        }
         if damage_clip.is_empty() {
             return false;
         }
@@ -566,9 +596,59 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
 
     /// The scratch buffer as the display's pixels, into the surface: a full screen at the panel's width `stride`, the frame at (`fx`, `fy`) on it (ferros WINDOWS.md: every app's surface is the whole screen). With the display's `bake` (op 65) the pixels are baked here ([`PanelPixel::to_baked`]: the display then only dithers them, ferros COMPOSITOR.md "Baked"), else converted as the depth's own format ([`PanelPixel::to_panel`]).
     /// Only what the last draw changed is converted (the surface keeps the rest from the frames before), its rows split across the worker cores in one dispatch.
-    pub fn present(&self, surface: &mut [u64], stride: usize, fx: usize, fy: usize, bake: Option<&crate::host::panel::Bake>) {
+    pub fn present(&mut self, surface: &mut [u64], stride: usize, fx: usize, fy: usize, bake: Option<&crate::host::panel::Bake>) {
         use rayon::prelude::*;
         let (w, h) = (self.viewport.width_px as usize, self.viewport.height_px as usize);
+        // A pinch's preview: the frame shown when the pinch began (its surface rows, already the panel's codes, copied once), resampled about the anchor by the pinch's scale so far, as set_zoom will clamp it.
+        // Bilinear over the three colour codes, so a pixel's value moves continuously as the scale does (nearest would step, photon-02 and the owner's C1 rule); the fourth lane (transparency and the see-through bit) is the nearest sample's, never blended.
+        // A pixel the scaled frame does not reach takes the frame's nearest edge.
+        if let Some((total, ax, ay)) = self.preview {
+            if !self.preview_taken {
+                self.preview_src.clear();
+                for y in 0..h {
+                    self.preview_src.extend_from_slice(&surface[(fy + y) * stride + fx..(fy + y) * stride + fx + w]);
+                }
+                self.preview_taken = true;
+            }
+            let mut v = self.viewport;
+            v.set_zoom(self.viewport.ru * total);
+            let inv = self.viewport.ru / v.ru;
+            // Each output column's two source columns and the second's weight (of 2^8), and the same per row: the source position is the anchor plus the distance scaled down, at pixel centres.
+            // WHY the clamps: for a zoom out the source position falls outside the frame; the nearest edge pixel stands in there until the zoom is applied at the pinch's end.
+            let taps = |q: usize, a: Coord, n: usize| {
+                let p = a + (q as Coord + 0.5 - a) * inv - 0.5;
+                let f = p.floor();
+                let i0 = (f as isize).clamp(0, n as isize - 1) as usize;
+                let i1 = (f as isize + 1).clamp(0, n as isize - 1) as usize;
+                (i0, i1, ((p - f) * ((1 << 8) as Coord)) as u64)
+            };
+            let xs: Vec<(usize, usize, u64)> = (0..w).map(|x| taps(x, ax, w)).collect();
+            let src = &self.preview_src;
+            // Lanes 0-2 (the colour codes) blended by weights of 2^8 summing to 2^16, which a 16-bit code times stays under 2^32; lane 3 from the nearest of the four.
+            let mix = |a: u64, b: u64, c: u64, d: u64, wx: u64, wy: u64| -> u64 {
+                let (w00, w01, w10, w11) = (((1 << 8) - wx) * ((1 << 8) - wy), wx * ((1 << 8) - wy), ((1 << 8) - wx) * wy, wx * wy);
+                let mut out = 0u64;
+                for lane in 0..3 {
+                    let at = |p: u64| (p >> (lane * 16)) & 0xFFFF;
+                    out |= ((at(a) * w00 + at(b) * w01 + at(c) * w10 + at(d) * w11) >> 16) << (lane * 16);
+                }
+                let near = match (wx >= 1 << 7, wy >= 1 << 7) {
+                    (false, false) => a,
+                    (true, false) => b,
+                    (false, true) => c,
+                    (true, true) => d,
+                };
+                out | (near & (0xFFFF << 48))
+            };
+            surface[fy * stride..(fy + h) * stride].par_chunks_mut(stride).enumerate().for_each(|(y, row)| {
+                let (y0, y1, wy) = taps(y, ay, h);
+                let (r0, r1) = (&src[y0 * w..(y0 + 1) * w], &src[y1 * w..(y1 + 1) * w]);
+                for (d, &(x0, x1, wx)) in row[fx..fx + w].iter_mut().zip(&xs) {
+                    *d = mix(r0[x0], r0[x1], r1[x0], r1[x1], wx, wy);
+                }
+            });
+            return;
+        }
         // WHY/PROOF: `changed` is the app's damage and scroll rects, which an app may hand over overhanging its frame (fluor's own primitives cut theirs at the buffer the same way, `Clip::resolve`); the slices below index the scratch and the surface up to its far edges.
         // A scroll frame: the surface's copy of the pane moved by the same rows as the scratch was (`draw`), so what is converted is the damage alone. The rect cut at the frame first, as below, so the move never reaches another part of the screen.
         if let Some((r, dy)) = self.shift {
@@ -620,7 +700,13 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
                     // WHY: the contacts are the touch controller's report, external input: two fingers reported at one point give a distance of 0, and a ratio against it is infinite or NaN. A pinch with a finger lifted gives 0 too (`pinch_distance`), and scales nothing.
                     if d > 0.0 && self.pinch_d > 0.0 {
                         let (ax, ay) = self.pinch_mid();
-                        self.on_scale(d / self.pinch_d, ax, ay);
+                        if self.app.owns_zoom_gesture() {
+                            self.on_scale(d / self.pinch_d, ax, ay);
+                        } else {
+                            let total = self.preview.map_or(1.0, |(s, _, _)| s) * (d / self.pinch_d);
+                            self.preview = Some((total, ax, ay));
+                            self.window.mark_dirty();
+                        }
                         self.pinch_scaled = true;
                     }
                     self.pinch_d = d;
@@ -641,6 +727,12 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
                     self.pinch_d = 0.0;
                     if self.pinch_scaled {
                         self.pinch_scaled = false;
+                        // The preview's scale applied once, as one zoom about where the fingers were: the app lays out and draws once, the frame whole.
+                        if let Some((total, ax, ay)) = self.preview.take() {
+                            self.preview_taken = false;
+                            self.set_zoom_and_relayout(self.viewport.ru * total, ax, ay);
+                            self.full_next = true;
+                        }
                         self.with_context(|app, ctx| app.on_zoom_end(ctx));
                     }
                     if self.pinch == [None, None] {
@@ -914,9 +1006,9 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             // WHY: a ten-second window with no frame drawn would divide by zero; it has nothing to say.
             if n_frames != 0 {
                 let px = (w as u64) * (h as u64);
-                println!("fluor: of those frames A#{} moved by a scroll hint; drawn A#{} % of the frame a frame, converted at present A#{} %", shell.hinted, shell.drawn_px * 100 / (px * n_frames), shell.changed_px * 100 / (px * n_frames));
+                println!("fluor: of those frames A#{} moved by a scroll hint, A#{} drawn whole by the host and A#{} by the app's damage; drawn A#{} % of the frame a frame, converted at present A#{} %", shell.hinted, shell.forced_whole, shell.app_whole, shell.drawn_px * 100 / (px * n_frames), shell.changed_px * 100 / (px * n_frames));
             }
-            (shell.hinted, shell.drawn_px, shell.changed_px) = (0, 0, 0);
+            (shell.hinted, shell.forced_whole, shell.app_whole, shell.drawn_px, shell.changed_px) = (0, 0, 0, 0, 0);
             (t_draw, t_present, t_show, t_max, n_frames) = (0, 0, 0, 0, 0);
         }
         // What the display said of this window since the last pass (`watch`): behind or in front, the keys and text it handed over, the keyboard's place, and whether its bake changed (a brightness change: the bake asked again, and the next frame drawn and baked whole).
