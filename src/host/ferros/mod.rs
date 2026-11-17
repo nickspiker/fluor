@@ -318,6 +318,39 @@ pub struct Contact {
     pub y: u16,
 }
 
+/// A frame's stages summed over the frames since the last console line, in counter ticks (2026-11-17, the owner: "61ms to shift memory and draw 1/16 the screen?"): the scratch moved by the scroll hint, the damage cleared, the app's render, the surface moved, the damage converted (baked) into it, and op 22's call; with how many frames and the pixels they drew and converted.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Stages {
+    pub frames: u64,
+    pub move_scratch: u64,
+    pub clear: u64,
+    pub render: u64,
+    pub move_surface: u64,
+    pub convert: u64,
+    pub show: u64,
+    pub drawn_px: u64,
+    pub converted_px: u64,
+}
+
+impl Stages {
+    /// The ten-second line's words for these frames: each stage's mean µs a frame, and the share of the frame drawn and converted (`px` its pixels).
+    fn line(&self, what: &str, px: u64) -> String {
+        let n = self.frames;
+        let us = |t: u64| t * 1_000_000 / sys::freq() / n;
+        alloc::format!(
+            "fluor: A#{n} {what}: move the scratch A#{} us, clear A#{} us, render A#{} us, move the surface A#{} us, convert A#{} us, show A#{} us a frame; drawn A#{} %, converted A#{} % of the frame",
+            us(self.move_scratch),
+            us(self.clear),
+            us(self.render),
+            us(self.move_surface),
+            us(self.convert),
+            us(self.show),
+            self.drawn_px * 100 / (px * n),
+            self.converted_px * 100 / (px * n)
+        )
+    }
+}
+
 /// The app and everything the host keeps for it between frames, at the app's pixel depth `P` (8-bit unless the app implements `FluorApp<G2t16>`).
 pub struct FerrosShell<A: FluorApp<P>, P: PanelPixel = Argb8> {
     app: A,
@@ -359,6 +392,14 @@ pub struct FerrosShell<A: FluorApp<P>, P: PanelPixel = Argb8> {
     shift: Option<(PixelRect, i32)>,
     pub drawn_px: u64,
     pub changed_px: u64,
+    /// Where the frames since the last console line went, stage by stage (`Stages`): `[0]` the frames a scroll hint moved, `[1]` every other frame drawn.
+    pub stages: [Stages; 2],
+    /// Which of `stages` the frame being made goes to.
+    bucket: usize,
+    /// When the present's move of the surface ended (counter ticks): the convert's start.
+    t_moved: u64,
+    /// The part of the frame the last present wrote into the surface (frame pixels): the converted rect, and on a scroll frame the moved rect with it. What op 22 names as changed, so the display publishes only that.
+    pub shown: PixelRect,
     wake: Arc<FerrosWakeSender<A::UserEvent>>,
     /// The window's bell (`Bell`): the display's events and the app's own sends.
     bell: Arc<Bell>,
@@ -405,6 +446,10 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             shift: None,
             drawn_px: 0,
             changed_px: 0,
+            stages: [Stages::default(); 2],
+            bucket: 1,
+            t_moved: 0,
+            shown: PixelRect::new(0, 0, width as usize, height as usize),
             wake,
             bell,
             full_next: false,
@@ -546,8 +591,11 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         // The surface holds the last frame converted from the scratch unless that frame was the app's own (`render_own`): only then can it be moved as the scratch is.
         let surface_is_scratch = !self.own;
         self.shift = None;
+        self.bucket = 1;
+        let t0 = sys::now();
         if damage_clip != viewport_rect {
             if let Some((rect, dy)) = self.app.scroll_hint(self.viewport) {
+                self.bucket = 0;
                 crate::paint::scroll_copy_rect(&mut self.scratch, win_w, win_h, rect.x0, rect.y0, rect.x1, rect.y1, dy);
                 // A scroll that moves the whole pane out (nothing of it survives the move) is converted whole, as before; otherwise the surface is moved the same rows and only the damage converted.
                 if surface_is_scratch && (dy.unsigned_abs() as usize) < rect.height() {
@@ -558,6 +606,7 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
                 self.hinted += 1;
             }
         }
+        let t_moved = sys::now();
         self.pending_damage.clear();
         // A frame the app made itself (its GPU's layer): the scratch is neither cleared nor drawn, and the present takes the app's frame whole.
         let mut own = false;
@@ -569,28 +618,54 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             return true;
         }
         clear_scratch_rect(&mut self.scratch, win_w, damage_clip);
+        let t_cleared = sys::now();
         self.with_context_render(damage_clip, |app, scratch, ctx| app.render(scratch, ctx));
-        self.drawn_px += (damage_clip.width() * damage_clip.height()) as u64;
-        self.changed_px += (self.changed.width() * self.changed.height()) as u64;
+        let t_rendered = sys::now();
+        let drawn = (damage_clip.width() * damage_clip.height()) as u64;
+        let converted = (self.changed.width() * self.changed.height()) as u64;
+        self.drawn_px += drawn;
+        self.changed_px += converted;
+        let s = &mut self.stages[self.bucket];
+        s.frames += 1;
+        s.move_scratch += t_moved - t0;
+        s.clear += t_cleared - t_moved;
+        s.render += t_rendered - t_cleared;
+        s.drawn_px += drawn;
+        s.converted_px += converted;
         true
     }
 
     /// The scratch buffer as the display's pixels, into the surface: a full screen at the panel's width `stride`, the frame at (`fx`, `fy`) on it (ferros WINDOWS.md: every app's surface is the whole screen). With the display's `bake` (op 65) the pixels are baked here ([`PanelPixel::to_baked`]: the display then only dithers them, ferros COMPOSITOR.md "Baked"), else converted as the depth's own format ([`PanelPixel::to_panel`]).
     /// Only what the last draw changed is converted (the surface keeps the rest from the frames before), its rows split across the worker cores in one dispatch.
-    pub fn present(&self, surface: &mut [u64], stride: usize, fx: usize, fy: usize, bake: Option<&crate::host::panel::Bake>) {
+    pub fn present(&mut self, surface: &mut [u64], stride: usize, fx: usize, fy: usize, bake: Option<&crate::host::panel::Bake>) {
+        let t0 = sys::now();
+        self.present_rows(surface, stride, fx, fy, bake);
+        // The stages of a scratch frame (an own frame is neither drawn nor counted in them).
+        if !self.own {
+            let s = &mut self.stages[self.bucket];
+            s.move_surface += self.t_moved - t0;
+            s.convert += sys::now() - self.t_moved;
+        }
+    }
+
+    fn present_rows(&mut self, surface: &mut [u64], stride: usize, fx: usize, fy: usize, bake: Option<&crate::host::panel::Bake>) {
         use rayon::prelude::*;
         let (w, h) = (self.viewport.width_px as usize, self.viewport.height_px as usize);
+        self.shown = PixelRect::new(0, 0, 0, 0);
         // WHY/PROOF: `changed` is the app's damage and scroll rects, which an app may hand over overhanging its frame (fluor's own primitives cut theirs at the buffer the same way, `Clip::resolve`); the slices below index the scratch and the surface up to its far edges.
         // A scroll frame: the surface's copy of the pane moved by the same rows as the scratch was (`draw`), so what is converted is the damage alone. The rect cut at the frame first, as below, so the move never reaches another part of the screen.
         if let Some((r, dy)) = self.shift {
             let (sx0, sy0, sx1, sy1) = (r.x0.min(w), r.y0.min(h), r.x1.min(w), r.y1.min(h));
             crate::paint::scroll_copy_rect(surface, stride, surface.len() / stride, fx + sx0, fy + sy0, fx + sx1, fy + sy1, dy);
+            self.shown = PixelRect::new(sx0, sy0, sx1, sy1);
         }
+        self.t_moved = sys::now();
         let c = self.changed;
         let (x0, y0, x1, y1) = (c.x0.min(w), c.y0.min(h), c.x1.min(w), c.y1.min(h));
         if x0 >= x1 || y0 >= y1 {
             return;
         }
+        self.shown = self.shown.union(PixelRect::new(x0, y0, x1, y1));
         // The app's own frame when it made one (`render_own`), else the scratch; nothing when it put its frame in the surface itself.
         let src = match (self.own, self.app.own_frame()) {
             (true, None) => return,
@@ -926,8 +1001,15 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             if n_frames != 0 {
                 let px = (w as u64) * (h as u64);
                 println!("fluor: of those frames A#{} moved by a scroll hint, A#{} drawn whole by the host and A#{} by the app's damage; drawn A#{} % of the frame a frame, converted at present A#{} %", shell.hinted, shell.forced_whole, shell.app_whole, shell.drawn_px * 100 / (px * n_frames), shell.changed_px * 100 / (px * n_frames));
+                // Each kind's stages, for the kinds that had frames (a kind with none has no mean).
+                for (s, what) in shell.stages.iter().zip(["scroll frames", "other frames"]) {
+                    if s.frames != 0 {
+                        println!("{}", s.line(what, px));
+                    }
+                }
             }
             (shell.hinted, shell.forced_whole, shell.app_whole, shell.drawn_px, shell.changed_px) = (0, 0, 0, 0, 0);
+            shell.stages = [Stages::default(); 2];
             (t_draw, t_present, t_show, t_max, n_frames) = (0, 0, 0, 0, 0);
         }
         // What the display said of this window since the last pass (`watch`): behind or in front, the keys and text it handed over, the keyboard's place, and whether its bake changed (a brightness change: the bake asked again, and the next frame drawn and baked whole).
@@ -1047,6 +1129,9 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
                 return Err(String::from("the display refused the frame"));
             }
             let t_shown = sys::now();
+            if !shell.own {
+                shell.stages[shell.bucket].show += t_shown - t_presented;
+            }
             t_draw += t_drawn - t;
             t_present += t_presented - t_drawn;
             t_show += t_shown - t_presented;
