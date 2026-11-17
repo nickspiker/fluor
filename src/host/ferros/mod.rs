@@ -624,21 +624,24 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             };
             let xs: Vec<(usize, usize, u64)> = (0..w).map(|x| taps(x, ax, w)).collect();
             let src = &self.preview_src;
-            // Lanes 0-2 (the colour codes) blended by weights of 2^8 summing to 2^16, which a 16-bit code times stays under 2^32; lane 3 from the nearest of the four.
+            // Two pixels mixed by a weight of 2^8 within a u64 (four lanes, two at a time): lanes 0 and 2 then 1 and 3 each in a 32-bit field, where a 16-bit code times 2^8, twice, stays under 2^25, so no field carries into the next (the 2026-11-17 lane-by-lane loop took 23 ms a frame).
+            const FIELDS: u64 = 0x0000_FFFF_0000_FFFF;
+            let lerp = |a: u64, b: u64, wb: u64| -> u64 {
+                let wa = (1 << 8) - wb;
+                let even = (((a & FIELDS) * wa + (b & FIELDS) * wb) >> 8) & FIELDS;
+                let odd = ((((a >> 16) & FIELDS) * wa + ((b >> 16) & FIELDS) * wb) >> 8) & FIELDS;
+                even | (odd << 16)
+            };
+            // Lanes 0-2 (the colour codes) blended across the four; lane 3 (transparency, the see-through bit) from the nearest of the four.
             let mix = |a: u64, b: u64, c: u64, d: u64, wx: u64, wy: u64| -> u64 {
-                let (w00, w01, w10, w11) = (((1 << 8) - wx) * ((1 << 8) - wy), wx * ((1 << 8) - wy), ((1 << 8) - wx) * wy, wx * wy);
-                let mut out = 0u64;
-                for lane in 0..3 {
-                    let at = |p: u64| (p >> (lane * 16)) & 0xFFFF;
-                    out |= ((at(a) * w00 + at(b) * w01 + at(c) * w10 + at(d) * w11) >> 16) << (lane * 16);
-                }
+                let out = lerp(lerp(a, b, wx), lerp(c, d, wx), wy);
                 let near = match (wx >= 1 << 7, wy >= 1 << 7) {
                     (false, false) => a,
                     (true, false) => b,
                     (false, true) => c,
                     (true, true) => d,
                 };
-                out | (near & (0xFFFF << 48))
+                (out & !(0xFFFF << 48)) | (near & (0xFFFF << 48))
             };
             surface[fy * stride..(fy + h) * stride].par_chunks_mut(stride).enumerate().for_each(|(y, row)| {
                 let (y0, y1, wy) = taps(y, ay, h);
