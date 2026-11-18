@@ -299,12 +299,14 @@ impl List {
             let bw = canvas.width;
             let bh = canvas.height;
             // WHY/PROOF: the rect is the app's layout, past the canvas when a pane scrolls off an edge — the stamp would index outside the hit map.
+            // A rect wholly past the right edge leaves x0 > x1, and a reversed slice range panics where the loop it replaced ran empty, hence the x0 < x1 test.
             let x1 = rect.x1.min(bw);
             let y1 = rect.y1.min(bh);
-            for y in rect.y0..y1 {
-                let base = y * bw;
-                for x in rect.x0..x1 {
-                    map[base + x] = self.hit_id;
+            // A pixel something in front already holds stays theirs.
+            if rect.x0 < x1 {
+                for y in rect.y0..y1 {
+                    let base = y * bw;
+                    paint::claim_hits(&mut map[base + rect.x0..base + x1], self.hit_id);
                 }
             }
         }

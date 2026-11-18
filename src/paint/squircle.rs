@@ -136,6 +136,8 @@ fn draw_squircle_pill_with_crossings<P: Pixel>(
 /// No `fill` parameter — the pill is exactly two colours.
 ///
 /// Every pixel write composes UNDER the buffer via [`Blend::under`](crate::pixel::Blend::under) (Normal) — same kernel as the single-colour path.
+///
+/// With a `hit_map`, every solid pixel claims `hit_id` unless something in front already holds it ([`crate::paint::claim_hit`]), the hit map's half of the same front to back.
 pub fn draw_squircle_pill_two_tone<P: Pixel>(
     canvas: &mut Canvas<P>,
     pill_x: isize,
@@ -294,7 +296,7 @@ fn draw_squircle_pill_two_tone_with_crossings<P: Pixel>(
                     let dx = fx as isize - pill_x;
                     pixels[idx] = pixels[idx].under(pick_solid(dx, dy), BlendMode::Normal);
                     if let Some(hm) = hit_map.as_deref_mut() {
-                        hm[idx] = hit_id;
+                        crate::paint::claim_hit(&mut hm[idx], hit_id);
                     }
                 }
             }
@@ -331,7 +333,7 @@ fn draw_squircle_pill_two_tone_with_crossings<P: Pixel>(
                     let dy = fy as isize - pill_y;
                     pixels[idx] = pixels[idx].under(pick_solid(dx, dy), BlendMode::Normal);
                     if let Some(hm) = hit_map.as_deref_mut() {
-                        hm[idx] = hit_id;
+                        crate::paint::claim_hit(&mut hm[idx], hit_id);
                     }
                 }
             }
@@ -354,7 +356,7 @@ fn draw_squircle_pill_two_tone_with_crossings<P: Pixel>(
                 let dx = fx as isize - pill_x;
                 pixels[idx] = pixels[idx].under(pick_solid(dx, dy), BlendMode::Normal);
                 if let Some(hm) = hit_map.as_deref_mut() {
-                    hm[idx] = hit_id;
+                    crate::paint::claim_hit(&mut hm[idx], hit_id);
                 }
             }
         }
@@ -699,7 +701,8 @@ pub fn asymmetric_radii(big: f32) -> CornerRadii {
     [big, big * 0.5, big, big * 0.5]
 }
 
-/// Two-tone variant of [`draw_squircle_rrect`]: `light` on the top-left side of the box's anti-diagonal, `shadow` below it (the pill's football seam collapses to exactly this for a square, and a rounded rect with small corners reads the same way). Optional hit stamping like the pill.
+/// Two-tone variant of [`draw_squircle_rrect`]: `light` on the top-left side of the box's anti-diagonal, `shadow` below it (the pill's football seam collapses to exactly this for a square, and a rounded rect with small corners reads the same way).
+/// Optional hit claiming like the pill.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_squircle_rrect_two_tone<P: Pixel>(
     canvas: &mut Canvas<P>,
@@ -843,7 +846,7 @@ fn draw_squircle_rrect_kernel<P: Pixel>(
                     let (_, solid) = pick(fx as isize - x, v_row - y);
                     pixels[idx] = pixels[idx].under(solid, BlendMode::Normal);
                     if let Some(hm) = hit_map.as_deref_mut() {
-                        hm[idx] = hit_id;
+                        crate::paint::claim_hit(&mut hm[idx], hit_id);
                     }
                 }
             }
@@ -865,7 +868,7 @@ fn draw_squircle_rrect_kernel<P: Pixel>(
                     let (_, solid) = pick(h_col - x, fy as isize - y);
                     pixels[idx] = pixels[idx].under(solid, BlendMode::Normal);
                     if let Some(hm) = hit_map.as_deref_mut() {
-                        hm[idx] = hit_id;
+                        crate::paint::claim_hit(&mut hm[idx], hit_id);
                     }
                 }
             }
@@ -889,7 +892,7 @@ fn draw_squircle_rrect_kernel<P: Pixel>(
             let (_, solid) = pick(fx as isize - x, dy);
             pixels[idx] = pixels[idx].under(solid, BlendMode::Normal);
             if let Some(hm) = hit_map.as_deref_mut() {
-                hm[idx] = hit_id;
+                crate::paint::claim_hit(&mut hm[idx], hit_id);
             }
         }
     }

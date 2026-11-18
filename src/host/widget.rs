@@ -13,18 +13,21 @@ use crate::paint::{Clip, HitId};
 use crate::pixel::{Argb8, Pixel};
 use crate::text::TextRenderer;
 
-pub use crate::paint::HIT_NONE;
+pub use crate::paint::{HIT_BLOCK, HIT_NONE};
 
-/// Allocate the next dense hit ID. Threaded thru widget constructors at app startup — `let mut counter: HitId = HIT_NONE; let id = next_id(&mut counter);`. Increments first, returns the post-increment value, so the first call yields `1` (never `HIT_NONE`). 65 535-call ceiling at the [`HitId`] type's `u16` width; panics on overflow because exceeding 65 535 interactive zones in one app is a design error, not something to silently wrap and corrupt dispatch.
+/// Allocate the next dense hit ID. Threaded thru widget constructors at app startup: `let mut counter: HitId = HIT_NONE; let id = next_id(&mut counter);`.
+/// Increments first, returns the post-increment value, so the first call yields `1` (never `HIT_NONE`). 65 534-call ceiling: the [`HitId`] type's `u16` top value is [`HIT_BLOCK`], never handed out; panics past it because exceeding 65 534 interactive zones in one app is a design error, not something to silently wrap and corrupt dispatch.
 pub fn next_id(counter: &mut HitId) -> HitId {
-    // WHY/PROOF: not a dodge but a loud failure — plain `+ 1` would wrap to HIT_NONE silently in release and hand two widgets the same dispatch id.
+    // WHY/PROOF: not a dodge but a loud failure: plain `+ 1` would wrap to HIT_NONE silently in release and hand two widgets the same dispatch id, and the top value is HIT_BLOCK, which no widget may answer to.
     *counter = counter
         .checked_add(1)
-        .expect("HitId allocator overflowed u16 — more than 65 535 widgets registered, which is almost certainly a leak in the allocation pattern, not a real need");
+        .filter(|&id| id != HIT_BLOCK)
+        .expect("HitId allocator overflowed u16: more than 65 534 widgets registered, which is almost certainly a leak in the allocation pattern, not a real need");
     *counter
 }
 
-/// Per-paint scratchpad bundling everything a widget's [`Widget::paint`] method needs: a mutable canvas for drawing, the shared font + glyph cache for text widgets, the shared per-pixel hit map for stamping the widget's silhouette, and an optional clip rect for damage-narrowed paints. Built fresh by the host (or app) once per render call; widgets borrow it immutably-by-shape for the duration of a single `paint`.
+/// Per-paint scratchpad bundling everything a widget's [`Widget::paint`] method needs: a mutable canvas for drawing, the shared font + glyph cache for text widgets, the shared per-pixel hit map the widget claims its silhouette in, and an optional clip rect for damage-narrowed paints.
+/// Built fresh by the host (or app) once per render call; widgets borrow it immutably-by-shape for the duration of a single `paint`.
 ///
 /// Lifetimes: the inner borrows all share `'ctx` (the duration of the per-frame paint call). Canvas's own buffer borrow `'buf` is separate so a long-lived canvas can be reused across paints without re-binding the lifetime.
 ///
@@ -36,13 +39,17 @@ pub struct PaintCtx<'ctx, 'buf, P: Pixel = Argb8> {
     pub clip: Option<Clip>,
 }
 
-/// Universal widget contract. Every interactive thing has a stable [`HitId`] and a `paint` method that stamps both pixels and (via `ctx.hit_map`) its hit-test silhouette. Capability accessors below default to `None` — implementers opt into [`Click`] / [`Key`] / [`Focus`] / [`Hover`] only for the behaviours they want. The Option-returning shape is what makes the type system load-bearing: a widget without a [`Key`] impl literally cannot receive keyboard events because there's no `&mut dyn Key` to deliver them to.
+/// Universal widget contract.
+/// Every interactive thing has a stable [`HitId`] and a `paint` method that draws its pixels and claims (via `ctx.hit_map`) its hit-test silhouette, both front to back.
+/// Capability accessors below default to `None`: implementers opt into [`Click`] / [`Key`] / [`Focus`] / [`Hover`] only for the behaviours they want.
+/// The Option-returning shape is what makes the type system load-bearing: a widget without a [`Key`] impl literally cannot receive keyboard events because there's no `&mut dyn Key` to deliver them to.
 ///
 /// Object-safe by construction (all methods take `&self` or `&mut self`, no generic methods, no associated types). `&mut dyn Widget` is the common currency of dispatch.
 pub trait Widget {
     /// The widget's hit ID. Allocated once at construction via [`next_id`]; stored on the widget; returned verbatim here every paint and every dispatch.
     fn id(&self) -> HitId;
-    /// Rasterize self into `ctx.canvas` and stamp `id()` into `ctx.hit_map` at every opaque pixel the widget owns. Stamping is what makes `ctx.hit_map[y * w + x]` the canonical source of truth for "what's under the cursor."
+    /// Rasterize self into `ctx.canvas` and claim `id()` in `ctx.hit_map` at every opaque pixel the widget owns that nothing in front already claimed ([`crate::paint::claim_hit`]).
+    /// Widgets paint front to back, so the claims settle overlap the way the pixels do: `ctx.hit_map[y * w + x]` is the frontmost thing under the cursor, the canonical source of truth for "what's under the cursor."
     fn paint(&mut self, ctx: &mut PaintCtx<'_, '_>);
     /// Click capability. Default `None` ⇒ this widget ignores clicks (decoration-only). Implementers return `Some(self)`.
     fn click(&mut self) -> Option<&mut dyn Click> {

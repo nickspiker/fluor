@@ -2,7 +2,9 @@
 //!
 //! **Row dispatch.** Each option row owns its own dense [`HitId`] ([`DropdownRow`], a tiny [`Widget`] impl), mirroring how [`crate::host::chrome_widget::DefaultChrome`] owns four `ChromeButton`s. Per-row hover tints, click routing, and hit-testing all ride the existing id-indexed machinery for free. The app's [`crate::host::widget::Container::visit`] should hand out the dropdown itself (the pill) and then call [`Dropdown::visit_rows`] — rows only appear in the walk while the popup is open, so they never enter the tab cycle or overlay table when closed.
 //!
-//! **Front-to-back placement.** fluor composites under-blend (first writer wins), so the OPEN popup must be the first content painted into the frame: call [`Dropdown::render_popup_into`] at the top of the app's render, before other widgets and before the chrome flatten. Everything painted afterwards composes underneath it — no z-order machinery needed. The closed pill renders in normal widget order via [`Dropdown::render_content_into`].
+//! **Front-to-back placement.** fluor composites under-blend (first writer wins), so the OPEN popup must be the first content painted into the frame: call [`Dropdown::render_popup_into`] at the top of the app's render, before other widgets and before the chrome flatten.
+//! Everything painted afterwards composes underneath it, and claims no hit where the popup already claimed one (the hit map is front to back too, [`paint::claim_hit`]): no z-order machinery needed.
+//! The closed pill renders in normal widget order via [`Dropdown::render_content_into`].
 //!
 //! **Action model.** Poll-based like Button/Slider: row clicks and keyboard commits accumulate into a change counter; the app calls [`Dropdown::take_change`] after dispatch (and/or in `tick`) — `Some(index)` means the selection changed since last poll. `take_change` is also where row-click commits are folded into `selected` (the row widgets can't reach back into the parent during the visit walk).
 
@@ -459,7 +461,9 @@ impl<P: Pixel> Dropdown<P> {
         }
     }
 
-    /// Paint the OPEN popup into `canvas`, stamping each row's hit id over its band. MUST be called before any content the popup should cover (top of the app's render — see module docs). No-op when closed or disabled.
+    /// Paint the OPEN popup into `canvas`, each row claiming its band in the hit map and the frame round them claiming the rest of the popup with [`paint::HIT_BLOCK`].
+    /// MUST be called before any content the popup should cover (the top of the app's render, see the module docs): pixels and hits both go front to back, so what is drawn after it lands behind it and takes no click where it shows.
+    /// No-op when closed or disabled.
     pub fn render_popup_into(
         &mut self,
         canvas: &mut crate::canvas::Canvas<P>,
@@ -508,7 +512,7 @@ impl<P: Pixel> Dropdown<P> {
                 );
             }
             text.draw_text_left(canvas, label, text_left, row_cy, &TextStyle::new(self.font_size, theme::TEXTBOX_TEXT).font(self.font), clip, None);
-            // Stamp the row's hit band (interior of the popup only, clear of the AA edge).
+            // Claim the row's hit band (interior of the popup only, clear of the AA edge, so a row's hover tint never lands on the edge).
             if let Some(map) = hit_map.as_deref_mut() {
                 // WHY/PROOF: the popup follows the app's layout past the viewport edge — a negative start would wrap the index and the far edges would stamp outside the hit map.
                 let x0 = (x + stroke_px).max(0) as usize;
@@ -516,11 +520,27 @@ impl<P: Pixel> Dropdown<P> {
                 let y0 = (row_top as isize).max(0) as usize;
                 let y1 = ((row_top + row_h) as isize).max(0) as usize;
                 let y1 = y1.min(viewport_h);
+                // A popup wholly past the right edge leaves x0 > x1, and a reversed slice range panics where the loop it replaced ran empty.
+                if x0 < x1 {
+                    for yy in y0..y1 {
+                        let base = yy * viewport_w;
+                        paint::claim_hits(&mut map[base + x0..base + x1], self.rows[i].hit_id);
+                    }
+                }
+            }
+        }
+        // The frame round the rows (the padding above and below them, the edge) is popup too: it claims what the rows left with HIT_BLOCK, so a click there reaches nothing behind the popup and no row's tint spreads onto it.
+        // The whole rect, corners outside the squircle included, the same bbox doctrine as a pill's stamp.
+        if let Some(map) = hit_map.as_deref_mut() {
+            // WHY/PROOF: as for the rows, the popup follows the app's layout past the viewport edge; the casts would wrap and the far edges would claim outside the hit map, and a popup wholly past the right edge leaves x0 > x1.
+            let x0 = x.max(0) as usize;
+            let x1 = ((x + w).max(0) as usize).min(viewport_w);
+            let y0 = y.max(0) as usize;
+            let y1 = ((y + h).max(0) as usize).min(viewport_h);
+            if x0 < x1 {
                 for yy in y0..y1 {
                     let base = yy * viewport_w;
-                    for xx in x0..x1 {
-                        map[base + xx] = self.rows[i].hit_id;
-                    }
+                    paint::claim_hits(&mut map[base + x0..base + x1], paint::HIT_BLOCK);
                 }
             }
         }

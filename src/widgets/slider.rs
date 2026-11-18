@@ -235,18 +235,19 @@ impl Slider {
             None,
         );
 
-        // Stamp the hit map across the full band so clicks and drags land anywhere on it.
+        // Claim the full band so clicks and drags land anywhere on it, except where something in front already holds the pixel.
         if let Some(map) = hit_map {
             let vw = canvas.width;
             let vh = canvas.height;
             // WHY/PROOF: the band is placed by the app's layout and runs past the viewport when the slider scrolls past an edge — the stamp would index outside the hit map.
+            // A band wholly past the right edge leaves x0 > x1, and a reversed slice range panics where the loop it replaced ran empty, hence the x0 < x1 test.
             let x0 = band_x.max(0) as usize;
             let y0 = band_y.max(0) as usize;
             let x1 = ((band_x + band_w).max(0) as usize).min(vw);
             let y1 = ((band_y + band_h).max(0) as usize).min(vh);
-            for row in y0..y1 {
-                for col in x0..x1 {
-                    map[row * vw + col] = hit_id;
+            if x0 < x1 {
+                for row in y0..y1 {
+                    paint::claim_hits(&mut map[row * vw + x0..row * vw + x1], hit_id);
                 }
             }
         }

@@ -266,7 +266,7 @@ impl Checkbox {
             }
         }
 
-        // Stamp the hit id over the whole widget rect (box + label) so the entire row is clickable.
+        // Claim the whole widget rect (box + label) so the entire row is clickable, except where something in front already holds the pixel.
         if let Some(map) = hit_map.as_deref_mut() {
             let rect = PixelRect::new(
                 (self.center_x - self.width * 0.5) as usize,
@@ -277,12 +277,13 @@ impl Checkbox {
             let bw = canvas.width;
             let bh = canvas.height;
             // WHY/PROOF: the widget rect is the app's layout, past the canvas when the row scrolls off an edge — the stamp would index outside the hit map.
+            // A rect wholly past the right edge leaves x0 > x1, and a reversed slice range panics where the loop it replaced ran empty, hence the x0 < x1 test.
             let x1 = rect.x1.min(bw);
             let y1 = rect.y1.min(bh);
-            for y in rect.y0..y1 {
-                let base = y * bw;
-                for x in rect.x0..x1 {
-                    map[base + x] = self.hit_id;
+            if rect.x0 < x1 {
+                for y in rect.y0..y1 {
+                    let base = y * bw;
+                    paint::claim_hits(&mut map[base + rect.x0..base + x1], self.hit_id);
                 }
             }
         }

@@ -71,6 +71,12 @@ fn paint_rects<P: Pixel>() -> Vec<P> {
     let (mut px, mut dmg) = scene::<P>();
     let mask_bytes: Vec<u8> = (0..W * H).map(|i| ((i % W) * 255 / W) as u8).collect();
     let mask = AlphaMask::new(&mask_bytes, W, H);
+    // The blinkeys first: they are light in front of the rects, and front to back the frontmost goes in first.
+    {
+        let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+        paint::draw_blinkey(&mut c, 100, 20, 40, true);
+        paint::draw_blinkey_tinted(&mut c, 120, 20, 40, false, (160, 80, 255));
+    }
     {
         let mut c = Canvas::new(&mut px, W, H, &mut dmg);
         paint::fill_rect(&mut c, 8, 8, 120, 60, theme::BUTTON_FILL, None, None);
@@ -81,17 +87,14 @@ fn paint_rects<P: Pixel>() -> Vec<P> {
         paint::circle_filled(&mut c, 260, 150, 24, theme::CLOSE_HOVER, None, None);
         paint::circle_filled(&mut c, 300, 30, 40, (theme::MAXIMIZE_HOVER & 0x00FF_FFFF) | 0x6000_0000, None, Some(&mask));
     }
-    {
-        let mut c = Canvas::new(&mut px, W, H, &mut dmg);
-        paint::draw_blinkey(&mut c, 100, 20, 40, true);
-        paint::draw_blinkey_tinted(&mut c, 120, 20, 40, false, (160, 80, 255));
-    }
     px
 }
 
+/// Re-recorded 2026-11-17 (was 0xa787_df13_d2cc_1437): the caret goes in first and the rects under it, where it was laid over the finished rects.
+/// 274 caret pixels moved by one code in one or more channels (`under` rounds per composite, and the two orders round differently), nothing else.
 #[test]
 fn golden_paint_rects() {
-    check("paint_rects", &paint_rects::<Argb8>(), 0xa787_df13_d2cc_1437);
+    check("paint_rects", &paint_rects::<Argb8>(), 0x2a1f_f410_4b1f_f77d);
 }
 
 /// The float AA shapes in paint/shape.rs: axis rect with fractional edges, hairlines, rotated rect, AA circle, segmented ring.
@@ -557,12 +560,14 @@ fn chrome_scene<P: Pixel>() -> (Vec<P>, Vec<u8>) {
     chrome::draw_window_edges_and_mask(&mut px, &mut hit, &mut clip, w as u32, h as u32, start_big, &cross_big, start_small, &cross_small, theme::WINDOW_LIGHT_EDGE, theme::WINDOW_SHADOW_EDGE);
     let button = 40usize;
     let (bs, bc) = compute_squircle_crossings(button as f32 / 2., 8);
-    chrome::draw_strip_bg(&mut px, &mut hit, w as u32, h as u32, button, bs, &bc);
-    chrome::draw_strip_curves(&mut px, &mut hit, w as u32, h as u32, button, bs, &bc, theme::WINDOW_LIGHT_EDGE, theme::WINDOW_SHADOW_EDGE);
+    // Front to back, the order `DefaultChrome::rasterize_chrome` draws in: the hairlines, then the curves into the gaps they left, the glyphs, and the strip's background last, under all of them.
+    // Until 2026-11-17 the background went first and every glyph after it landed under its opaque fill, so the scene showed none of them.
     chrome::draw_strip_hairlines(&mut px, w as u32, h as u32, button, bs, &bc, theme::WINDOW_LIGHT_EDGE);
+    chrome::draw_strip_curves(&mut px, &mut hit, w as u32, h as u32, button, bs, &bc, theme::WINDOW_LIGHT_EDGE, theme::WINDOW_SHADOW_EDGE);
     chrome::draw_minimize_symbol(&mut px, w, h, w - 100, 20, 8, theme::MINIMIZE_GLYPH, theme::WINDOW_CONTROLS_BG);
     chrome::draw_maximize_symbol(&mut px, w, h, w - 60, 20, 8, theme::MAXIMIZE_GLYPH, theme::MAXIMIZE_GLYPH_INTERIOR, theme::WINDOW_CONTROLS_BG);
     chrome::draw_close_symbol(&mut px, w, h, w - 20, 20, 8, theme::CLOSE_GLYPH, theme::WINDOW_CONTROLS_BG);
+    chrome::draw_strip_bg(&mut px, &mut hit, w as u32, h as u32, button, bs, &bc);
     let mut text = crate::text::TextRenderer::new();
     let mut dmg = Damage::new();
     {
@@ -573,11 +578,13 @@ fn chrome_scene<P: Pixel>() -> (Vec<P>, Vec<u8>) {
     (px, clip)
 }
 
+/// Re-recorded 2026-11-17 (was 0x08cb_c742_f4c0_f567): the scene now draws front to back, so the control glyphs, the strip's hairlines and its curves show where the strip's background used to cover them.
+/// On that scene the maximize glyph's inner edge, now its fill layered in front of its stroke instead of the two hand-mixed, moved 32 pixels by one code (0x0ed9_97e2_41ef_3e90 with the old mix).
 #[cfg(all(feature = "text", feature = "icon"))]
 #[test]
 fn golden_chrome() {
     let (px, clip) = chrome_scene::<Argb8>();
-    check("chrome", &px, 0x08cb_c742_f4c0_f567);
+    check("chrome", &px, 0xfc2b_deb8_446a_95b0);
     check8("chrome_clip", &clip, 0x6ef3_84cb_654d_5c65);
     let (_, clip16) = chrome_scene::<crate::pixel::G2t16>();
     assert_eq!(clip16, clip, "the clip mask is the crossings' top byte at either depth");

@@ -43,6 +43,10 @@ pub mod packs;
 #[cfg(feature = "text")]
 pub mod widgets;
 
+// The hit map front to back with the pixels: every overlap's click goes to the frontmost.
+#[cfg(all(test, feature = "text"))]
+mod hit_order;
+
 pub use coord::Coord;
 pub use geom::Viewport;
 pub use group::Group;

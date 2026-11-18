@@ -5,9 +5,12 @@
 //! Built on the verbatim photon primitives in [`super::chrome`] — `draw_window_controls`, `draw_window_edges_and_mask`, `draw_button_hairlines`, `draw_button_hover_by_pixels`, `pixels_for_button`. Those stay; this module is a stateful wrapper that schedules them against the chrome group's dirty layers.
 //!
 //! Pattern: `chrome.rasterize_bg(|bg, w, h| { /* paint into bg */ });` → `chrome.rasterize_chrome(text);` → `chrome.flatten_into(target, w, h);`. Each rasterize_* checks the layer's dirty bit internally and is a no-op on clean. Hover / focus tint is NOT rasterized — it's applied by the host's post-finalize overlay pass against `persistent_screen` via [`super::widget::build_overlay_deltas`] reading [`Hover::tint_delta`] off each chrome button.
+//!
+//! The frame, front to back, for pixels and hits alike: `clear_hits` over each damage rect (the host has cleared the scratch there), `rasterize_perimeter` and `rasterize_chrome` (no claims), anything in front of the chrome (an open dropdown's popup), `flatten_chrome_into` (the chrome's pixels and its hits), the app's widgets in front-to-back order, each claiming only what nothing in front claimed, and `flatten_bg_into` last.
+//! The hit map is never last-writer-wins: every write into it is a claim ([`crate::paint::claim_hit`]), or a clear or a scroll's move made before the frame's first claim.
 
 use super::EventResponse;
-use super::chrome::{self, HIT_NONE, HitId};
+use super::chrome::{self, HIT_BLOCK, HIT_NONE, HitId};
 use super::widget::{self, Click, Container, Hover, PaintCtx, Widget};
 use crate::coord::Coord;
 use crate::geom::Viewport;
@@ -156,9 +159,16 @@ impl widget::Key for ChromeButton {
 pub struct DefaultChrome<P: Pixel = Argb8> {
     /// Full-viewport Group with 3 layers (bg, chrome, hover) composed via Stack Notation. Topmost-first: `Push chrome, Push bg, Under(Normal)` for the minimal scaffold; expand to include hover via `Push hover, Push chrome, Under(Add), Push bg, Under(Normal)` as the design grows.
     pub group: Group<P>,
-    /// Per-pixel button-id map. `HIT_NONE` (0) for pixels outside any chrome button; otherwise the dense `HitId` of whichever button the pixel belongs to (min / max / close / app-icon — each id is allocated at chrome construction time via [`super::widget::next_id`]). Sized to `width * height` pixels of the current viewport.
+    /// The frame's hit map, shared: the chrome's buttons and every widget the app draws claim their pixels here front to back ([`crate::paint::claim_hit`]), so whatever is frontmost on screen takes the click.
+    /// Per pixel `HIT_NONE` (0) where nothing claimed it, otherwise the dense `HitId` of what did (the chrome's min / max / close / app-icon, each allocated at construction via [`super::widget::next_id`], or the app's own).
+    /// Sized to `width * height` pixels of the current viewport.
+    /// A frame clears it over its damage first ([`Self::clear_hits`]), as the host clears the scratch.
     pub hit_test_map: Vec<HitId>,
-    /// Where the chrome layer holds anything (the bounding box of its non-empty pixels), found by one scan after each re-raster and kept until the next: the per-frame flatten covers only this, not the whole viewport (2026-11-08: on a phone the chrome is an orb in a corner, and the full-frame blit of its empty rest cost a pass over every pixel each frame). None until scanned.
+    /// The chrome's own hits, a layer like its pixels: written by each re-raster, and claimed into [`Self::hit_test_map`] when the chrome layer goes into the frame ([`Self::flatten_chrome_into`], [`Self::flatten_into`]), so the chrome's hits take the same place in the front-to-back order as its pixels.
+    /// [`HIT_BLOCK`] marks a pixel outside the window's silhouette, claimed before any button so none takes it, and never claimed into the frame's map.
+    chrome_hits: Vec<HitId>,
+    /// Where the chrome layer holds anything (the bounding box of its non-empty pixels and of its own hits), found by one scan after each re-raster and kept until the next: the per-frame flatten covers only this, not the whole viewport (2026-11-08: on a phone the chrome is an orb in a corner, and the full-frame blit of its empty rest cost a pass over every pixel each frame).
+    /// None until scanned.
     chrome_bbox: Option<crate::canvas::PixelRect>,
     /// Window title rendered into the chrome layer (left-aligned in the controls strip). Empty string = skip text rendering.
     pub title: String,
@@ -215,10 +225,15 @@ fn content_bbox<P: Pixel>(pixels: &[P], w: usize, h: usize) -> crate::canvas::Pi
 
 /// [`content_bbox`] of the part of a `w`-wide layer inside `r` (the layer empty outside it).
 fn region_bbox<P: Pixel>(pixels: &[P], w: usize, r: crate::canvas::PixelRect) -> crate::canvas::PixelRect {
+    region_bbox_by(pixels, w, r, |p| p != P::EMPTY)
+}
+
+/// The bounding box, inside `r` of a `w`-wide buffer, of the entries `held` picks.
+fn region_bbox_by<T: Copy>(buf: &[T], w: usize, r: crate::canvas::PixelRect, held: impl Fn(T) -> bool) -> crate::canvas::PixelRect {
     let mut b = crate::canvas::PixelRect::empty();
     for y in r.y0..r.y1 {
-        let row = &pixels[y * w + r.x0..y * w + r.x1];
-        if let (Some(x0), Some(x1)) = (row.iter().position(|&p| p != P::EMPTY), row.iter().rposition(|&p| p != P::EMPTY)) {
+        let row = &buf[y * w + r.x0..y * w + r.x1];
+        if let (Some(x0), Some(x1)) = (row.iter().position(|&p| held(p)), row.iter().rposition(|&p| held(p))) {
             b = b.union(crate::canvas::PixelRect::new(r.x0 + x0, y, r.x0 + x1 + 1, y + 1));
         }
     }
@@ -289,6 +304,7 @@ impl<P: Pixel> DefaultChrome<P> {
         Self {
             group,
             hit_test_map: alloc::vec![HIT_NONE; map_len],
+            chrome_hits: alloc::vec![HIT_NONE; map_len],
             chrome_bbox: None,
             title: title.into(),
             status_text,
@@ -322,6 +338,9 @@ impl<P: Pixel> DefaultChrome<P> {
         self.group.resize(region);
         let map_len = viewport.width_px as usize * viewport.height_px as usize;
         self.hit_test_map.resize(map_len, HIT_NONE);
+        // The chrome's own hits start empty at the new size; the next re-raster covers the whole viewport (chrome_bbox below goes None).
+        self.chrome_hits.clear();
+        self.chrome_hits.resize(map_len, HIT_NONE);
         self.viewport = viewport;
         // What the layer held is of the old size (its buffer kept and read at the new width): unknown, so its next re-raster clears and damages all of it.
         self.chrome_bbox = None;
@@ -413,6 +432,7 @@ impl<P: Pixel> DefaultChrome<P> {
     }
 
     /// The same shift for the per-pixel hit map: a scrolled pane's hit zones travel with its pixels, so the rows inside `rect` memmove by `dy` and only the exposed band waits for the pane's own re-stamp. Without this a memmoved frame would leave every hit zone one shift behind the pixels.
+    /// Call it before anything claims in the frame, with the scratch's own move.
     pub fn scroll_hit_map(&mut self, rect: crate::canvas::PixelRect, dy: i32) {
         let (w, h) = self.dims();
         // WHY/PROOF: rect is the app's scroll hint, which can overhang the hit map — the row copies would index past it.
@@ -424,6 +444,7 @@ impl<P: Pixel> DefaultChrome<P> {
         if n >= y1 - y0 {
             return;
         }
+        // WHY/PROOF that order cannot matter: the move runs before the frame's first claim, so what it overwrites is last frame's settled claims, each replaced by the claim of the pixel that scrolled there.
         let span = x1 - x0;
         if dy > 0 {
             for dst in (y0 + n..y1).rev() {
@@ -534,7 +555,9 @@ impl<P: Pixel> DefaultChrome<P> {
         let pixels = &self.group.rpn.layers[self.layer_chrome].pixels;
         let held = region_bbox(pixels, w, region);
         debug_assert_eq!(held, content_bbox(pixels, w, h), "the chrome drew outside its reach");
-        self.chrome_bbox = Some(held);
+        // The box covers the chrome's hits too: the flatten claims them over it, and a hit can sit where the chrome draws nothing (the orb claims out to its ring's radius, whose last pixel takes no coverage).
+        let hits = region_bbox_by(&self.chrome_hits, w, region, |id| id != HIT_NONE && id != HIT_BLOCK);
+        self.chrome_bbox = Some(held.union(hits));
     }
 
     /// The re-raster itself, the layer and the hit map cleared over `region` first.
@@ -550,8 +573,20 @@ impl<P: Pixel> DefaultChrome<P> {
         let vp_h = buf_h as u32;
         crate::paint::RASTERIZE_OPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
-        // clip_mask is owned + carved by `rasterize_perimeter` (runs before content, every frame). This pass only READS it (button hit-scan walls below, silhouette restriction post-pass). hit_test_map is still owned here — wiped over the region on each dirty cycle before re-stamping the buttons.
+        // clip_mask is owned + carved by `rasterize_perimeter` (runs before content, every frame).
+        // This pass only READS it (button hit-scan walls below, the silhouette pre-claim).
+        // The frame's map is cleared over the region, which is this frame's chrome damage (`chrome_damage_rect` names exactly it), so whatever claimed there last frame claims again this frame.
+        // WHY/PROOF that order cannot matter: this runs before anything claims in the frame (the app calls `rasterize_chrome` ahead of its content, and the chrome's own hits go in later, at its flatten), so the clear overwrites only last frame's claims, never one of this frame's.
         fill_rect(&mut self.hit_test_map, buf_w, region, HIT_NONE);
+        // The chrome's own hit layer over the region, reset in one write per pixel with the window's shape in front of everything: a pixel the perimeter cut (clip_mask < 255, the corners and their AA fringe) takes HIT_BLOCK first, so no button claims it after.
+        // Until 2026-11-17 the buttons stamped first and a post-pass wrote HIT_NONE over the cut pixels afterwards, the silhouette drawn last.
+        // WHY/PROOF that order cannot matter: this is this raster's first write to its own hit layer over the region, before any button claims, so it overwrites only the last raster's hits.
+        for y in region.y0..region.y1 {
+            let row = y * buf_w + region.x0..y * buf_w + region.x1;
+            for (slot, &m) in self.chrome_hits[row.clone()].iter_mut().zip(&clip_mask[row]) {
+                *slot = if m < 255 { HIT_BLOCK } else { HIT_NONE };
+            }
+        }
 
         // Compute span + button size shared by controls and squircle. Use the viewport's `effective_span` (= `span * ru`) so chrome scales with the user's zoom — Ctrl+/Ctrl-/Ctrl+scroll zoom the chrome together with content.
         let span = self.viewport.effective_span();
@@ -562,6 +597,7 @@ impl<P: Pixel> DefaultChrome<P> {
 
         let chrome_buf = &mut self.group.rpn.layers[self.layer_chrome].pixels;
         // α + darkness: transparent init (α=0, dark=0) so the bg shows thru everywhere except the hairline + AA pixels.
+        // WHY/PROOF that order cannot matter: this is this raster's first write to its layer over the region, before anything below draws into it, so it clears only the last raster's pixels.
         fill_rect(chrome_buf, buf_w, region, P::EMPTY);
 
         if vp_w < 2 || vp_h < 2 {
@@ -640,7 +676,7 @@ impl<P: Pixel> DefaultChrome<P> {
             if orb_present {
                 chrome::draw_app_icon(
                     chrome_buf,
-                    Some(&mut self.hit_test_map),
+                    Some(&mut self.chrome_hits),
                     self.app_icon_btn.id(),
                     buf_w,
                     buf_h,
@@ -713,7 +749,7 @@ impl<P: Pixel> DefaultChrome<P> {
         chrome::paint_button_hit_row_scan(
             chrome_buf,
             clip_mask,
-            &mut self.hit_test_map,
+            &mut self.chrome_hits,
             buf_w,
             div1_col - 1,
             false,
@@ -728,7 +764,7 @@ impl<P: Pixel> DefaultChrome<P> {
         chrome::paint_button_hit_row_scan(
             chrome_buf,
             clip_mask,
-            &mut self.hit_test_map,
+            &mut self.chrome_hits,
             buf_w,
             div2_col + 1,
             true,
@@ -743,7 +779,7 @@ impl<P: Pixel> DefaultChrome<P> {
         chrome::paint_button_hit_row_scan(
             chrome_buf,
             clip_mask,
-            &mut self.hit_test_map,
+            &mut self.chrome_hits,
             buf_w,
             div1_col + 1,
             true,
@@ -758,7 +794,7 @@ impl<P: Pixel> DefaultChrome<P> {
         chrome::paint_button_hit_row_scan(
             chrome_buf,
             clip_mask,
-            &mut self.hit_test_map,
+            &mut self.chrome_hits,
             buf_w,
             div2_col - 1,
             false,
@@ -769,7 +805,7 @@ impl<P: Pixel> DefaultChrome<P> {
             bound_x_max,
         );
 
-        // Symbols painted AFTER flood-fill: now that hit_test_map is populated, glyph opacity in chrome_buf no longer affects the hit map (and the hit fill won't see them as walls since it already ran).
+        // Symbols painted AFTER flood-fill: now that chrome_hits is populated, glyph opacity in chrome_buf no longer affects the hit map (and the hit fill won't see them as walls since it already ran).
         chrome::draw_maximize_symbol(
             chrome_buf,
             buf_w,
@@ -804,7 +840,7 @@ impl<P: Pixel> DefaultChrome<P> {
 
         chrome::draw_strip_bg(
             chrome_buf,
-            &mut self.hit_test_map,
+            &mut self.chrome_hits,
             vp_w,
             vp_h,
             ctl,
@@ -831,19 +867,12 @@ impl<P: Pixel> DefaultChrome<P> {
         }
 
         // Hover paint moved to the host overlay path; chrome_buf is intentionally tint-free here.
-
-        // Silhouette restriction post-pass — photon-style. Any pixel the perimeter dropped below full coverage (clip_mask < 255 = corner cutouts, AA fringes) gets HIT_NONE so a non-strip rasterizer (currently the app icon at the top-left) can't leave a stale hit_id at a pixel that's geometrically outside the silhouette.
-        // Over the region alone: the buttons and the orb stamp nothing outside it, and an app's own stamps outside it are the app's.
-        for y in region.y0..region.y1 {
-            for i in y * buf_w + region.x0..y * buf_w + region.x1 {
-                if clip_mask[i] < 255 {
-                    self.hit_test_map[i] = HIT_NONE;
-                }
-            }
-        }
     }
 
-    /// Composite the chrome group (bg + chrome layers via internal Stack `Push chrome, Push bg, Under(Normal)`) and flatten under the present buffer. Front-to-back: chrome's composited result is blended `under` whatever's already in target, so chrome wins where opaque and bg shows thru where chrome is transparent.
+    /// Composite the chrome group (bg + chrome layers via internal Stack `Push chrome, Push bg, Under(Normal)`) and flatten it under `target`.
+    /// Front to back: the group goes under whatever is already in `target`, so content drawn before this call is in front of the chrome, the chrome is in front of the bg, and the bg shows thru where the chrome is transparent.
+    /// The chrome's hits are claimed into [`Self::hit_test_map`] at the same step, over the same clip, so they too land behind what the content already claimed.
+    /// For a chrome in front of the content use [`Self::flatten_chrome_into`] before the content and [`Self::flatten_bg_into`] after it.
     ///
     /// `clip`: optional damage-clip in target pixel coords; passed straight thru to [`Group::flatten_into`]. `None` = full target (current behavior).
     pub fn flatten_into(
@@ -853,10 +882,14 @@ impl<P: Pixel> DefaultChrome<P> {
         target_h: usize,
         clip: Option<crate::paint::Clip>,
     ) {
+        let boxed = self.chrome_clip(clip, target_w, target_h);
+        self.claim_chrome_hits(boxed);
         self.group.flatten_into(target, target_w, target_h, clip);
     }
 
     /// Flatten ONLY the chrome layer (buttons, orb, controls strip, title) into `target`. Call it BEFORE painting content: fluor is front-to-back, so the chrome then sits on top of everything the app draws — content scrolled up under the title strip, or a full-screen panel, can never bury the window controls. Pair with [`Self::flatten_bg_into`] after the content, in place of [`Self::flatten_into`].
+    /// The chrome's hits are claimed into [`Self::hit_test_map`] at the same step and over the same clip as its pixels, so the controls take the click wherever they show, and what the app draws after claims only what they left.
+    /// Anything the app put in front of the chrome (an open dropdown's popup, drawn before this call) keeps both its pixels and its hits.
     pub fn flatten_chrome_into(
         &mut self,
         target: &mut [P],
@@ -864,13 +897,45 @@ impl<P: Pixel> DefaultChrome<P> {
         target_h: usize,
         clip: Option<crate::paint::Clip>,
     ) {
-        // Only where the layer holds anything: the rest of it is empty, and an empty pixel under anything leaves it as it was.
+        let clip = self.chrome_clip(clip, target_w, target_h);
+        self.claim_chrome_hits(clip);
+        self.group.flatten_layer_into(self.layer_chrome, target, target_w, target_h, Some(clip));
+    }
+
+    /// `clip` (the whole target when `None`) cut to where the chrome layer holds anything: the rest of it is empty, an empty pixel under anything leaves it as it was, and the box covers the chrome's hits too (found with its pixels after each re-raster), so the claim needs nothing outside it.
+    /// An empty intersection comes out with its start at or past its end, which the blit and the claim cover nothing of.
+    fn chrome_clip(&mut self, clip: Option<crate::paint::Clip>, target_w: usize, target_h: usize) -> crate::paint::Clip {
         let (w, h) = self.dims();
         let bbox = *self.chrome_bbox.get_or_insert_with(|| content_bbox(&self.group.rpn.layers[self.layer_chrome].pixels, w, h));
         let c = crate::paint::Clip::resolve(clip, target_w, target_h);
-        // The clip and the box intersected; an empty intersection comes out with its start at or past its end, which the blit draws nothing for (and the layer is still settled).
-        let clip = crate::paint::Clip::new(c.x_start.max(bbox.x0), c.y_start.max(bbox.y0), c.x_end.min(bbox.x1), c.y_end.min(bbox.y1));
-        self.group.flatten_layer_into(self.layer_chrome, target, target_w, target_h, Some(clip));
+        crate::paint::Clip::new(c.x_start.max(bbox.x0), c.y_start.max(bbox.y0), c.x_end.min(bbox.x1), c.y_end.min(bbox.y1))
+    }
+
+    /// Claim the chrome's own hits into the frame's map over `clip` (already inside the chrome's box, so inside the map): each pixel nothing in front claimed takes the chrome's id there; a [`HIT_BLOCK`] (outside the window's silhouette) claims nothing.
+    fn claim_chrome_hits(&mut self, clip: crate::paint::Clip) {
+        let w = self.dims().0;
+        // WHY/PROOF: a clip that misses the chrome's box comes out with its start past its end (`chrome_clip`), and a reversed slice range panics where an empty loop would not.
+        if clip.x_start >= clip.x_end {
+            return;
+        }
+        for y in clip.y_start..clip.y_end {
+            let row = y * w + clip.x_start..y * w + clip.x_end;
+            for (slot, &mine) in self.hit_test_map[row.clone()].iter_mut().zip(&self.chrome_hits[row]) {
+                let held = *slot;
+                *slot = if held == HIT_NONE && mine != HIT_BLOCK { mine } else { held };
+            }
+        }
+    }
+
+    /// Start the frame's hits over one damage rect: everything claimed there last frame is cleared, so this frame's front-to-back claims (the popups, the chrome at its flatten, the widgets in order) settle every pixel afresh.
+    /// The hit map's half of the host clearing the scratch over the damage: call it for each of the frame's rects ([`super::app::Context::damage_rects`]) at the top of `render`, before anything claims.
+    /// Outside the damage the map keeps last frame's claims, as the frame keeps last frame's pixels.
+    pub fn clear_hits(&mut self, rect: crate::canvas::PixelRect) {
+        let (w, h) = self.dims();
+        // WHY/PROOF: the rect is the app's damage, which may overhang the frame (`DamageRects::cut` cuts it the same way for the hosts); the fill would index past the map.
+        let r = crate::canvas::PixelRect::new(rect.x0.min(w), rect.y0.min(h), rect.x1.min(w), rect.y1.min(h));
+        // WHY/PROOF that order cannot matter: this is the frame's first write to these pixels, called before anything claims, so it overwrites only last frame's claims.
+        fill_rect(&mut self.hit_test_map, w, r, HIT_NONE);
     }
 
     /// Flatten ONLY the bg layer (panes + background noise) into `target`: the LAST paint of the frame, under all content. See [`Self::flatten_chrome_into`].
@@ -1157,17 +1222,77 @@ mod tests {
     fn taps_outside_the_chrome_damage_still_hit() {
         let (w, h) = (900, 700);
         let (mut text, mut clip_mask, mut counter) = (TextRenderer::new(), alloc::vec![255u8; w * h], HIT_NONE);
-        let (mut chrome, _) = settled(w, h, "Peers 3", &mut text, &mut clip_mask, &mut counter);
+        let (mut chrome, mut frame) = settled(w, h, "Peers 3", &mut text, &mut clip_mask, &mut counter);
         let row = widget::next_id(&mut counter);
         let (x, y) = (w / 2, h - 40);
-        chrome.hit_test_map[y * w + x] = row;
+        crate::paint::claim_hit(&mut chrome.hit_test_map[y * w + x], row);
         chrome.set_orb_tint(chrome::OrbTint::Custom { ring: 0xFF60_4020, brighten: true });
         let dmg = chrome.damage_rect().unwrap();
         assert!(!(dmg.x0..dmg.x1).contains(&x) || !(dmg.y0..dmg.y1).contains(&y), "the row is outside the damage {dmg:?}");
         chrome.rasterize_chrome(&mut crate::canvas::Damage::new(), &mut text, &mut clip_mask);
+        // The chrome's hits go into the frame's map with its pixels, over the frame's damage.
+        chrome.flatten_chrome_into(&mut frame, w, h, Some(crate::paint::Clip::new(dmg.x0, dmg.y0, dmg.x1, dmg.y1)));
         assert_eq!(chrome.hit_at(x as Coord, y as Coord), row);
         let (cx, cy, _) = chrome.orb_geometry().unwrap();
         assert_eq!(chrome.hit_at(cx as Coord, cy as Coord), chrome.app_icon_btn.id(), "the orb is stamped again");
+    }
+
+    /// The chrome over content, front to back: the frame's hits are cleared over the damage, something in front of the chrome (a popup) claims first, the chrome's hits go in at its flatten, and a widget drawn after it across the controls strip and the orb takes none of their pixels.
+    /// At every pixel the click goes to the frontmost, and the chrome's opaque pixels stay its own.
+    #[test]
+    fn the_chrome_keeps_its_clicks_from_content_drawn_after_it() {
+        let (w, h) = (900usize, 700usize);
+        let (mut text, mut clip_mask, mut counter) = (TextRenderer::new(), alloc::vec![255u8; w * h], HIT_NONE);
+        let mut chrome = DefaultChrome::new(Viewport::new(w as u32, h as u32), "Front to back", None, None, &mut counter);
+        chrome.set_orb_tint(chrome::OrbTint::Custom { ring: 0xFF20_4060, brighten: false });
+        let popup = widget::next_id(&mut counter);
+        let mut slider = crate::widgets::Slider::new(&mut counter, w as Coord * 0.5, 50., w as Coord, 100., 0.5);
+        let sid = slider.hit_id();
+        let mut frame = alloc::vec![0u32; w * h];
+        // Last frame's claims everywhere: the clear must take them all.
+        chrome.hit_test_map.fill(sid);
+        chrome.clear_hits(crate::canvas::PixelRect::new(0, 0, w, h));
+        chrome.rasterize_perimeter(&mut frame, w, h, &mut clip_mask);
+        chrome.rasterize_chrome(&mut crate::canvas::Damage::new(), &mut text, &mut clip_mask);
+        // A popup in front of the chrome, over the close button's end of the strip.
+        let (px0, py0, px1, py1) = (w - 60, 0, w, 40);
+        for y in py0..py1 {
+            crate::paint::claim_hits(&mut chrome.hit_test_map[y * w + px0..y * w + px1], popup);
+        }
+        chrome.flatten_chrome_into(&mut frame, w, h, None);
+        let before = frame.clone();
+        let mut damage = crate::canvas::Damage::new();
+        {
+            let mut c = crate::canvas::Canvas::new(&mut frame, w, h, &mut damage);
+            slider.render_content_into(&mut c, Some(&mut chrome.hit_test_map), sid);
+        }
+        let chrome_ids = [chrome.min_btn.id(), chrome.max_btn.id(), chrome.close_btn.id(), chrome.app_icon_btn.id()];
+        let (mut under_chrome, mut under_popup) = (0, 0);
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                let mine = chrome.chrome_hits[i];
+                let got = chrome.hit_test_map[i];
+                if (px0..px1).contains(&x) && (py0..py1).contains(&y) {
+                    assert_eq!(got, popup, "({x}, {y}) went behind the popup");
+                    under_popup += (mine != HIT_NONE && mine != HIT_BLOCK) as usize;
+                } else if mine != HIT_NONE && mine != HIT_BLOCK {
+                    assert!(chrome_ids.contains(&mine));
+                    assert_eq!(got, mine, "({x}, {y}): the slider drawn after took the chrome's click");
+                    under_chrome += (y < 100) as usize;
+                } else if y < 100 {
+                    assert_eq!(got, sid, "({x}, {y}): the slider lost a pixel nothing is in front of");
+                } else {
+                    assert_eq!(got, HIT_NONE, "({x}, {y}): last frame's claim outlived the clear");
+                }
+                if before[i].alpha() == Argb8::ONE {
+                    assert_eq!(frame[i], before[i], "({x}, {y}): the slider came out in front of the chrome");
+                }
+            }
+        }
+        assert!(under_chrome > 0 && under_popup > 0, "nothing overlapped ({under_chrome} under the chrome, {under_popup} of the chrome under the popup)");
+        let (cx, cy, _) = chrome.orb_geometry().unwrap();
+        assert_eq!(chrome.hit_at(cx as Coord, cy as Coord), chrome.app_icon_btn.id(), "the orb");
     }
 
     #[test]

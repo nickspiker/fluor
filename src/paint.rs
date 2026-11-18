@@ -285,6 +285,29 @@ pub type HitId = u16;
 /// Reserved "no widget here" ID. Always 0 — registrations start at 1 so the value cannot collide.
 pub const HIT_NONE: HitId = 0;
 
+/// Reserved id for a front surface that takes no click of its own but hides whatever is behind it (an open dropdown's frame round its rows).
+/// It claims its pixels like any id, no widget answers to it, and the overlay table never reaches it, so it is never tinted.
+/// The allocator ([`crate::host::widget::next_id`]) never hands it out.
+pub const HIT_BLOCK: HitId = HitId::MAX;
+
+/// Claim one hit-map pixel for `id`: the hit map's half of front to back (AGENT.md, "Compositing: Front to Back").
+/// The frontmost thing claims its pixels first and a pixel already claimed is never written again, so whatever is frontmost on screen takes the click, exactly as the pixel kernels' opaque early-out keeps the front pixel.
+/// The map must start the frame empty over what is redrawn: [`crate::host::chrome_widget::DefaultChrome::clear_hits`].
+/// One compare and a select, no branch on the store.
+#[inline(always)]
+pub fn claim_hit(slot: &mut HitId, id: HitId) {
+    let held = *slot;
+    *slot = if held == HIT_NONE { id } else { held };
+}
+
+/// [`claim_hit`] over a run of pixels; branch free, so the compiler widens it.
+#[inline]
+pub fn claim_hits(run: &mut [HitId], id: HitId) {
+    for slot in run {
+        claim_hit(slot, id);
+    }
+}
+
 /// Compose `src` underneath `dst` where `src` is in *pre-composed* α + darkness form (the result of a chain of `under()` writes starting from empty — so `src.dark` is already attenuated by `src.α`). Unlike [`flatten`] with `BlendMode::Normal`, this kernel scales src's contribution by `(256 − dst.α)` only, NOT by `(256 − dst.α) × src.α`, avoiding the second premult that would dim every AA pixel.
 ///
 /// Use case: blit a cached widget layer (built by repeated `under()` from empty) onto a target buffer — every Stack layer, Group composite and chrome layer is one.
@@ -979,7 +1002,8 @@ impl DebugStats {
     }
 }
 
-/// Overlay a one-line diagnostic strip across the bottom of `pixels` showing the live stats in [`DebugStats`]. Gated by [`DEBUG_SHOW_FPS`] — the host should check that flag before calling. Paints into the α + darkness scratch buffer BEFORE the boundary pass so the strip flows thru `finalize_*` like any other content (no special handling needed downstream).
+/// Rasterize a one-line diagnostic strip showing the live stats in [`DebugStats`]. Gated by [`DEBUG_SHOW_FPS`]: the host should check that flag before calling.
+/// It paints α + darkness into the host's own staging buffer, and the host lays that in front of the frame's pixels as it converts them: the strip is the frontmost layer, and what is under its translucent bar shows thru.
 ///
 /// The strip is `~24` pixels tall, semi-opaque black background, bright green monospace text (terminal-style for readability against any underlying content). Positioned at the very bottom of `pixels`; clipped to the buffer if the window is too short to fit the strip (returns early in that case — diagnostic, not load-bearing).
 ///
@@ -1051,9 +1075,10 @@ const _: () = {
 
 /// The blinkey in a COLOUR: the same brightness wave, scaled per channel by `tint` (255 = the full wave, 0 = that channel stays dark). White tint = the plain blinkey; a link-purple caret is (160, 80, 255). Same bounds contract as [`draw_blinkey`].
 ///
-/// The caret is a layer of light in FRONT of what is drawn: a glow of white's colour (the theme's WHITE, channel by channel) at a falling α, `α = light ÷ the code of white's brightest channel` (so over black that channel shows exactly `light`, and over white the caret shows white), each channel's light `α × its white code ÷ ONE × tint ÷ 255`.
-/// It is drawn after the text it sits in (the callers paint the field, then the caret), so it cannot go into the accumulator first; it goes in front of the finished pixels instead, `caret.under_premult(pixel)`, which is the same composite as the caret laid first and the field under it, since `under` is associative over premultiplied operands.
+/// The caret is a layer of light in FRONT of the field it sits in: a glow of white's colour (the theme's WHITE, channel by channel) at a falling α, `α = light ÷ the code of white's brightest channel` (so over black that channel shows exactly `light`, and over white the caret shows white), each channel's light `α × its white code ÷ ONE × tint ÷ 255`.
+/// It goes into the accumulator at its place in the front-to-back order, under whatever is already there (`pixel.under_premult(caret)`): the callers draw it BEFORE the text and the field it sits in, which then land under it, and anything drawn in front of the textbox (a popup over it) stays in front of the caret.
 /// Until 2026-11-07 the caret subtracted its light from the finished darkness (drawn last, painter's order), floored at white: a pixel already brighter than white kept its light, and on a translucent pixel the caret added no coverage of its own.
+/// Until 2026-11-17 it was still drawn after the field, in front of the finished pixels (`caret.under_premult(pixel)`), which put it in front of everything drawn before the textbox too.
 pub fn draw_blinkey_tinted<P: Pixel>(canvas: &mut Canvas<P>, bx: usize, by: usize, height: usize, top_bright: bool, tint: (u8, u8, u8)) {
     let buf_w = canvas.width;
     // Damage: ±7 horizontal spread × `height` vertical band. Caller's bounds invariant (bx ≥ 7, bx < buf_w-7) guarantees this stays in-buffer.
@@ -1082,7 +1107,7 @@ pub fn draw_blinkey_tinted<P: Pixel>(canvas: &mut Canvas<P>, bx: usize, by: usiz
             let light: [u32; 3] = core::array::from_fn(|c| ((a as u64 * white_code[c] as u64 * tints[c] as u64 + (P::ONE as u64 * 255 >> 1)) / (P::ONE as u64 * 255)) as u32);
             let caret = P::from_channels(a, light.map(|l| a - l));
             let p = &mut pixels[(idx as isize + dx as isize) as usize];
-            *p = caret.under_premult(*p, BlendMode::Normal);
+            *p = p.under_premult(caret, BlendMode::Normal);
         }
     }
 }
@@ -1217,7 +1242,9 @@ mod tests {
         assert_eq!((r, g, b), (50, 80, 110));
     }
 
-    /// The blinkey is light in front of what is drawn, at both depths: over opaque black it brightens and stays opaque, over white it stays white (to a code), and over an empty buffer it lands as a layer of its own, white at its α. Until 2026-11-07 it subtracted from the darkness already there: an empty buffer stayed empty.
+    /// The blinkey is light in front of the field it sits in, at both depths: it goes into an empty accumulator first and the field lands under it, so over opaque black it brightens and stays opaque, over white it stays white (to a code), and with nothing under it it is a layer of its own, white at its α.
+    /// Until 2026-11-07 it subtracted from the darkness already there: an empty buffer stayed empty.
+    /// Something already opaque when the caret arrives (drawn in front of the textbox) stays in front of it, untouched.
     #[test]
     fn blinkey_is_light_in_front() {
         fn run<P: Pixel>() {
@@ -1225,9 +1252,12 @@ mod tests {
             let white = P::from_g2t8(crate::theme::WHITE);
             let white_dark = white.channels();
             for (fill, name) in [(P::from_channels(P::ONE, [P::ONE; 3]), "black"), (white, "white"), (P::EMPTY, "empty")] {
-                let mut buf = vec![fill; w * h];
+                let mut buf = vec![P::EMPTY; w * h];
                 let mut damage = crate::canvas::Damage::new();
                 draw_blinkey(&mut crate::canvas::Canvas::new(&mut buf, w, h, &mut damage), 12, 0, h, true);
+                for p in buf.iter_mut() {
+                    *p = p.under_premult(fill, BlendMode::Normal);
+                }
                 assert!(buf.iter().any(|&p| p != fill), "{name}: the caret drew nothing");
                 for p in buf {
                     let (a, d) = (p.alpha(), p.channels());
@@ -1240,6 +1270,11 @@ mod tests {
                     }
                 }
             }
+            let front = P::from_channels(P::ONE, [P::ONE; 3]);
+            let mut buf = vec![front; w * h];
+            let mut damage = crate::canvas::Damage::new();
+            draw_blinkey(&mut crate::canvas::Canvas::new(&mut buf, w, h, &mut damage), 12, 0, h, true);
+            assert!(buf.iter().all(|&p| p == front), "the caret came out in front of what was drawn before it");
         }
         run::<Argb8>();
         run::<crate::pixel::G2t16>();

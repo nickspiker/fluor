@@ -5,7 +5,7 @@
 use crate::canvas::PixelRect;
 use crate::text::TextStyle;
 use crate::coord::Coord;
-use crate::paint::{self, Clip, HitId};
+use crate::paint::{self, Clip, HitId, HIT_NONE};
 use crate::region::Region;
 use crate::text::TextRenderer;
 use crate::pixel::{Argb8, Pixel};
@@ -122,7 +122,7 @@ pub(crate) fn region_to_pixelrect(
 ///
 /// Composition is [`paint::flatten_premult`]'s kernel, row by row (src is pre-attenuated, so we scale by `(ONE + 1 − dst.α)` only — not by that × src.α): one copy of the maths for every premultiplied blit.
 ///
-/// Hit stamp: writes `hit_id` to `hit_map` at every opaque cache pixel during the same walk.
+/// Hit claim: every opaque cache pixel claims `hit_id` in `hit_map` during the same walk, unless something in front already holds that pixel ([`paint::claim_hit`]): the hit map goes front to back with the colour.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn blit_cache_to_target<P: Pixel>(
     cache: &[P],
@@ -164,10 +164,10 @@ pub(crate) fn blit_cache_to_target<P: Pixel>(
         let target_row = ty * target_w + dx0;
         paint::flatten_premult_chunk(&mut target[target_row..target_row + run], src);
         if let Some(hm) = hit_map.as_deref_mut() {
-            for (i, s) in src.iter().enumerate() {
-                if s.alpha() == P::ONE {
-                    hm[target_row + i] = hit_id;
-                }
+            // An opaque cache pixel claims its hit pixel unless something in front already holds it.
+            for (slot, s) in hm[target_row..target_row + run].iter_mut().zip(src) {
+                let held = *slot;
+                *slot = if s.alpha() == P::ONE && held == HIT_NONE { hit_id } else { held };
             }
         }
     }
@@ -1064,6 +1064,20 @@ impl<P: Pixel> Textbox<P> {
         self.pill_cache_origin_x = pill_x_target;
         self.pill_cache_origin_y = pill_y_target;
 
+        // The blinkey first: THE canonical painter (paint::draw_blinkey), a layer of light in front of the field, so it goes into the accumulator before the text and the pill land under it.
+        // Until 2026-11-07 this was a hand-rolled copy that subtracted the wave from the finished darkness, painter's order; until 2026-11-17 the canonical one was still drawn after the field, in front of the finished pixels and so in front of anything drawn before the textbox too.
+        if self.focused && !self.has_selection() && self.blinkey_visible {
+            let buf_w = canvas.width;
+            let buf_h = canvas.height;
+            let blinkey_x = (self.cursor_pixel_x() as isize - offset_x as isize) as usize;
+            let blinkey_y = ((self.center_y - self.font_size * 0.5) - offset_y) as usize;
+            let blinkey_h = self.font_size as usize;
+            // WHY/PROOF: the caret follows the scroll and the app's layout, so its 15-px smear can hang past the buffer's edge, and the smear would index outside it.
+            if blinkey_x >= 7 && blinkey_x + 7 < buf_w && blinkey_y + blinkey_h <= buf_h {
+                paint::draw_blinkey(canvas, blinkey_x, blinkey_y, blinkey_h, self.blinkey_wave_top);
+            }
+        }
+
         // --- Three-layer composition via under() — topmost first (fluor front-to-back) --- Step 1: text glyphs (topmost). Opaque glyph pixels claim their cells in target; surrounding empties don't write (α=0 in text_cache). No hit_map writes — pill layer stamps that.
         blit_cache_to_target(
             &self.text_cache,
@@ -1142,24 +1156,12 @@ impl<P: Pixel> Textbox<P> {
             );
         }
 
-        // The blinkey: THE canonical painter (paint::draw_blinkey), a layer of light composed in front of the field just drawn. Until 2026-11-07 this was a hand-rolled copy that subtracted the wave from the finished darkness, painter's order.
-        if self.focused && !self.has_selection() && self.blinkey_visible {
-            let buf_w = canvas.width;
-            let buf_h = canvas.height;
-            let blinkey_x = (self.cursor_pixel_x() as isize - offset_x as isize) as usize;
-            let blinkey_y = ((self.center_y - self.font_size * 0.5) - offset_y) as usize;
-            let blinkey_h = self.font_size as usize;
-            // WHY/PROOF: the caret follows the scroll and the app's layout, so its 15-px smear can hang past the buffer's edge — the smear would index outside it.
-            if blinkey_x >= 7 && blinkey_x + 7 < buf_w && blinkey_y + blinkey_h <= buf_h {
-                paint::draw_blinkey(canvas, blinkey_x, blinkey_y, blinkey_h, self.blinkey_wave_top);
-            }
-        }
-
         // Record what we just painted so the next frame's damage_rect can union prev∪current bboxes (handles moves, hover-only changes, focus-on/off).
         self.record_painted(canvas.width, canvas.height);
     }
 
     /// Render only the blinkey wave cursor into a buffer (typically a sub-viewport `cursor_group` buffer). `(offset_x, offset_y)` is the buffer's top-left in viewport coords. The buffer should be cleared to empty before calling: the blinkey lands there as a layer of its own (white light at a falling α, premultiplied), to go in front of the field by `flatten_premult` or `under`. (Until 2026-11-07 the caret subtracted from darkness already there, so on an empty buffer it drew nothing.)
+    /// Into a buffer that already holds pixels it goes under them, as everything does: a caret laid on a finished field is hidden where the field is opaque.
     pub fn render_blinkey_into(
         &self,
         canvas: &mut crate::canvas::Canvas<P>,

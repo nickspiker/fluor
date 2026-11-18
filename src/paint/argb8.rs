@@ -12,23 +12,6 @@ pub fn pack_argb(r: u8, g: u8, b: u8, a: u8) -> u32 {
 }
 
 
-/// Wrap-add the RGB bytes of `delta_rgb` into `pixels[i]` for every `i` where `hit_map[i] == target_id`. The α byte is preserved. Used to apply a "tint" effect (hover, focus, etc.) on top of an already-painted region whose pixels were stamped with a known hit ID — mirrors the chrome's bake_hover pattern but generic over any hit ID. `wrapping_sub` of the same delta exactly reverses the add, so callers maintain old_delta/new_delta state and unbake/bake atomically.
-pub fn wrap_add_rgb_where(pixels: &mut [u32], hit_map: &[HitId], target_id: HitId, delta_rgb: u32) {
-    let dr = ((delta_rgb >> 16) & 0xFF) as u8;
-    let dg = ((delta_rgb >> 8) & 0xFF) as u8;
-    let db = (delta_rgb & 0xFF) as u8;
-    for i in 0..pixels.len() {
-        if hit_map[i] == target_id {
-            let p = pixels[i];
-            let a = p & 0xFF00_0000;
-            let r = (((p >> 16) & 0xFF) as u8).wrapping_add(dr) as u32;
-            let g = (((p >> 8) & 0xFF) as u8).wrapping_add(dg) as u32;
-            let b = ((p & 0xFF) as u8).wrapping_add(db) as u32;
-            pixels[i] = a | (r << 16) | (g << 8) | b;
-        }
-    }
-}
-
 /// Generic per-hit-id overlay pass: walk `hit_test_map`, for each pixel whose hit id is currently tinted OR was tinted last frame, COPY the corresponding scratch pixel into persistent_screen — XOR'd to visible RGB, forced opaque, with an optional per-channel wrap-sub of `deltas[id]` if the id is currently tinted. The hit_test_map IS the silhouette trace of each interactive element (same flood-fill identification Photon uses), and we use it strictly to bound which pixels we touch — there's no diff math, no `last_applied_delta` accumulation, just "read scratch, maybe-adjust, write screen." Every frame's overlay is independently correct against scratch's content, so nothing the persistent_screen does between frames (fade, debug toggles, anything) can corrupt the tint.
 ///
 /// Overlay-delta flag (bit 24, above the three channel bytes): apply the per-pixel sqrt gamma lift instead of a constant wrap-sub. The low 24 bits are zero, so a consumer that predates the flag degrades to a visible no-op write rather than a wrong colour.
@@ -166,6 +149,8 @@ pub fn apply_overlay<P: super::Finalize>(
                 } else {
                     raw.tint_g2t8(delta).to_sdr_visible_at(scr_x, scr_y)
                 };
+                // WHY/PROOF that order cannot matter: the value is a function of this pixel's scratch (the frame's finished front-to-back composite) and its id's tint alone, never of what persistent_screen held, so it replaces finalize's conversion of the same pixel with that conversion tinted; no layer is laid over another.
+                // Each pixel holds one id, so one id's scan writes it at most once per pass.
                 persistent_screen[scr_row + scr_x] = 0xFF00_0000 | (visible & 0x00FF_FFFF);
             }
         }
@@ -175,7 +160,10 @@ pub fn apply_overlay<P: super::Finalize>(
 }
 
 
-/// Per-byte wrap-subtract of `b` from `a`'s RGB bytes, returning a packed RGB delta suitable for [`wrap_add_rgb_where`]. The α byte is zeroed in the result. Used to derive a tint delta from two theme colours at runtime (e.g. `wrap_sub_rgb(TEXTBOX_HOVER, TEXTBOX_FILL)` → the per-channel offset that, wrap-added to a `TEXTBOX_FILL` pixel, lands at `TEXTBOX_HOVER`).
+/// Per-byte wrap-subtract of `b` from `a`'s RGB bytes, returning a packed RGB delta: an overlay tint ([`Hover::tint_delta`](crate::host::widget::Hover::tint_delta), applied by [`apply_overlay`]).
+/// The α byte is zeroed in the result.
+/// Used to derive a tint delta from two theme colours at runtime (e.g.
+/// `wrap_sub_rgb(TEXTBOX_HOVER, TEXTBOX_FILL)` → the per-channel offset that, added to a `TEXTBOX_FILL` pixel's darkness, lands it at `TEXTBOX_HOVER`).
 #[inline]
 pub fn wrap_sub_rgb(a: u32, b: u32) -> u32 {
     let ar = (a >> 16) & 0xFF;
@@ -222,9 +210,14 @@ pub fn scale_brightness(packed: u32, num: u16, den: u16) -> u32 {
 }
 
 
-/// Stamp a 1-pixel magenta hairline around `bbox` directly into the screen-sized, visible-RGB back buffer. `bbox` is window-local; `offset_x` / `offset_y` are the window's top-left in screen space. Pure overwrite — no blending, no `under` path, no damage tracking. Caller invokes between `copy_from_slice(&persistent_screen)` and `buffer.present()` so the magenta lives for exactly one frame.
-pub fn stamp_damage_outline_visible(
-    buf: &mut [u32],
+/// The present buffer with the damage outline in front: a 1-pixel magenta hairline round `bbox` goes into `dst` first, and `screen` (the screen-sized, visible-RGB frame) fills every other pixel of it.
+/// `bbox` is window-local; `offset_x` / `offset_y` are the window's top-left in screen space.
+/// No blending, no `under` path, no damage tracking: the outline is opaque, so where it is nothing behind is read, and each pixel of `dst` is written once.
+/// The caller presents `dst` in place of `screen` for one frame, so the magenta never enters `screen` and never outlives the frame.
+/// Until 2026-11-17 the screen was copied whole and the outline stamped over it afterwards, the overlay drawn last.
+pub fn compose_damage_outline(
+    dst: &mut [u32],
+    screen: &[u32],
     scr_w: usize,
     scr_h: usize,
     bbox: crate::canvas::PixelRect,
@@ -232,9 +225,6 @@ pub fn stamp_damage_outline_visible(
     offset_y: i32,
 ) {
     const MAGENTA: u32 = 0xFFFF_00FF;
-    if bbox.is_empty() || scr_w == 0 || scr_h == 0 {
-        return;
-    }
     let sx0_i = offset_x + bbox.x0 as i32;
     let sy0_i = offset_y + bbox.y0 as i32;
     let sx1_i = offset_x + bbox.x1 as i32;
@@ -244,33 +234,31 @@ pub fn stamp_damage_outline_visible(
     let y0 = sy0_i.max(0) as usize;
     let x1 = (sx1_i.max(0) as usize).min(scr_w);
     let y1 = (sy1_i.max(0) as usize).min(scr_h);
-    if x0 >= x1 || y0 >= y1 {
+    // No outline (an empty bbox, or one wholly off the screen): every pixel is the screen's.
+    if bbox.is_empty() || x0 >= x1 || y0 >= y1 {
+        dst[..scr_w * scr_h].copy_from_slice(&screen[..scr_w * scr_h]);
         return;
     }
-
-    // Top row.
-    let top_row = y0 * scr_w;
-    for px in x0..x1 {
-        buf[top_row + px] = MAGENTA;
-    }
-    // Bottom row — only paint if distinct from the top (i.e., rect is ≥ 2 tall); otherwise the top row already covered it.
-    if y1 - 1 > y0 {
-        let bot_row = (y1 - 1) * scr_w;
-        for px in x0..x1 {
-            buf[bot_row + px] = MAGENTA;
-        }
-    }
-    // Left and right columns (interior rows only — corners are claimed by the top/bottom rows).
-    let interior_y0 = y0 + 1;
-    let interior_y1 = y1 - 1;
-    if interior_y0 < interior_y1 {
-        let right_col = x1 - 1;
-        for py in interior_y0..interior_y1 {
-            let row = py * scr_w;
-            buf[row + x0] = MAGENTA;
-            if right_col > x0 {
-                buf[row + right_col] = MAGENTA;
+    // The outline's two edge rows (one when the rect is a single row) and its two edge columns (one when it is a single column); every other pixel copies the screen.
+    let (top, bottom, left, right) = (y0, y1 - 1, x0, x1 - 1);
+    for y in 0..scr_h {
+        let row = y * scr_w..(y + 1) * scr_w;
+        let (d, s) = (&mut dst[row.clone()], &screen[row]);
+        if y == top || y == bottom {
+            d[..x0].copy_from_slice(&s[..x0]);
+            d[x0..x1].fill(MAGENTA);
+            d[x1..].copy_from_slice(&s[x1..]);
+        } else if y > top && y < bottom {
+            d[..left].copy_from_slice(&s[..left]);
+            d[left] = MAGENTA;
+            // A one-column rect has both edges on the same column: written once, and the run between them is empty (a reversed range would panic).
+            if right > left {
+                d[left + 1..right].copy_from_slice(&s[left + 1..right]);
+                d[right] = MAGENTA;
             }
+            d[right + 1..].copy_from_slice(&s[right + 1..]);
+        } else {
+            d.copy_from_slice(s);
         }
     }
 }

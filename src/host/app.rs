@@ -1192,8 +1192,10 @@ struct DesktopShell<A: FluorApp<P>, P: Finalize> {
     last_alpha_mode: u8,
     /// Last-seen value of `paint::DEBUG_SHOW_OPAQUE_SCAN`. Same transition logic as `last_hitmask` — toggling the opaque-scan tint changes what finalize stamps into persistent_screen (every interior pixel gains +16 blue while on; goes back to clean copy while off), so the next frame must be a full_repaint to wash the entire silhouette interior in one shot rather than only the next incidentally-damaged sub-rect.
     last_opaque_scan: bool,
-    /// Dedicated staging buffer for the FPS strip (debug). Sized to `win_w × DEBUG_STRIP_H` lazily on first use; the strip rasterizes here in α + darkness and then gets converted + clobbered into persistent_screen. Kept entirely separate from the app's scratch so the strip never contaminates the consumer's render path.
-    strip_buf: Vec<u32>,
+    /// Dedicated staging buffer for the FPS strip (debug), at the frame's depth.
+    /// Sized to `win_w × DEBUG_STRIP_H` lazily on first use; the strip rasterizes here in α + darkness, then goes in front of the frame's own pixels as it is converted into persistent_screen.
+    /// Kept entirely separate from the app's scratch so the strip never contaminates the consumer's render path.
+    strip_buf: Vec<P>,
     /// macOS click-thru: true when we've told the OS to ignore mouse events for this window (cursor is over a transparent area). A global NSEvent monitor polls cursor position to detect re-entry.
     #[cfg(target_os = "macos")]
     hittest_off: bool,
@@ -2569,9 +2571,11 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             // The app's rects as their bounding box, cleared, drawn and finalized whole: this host keeps one damage rect (the render's context names that box as its one rect, so an app that named several draws all of it).
             app_damage(&mut self.app, self.viewport).map_or(crate::canvas::PixelRect::empty(), |d| d.bbox())
         };
-        // Strip is painted in a clobber pass AFTER finalize + overlay — it does NOT contribute to damage_clip and does NOT bump damage_pct.
+        // The strip goes in front of the frame's pixels as they are converted, after finalize + overlay: it does NOT contribute to damage_clip and does NOT bump damage_pct.
 
-        // Damage outline overlay (`[]w`). Sampled once here so the post-finalize stamp uses a stable value for this frame. The outline is stamped DIRECTLY into the platform back buffer between the persistent_screen copy and `present()`, so it never enters persistent_screen, never flows thru finalize, and never carries state between frames.
+        // Damage outline overlay (`[]w`).
+        // Sampled once here so the post-finalize pass uses a stable value for this frame.
+        // The outline goes DIRECTLY into the platform back buffer first and the persistent_screen copy fills the rest before `present()`, so it never enters persistent_screen, never flows thru finalize, and never carries state between frames.
         let outline_active =
             crate::paint::DEBUG_SHOW_DAMAGE.load(std::sync::atomic::Ordering::Relaxed);
 
@@ -2853,7 +2857,11 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             }
         }
 
-        // FPS strip: drawn LAST, clobber-style, into a DEDICATED staging buffer (`self.strip_buf`) — never touches the app's scratch or clip_mask. After rasterizing α + darkness into the staging buffer we XOR → visible RGB, force α=0xFF, and clobber-write into persistent_screen at the strip rect. The whole pass is bracketed by a snapshot+restore of `RASTERIZE_OPS` so the strip's text/rect rasterizers don't bump the R counter or pollute `damage_pct`. Does NOT contribute to `damage_clip`, does NOT trigger paint_shadow. Toggle on/off promotes to full repaint via the transition detector above so the strip-rect underlying pixels get correctly restored when it disappears.
+        // FPS strip: the frontmost layer of the frame, so it goes in first: rasterized at the frame's depth into a DEDICATED staging buffer (`self.strip_buf`, never the app's scratch or clip_mask), then each strip pixel takes the frame's own pixel under it (`strip.under_premult(scratch)`) and that composite is converted at its screen place, as finalize converts any pixel, into persistent_screen.
+        // The whole pass is bracketed by a snapshot+restore of `RASTERIZE_OPS` so the strip's text/rect rasterizers don't bump the R counter or pollute `damage_pct`.
+        // Does NOT contribute to `damage_clip`, does NOT trigger paint_shadow.
+        // Toggle on/off promotes to full repaint via the transition detector above so the strip-rect underlying pixels get correctly restored when it disappears.
+        // Until 2026-11-17 the strip was converted alone and clobbered over the finished screen, drawn last: its bar is translucent (α E0), and what was under it never showed thru.
         #[cfg(feature = "text")]
         if strip_active && pass_primary {
             let strip_h = crate::paint::DEBUG_STRIP_H;
@@ -2861,12 +2869,14 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             let band_top = (win_h * 11) / 12;
             // WHY/PROOF: win_h is the OS window's, and a window shorter than 12 strip heights leaves the band thinner than the strip — the subtraction would underflow usize.
             let strip_y_in_window = band_top + ((win_h - band_top).saturating_sub(strip_h)) / 2;
+            // WHY/PROOF: in that same short window the strip hangs past the window's bottom (strip_y_in_window is band_top, at most win_h), and the rows past it have no frame pixel to go under them: the scratch read would index past it.
+            let strip_rows = strip_h.min(win_h - strip_y_in_window);
 
             let strip_px = win_w * strip_h;
             if self.strip_buf.len() != strip_px {
-                self.strip_buf = vec![0u32; strip_px];
+                self.strip_buf = vec![P::EMPTY; strip_px];
             } else {
-                self.strip_buf.fill(0);
+                self.strip_buf.fill(P::EMPTY);
             }
             let saved_ops = crate::paint::RASTERIZE_OPS.load(std::sync::atomic::Ordering::Relaxed);
             if let Some(text) = self.text.as_mut() {
@@ -2881,17 +2891,19 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             }
             crate::paint::RASTERIZE_OPS.store(saved_ops, std::sync::atomic::Ordering::Relaxed);
 
-            // Clobber `strip_buf` rows into this surface's persistent_screen at the surface-local `(rect_x, rect_y + strip_y_in_window)`. Per-pixel: XOR α + darkness → visible RGB, force α=0xFF.
+            // Each strip pixel in front of the frame's pixel at its place, converted into this surface's persistent_screen at the surface-local `(rect_x, rect_y + strip_y_in_window)`, α forced to 0xFF.
+            // WHY/PROOF that order cannot matter: the value written is a function of the strip and this frame's scratch alone, not of what persistent_screen held, so it replaces finalize's conversion of the same scratch pixel with the conversion of the strip in front of it; nothing composed there is lost.
             let rect_y_top = rect_y + strip_y_in_window as i32;
             let ps = &mut self.surfaces[si].persistent_screen;
             // WHY/PROOF: rect_x and rect_y are the OS window's place on the surface, off its edges while the window hangs past them — the row and column tests keep the strip inside persistent_screen.
-            for y in 0..strip_h {
+            for y in 0..strip_rows {
                 let scr_y = rect_y_top + y as i32;
                 if scr_y < 0 || (scr_y as usize) >= scr_h {
                     continue;
                 }
                 let scr_y = scr_y as usize;
                 let sb_row = y * win_w;
+                let frame_row = (strip_y_in_window + y) * win_w;
                 let ps_row = scr_y * scr_w;
                 for x in 0..win_w {
                     let scr_x = rect_x + x as i32;
@@ -2899,15 +2911,17 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
                         continue;
                     }
                     let scr_x = scr_x as usize;
-                    let v = crate::theme::to_sdr_visible(self.strip_buf[sb_row + x]);
+                    let composite = self.strip_buf[sb_row + x].under_premult(src_scratch[frame_row + x], crate::pixel::BlendMode::Normal);
+                    let v = composite.to_sdr_visible_at(scr_x, scr_y);
                     ps[ps_row + scr_x] = 0xFF00_0000 | (v & 0x00FF_FFFF);
                 }
             }
-            self.surfaces[si].mark(rect_x, rect_y_top, rect_x + win_w as i32, rect_y_top + strip_h as i32);
+            self.surfaces[si].mark(rect_x, rect_y_top, rect_x + win_w as i32, rect_y_top + strip_rows as i32);
         }
 
-        // Copy persistent_screen → platform back buffer (whichever softbuffer/wgpu hands us this frame; it may be stale or rotated, but we always overwrite the whole thing from our owned persistent_screen). The damage outline overlay is stamped AFTER this copy and BEFORE present so it lives for exactly one frame and never touches persistent_screen.
-        // The GPU present (macOS always; Linux when the app draws on fluor's device): the changed part of persistent_screen uploaded, the app's layer laid under it on the GPU. The damage outline (a dev overlay) is stamped into a copy presented whole, and the next present uploads the clean buffer whole again.
+        // Copy persistent_screen → platform back buffer (whichever softbuffer/wgpu hands us this frame; it may be stale or rotated, but we always overwrite the whole thing from our owned persistent_screen).
+        // The damage outline overlay goes into the back buffer first and persistent_screen fills the rest ([`crate::paint::compose_damage_outline`]), so it lives for exactly one frame and never touches persistent_screen.
+        // The GPU present (macOS always; Linux when the app draws on fluor's device): the changed part of persistent_screen uploaded, the app's layer laid under it on the GPU. The damage outline (a dev overlay) goes into a copy first, the screen filling the rest, presented whole, and the next present uploads the clean buffer whole again.
         #[cfg(fluor_gpu)]
         if self.surfaces[si].presenter.is_some() {
             // First composite after a wake (cross-monitor move / window entering a dormant surface): the surface was configured back at creation, while this window was dormant/off-screen, so its CAMetalLayer drawable is stale — `get_current_texture` hands back a black drawable and every later present inherits it (root cause of the "move to the other monitor → solid black, stays black" field report). Configure it again at its current backing so the layer re-establishes a live drawable bound to the monitor it's actually showing on. One-shot: `first_after_wake` was consumed above.
@@ -2917,8 +2931,8 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
                 }
             }
             if outline_active && !damage_clip.is_empty() {
-                let mut stamped = self.surfaces[si].persistent_screen.clone();
-                crate::paint::stamp_damage_outline_visible(&mut stamped, scr_w, scr_h, damage_clip, rect_x, rect_y);
+                let mut stamped = vec![0u32; self.surfaces[si].persistent_screen.len()];
+                crate::paint::compose_damage_outline(&mut stamped, &self.surfaces[si].persistent_screen, scr_w, scr_h, damage_clip, rect_x, rect_y);
                 let clean = std::mem::replace(&mut self.surfaces[si].persistent_screen, stamped);
                 self.gpu_present(si, true, full_repaint);
                 self.surfaces[si].persistent_screen = clean;
@@ -2934,15 +2948,17 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             }
             return (fill_dt, finalize_dt, shadow_dt);
         }
-        // Windows: present the owned screen buffer thru the layered window (per-pixel alpha + click-thru on α=0). The damage outline (a dev overlay) is stamped into a scratch copy first so it lives one frame and never touches persistent_screen, matching the softbuffer path.
+        // Windows: present the owned screen buffer thru the layered window (per-pixel alpha + click-thru on α=0).
+        // The damage outline (a dev overlay) goes into a scratch copy first, the screen filling the rest, so it lives one frame and never touches persistent_screen, matching the softbuffer path.
         #[cfg(target_os = "windows")]
         {
             let s = &self.surfaces[si];
             let (sw, sh) = (scr_w as u32, scr_h as u32);
             if outline_active && !damage_clip.is_empty() {
-                let mut scratch_screen = s.persistent_screen.clone();
-                crate::paint::stamp_damage_outline_visible(
+                let mut scratch_screen = vec![0u32; s.persistent_screen.len()];
+                crate::paint::compose_damage_outline(
                     &mut scratch_screen,
+                    &s.persistent_screen,
                     scr_w,
                     scr_h,
                     damage_clip,
@@ -2970,16 +2986,19 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             if buffer.len() != s.persistent_screen.len() {
                 return (fill_dt, finalize_dt, shadow_dt);
             }
-            buffer.copy_from_slice(&s.persistent_screen);
+            // The damage outline (a dev overlay) goes in first and the screen fills the rest; without it the screen is the whole buffer.
             if outline_active && !damage_clip.is_empty() {
-                crate::paint::stamp_damage_outline_visible(
+                crate::paint::compose_damage_outline(
                     &mut buffer,
+                    &s.persistent_screen,
                     scr_w,
                     scr_h,
                     damage_clip,
                     rect_x,
                     rect_y,
                 );
+            } else {
+                buffer.copy_from_slice(&s.persistent_screen);
             }
             buffer.present().expect("softbuffer buffer.present");
         }

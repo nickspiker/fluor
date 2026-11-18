@@ -18,7 +18,7 @@ use crate::pixel::{Argb8, BlendMode, Pixel};
 use crate::text::TextRenderer;
 use crate::theme;
 
-pub use crate::paint::{HIT_NONE, HitId};
+pub use crate::paint::{HIT_BLOCK, HIT_NONE, HitId};
 
 /// Orb visual state. The app sets this to give the orb a meaning beyond window-focus (network indicator, recording badge, presence light). Layered defaults: `FollowFocus` means "ring matches the perimeter, image dims when the window is unfocused" with zero app code; `Custom` lets the app dictate ring colour + brightness regardless of window state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -253,7 +253,8 @@ pub fn draw_status_bar<P: Pixel>(
 ///
 /// Pixel sampling is nearest-neighbour from `icon`'s `width × height` source — the source is square in practice (`vsfimg` doesn't reshape) but the math doesn't assume that. Per-pixel cost is one map index + one `under` composite; total work is `O(diameter²)`, well under a millisecond at typical chrome sizes (~30–100 px orbs).
 ///
-/// Hit-test: every pixel inside `r_outer²` (excluding the AA fringe) is tagged with `hit_id` so the host can route clicks to the chrome's app-icon widget. Decorative-only consumers can pass `None` for `hit_test_map` to skip the tag (in which case `hit_id` is ignored).
+/// Hit-test: every pixel inside `r_outer²` (excluding the AA fringe) claims `hit_id` unless something in front already holds it so the host can route clicks to the chrome's app-icon widget.
+/// Decorative-only consumers can pass `None` for `hit_test_map` to skip the tag (in which case `hit_id` is ignored).
 /// Rasterize the top-left app-icon orb: the icon sampled into a circle of radius `r−1`, wrapped in a thin ring of `ring_colour`. Integer `dist²` bands — same approach as the avatar / window-edge rasterizers: icon interior (`≤ (r−1)²`), then a `stroke_width`-px solid ring, then a 1-px outer AA against the chrome (`(r_aa²−dist²) << 8 / diff`). No floating point, no sqrt.
 ///
 /// `stroke_width = (r >> 5) + 2`: the additive floor was +1 (the textbox minimum-stroke idiom) and read too skinny against the +1px-fattened avatar rings — Nick bumped it to match (2026-09-02); `r >> 5` still adds a proportional pixel only on large / zoomed orbs.
@@ -382,7 +383,8 @@ pub fn draw_app_icon<P: Pixel>(
             let idx = y * width + x;
 
             if let Some(map) = htm.as_mut() {
-                map[idx] = hit_id; // dist2 ≤ r_ring2 here by the continue above
+                // dist2 ≤ r_ring2 here by the continue above; a pixel something in front already claimed stays theirs.
+                crate::paint::claim_hit(&mut map[idx], hit_id);
             }
 
             // Icon, topmost: inward 1-px coverage ramp on r_icon. Sample only fires while a_icon ≠ 0, i.e. dist2 < r_icon² = (r-1)² → sample_icon's |dx|,|dy| ≤ r-2 precondition holds with margin.
@@ -518,7 +520,9 @@ fn strip_layout(
     Some((w, strip_w, strip_x, button_area_offset, last_row, h))
 }
 
-/// Per-row directional fill. For each row in `[row_start, row_end)`, anchor at `start_col` (typically one pixel past the inner divider — i.e. just inside the slot) and walk in the direction given by `scan_right` until hitting a wall or peaking past one. Stamps `hit_id` at each accepted pixel.
+/// Per-row directional fill.
+/// For each row in `[row_start, row_end)`, anchor at `start_col` (typically one pixel past the inner divider, just inside the slot) and walk in the direction given by `scan_right` until hitting a wall or peaking past one.
+/// Claims `hit_id` at each accepted pixel, unless something in front already holds it.
 ///
 /// Stop conditions per step: static wall (`chrome α == 0xFF` OR `clip_mask < 128`), or peak-descent (`current α < prev α`, single check). Since `start_col` is positioned one pixel inside the divider on the inner side, the scan goes **outward** across the slot toward the curve / silhouette / strip edge on the far side — no inward scan is needed because the divider itself is the inner boundary and we start past it.
 ///
@@ -547,7 +551,7 @@ pub fn paint_button_hit_row_scan<P: Pixel>(
         if static_wall(start_idx) {
             continue;
         }
-        hit_test_map[start_idx] = hit_id;
+        crate::paint::claim_hit(&mut hit_test_map[start_idx], hit_id);
         let mut prev_a = chrome_buf[start_idx].alpha();
         if scan_right {
             let mut col = start_col + 1;
@@ -560,7 +564,7 @@ pub fn paint_button_hit_row_scan<P: Pixel>(
                 if a < prev_a {
                     break;
                 }
-                hit_test_map[idx] = hit_id;
+                crate::paint::claim_hit(&mut hit_test_map[idx], hit_id);
                 prev_a = a;
                 col += 1;
             }
@@ -576,7 +580,7 @@ pub fn paint_button_hit_row_scan<P: Pixel>(
                 if a < prev_a {
                     break;
                 }
-                hit_test_map[idx] = hit_id;
+                crate::paint::claim_hit(&mut hit_test_map[idx], hit_id);
                 prev_a = a;
             }
         }
@@ -827,9 +831,8 @@ pub fn draw_maximize_symbol<P: Pixel>(
     // r ≥ 1 and r_inner ≥ 1, so both thresholds are ≥ 4 — no zero divisor.
     let outer_thresh = r3 << 2;
     let inner_thresh = r_inner3 << 2;
-    // The glyph colours widened once to the layer's depth; the stroke ↔ fill blend runs on the depth's own channels (`s × inv + f × α` stays under `ONE × 2^DEPTH`, which fits a u32 at 16 bits).
+    // The glyph colours widened once to the layer's depth.
     let (stroke, fill) = (P::from_g2t8(stroke), P::from_g2t8(fill));
-    let (stroke_rgb, fill_rgb) = (stroke.channels(), fill.channels());
     let _ = bg;
 
     for h in -(r as isize)..=(r as isize) {
@@ -851,14 +854,15 @@ pub fn draw_maximize_symbol<P: Pixel>(
             let idx = (py as usize) * width + (px as usize);
 
             let value = if dist4 <= r_inner4 {
-                // INSIDE inner squircle = fill region. Inner edge (stroke ↔ fill) is between two known glyph colours, so pre-blending is correct here (both colours are deterministic, no bg layer involvement). Both `stroke` and `fill` are stored in darkness (theme constants); linear interpolation in darkness space = linear interpolation in visible space, so the formula is identical to the visible-space version. Theme constants are α=0xFF (opaque) by default.
+                // INSIDE inner squircle = fill region.
+                // The inner edge is two layers, front to back: the fill at its coverage goes in first and the stroke goes under it, so the stroke shows thru exactly where the fill's coverage falls short.
+                // Until 2026-11-17 the two colours were hand-mixed here (`stroke × (1 − α) + fill × α`), a second blend path beside `under`.
                 let dist_from_inner = r_inner4 - dist4;
-                if dist_from_inner <= inner_thresh {
-                    let gradient = (dist_from_inner << P::DEPTH) / inner_thresh;
-                    let alpha = gradient as u32;
-                    let inv = (1 << P::DEPTH) - alpha;
-                    let blend: [u32; 3] = core::array::from_fn(|k| (stroke_rgb[k] * inv + fill_rgb[k] * alpha) >> P::DEPTH);
-                    P::from_channels(P::ONE, blend)
+                if dist_from_inner < inner_thresh {
+                    // dist_from_inner < inner_thresh, so the coverage is below 2^DEPTH: at most ONE, inside the α field.
+                    let coverage = ((dist_from_inner << P::DEPTH) / inner_thresh) as u32;
+                    pixels[idx] = pixels[idx].under(fill.with_alpha(coverage), BlendMode::Normal);
+                    stroke
                 } else {
                     fill
                 }

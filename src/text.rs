@@ -11,7 +11,7 @@ use unicode_script::Script;
 use swash::scale::{Render, ScaleContext, Source, image::Image as SwashImage};
 use swash::zeno::Transform as PathTransform;
 
-// The 8-bit-only blits (legacy byte buffers, additive tints), kept apart from the α + darkness path every depth shares.
+// The 8-bit-only blits (legacy byte buffers), kept apart from the α + darkness path every depth shares.
 mod argb8;
 
 /// Report the painted text bbox to the canvas damage accumulator. Bbox is the alignment-adjusted text rect clipped to buffer dimensions — slightly conservative versus the per-glyph union, but cheap and never under-reports. `alignment`: 0 = center, 1 = left, 2 = right (matching `render_buffer_u32`'s convention).

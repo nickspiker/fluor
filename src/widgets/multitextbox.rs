@@ -1178,30 +1178,8 @@ impl<P: Pixel> MultiTextbox<P> {
             self.text_cache_dirty = false;
         }
 
-        blit_cache_to_target(
-            &self.text_cache,
-            self.text_cache_w,
-            self.text_cache_h,
-            pill_x_target,
-            pill_y_target,
-            canvas,
-            None,
-            0,
-            clip,
-        );
-        blit_cache_to_target(
-            &self.pill_cache,
-            self.pill_cache_w,
-            self.pill_cache_h,
-            pill_x_target,
-            pill_y_target,
-            canvas,
-            hit_map,
-            hit_id,
-            clip,
-        );
-
-        // Blinkey — THE canonical painter (paint::draw_blinkey), at the caret's (line, x). The first cut hand-rolled a wave that read as no cursor at all (field, 2026-08-09).
+        // Blinkey first: THE canonical painter (paint::draw_blinkey), at the caret's (line, x), a layer of light in front of the field, so it goes into the accumulator before the text and the pill land under it.
+        // The first cut hand-rolled a wave that read as no cursor at all (field, 2026-08-09); until 2026-11-17 the caret was drawn after the field, in front of the finished pixels and so in front of anything drawn before this box too.
         if self.focused && !self.has_selection() && self.blinkey_visible {
             let cb = self.cursor_bbox();
             // Centre of the smear = left edge + half its (font-scaled) width — tracks cursor_bbox, no magic offset.
@@ -1227,6 +1205,29 @@ impl<P: Pixel> MultiTextbox<P> {
                 );
             }
         }
+
+        blit_cache_to_target(
+            &self.text_cache,
+            self.text_cache_w,
+            self.text_cache_h,
+            pill_x_target,
+            pill_y_target,
+            canvas,
+            None,
+            0,
+            clip,
+        );
+        blit_cache_to_target(
+            &self.pill_cache,
+            self.pill_cache_w,
+            self.pill_cache_h,
+            pill_x_target,
+            pill_y_target,
+            canvas,
+            hit_map,
+            hit_id,
+            clip,
+        );
 
         self.record_painted(canvas.width, canvas.height);
     }

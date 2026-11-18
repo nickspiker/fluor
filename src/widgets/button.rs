@@ -641,8 +641,9 @@ impl<P: Pixel> Button<P> {
                 let row = py as usize * buf_w;
                 for px in sx..x1 {
                     let i = row + px as usize;
+                    // A pixel that is still see-thru claims, unless something in front already holds its hit (a widget whose pixels are not opaque there yet, or not at all).
                     if canvas.pixels[i].alpha() != P::ONE {
-                        hm[i] = hit_id;
+                        paint::claim_hit(&mut hm[i], hit_id);
                     }
                 }
             }
@@ -688,9 +689,12 @@ impl<P: Pixel> Button<P> {
         );
     }
 
-    /// Stamp this button's `hit_id` into `hit_map` at every pixel its pill (fill + two-tone stroke) touches — the true squircle silhouette, not a bbox rectangle.
-    /// Call AFTER any widget that overlaps this button (e.g. a textbox this button is overlaid inside): those widgets stamp their own id over the button's during their colour blit, so this re-wins the button's hit region as the last writer. `render_content_into` must have run first this frame to populate `pill_cache`.
-    /// Anything the pill covers → this id (α > 0 catches the AA edge too), so the whole visible button — including a glyph painted over it by the host — dispatches to this button.
+    /// Claim this button's `hit_id` in `hit_map` at every pixel its pill (fill + two-tone stroke) touches, the true squircle silhouette, not a bbox rectangle.
+    /// It is the button's hits as a step of their own, for a pass that painted its pixels with `hit_map = None` or wants the anti-aliased rim claimed too: call it at the button's own place in the front-to-back order, right after its paint and before anything behind it.
+    /// A pixel something in front already claimed stays theirs, and a pixel this claims stays the button's against everything after it, so overlap is settled by what is in front, never by which call came last.
+    /// `render_content_into` must have run first this frame to populate `pill_cache`.
+    /// Anything the pill covers claims this id (α > 0 catches the AA edge too), so the whole visible button, including a glyph painted in front of it by the host, dispatches to this button.
+    /// Until 2026-11-17 this overwrote what was there and its doc said to call it after the widgets the button overlaps so it would "re-win" as the last writer, which let any later widget take the button's clicks (the owner: "that's real bad").
     pub fn stamp_hit_into(&self, hit_map: &mut [HitId], buf_w: usize, buf_h: usize, hit_id: HitId) {
         let pill_x = (self.center_x - self.width * 0.5) as isize;
         let pill_y = (self.center_y - self.height * 0.5) as isize;
@@ -715,7 +719,7 @@ impl<P: Pixel> Button<P> {
                 if tx < 0 || tx as usize >= buf_w {
                     continue;
                 }
-                hit_map[ty as usize * buf_w + tx as usize] = hit_id;
+                paint::claim_hit(&mut hit_map[ty as usize * buf_w + tx as usize], hit_id);
             }
         }
     }

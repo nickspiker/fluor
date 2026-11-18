@@ -2,7 +2,10 @@
 //!
 //! A `Group` wraps a [`Region`] (pixel-space bbox in target-buffer coordinates), a [`StackCompositor`] for internal RGB compositing, and optional side channels: a binary hit mask (`Option<Vec<u8>>`, one byte per pixel, 0 or 1) and a per-pixel text-clip alpha mask (`Option<Vec<u8>>`). All buffers are sized to the group's bbox — *not* the viewport — so memory scales with content area, not with viewport size.
 //!
-//! Groups are leaf-ish: there is no `children` field. The tree IS the consumer's code, exactly like [`Region`]'s "no parent pointers" doctrine. Consumers compose by holding a `Vec<Group>` (or any structure they prefer) and calling [`Group::flatten_into`] in order; hit testing iterates the same vec in reverse.
+//! Groups are leaf-ish: there is no `children` field.
+//! The tree IS the consumer's code, exactly like [`Region`]'s "no parent pointers" doctrine.
+//! Consumers compose by holding a `Vec<Group>` (or any structure they prefer) and calling [`Group::flatten_into`] in order, front to back: the first group flattened is the frontmost, since each flatten goes under what is already in the target.
+//! Hit testing walks the same vec in the same order and the first group whose [`Group::hit`] answers takes the click ([`front_hit`]): the frontmost on screen, never the last one drawn.
 //!
 //! Coordinate translation: paint primitives take buffer-relative pixel coordinates. When rasterizing into a group's Stack layer, the buffer is sized to `(region.w, region.h)`, so consumers must subtract `region.x, region.y` from any viewport-relative coordinate.
 //!
@@ -173,6 +176,11 @@ impl<P: Pixel> Group<P> {
         blit_region(&self.rpn.layers[idx].pixels, region, blend, target, target_w, target_h, clip);
         self.rpn.settle_layer(idx);
     }
+}
+
+/// The group that takes a click at `(x, y)` among `groups` held in front-to-back order (the order they flatten in): the first whose [`Group::hit`] answers, so the frontmost on screen.
+pub fn front_hit<P: Pixel>(groups: &[Group<P>], x: Coord, y: Coord) -> Option<usize> {
+    groups.iter().position(|g| g.hit(x, y))
 }
 
 /// Composite a region-sized premultiplied buffer under `target` at the region's origin, clipped to the target and to `clip`, in every mode thru the premultiplied compose (the buffer's darkness is already attenuated by its α; until 2026-11-07 the modes other than Normal took `flatten`, which applied it a second time).
@@ -361,5 +369,24 @@ mod tests {
         assert!(!g.hit(7.0, 5.0)); // right of bbox (exclusive)
         assert!(!g.hit(3.0, 2.0)); // above bbox
         assert!(!g.hit(3.0, 8.0)); // below bbox (exclusive)
+    }
+
+    /// Two overlapping groups held front to back: at every overlapped pixel the front one takes the click, as its pixels win the flatten there.
+    #[test]
+    fn front_hit_is_the_first_in_order() {
+        let mut front = Group::new(Region::new(0.0, 0.0, 6.0, 6.0), BlendMode::Normal);
+        front.enable_hitmask();
+        front.hitmask_mut().unwrap().fill(1);
+        let mut back = Group::new(Region::new(3.0, 3.0, 6.0, 6.0), BlendMode::Normal);
+        back.enable_hitmask();
+        back.hitmask_mut().unwrap().fill(1);
+        let groups = [front, back];
+        for y in 0..9 {
+            for x in 0..9 {
+                let (xf, yf) = (x as Coord + 0.5, y as Coord + 0.5);
+                let want = if x < 6 && y < 6 { Some(0) } else if x >= 3 && y >= 3 { Some(1) } else { None };
+                assert_eq!(front_hit(&groups, xf, yf), want, "({x}, {y})");
+            }
+        }
     }
 }
