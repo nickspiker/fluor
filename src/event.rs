@@ -158,6 +158,8 @@ pub enum NamedKey {
     Control,
     Alt,
     Super,
+    /// Forward: the redo of the last step back, a browser's forward (ferros: Back's swipe set to go forward, owner 2026-11-18: "swiping back might move you to the page you just went 'back' from ... like a redo or a forward browser navigation"; USB HID usage Again, G#79).
+    Forward,
 }
 
 /// Key press / release. `state` distinguishes press vs release; `repeat = true` means an OS-generated repeat (held-key auto-fire). `text` carries the character-producing keystroke (e.g. `Some("a")` for an unshifted A) when the press would type something — widgets typically read `text` to insert characters and read `logical_key` (Named arms) for control keys.

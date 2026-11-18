@@ -192,6 +192,8 @@ const KEY_RIGHT: u8 = 0x4F;
 const KEY_LEFT: u8 = 0x50;
 const KEY_DOWN: u8 = 0x51;
 const KEY_UP: u8 = 0x52;
+/// Again (HID G#79): Back's swipe set to go forward, the redo of the last step back (`NamedKey::Forward`).
+const KEY_AGAIN: u8 = 0x79;
 /// The most records one reply of the touch server's op 0 carries (ferros payloads/touch, CHANGES); it holds up to 64 waiting.
 const TOUCH_BATCH: usize = 1 << 4;
 
@@ -552,7 +554,8 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
     }
 
     /// A key the display handed this window, by its USB HID usage (ferros display ops 61 and 70): Escape (back's tap, "up one page"), the system keyboard's Enter and Backspace, and the other editing keys, each as a press and its release, as from a keyboard. A usage with no key here is passed over.
-    pub fn on_key(&mut self, usage: u8) {
+    /// Whether the app used the key (its press answered other than `Pass`): an Escape it did not use means it is at its top already, which the display is told (op 76, `escape_unused`), so the deck can take Back's next tap out of the kist when the person chose that (ferros PREF_HELM, owner 2026-11-18).
+    pub fn on_key(&mut self, usage: u8) -> bool {
         let logical_key = match usage {
             KEY_ESCAPE => Key::Named(NamedKey::Escape),
             KEY_ENTER => Key::Named(NamedKey::Enter),
@@ -563,15 +566,22 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             KEY_LEFT => Key::Named(NamedKey::ArrowLeft),
             KEY_DOWN => Key::Named(NamedKey::ArrowDown),
             KEY_UP => Key::Named(NamedKey::ArrowUp),
-            _ => return,
+            KEY_AGAIN => Key::Named(NamedKey::Forward),
+            _ => return true,
         };
+        let mut used = true;
         for state in [ElementState::Pressed, ElementState::Released] {
             let ev = FEvent::KeyboardInput { event: KeyEvent { logical_key: logical_key.clone(), state, repeat: false, text: None, physical_key: usage as u16 } };
-            if self.dispatch(&ev) == EventResponse::Close {
+            let r = self.dispatch(&ev);
+            if r == EventResponse::Close {
                 self.close = true;
+            }
+            if state == ElementState::Pressed {
+                used = r != EventResponse::Pass;
             }
         }
         self.window.mark_dirty();
+        used
     }
 
     /// Text the system keyboard typed for this window (ferros display op 70, `EV_TEXT`): an IME commit, as Android's soft keyboard commits text (`Event::Ime(Ime::Commit)`), to whatever field has focus.
@@ -1123,7 +1133,14 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
                 Typed::Key(k) => {
                     // Said, so back's tap and the keyboard's keys can be followed on the console whatever the app does with them.
                     println!("fluor: key G#{k:02X} from the display");
-                    shell.on_key(k);
+                    // Back's Escape unused: the app is at its top (`on_key`); the display counts it for the deck (op 76 `[76][surface base u64]`, its answer not waited on beyond the call).
+                    if !shell.on_key(k) && k == KEY_ESCAPE {
+                        let mut m = [0u8; 9];
+                        m[0] = 76;
+                        m[1..9].copy_from_slice(&base.to_le_bytes());
+                        let mut r = [0u8; 1];
+                        sys::call(display, &m, &mut r);
+                    }
                 }
                 // The text itself is not said: it is the person's (a handle, a message), and the console is not theirs.
                 Typed::Text(s) => {
