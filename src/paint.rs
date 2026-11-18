@@ -318,8 +318,10 @@ pub fn claim_if_shown(slot: &mut HitId, id: HitId, before: u32, after: u32) {
     *slot = if held == HIT_NONE && after > before { id } else { held };
 }
 
-/// Where a layer drawn with primitives that take no hit map shows: the canvas's α over the layer's reach, taken before it draws and compared after.
-/// `before`, draw the layer (every primitive of the widget, its glow included), `settle`, then `claim`: each pixel where the layer raised the α claims the layer's id, unless something in front already holds it ([`claim_if_shown`]'s rule, a pixel at a time).
+/// Where a widget drawn with primitives that take no hit map shows, and where it was still open to show: the canvas's α over its reach, taken before it draws and compared after.
+/// `before`, draw the widget (every primitive of it, its glow included), `settle`, then claim.
+/// A widget claims its declared tap shape (a pill, a row, a box and its label's box, a slider's band) at every pixel that was not already opaque before it drew, and beyond that shape every pixel it showed on (its anti-aliased edge, its glow), each unless something in front claimed first ([`claim_hit`]).
+/// What shows decides who is in front, not the outline (the owner, 2026-11-17): the gaps between a label's letters are the label's, a pixel already opaque before the widget is not.
 /// A widget keeps one and reuses its allocation frame after frame; a settled mask also lets a widget claim later than it drew ([`crate::widgets::Button::stamp_hit_into`]).
 #[derive(Default)]
 pub struct Shown {
@@ -327,12 +329,17 @@ pub struct Shown {
     rect: crate::canvas::PixelRect,
     /// The canvas width the reach indexes into.
     width: usize,
-    /// Each reach pixel's α before the layer drew; after `settle`, 1 where the layer shows and 0 where it does not.
+    /// Each reach pixel's α before the widget drew; after `settle`, bit 0 set where the widget showed (the α rose) and bit 1 where the pixel was still open (not opaque) before it.
     alpha: alloc::vec::Vec<u32>,
 }
 
+/// [`Shown`]'s settled bit: the widget raised the α here.
+const SHOWED: u32 = 1;
+/// [`Shown`]'s settled bit: the pixel was not opaque before the widget drew.
+const OPEN: u32 = 2;
+
 impl Shown {
-    /// Record the α over `reach` (canvas pixels, cut to the canvas here) before the layer draws.
+    /// Record the α over `reach` (canvas pixels, cut to the canvas here) before the widget draws.
     pub fn before<P: Pixel>(&mut self, pixels: &[P], width: usize, height: usize, reach: crate::canvas::PixelRect) {
         // WHY/PROOF: the reach is the widget's layout, which runs past the canvas when it scrolls off an edge; the reads below would index outside the canvas.
         let r = crate::canvas::PixelRect::new(reach.x0.min(width), reach.y0.min(height), reach.x1.min(width), reach.y1.min(height));
@@ -348,7 +355,7 @@ impl Shown {
         }
     }
 
-    /// After the layer drew: mark each reach pixel whose α rose.
+    /// After the widget drew: mark each reach pixel whose α rose, and each that was open before it.
     pub fn settle<P: Pixel>(&mut self, pixels: &[P]) {
         // The rect is the zero rect or ordered (`before`), so this is a plain difference; an empty reach has no rows, and chunks_exact of width 0 would panic.
         let w = self.rect.x1 - self.rect.x0;
@@ -358,28 +365,33 @@ impl Shown {
         for (row, before) in self.alpha.chunks_exact_mut(w).enumerate() {
             let base = (self.rect.y0 + row) * self.width + self.rect.x0;
             for (b, p) in before.iter_mut().zip(&pixels[base..base + w]) {
-                *b = (p.alpha() > *b) as u32;
+                *b = (p.alpha() > *b) as u32 * SHOWED | (*b < P::ONE) as u32 * OPEN;
             }
         }
     }
 
-    /// Claim `id` wherever the settled layer shows and nothing in front claimed first.
+    /// Claim `id` wherever the settled widget showed (nothing of a declared shape): a layer whose shape is just what it draws, a glow, a wash.
     pub fn claim(&self, map: &mut [HitId], id: HitId) {
-        self.claim_by(map, |_, _| id);
+        self.claim_with(map, |_, _, showed, _| if showed { id } else { HIT_NONE });
     }
 
-    /// [`Self::claim`] with the id picked per pixel (canvas coordinates): a widget whose parts answer to different ids (a popup's rows and its frame).
-    pub fn claim_by(&self, map: &mut [HitId], pick: impl Fn(usize, usize) -> HitId) {
+    /// Claim `id` over the widget's declared tap shape (`in_shape`, canvas coordinates) wherever the pixel was open before it drew, and wherever else it showed.
+    pub fn claim_shape(&self, map: &mut [HitId], id: HitId, in_shape: impl Fn(usize, usize) -> bool) {
+        self.claim_with(map, |x, y, showed, open| if showed || (open && in_shape(x, y)) { id } else { HIT_NONE });
+    }
+
+    /// The general claim: `pick(x, y, showed, open)` names the id a pixel claims (HIT_NONE for none), for a widget whose parts answer to different ids (a popup's rows and its frame).
+    pub fn claim_with(&self, map: &mut [HitId], pick: impl Fn(usize, usize, bool, bool) -> HitId) {
         let w = self.rect.x1 - self.rect.x0;
         // An empty reach has no rows; chunks_exact of width 0 would panic.
         if w == 0 {
             return;
         }
-        for (row, shown) in self.alpha.chunks_exact(w).enumerate() {
+        for (row, bits) in self.alpha.chunks_exact(w).enumerate() {
             let y = self.rect.y0 + row;
             let base = y * self.width + self.rect.x0;
-            for (dx, (&s, slot)) in shown.iter().zip(&mut map[base..base + w]).enumerate() {
-                claim_if_shown(slot, pick(self.rect.x0 + dx, y), 0, s);
+            for (dx, (&b, slot)) in bits.iter().zip(&mut map[base..base + w]).enumerate() {
+                claim_hit(slot, pick(self.rect.x0 + dx, y, b & SHOWED != 0, b & OPEN != 0));
             }
         }
     }

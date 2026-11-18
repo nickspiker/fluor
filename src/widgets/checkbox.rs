@@ -256,30 +256,31 @@ impl Checkbox {
             0,
         );
 
-        // Label to the right of the box.
+        // Label to the right of the box; each line's box (its measured width, a line step tall) is part of the tap shape.
+        let mut label_boxes: alloc::vec::Vec<(Coord, Coord, Coord, Coord)> = alloc::vec::Vec::new();
         if !self.label.is_empty() {
             // Wrapped label, vertically centred on the widget: one line sits on center_y exactly as before; more lines stack around it.
             let lines = self.label_lines(text);
             let step = self.font_size * 1.25;
             let first_y = self.center_y - step * (lines.len() as Coord - 1.0) * 0.5;
             for (i, line) in lines.iter().enumerate() {
-                text.draw_text_left(
-                    canvas,
-                    line,
-                    box_x0 + side + self.font_size * 0.5,
-                    first_y + step * i as Coord,
-                    &TextStyle::new(self.font_size, theme::TEXTBOX_TEXT),
-                    clip,
-                    None,
-                );
+                let (lx, ly) = (box_x0 + side + self.font_size * 0.5, first_y + step * i as Coord);
+                let style = TextStyle::new(self.font_size, theme::TEXTBOX_TEXT);
+                text.draw_text_left(canvas, line, lx, ly, &style, clip, None);
+                label_boxes.push((lx, ly - step * 0.5, lx + text.measure_text(line, &style), ly + step * 0.5));
             }
         }
 
-        // Claim where the checkbox showed (the tick, the box, its rim and the label's glyphs), none of the pixels already opaque before it, and none something in front claimed.
-        // Until 2026-11-17 it claimed its whole rect, the empty space round the box and between the label's glyphs included.
+        // Claim the checkbox's declared shape, its box and each label line's box (so a tap between the label's letters or inside an "o" is the checkbox's), wherever the pixel was not already opaque before it, and anything else of it that showed; none something in front claimed.
+        // Until 2026-11-17 it claimed its whole rect, the empty space beyond the label's end included.
         if let Some(map) = hit_map.as_deref_mut() {
             self.shown.settle(canvas.pixels);
-            self.shown.claim(map, self.hit_id);
+            let (bx0, by0, bx1, by1) = (box_x0, box_y0, box_x0 + side, box_y0 + side);
+            self.shown.claim_shape(map, self.hit_id, |x, y| {
+                let (x, y) = (x as Coord + 0.5, y as Coord + 0.5);
+                let inside = |(x0, y0, x1, y1): (Coord, Coord, Coord, Coord)| x >= x0 && x < x1 && y >= y0 && y < y1;
+                inside((bx0, by0, bx1, by1)) || label_boxes.iter().any(|&b| inside(b))
+            });
         }
         let _ = HIT_NONE;
     }

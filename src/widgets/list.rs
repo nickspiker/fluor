@@ -300,11 +300,16 @@ impl List {
             }
             top += h;
         }
-        // Claim where the list showed (its rows' marks, titles, details, swatches and the picked row's band), none of the pixels already opaque before it, and none something in front claimed.
-        // Until 2026-11-17 it claimed its whole rect, the empty space between its marks included.
+        // Claim the list's declared shape, its rows' bands across its width (from its top to the end of its last row, inside its rect), wherever the pixel was not already opaque before it; none something in front claimed.
+        // `top` is the end of the last row here (the loop above added every row's height).
+        // Until 2026-11-17 it claimed its whole rect, the empty space below its last row included.
         if let Some(map) = hit_map {
             self.shown.settle(canvas.pixels);
-            self.shown.claim(map, self.hit_id);
+            let (x0, x1, y0, y1, rows_end) = (self.x, self.x + self.width, self.y, self.y + self.height, top);
+            self.shown.claim_shape(map, self.hit_id, |x, y| {
+                let (x, y) = (x as Coord + 0.5, y as Coord + 0.5);
+                x >= x0 && x < x1 && y >= y0 && y < y1 && y < rows_end
+            });
         }
     }
 

@@ -11,7 +11,7 @@
 use crate::canvas::PixelRect;
 use crate::text::TextStyle;
 use crate::coord::Coord;
-use crate::paint::{self, Clip, HitId};
+use crate::paint::{self, Clip, HitId, HIT_NONE};
 use crate::region::Region;
 use crate::text::TextRenderer;
 use crate::pixel::{Argb8, Pixel};
@@ -549,21 +549,23 @@ impl<P: Pixel> Dropdown<P> {
             0,
         );
 
-        // Claim where the popup showed: a row its band (inside the edge, so a row's hover tint never lands on the edge), and the frame round the rows (the padding above and below them, the edge) HIT_BLOCK, so a click there reaches nothing behind the popup.
-        // Translucent or opaque alike: the frontmost layer that shows takes the pixel (the owner, 2026-11-17: "if it's not opaque ... the frontmost is locking it up"); the corners outside the squircle, where it does not show, claim nothing.
+        // Claim the popup: each row its declared band (inside the edge, so a row's hover tint never lands on the edge) wherever the pixel was open before the popup, and the frame round the rows (the padding above and below them, the edge) HIT_BLOCK wherever it shows, so a click there reaches nothing behind the popup.
+        // Translucent or opaque alike: the frontmost layer that shows takes the pixel (the owner, 2026-11-17: "if it's not opaque ... the frontmost is locking it up"); the frame's corners outside the squircle, where it does not show, claim nothing.
         if let Some(map) = hit_map {
             self.shown.settle(canvas.pixels);
             let rows: Vec<HitId> = self.rows.iter().map(|r| r.hit_id).collect();
             let (band_x0, band_x1) = ((x + stroke_px) as Coord, (x + w - stroke_px) as Coord);
             let rows_top = region.y + pad;
-            self.shown.claim_by(map, |px, py| {
+            self.shown.claim_with(map, |px, py, showed, open| {
                 let (px, py) = (px as Coord, py as Coord);
                 // The row whose band holds the pixel, from its distance below the first band: past the bands or beside them is the frame.
                 let k = ((py - rows_top) / row_h).floor();
                 if px >= band_x0 && px < band_x1 && k >= 0. && (k as usize) < rows.len() {
-                    rows[k as usize]
-                } else {
+                    if open { rows[k as usize] } else { HIT_NONE }
+                } else if showed {
                     paint::HIT_BLOCK
+                } else {
+                    HIT_NONE
                 }
             });
         }
@@ -748,7 +750,7 @@ impl<P: Pixel> Dropdown<P> {
         // Claim where the pill showed (label, chevron, pill, its anti-aliased rim, its glow), none of the pixels already opaque before it, and none something in front claimed.
         if let Some(map) = hit_map {
             self.shown.settle(canvas.pixels);
-            self.shown.claim(map, self.hit_id);
+            self.shown.claim_shape(map, self.hit_id, crate::widgets::textbox::cache_covers(&self.pill_cache, self.pill_cache_w, self.pill_cache_h, pill_x_target, pill_y_target));
         }
         self.last_painted_bbox = Some(region_to_pixelrect(
             self.bbox(),

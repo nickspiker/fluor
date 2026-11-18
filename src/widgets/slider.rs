@@ -178,7 +178,7 @@ impl Slider {
         Some(self.last_painted_bbox.map_or(current, |p| p.union(current)))
     }
 
-    /// Paint the slider into `canvas` and claim `hit_id` in `hit_map` wherever it shows (the track and the handle).
+    /// Paint the slider into `canvas` and claim `hit_id` in `hit_map` over its touch band (the track widened to span / 16) and wherever its handle shows.
     /// Draws directly (no caches) — two rects and a circle are cheap enough to rasterize per frame.
     pub fn render_content_into<P: Pixel>(
         &mut self,
@@ -206,9 +206,16 @@ impl Slider {
         let handle_x = band_x + (self.value as Coord * self.width) as isize;
         let radius = band_h / 2;
 
-        // The hits ride the paint: where the α stood before the handle and the track, so the slider claims exactly the pixels it shows on; the handle's circle reaches a radius past the band's ends.
+        // The declared tap shape: the track widened to a finger-sized band, span / 16 tall (span the canvas's harmonic mean, 2wh / (w + h): about 6 mm on the Pixel 8 Pro, 86 px in a 1920 × 1080 window), centred on the track, along the slider's length.
+        let (cw, chh) = (canvas.width as Coord, canvas.height as Coord);
+        let touch = 2. * cw * chh / (cw + chh) * (1. / (1u32 << 4) as Coord);
+        let track_cy = (track_y as Coord) + track_h as Coord * 0.5;
+        let (touch_y0, touch_y1) = (track_cy - touch * 0.5, track_cy + touch * 0.5);
+        // The hits ride the paint: where the α stood before the handle and the track, over the handle's reach (its circle a radius past the band's ends) and the touch band.
         if hit_map.is_some() {
-            self.shown.before(canvas.pixels, canvas.width, canvas.height, paint::reach_rect(band_x - radius - 1, band_y - 1, band_x + band_w + radius + 1, band_y + band_h + 1, canvas.width, canvas.height));
+            let handle = paint::reach_rect(band_x - radius - 1, band_y - 1, band_x + band_w + radius + 1, band_y + band_h + 1, canvas.width, canvas.height);
+            let band = paint::reach_rect(band_x, touch_y0.floor() as isize, band_x + band_w, touch_y1.ceil() as isize, canvas.width, canvas.height);
+            self.shown.before(canvas.pixels, canvas.width, canvas.height, handle.union(band));
         }
         // Handle first: topmost-first doctrine, the circle wins where it overlaps the track.
         paint::circle_filled(
@@ -242,11 +249,15 @@ impl Slider {
             None,
         );
 
-        // Claim where the slider showed (the track either side of the handle, the handle and its anti-aliased rim), none of the pixels already opaque before it, and none something in front claimed.
-        // Until 2026-11-17 it claimed its whole grab band, the empty rows above and below the track included.
+        // Claim the touch band wherever the pixel was not already opaque before the slider, and the handle and its anti-aliased rim wherever they showed; none something in front claimed.
+        // Until 2026-11-17 it claimed the app's whole layout band regardless of what was in front.
         if let Some(map) = hit_map {
             self.shown.settle(canvas.pixels);
-            self.shown.claim(map, hit_id);
+            let (x0, x1) = (band_x as Coord, (band_x + band_w) as Coord);
+            self.shown.claim_shape(map, hit_id, |x, y| {
+                let (x, y) = (x as Coord + 0.5, y as Coord + 0.5);
+                x >= x0 && x < x1 && y >= touch_y0 && y < touch_y1
+            });
         }
 
         let vw = canvas.width;

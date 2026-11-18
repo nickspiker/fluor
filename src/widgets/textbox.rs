@@ -113,6 +113,15 @@ pub(crate) fn reach_of(region: Region, offset_x: Coord, offset_y: Coord, w: usiz
     paint::reach_rect(x0, y0, x1, y1, w, h)
 }
 
+/// A pill's declared tap shape: whether its cache (`cw × ch`, drawn with its top-left at canvas `(ox, oy)`) covers canvas pixel `(x, y)`, the squircle silhouette with its anti-aliased rim.
+pub(crate) fn cache_covers<P: Pixel>(cache: &[P], cw: usize, ch: usize, ox: isize, oy: isize) -> impl Fn(usize, usize) -> bool + '_ {
+    move |x, y| {
+        let (cx, cy) = (x as isize - ox, y as isize - oy);
+        // WHY/PROOF: the claim walks the widget's reach, which holds its glow past the cache on every side; a pixel off the cache would index outside it (or wrap, left of or above it).
+        cx >= 0 && cy >= 0 && (cx as usize) < cw && (cy as usize) < ch && cache[cy as usize * cw + cx as usize].alpha() != 0
+    }
+}
+
 /// Convert a viewport-coord `Region` (Coord f32 rectangle, possibly negative or off-buffer) into a `PixelRect` (usize half-open rect) clamped to the viewport bounds. Used by [`Textbox::damage_rect`] / [`Textbox::record_painted`] to express widget bboxes in the host's pixel-rect language for damage union. `pub(crate)` so sibling widgets ([`crate::widgets::button::Button`], future scroll views) share one canonical Region→PixelRect cast rather than duplicating the clamp math.
 pub(crate) fn region_to_pixelrect(
     region: Region,
@@ -1167,7 +1176,7 @@ impl<P: Pixel> Textbox<P> {
         // Claim where the box showed: its caret (light inside the pill, never opaque), text, pill, anti-aliased rim and glow, none of the pixels already opaque before it, and none something in front claimed.
         if let Some(map) = hit_map {
             self.shown.settle(canvas.pixels);
-            self.shown.claim(map, hit_id);
+            self.shown.claim_shape(map, hit_id, crate::widgets::textbox::cache_covers(&self.pill_cache, self.pill_cache_w, self.pill_cache_h, pill_x_target, pill_y_target));
         }
 
         // Record what we just painted so the next frame's damage_rect can union prev∪current bboxes (handles moves, hover-only changes, focus-on/off).

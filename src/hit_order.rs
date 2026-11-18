@@ -311,3 +311,78 @@ fn the_caret_is_in_front_of_its_text_and_behind_what_is_in_front_of_the_box() {
     }
     assert!(hidden > 0, "the front widget does not cover the caret");
 }
+
+/// A checkbox's tap shape is its box and its label's box: a tap between the label's letters, or inside an "o", is the checkbox's, though nothing is drawn there; past the label's end nothing claims.
+#[test]
+fn a_tap_between_label_letters_or_inside_an_o_hits_the_checkbox() {
+    let mut text = TextRenderer::new();
+    let mut ids: HitId = HIT_NONE;
+    let mut cb = crate::widgets::Checkbox::new(&mut ids, "Good dog", 160., 120., 280., 40., 24., false);
+    let cid = cb.hit_id();
+    let (mut px, mut hit, mut dmg) = frame();
+    {
+        let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+        cb.render_content_into(&mut c, &mut text, None, Some(&mut hit));
+    }
+    // The label's box as the checkbox lays it out: right of the box, one line step tall round the centre.
+    let lx = cb.center_x - cb.width * 0.5 + cb.box_side() + cb.font_size * 0.5;
+    let lw = text.measure_text("Good dog", &crate::text::TextStyle::new(cb.font_size, crate::theme::TEXTBOX_TEXT));
+    let half = cb.font_size * 1.25 * 0.5;
+    let (x0, x1, y0, y1) = (lx.ceil() as usize, (lx + lw).floor() as usize, (cb.center_y - half).ceil() as usize, (cb.center_y + half).floor() as usize);
+    let clear = |x: usize, y: usize| px[y * W + x].alpha() == 0;
+    let (mut gaps, mut counters) = (0, 0);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if !clear(x, y) {
+                continue;
+            }
+            assert_eq!(hit[y * W + x], cid, "({x}, {y}) in the label's box went elsewhere");
+            // Between letters: the whole column of the label's box is clear.
+            gaps += (y0..y1).all(|yy| clear(x, yy)) as usize;
+            // Inside a counter (an "o"): ink on both sides of the row and above and below in the column, within the label's box.
+            let ink = |mut it: core::ops::Range<usize>, f: &dyn Fn(usize) -> bool| it.any(|v| !f(v));
+            let (row, col) = (|v: usize| clear(v, y), |v: usize| clear(x, v));
+            counters += (ink(x0..x, &row) && ink(x + 1..x1, &row) && ink(y0..y, &col) && ink(y + 1..y1, &col)) as usize;
+        }
+    }
+    assert!(gaps > 0, "no tap landed between letters");
+    assert!(counters > 0, "no tap landed inside a letter's counter");
+    // Past the label's end, on its centre row: nothing drawn and outside the shape, so nothing claims.
+    let y = cb.center_y as usize;
+    let past = (lx + lw).ceil() as usize + 4;
+    assert!(clear(past, y));
+    assert_eq!(hit[y * W + past], HIT_NONE, "past the label's end");
+}
+
+/// A slider's tap shape is its track widened to a band span / 16 tall: a tap beside the track (above or below it, away from the handle) within the band hits the slider; outside the band, nothing.
+#[test]
+fn a_tap_beside_the_slider_track_within_the_band_hits_the_slider() {
+    let mut ids: HitId = HIT_NONE;
+    let mut s = crate::widgets::Slider::new(&mut ids, 160., 120., 200., 20., 0.5);
+    let sid = s.hit_id();
+    let (mut px, mut hit, mut dmg) = frame();
+    {
+        let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+        s.render_content_into(&mut c, Some(&mut hit), sid);
+    }
+    // The band the slider declares: span / 16 round the track's centre (a 20-tall layout band, its track a quarter of it from row 117: centre 119.5).
+    let span = 2. * W as f32 * H as f32 / (W + H) as f32;
+    let (cy, half) = (119.5f32, span / 32.);
+    let (mut beside, mut outside) = (0, 0);
+    // Columns well clear of the handle (radius 10 round x = 160).
+    for x in (64..140).chain(180..256) {
+        for y in 96..144 {
+            let i = y * W + x;
+            let in_band = ((y as f32 + 0.5) - cy).abs() < half;
+            if in_band {
+                assert_eq!(hit[i], sid, "({x}, {y}) inside the slider's band");
+                beside += (px[i].alpha() == 0) as usize;
+            } else {
+                assert_eq!(px[i].alpha(), 0, "({x}, {y}): the slider drew outside its band");
+                assert_eq!(hit[i], HIT_NONE, "({x}, {y}) outside the slider's band");
+                outside += 1;
+            }
+        }
+    }
+    assert!(beside > 0 && outside > 0, "{beside} taps beside the track, {outside} outside the band");
+}

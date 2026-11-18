@@ -569,7 +569,7 @@ impl<P: Pixel> Button<P> {
         // Where the button showed (label, pill, its anti-aliased rim, its glow), settled whether or not a map came with this paint: `stamp_hit_into` claims from the same mask later.
         self.shown.settle(canvas.pixels);
         if let Some(map) = hit_map {
-            self.shown.claim(map, hit_id);
+            self.shown.claim_shape(map, hit_id, crate::widgets::textbox::cache_covers(&self.pill_cache, self.pill_cache_w, self.pill_cache_h, pill_x_target, pill_y_target));
         }
         self.last_painted_focused = self.focused;
         self.last_painted_hovered = self.hovered;
@@ -640,7 +640,7 @@ impl<P: Pixel> Button<P> {
             theme::LABEL_COLOUR
         };
         // THE HIT CLAIM RIDES THE PAINT (photon 2026-10-01; the owner 2026-11-17: "if it's showing on screen, it NEEDS to be hitting the hitmap, if it's already opaque and won't show? SKIP!").
-        // The α over the pill and its slot before the label and the pill go in, compared after: the pill claims each pixel it shows on (label, fill, two-tone rim), none already opaque before it (the chrome's strip or orb, flattened first), none outside its silhouette, and none something in front claimed.
+        // The α over the pill before the label and the pill go in, compared after: the pill claims its declared shape, its silhouette, which is exactly what it draws (fill and two-tone rim, the label inside it), so the pixels it showed on are that shape; none already opaque before it (the chrome's strip or orb, flattened first), none outside its silhouette, and none something in front claimed.
         // Until 2026-11-17 it claimed its whole bbox wherever the pixel was not yet opaque, the corners outside the silhouette included.
         // A disabled pill passes hit_map = None and claims nothing.
         let mut shown = hit_map.is_some().then(paint::Shown::default);
@@ -694,7 +694,7 @@ impl<P: Pixel> Button<P> {
         }
     }
 
-    /// Claim this button's `hit_id` in `hit_map` where its last paint showed: the label, the pill, its anti-aliased rim and its glow, none of the pixels already opaque before it (a layer in front hid it there), none it does not cover.
+    /// Claim this button's `hit_id` in `hit_map` by its last paint: its declared shape (the pill's silhouette) wherever the pixel was not already opaque before it (a layer in front hid it there), and its glow wherever it showed.
     /// It is the button's hits as a step of their own, for a pass that painted it with `hit_map = None`: call it right after that paint, before anything behind it claims, since something drawn behind a translucent part of the button claims there first otherwise.
     /// A pixel something in front already claimed stays theirs, so overlap is settled by what is in front, never by which call came last.
     /// Until 2026-11-17 this overwrote what was there and its doc said to call it after the widgets the button overlaps so it would "re-win" as the last writer, which let any later widget take the button's clicks (the owner: "that's real bad"); until the same day's second pass it claimed every pixel the pill's cache covered, shown or not.
@@ -705,7 +705,9 @@ impl<P: Pixel> Button<P> {
         }
         assert_eq!(self.shown.width(), buf_w, "stamp_hit_into on a map {buf_w} wide after a paint {} wide", self.shown.width());
         let _ = buf_h;
-        self.shown.claim(hit_map, hit_id);
+        // The pill where the last paint drew it (an offset paint draws it shifted; this claims at the viewport place, as it always did).
+        let (ox, oy) = ((self.center_x - self.width * 0.5) as isize, (self.center_y - self.height * 0.5) as isize);
+        self.shown.claim_shape(hit_map, hit_id, crate::widgets::textbox::cache_covers(&self.pill_cache, self.pill_cache_w, self.pill_cache_h, ox, oy));
     }
 }
 

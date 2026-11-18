@@ -1237,7 +1237,7 @@ impl<P: Pixel> MultiTextbox<P> {
         // Claim where the box showed (caret, text, pill and its anti-aliased rim), none of the pixels already opaque before it, and none something in front claimed.
         if let Some(map) = hit_map {
             self.shown.settle(canvas.pixels);
-            self.shown.claim(map, hit_id);
+            self.shown.claim_shape(map, hit_id, crate::widgets::textbox::cache_covers(&self.pill_cache, self.pill_cache_w, self.pill_cache_h, pill_x_target, pill_y_target));
         }
 
         self.record_painted(canvas.width, canvas.height);

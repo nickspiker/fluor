@@ -1283,8 +1283,10 @@ mod tests {
                 let got = chrome.hit_test_map[i];
                 // The chrome shows where its layer has coverage and the perimeter hairline, drawn in front of it, had not made the pixel opaque.
                 let chrome_shows = mine != HIT_NONE && mine != HIT_BLOCK && chrome.group.rpn.layers[chrome.layer_chrome].pixels[i].alpha() != 0 && perimeter[i].alpha() != Argb8::ONE;
-                // The slider shows where its paint raised the α.
-                let slider_shows = frame[i].alpha() > before[i].alpha();
+                // The slider claims where its paint raised the α, and over its touch band (span / 16 round the track's centre, here 37 + 25 / 2) where the frame was not already opaque.
+                let (span, cy) = (2. * w as Coord * h as Coord / (w + h) as Coord, 49.5);
+                let in_band = ((y as Coord + 0.5) - cy).abs() < span / 32.;
+                let slider_shows = frame[i].alpha() > before[i].alpha() || (in_band && before[i].alpha() != Argb8::ONE);
                 if (px0..px1).contains(&x) && (py0..py1).contains(&y) {
                     assert_eq!(got, popup, "({x}, {y}) went behind the popup");
                     under_popup += chrome_shows as usize;
