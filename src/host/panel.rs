@@ -445,4 +445,26 @@ mod tests {
         assert_eq!(f16(1e9), 0x7C00);
         assert_eq!(f16(0.), 0);
     }
+
+    /// An app that bakes its own opaque frame (`FluorApp::present_baked`) hands `Bake::row` each pixel's codes over black and the opaque lane (2: the transparency 16384 − 65535 / 4, shifted to bits 49-62): exactly what the host's bake of the same frame as opaque G2t16 pixels gives, every code and lane bit for bit.
+    #[test]
+    fn baking_codes_equals_baking_the_opaque_frame() {
+        let bake = Bake::new(1, 1.25, [[0.9, 0.08, 0.02], [0.05, 0.9, 0.05], [0.01, 0.07, 0.92]], 1. / 2.19);
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Odd lengths: the 16-pixel blocks' tail too.
+        for n in [1usize, 15, 16, 17, 333] {
+            let codes: alloc::vec::Vec<[u16; 3]> = (0..n).map(|_| [next() as u16, next() as u16, next() as u16]).collect();
+            let frame: alloc::vec::Vec<G2t16> = codes.iter().map(|c| G2t16::from_channels(G2t16::ONE, c.map(|c| G2t16::ONE - c as u32))).collect();
+            let (mut host, mut app) = (alloc::vec![0u64; n], alloc::vec![0u64; n]);
+            G2t16::to_baked(&frame, &mut host, &bake);
+            bake.row(|i| (codes[i], 2), &mut app);
+            assert_eq!(host, app, "{n} pixels");
+        }
+    }
 }

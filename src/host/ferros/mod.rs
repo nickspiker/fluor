@@ -433,6 +433,10 @@ pub struct FerrosShell<A: FluorApp<P>, P: PanelPixel = Argb8> {
     full_next: bool,
     /// The last draw was the app's own frame (`FluorApp::render_own`), not the scratch.
     own: bool,
+    /// The display bakes (op 65 answered): set by the frame loop before each draw, so `draw` knows whether the app may bake its own frame.
+    pub display_bakes: bool,
+    /// This frame the app bakes its changed rects into the surface itself (`FluorApp::bakes_own`): the scratch was neither cleared nor rendered.
+    app_bakes: bool,
 }
 
 impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
@@ -480,6 +484,8 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             bell,
             full_next: false,
             own: false,
+            display_bakes: false,
+            app_bakes: false,
         };
         shell.with_context(|app, ctx| app.init(ctx));
         shell.with_context(|app, ctx| app.on_resize(width, height, ctx));
@@ -626,6 +632,7 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         // The surface holds the last frame converted from the scratch unless that frame was the app's own (`render_own`): only then can it be moved as the scratch is.
         let surface_is_scratch = !self.own;
         self.shift = None;
+        self.app_bakes = false;
         self.bucket = 1;
         let t0 = sys::now();
         if damage_clip != viewport_rect {
@@ -653,6 +660,12 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         self.own = own;
         if own {
             self.changed = whole;
+            self.shift = None;
+            return true;
+        }
+        // The app bakes its own frame into the surface (`FluorApp::bakes_own`): nothing to clear or render here, the present hands it the changed rects. A scroll hint's move of the scratch above was the scratch path's; this path redraws the whole damage.
+        self.app_bakes = self.display_bakes && self.app.bakes_own();
+        if self.app_bakes {
             self.shift = None;
             return true;
         }
@@ -707,6 +720,13 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             return;
         }
         self.shown = self.shown.union(changed.bbox());
+        // The app bakes its changed rects itself (`FluorApp::present_baked`), straight from its own frame.
+        if let (true, Some(b)) = (self.app_bakes, bake) {
+            for &r in changed.as_slice() {
+                self.app.present_baked(r, &mut surface[(fy + r.y0) * stride..(fy + r.y1) * stride], stride, fx, b);
+            }
+            return;
+        }
         // The app's own frame when it made one (`render_own`), else the scratch; nothing when it put its frame in the surface itself.
         let src = match (self.own, self.app.own_frame()) {
             (true, None) => return,
@@ -1138,6 +1158,7 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             return Ok(());
         }
         let t = sys::now();
+        shell.display_bakes = bake.is_some();
         if shell.draw() {
             let t_drawn = sys::now();
             shell.present(surface, pw, fx, fy, bake.as_deref());

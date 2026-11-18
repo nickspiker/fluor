@@ -809,6 +809,16 @@ pub trait FluorApp<P: crate::pixel::Pixel = crate::pixel::Argb8> {
         false
     }
 
+    /// The app writes its changed rects straight into the surface in the ferros display's baked codes ([`Self::present_baked`]), so when the display bakes the host neither clears nor renders the scratch nor bakes it: one pass instead of four, for an app whose frame is its own whole buffer (Lumis's camera frame). Asked each frame; false (the default) keeps the scratch path.
+    #[cfg(all(feature = "host-ferros", target_os = "ferros"))]
+    fn bakes_own(&self) -> bool {
+        false
+    }
+
+    /// One changed rect of the frame into the surface, baked ([`crate::host::panel::Bake`], the display's own: `Bake::row` gives the codes the host's bake of a scratch row gives): `rows` holds the rect's rows of the surface, `stride` pixels apart, the rect's columns at `fx + rect.x0 .. fx + rect.x1`. Called only after [`Self::bakes_own`] said yes this frame and the display bakes; every pixel of the rect must be written (nothing lies under it).
+    #[cfg(all(feature = "host-ferros", target_os = "ferros"))]
+    fn present_baked(&mut self, _rect: crate::canvas::PixelRect, _rows: &mut [u64], _stride: usize, _fx: usize, _bake: &crate::host::panel::Bake) {}
+
     /// No pixel of the app's frame is see-through: a host that composes windows (ferros's display) never reads what the window covers. False (the default).
     fn opaque(&self) -> bool {
         false
