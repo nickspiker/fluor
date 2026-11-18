@@ -457,6 +457,11 @@ pub struct FerrosShell<A: FluorApp<P>, P: PanelPixel = Argb8> {
     app_bakes: bool,
     /// The last frame drawn was baked by the app (`app_bakes`): the next one that is not is drawn whole (`panel::whole_frame`).
     baked_last: bool,
+    /// The surface's scrolling pane as a ring of rows (`paint::ring`, ferros DISPLAY-SCROLL.md option B), in the surface's (the screen's) coordinates: a scroll frame moves its origin instead of the pane's pixels, and op 22 names it with every show.
+    /// None: the surface is linear.
+    pub ring: Option<crate::paint::ring::Ring>,
+    /// The display reads a ring (op 5's feature bits): without it a scroll frame moves the surface's pane as before.
+    pub ring_ok: bool,
 }
 
 impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
@@ -507,6 +512,8 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             display_bakes: false,
             app_bakes: false,
             baked_last: false,
+            ring: None,
+            ring_ok: false,
         };
         shell.with_context(|app, ctx| app.init(ctx));
         shell.with_context(|app, ctx| app.on_resize(width, height, ctx));
@@ -765,24 +772,54 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         self.shown = PixelRect::new(0, 0, 0, 0);
         // WHY/PROOF: `changed` is the app's damage and scroll rects, which an app may hand over overhanging its frame (fluor's own primitives cut theirs at the buffer the same way, `Clip::resolve`); the slices below index the scratch and the surface up to its far edges.
         // A scroll frame: the surface's copy of the pane moved by the same rows as the scratch was (`draw`), so what is converted is the damage alone. The rect cut at the frame first, as below, so the move never reaches another part of the screen.
+        // With a display that reads a ring (`ring_ok`), nothing moves: the pane's ring takes the scroll as a new origin (ferros DISPLAY-SCROLL.md option B, 2026-11-17: the move was 2.5 to 2.7 ms of the four A715s a scroll frame on the Pro).
+        // A pane other than the ring's: the old ring's rows rotated home once (origin 0), then a new ring over this pane.
         if let Some((r, dy)) = self.shift {
             let (sx0, sy0, sx1, sy1) = (r.x0.min(w), r.y0.min(h), r.x1.min(w), r.y1.min(h));
-            crate::paint::scroll_copy_rect(surface, stride, surface.len() / stride, fx + sx0, fy + sy0, fx + sx1, fy + sy1, dy);
+            if self.ring_ok {
+                let pane = PixelRect::new(fx + sx0, fy + sy0, fx + sx1, fy + sy1);
+                let ring = match self.ring.take() {
+                    Some(g) if g.rect == pane => g,
+                    Some(mut g) => {
+                        g.home(surface, stride);
+                        crate::paint::ring::Ring::new(pane)
+                    }
+                    None => crate::paint::ring::Ring::new(pane),
+                };
+                self.ring = Some(ring.scrolled(dy));
+            } else {
+                crate::paint::scroll_copy_rect(surface, stride, surface.len() / stride, fx + sx0, fy + sy0, fx + sx1, fy + sy1, dy);
+            }
             self.shown = PixelRect::new(sx0, sy0, sx1, sy1);
         }
         self.t_moved = sys::now();
         // Each changed rect cut at the frame (`DamageRects::cut`), converted in a dispatch of its rows to the workers.
         let changed = self.changed.cut(w, h);
+        // The app put its frame in the surface itself: every row where a linear reader looks, so no ring.
+        if self.own && self.app.own_frame().is_none() {
+            self.ring = None;
+        }
         if changed.as_slice().is_empty() {
             return;
         }
         self.shown = self.shown.union(changed.bbox());
         // The app bakes its changed rects itself (`FluorApp::present_baked`), straight from its own frame.
+        // Its rows are written where they stand, so a ring goes home first and is let go.
         if let (true, Some(b)) = (self.app_bakes, bake) {
+            if let Some(mut g) = self.ring.take() {
+                g.home(surface, stride);
+            }
             for &r in changed.as_slice() {
                 self.app.present_baked(r, &mut surface[(fy + r.y0) * stride..(fy + r.y1) * stride], stride, fx, b);
             }
             return;
+        }
+        // A frame that converts the ring's whole rect writes every one of its rows anyway: written linearly, the ring is let go at no cost (the first frame, back in front, a new bake, the app's own whole frame).
+        if let Some(g) = self.ring {
+            let whole = changed.as_slice().iter().any(|c| fx + c.x0 <= g.rect.x0 && fy + c.y0 <= g.rect.y0 && fx + c.x1 >= g.rect.x1 && fy + c.y1 >= g.rect.y1);
+            if whole {
+                self.ring = None;
+            }
         }
         // The app's own frame when it made one (`render_own`), else the scratch; nothing when it put its frame in the surface itself.
         let src = match (self.own, self.app.own_frame()) {
@@ -790,11 +827,26 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             (true, Some(f)) => f,
             (false, _) => &self.scratch,
         };
-        for &PixelRect { x0, y0, x1, y1 } in changed.as_slice() {
-            let dst = &mut surface[(fy + y0) * stride..(fy + y1) * stride];
-            match bake {
-                Some(b) => dst.par_chunks_mut(stride).zip(src[y0 * w..y1 * w].par_chunks(w)).for_each(|(d, s)| P::to_baked(&s[x0..x1], &mut d[fx + x0..fx + x1], b)),
-                None => dst.par_chunks_mut(stride).zip(src[y0 * w..y1 * w].par_chunks(w)).for_each(|(d, s)| P::to_panel(&s[x0..x1], &mut d[fx + x0..fx + x1])),
+        // Each changed rect in surface coordinates, cut where it meets the ring (`Ring::pieces`): each piece's rows run on in the surface from the row it names.
+        // Without a ring, the rect whole, where it is.
+        for c in changed.as_slice() {
+            let s = PixelRect::new(fx + c.x0, fy + c.y0, fx + c.x1, fy + c.y1);
+            let (pieces, n) = match self.ring {
+                Some(g) => g.pieces(s),
+                None => {
+                    let mut one = [(PixelRect::empty(), 0usize); crate::paint::ring::RING_PIECES];
+                    one[0] = (s, s.y0);
+                    (one, 1)
+                }
+            };
+            for &(p, at) in &pieces[..n] {
+                // The piece in frame coordinates (the scratch's), and its rows' first row in the surface.
+                let (x0, y0, x1, y1) = (p.x0 - fx, p.y0 - fy, p.x1 - fx, p.y1 - fy);
+                let dst = &mut surface[at * stride..(at + (y1 - y0)) * stride];
+                match bake {
+                    Some(b) => dst.par_chunks_mut(stride).zip(src[y0 * w..y1 * w].par_chunks(w)).for_each(|(d, s)| P::to_baked(&s[x0..x1], &mut d[fx + x0..fx + x1], b)),
+                    None => dst.par_chunks_mut(stride).zip(src[y0 * w..y1 * w].par_chunks(w)).for_each(|(d, s)| P::to_panel(&s[x0..x1], &mut d[fx + x0..fx + x1])),
+                }
             }
         }
     }
@@ -1082,8 +1134,11 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
     } else {
         (1.0, 1.0)
     };
-    println!("fluor: ferros host up, a {w} x {h} frame at ({fx}, {fy}) on a {pw} x {ph} panel");
+    // Op 5's byte 13, the display's features (absent from a display before them): bit 0, it reads a ring named in op 22's 50-byte form.
+    let ring_ok = sys::call(display, &[5], &mut r) >= 14 && r[13] & 1 != 0;
+    println!("fluor: ferros host up, a {w} x {h} frame at ({fx}, {fy}) on a {pw} x {ph} panel; {}", if ring_ok { "a scroll moves the pane's ring, not its pixels" } else { "the display reads no ring: a scroll moves the pane" });
     let mut shell = FerrosShell::new(app, w as u32, h as u32, ru);
+    shell.ring_ok = ring_ok;
     // The window's events (behind, in front, keys) on a thread of their own, the display's op 62 held there. None spawned: the window never hears them, and runs as before.
     let bell = shell.bell.clone();
     {
@@ -1239,7 +1294,7 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             let t_presented = sys::now();
             // The window (ferros WINDOWS.md): the frame's part of the screen, this surface, the app level, and what its pixels are (`PanelPixel::FORMAT`: at 16 bits fluor's own, which the display decodes).
             // An opaque app (`FluorApp::opaque`) says so in the mode byte: the display then never reads what the window covers (ferros_sys `window::show_full`, mode bit 3).
-            let mut m = [0u8; 36];
+            let mut m = [0u8; 50];
             m[0] = 22;
             m[1..3].copy_from_slice(&(fx as u16).to_le_bytes());
             m[3..5].copy_from_slice(&(fy as u16).to_le_bytes());
@@ -1249,7 +1304,8 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             // Baked when this host baked the frame (`present` with the display's bake), or the app made its own frame in the surface baked itself (`FluorApp::own_baked`); else the depth's own format.
             let own_in_surface = shell.own && shell.app.own_frame().is_none();
             m[18] = if (bake.is_some() && !own_in_surface) || (own_in_surface && shell.app.own_baked()) { crate::host::panel::BAKED } else { P::FORMAT };
-            // Every show is the 28-byte form, naming what changed (ferros_sys `show_changed`): the part of the surface this present wrote (`FerrosShell::shown`: the converted damage, and on a scroll frame the moved pane), or the whole frame for the app's own frame. The display publishes only that and owes it to its other phases (2026-11-17: until then a caret's blink or a hover was a whole screen's publish).
+            // Every show names what changed (ferros_sys `show_changed`): the part of the surface this present wrote (`FerrosShell::shown`: the converted damage, and on a scroll frame the moved pane or its ring), or the whole frame for the app's own frame.
+            // The display publishes only that and owes it to its other phases (2026-11-17: until then a caret's blink or a hover was a whole screen's publish).
             let opaque = shell.app.opaque();
             // An app that drew into a buffer of its own (`FluorApp::own_surface`) says which, in the 36-byte form: the display shows that buffer and answers once it has taken it (ferros GPU-KISTS.md 1.4, the mailbox).
             let own = if shell.own { shell.app.own_surface() } else { None };
@@ -1262,7 +1318,22 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             if let Some(b) = own {
                 m[28..36].copy_from_slice(&b.to_le_bytes());
             }
-            let len = if own.is_some() { 36 } else { 28 };
+            // To a display that reads a ring, every show is the 50-byte form: the 40-byte one (the buffer, 0 for the surface itself; the frame's own time, its draw and present) and the ring, [x u16][y u16][w u16][h u16][origin u16], a height of 0 for none.
+            // Stated with every show, so the display holds nothing of it the host did not just say.
+            let len = if ring_ok {
+                m[36..40].copy_from_slice(&(us(t_presented - t) as u32).to_le_bytes());
+                if let Some(g) = shell.ring {
+                    let g16 = [g.rect.x0, g.rect.y0, g.rect.width(), g.rect.height(), g.origin];
+                    for (i, v) in g16.iter().enumerate() {
+                        m[40 + 2 * i..42 + 2 * i].copy_from_slice(&(*v as u16).to_le_bytes());
+                    }
+                }
+                50
+            } else if own.is_some() {
+                36
+            } else {
+                28
+            };
             let mut rr = [0u8; 4];
             // A show answered ERR is a display that ended holding it (the kernel fails the calls a server that ended had taken): the frame is lost and the app runs on, its window held behind (`lost`) until the watch hears the display after it, which says where the window stands there (ferros WINDOWS.md "A display started again": behind, until the deck brings it to the front).
             // The app ends only when the watch has ended too (`gone`: no display answers any more), never by counting failures (2026-11-20: a display restarted under an app ended it).

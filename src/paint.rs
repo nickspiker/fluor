@@ -16,6 +16,7 @@ use crate::coord::Coord;
 pub mod argb8;
 pub mod finalize;
 pub mod glow;
+pub mod ring;
 pub mod shadow;
 pub mod edge;
 pub mod shape;
