@@ -52,6 +52,9 @@ pub struct Button<P: Pixel = Argb8> {
     /// When `true`, `render_content_into` bakes the current STATE fill ([`Self::effective_fill`]) directly into the pill instead of only the idle fill — for headless hosts (e.g. toka in the browser) that don't run the host's overlay-delta hover pass. When `false` (default, desktop/Android), the pill bakes the idle fill and hover/pressed come from the overlay via `tint_delta`. Set via [`Self::set_bake_states`].
     bake_states: bool,
 
+    /// When `true` the silhouette is a circle (an ellipse in a box that is not square): every corner at half the height, traced at exponent 2, in place of the house pill's asymmetric squircle. For a control that is a bead rather than a pill (photon's Wave and Beam beads round the orb on ferros, owner 2026-11-18). Set via [`Self::set_round`].
+    round: bool,
+
     /// Last effective fill actually rasterized into `pill_cache` — lets baked-state mode re-dirty the cache only when the state fill genuinely changes (hover/press transition), not every frame.
     last_baked_fill: Option<u32>,
 
@@ -122,6 +125,7 @@ impl<P: Pixel> Button<P> {
             fill: None,
             held_fill: None,
             bake_states: false,
+            round: false,
             last_baked_fill: None,
             click_counter: 0,
             last_seen_click_counter: 0,
@@ -174,6 +178,15 @@ impl<P: Pixel> Button<P> {
     /// `bake_states` field. Headless hosts (toka) set `true`; the desktop/Android host leaves it `false`.
     pub fn set_bake_states(&mut self, bake: bool) {
         self.bake_states = bake;
+    }
+
+    /// A circle (`true`) or the house pill (`false`, default). See the `round` field. Changing it redraws the silhouette and the label clipped to it.
+    pub fn set_round(&mut self, round: bool) {
+        if round != self.round {
+            self.round = round;
+            self.pill_cache_dirty = true;
+            self.text_cache_dirty = true;
+        }
     }
 
     /// Ratios that turn a resting fill into its hover / held variant — chosen so a default
@@ -396,7 +409,10 @@ impl<P: Pixel> Button<P> {
         let cw = pill_w as usize;
         let ch = pill_h as usize;
         // Fractional squirdleyness — slots between an ellipse (2) and a diamond (1). `1.5` reads as a noticeably-rounder, slightly-faceted pill: distinctly more curved than the textbox's `3.0` "slightly squared" but not as soft as a full ellipse. Routes thru paint's `_f` (powf) variant; the textbox / chrome keep the integer (powi) fast path. Adjustable per-instance via this constant; future API could expose it as a Button field if more shapes are desired.
-        let squirdleyness = paint::SHAPE_POWER as f32;
+        let squirdleyness = if self.round { 2. } else { paint::SHAPE_POWER as f32 };
+        // The corners at a radius: the house split (TL+BR deep, TR+BL half), or every corner at it for a circle.
+        let round = self.round;
+        let radii = move |r: f32| if round { [r; 4] } else { paint::asymmetric_radii(r) };
         // The `+ 1` idiom every other widget uses (textbox.rs): a 1 px floor on the ring. Without it the ring truncates to 0 below a 32 px font, the inner fill (painted first, so on top under under-blend) covers the whole pill, and the two-tone edge vanishes — the contact-screen action pills lost their hairline while Send kept its (2026-09-10).
         let stroke_px = (self.stroke_ru * self.font_size) as isize + 1;
 
@@ -434,7 +450,7 @@ impl<P: Pixel> Button<P> {
                         inner_w,
                         inner_h,
                         pill_fill,
-                        paint::asymmetric_radii(pill_h as f32 * 0.5 - stroke_px as f32),
+                        radii(pill_h as f32 * 0.5 - stroke_px as f32),
                         squirdleyness,
                     );
                 }
@@ -457,7 +473,7 @@ impl<P: Pixel> Button<P> {
                     pill_h,
                     theme::TEXTBOX_LIGHT_EDGE,
                     theme::TEXTBOX_SHADOW_EDGE,
-                    paint::asymmetric_radii(pill_h as f32 * 0.5),
+                    radii(pill_h as f32 * 0.5),
                     squirdleyness,
                     None,
                     0,
@@ -828,6 +844,46 @@ mod widget_impls {
                 viewport_w,
                 viewport_h,
             ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::canvas::{Canvas, Damage};
+    use alloc::vec;
+
+    /// A round button's silhouette is a circle: every pixel it shows on lies within its radius of its centre (plus the anti-aliased rim), it shows at the four points of the compass just inside, and its four corners are bare, where the house pill's deep corners would cover two of them.
+    #[test]
+    fn a_round_button_is_a_circle() {
+        let (w, h) = (128usize, 128usize);
+        let mut text = TextRenderer::new();
+        let mut ids: HitId = paint::HIT_NONE;
+        let mut b = Button::new(&mut ids, 64., 64., 96., 96., 20., "");
+        b.set_round(true);
+        let mut px = vec![Argb8::EMPTY; w * h];
+        let mut dmg = Damage::new();
+        {
+            let mut c = Canvas::new(&mut px, w, h, &mut dmg);
+            let id = b.hit_id();
+            b.render_content_into(&mut c, 0., 0., &mut text, None, None, id);
+        }
+        let shows = |x: usize, y: usize| px[y * w + x].alpha() != 0;
+        for y in 0..h {
+            for x in 0..w {
+                if shows(x, y) {
+                    let d = ((x as f32 + 0.5 - 64.).powi(2) + (y as f32 + 0.5 - 64.).powi(2)).sqrt();
+                    assert!(d <= 48. + 1.5, "({x}, {y}) shows {d} from the centre");
+                }
+            }
+        }
+        for (x, y) in [(64, 18), (64, 109), (18, 64), (109, 64)] {
+            assert!(shows(x, y), "({x}, {y}) inside the circle does not show");
+        }
+        // The box's corners, a twelfth in from each: outside a circle of radius 48, inside the pill's TL and BR squircle corners.
+        for (x, y) in [(24, 24), (103, 24), (24, 103), (103, 103)] {
+            assert!(!shows(x, y), "({x}, {y}) in a corner shows");
         }
     }
 }
