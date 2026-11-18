@@ -225,15 +225,10 @@ fn content_bbox<P: Pixel>(pixels: &[P], w: usize, h: usize) -> crate::canvas::Pi
 
 /// [`content_bbox`] of the part of a `w`-wide layer inside `r` (the layer empty outside it).
 fn region_bbox<P: Pixel>(pixels: &[P], w: usize, r: crate::canvas::PixelRect) -> crate::canvas::PixelRect {
-    region_bbox_by(pixels, w, r, |p| p != P::EMPTY)
-}
-
-/// The bounding box, inside `r` of a `w`-wide buffer, of the entries `held` picks.
-fn region_bbox_by<T: Copy>(buf: &[T], w: usize, r: crate::canvas::PixelRect, held: impl Fn(T) -> bool) -> crate::canvas::PixelRect {
     let mut b = crate::canvas::PixelRect::empty();
     for y in r.y0..r.y1 {
-        let row = &buf[y * w + r.x0..y * w + r.x1];
-        if let (Some(x0), Some(x1)) = (row.iter().position(|&p| held(p)), row.iter().rposition(|&p| held(p))) {
+        let row = &pixels[y * w + r.x0..y * w + r.x1];
+        if let (Some(x0), Some(x1)) = (row.iter().position(|&p| p != P::EMPTY), row.iter().rposition(|&p| p != P::EMPTY)) {
             b = b.union(crate::canvas::PixelRect::new(r.x0 + x0, y, r.x0 + x1 + 1, y + 1));
         }
     }
@@ -555,9 +550,8 @@ impl<P: Pixel> DefaultChrome<P> {
         let pixels = &self.group.rpn.layers[self.layer_chrome].pixels;
         let held = region_bbox(pixels, w, region);
         debug_assert_eq!(held, content_bbox(pixels, w, h), "the chrome drew outside its reach");
-        // The box covers the chrome's hits too: the flatten claims them over it, and a hit can sit where the chrome draws nothing (the orb claims out to its ring's radius, whose last pixel takes no coverage).
-        let hits = region_bbox_by(&self.chrome_hits, w, region, |id| id != HIT_NONE && id != HIT_BLOCK);
-        self.chrome_bbox = Some(held.union(hits));
+        // The box covers every hit that reaches the frame: the flatten claims the chrome's hits only where its layer shows (`claim_chrome_hits`).
+        self.chrome_bbox = Some(held);
     }
 
     /// The re-raster itself, the layer and the hit map cleared over `region` first.
@@ -690,7 +684,13 @@ impl<P: Pixel> DefaultChrome<P> {
                 );
                 if self.orb_pressed {
                     // Press glow — painted AFTER the orb+ring, so under()'s earliest-wins layering puts the halo BENEATH them: the opaque disk pixels early-out untouched and the bloom lands only in the transparent surround. Same pipeline as photon's text halos (disk coverage at the glow grey → soft h+v blurs → white-under), here with real under() because the chrome layer is still building.
-                    chrome::draw_orb_press_glow(chrome_buf, buf_w, buf_h, orb_cx, orb_cy + self.orb_dy as isize, orb_radius);
+                    // The glow is the orb's own light, so it claims for the orb wherever it shows (the same reach `chrome_reach` gives it, twice the radius).
+                    let (gx, gy, reach) = (orb_cx, orb_cy + self.orb_dy as isize, 2 * orb_radius + 2);
+                    let mut shown = crate::paint::Shown::default();
+                    shown.before(chrome_buf, buf_w, buf_h, crate::paint::reach_rect(gx - reach, gy - reach, gx + reach + 1, gy + reach + 1, buf_w, buf_h));
+                    chrome::draw_orb_press_glow(chrome_buf, buf_w, buf_h, gx, gy, orb_radius);
+                    shown.settle(chrome_buf);
+                    shown.claim(&mut self.chrome_hits, self.app_icon_btn.id());
                 }
             }
             {
@@ -883,7 +883,7 @@ impl<P: Pixel> DefaultChrome<P> {
         clip: Option<crate::paint::Clip>,
     ) {
         let boxed = self.chrome_clip(clip, target_w, target_h);
-        self.claim_chrome_hits(boxed);
+        self.claim_chrome_hits(boxed, target);
         self.group.flatten_into(target, target_w, target_h, clip);
     }
 
@@ -898,7 +898,7 @@ impl<P: Pixel> DefaultChrome<P> {
         clip: Option<crate::paint::Clip>,
     ) {
         let clip = self.chrome_clip(clip, target_w, target_h);
-        self.claim_chrome_hits(clip);
+        self.claim_chrome_hits(clip, target);
         self.group.flatten_layer_into(self.layer_chrome, target, target_w, target_h, Some(clip));
     }
 
@@ -911,18 +911,22 @@ impl<P: Pixel> DefaultChrome<P> {
         crate::paint::Clip::new(c.x_start.max(bbox.x0), c.y_start.max(bbox.y0), c.x_end.min(bbox.x1), c.y_end.min(bbox.y1))
     }
 
-    /// Claim the chrome's own hits into the frame's map over `clip` (already inside the chrome's box, so inside the map): each pixel nothing in front claimed takes the chrome's id there; a [`HIT_BLOCK`] (outside the window's silhouette) claims nothing.
-    fn claim_chrome_hits(&mut self, clip: crate::paint::Clip) {
+    /// Claim the chrome's own hits into the frame's map over `clip` (already inside the chrome's box, so inside the map), before its pixels go under `target`: each pixel where the chrome shows (its layer's coverage above zero, and `target` not already opaque there, so the layer goes under something it can still be seen thru) takes the chrome's id, unless something in front claimed it first.
+    /// A pixel where the chrome draws nothing, or where what is in front already made it opaque, claims nothing; a [`HIT_BLOCK`] (outside the window's silhouette) claims nothing either.
+    fn claim_chrome_hits(&mut self, clip: crate::paint::Clip, target: &[P]) {
         let w = self.dims().0;
         // WHY/PROOF: a clip that misses the chrome's box comes out with its start past its end (`chrome_clip`), and a reversed slice range panics where an empty loop would not.
         if clip.x_start >= clip.x_end {
             return;
         }
+        let layer = &self.group.rpn.layers[self.layer_chrome].pixels;
         for y in clip.y_start..clip.y_end {
             let row = y * w + clip.x_start..y * w + clip.x_end;
-            for (slot, &mine) in self.hit_test_map[row.clone()].iter_mut().zip(&self.chrome_hits[row]) {
-                let held = *slot;
-                *slot = if held == HIT_NONE && mine != HIT_BLOCK { mine } else { held };
+            let (map, mine, own, front) = (&mut self.hit_test_map[row.clone()], &self.chrome_hits[row.clone()], &layer[row.clone()], &target[row]);
+            for i in 0..map.len() {
+                let held = map[i];
+                let shows = own[i].alpha() != 0 && front[i].alpha() != P::ONE;
+                map[i] = if held == HIT_NONE && mine[i] != HIT_BLOCK && shows { mine[i] } else { held };
             }
         }
     }
@@ -1230,7 +1234,10 @@ mod tests {
         let dmg = chrome.damage_rect().unwrap();
         assert!(!(dmg.x0..dmg.x1).contains(&x) || !(dmg.y0..dmg.y1).contains(&y), "the row is outside the damage {dmg:?}");
         chrome.rasterize_chrome(&mut crate::canvas::Damage::new(), &mut text, &mut clip_mask);
-        // The chrome's hits go into the frame's map with its pixels, over the frame's damage.
+        // The host clears the frame over the damage, and the chrome's hits go into the frame's map with its pixels there.
+        for y in dmg.y0..dmg.y1 {
+            frame[y * w + dmg.x0..y * w + dmg.x1].fill(0);
+        }
         chrome.flatten_chrome_into(&mut frame, w, h, Some(crate::paint::Clip::new(dmg.x0, dmg.y0, dmg.x1, dmg.y1)));
         assert_eq!(chrome.hit_at(x as Coord, y as Coord), row);
         let (cx, cy, _) = chrome.orb_geometry().unwrap();
@@ -1259,6 +1266,7 @@ mod tests {
         for y in py0..py1 {
             crate::paint::claim_hits(&mut chrome.hit_test_map[y * w + px0..y * w + px1], popup);
         }
+        let perimeter = frame.clone();
         chrome.flatten_chrome_into(&mut frame, w, h, None);
         let before = frame.clone();
         let mut damage = crate::canvas::Damage::new();
@@ -1273,17 +1281,21 @@ mod tests {
                 let i = y * w + x;
                 let mine = chrome.chrome_hits[i];
                 let got = chrome.hit_test_map[i];
+                // The chrome shows where its layer has coverage and the perimeter hairline, drawn in front of it, had not made the pixel opaque.
+                let chrome_shows = mine != HIT_NONE && mine != HIT_BLOCK && chrome.group.rpn.layers[chrome.layer_chrome].pixels[i].alpha() != 0 && perimeter[i].alpha() != Argb8::ONE;
+                // The slider shows where its paint raised the α.
+                let slider_shows = frame[i].alpha() > before[i].alpha();
                 if (px0..px1).contains(&x) && (py0..py1).contains(&y) {
                     assert_eq!(got, popup, "({x}, {y}) went behind the popup");
-                    under_popup += (mine != HIT_NONE && mine != HIT_BLOCK) as usize;
-                } else if mine != HIT_NONE && mine != HIT_BLOCK {
+                    under_popup += chrome_shows as usize;
+                } else if chrome_shows {
                     assert!(chrome_ids.contains(&mine));
                     assert_eq!(got, mine, "({x}, {y}): the slider drawn after took the chrome's click");
-                    under_chrome += (y < 100) as usize;
-                } else if y < 100 {
-                    assert_eq!(got, sid, "({x}, {y}): the slider lost a pixel nothing is in front of");
+                    under_chrome += (37..62).contains(&y) as usize;
+                } else if slider_shows {
+                    assert_eq!(got, sid, "({x}, {y}): the slider lost a pixel it shows on");
                 } else {
-                    assert_eq!(got, HIT_NONE, "({x}, {y}): last frame's claim outlived the clear");
+                    assert_eq!(got, HIT_NONE, "({x}, {y}): a pixel nothing shows on was claimed, or last frame's claim outlived the clear");
                 }
                 if before[i].alpha() == Argb8::ONE {
                     assert_eq!(frame[i], before[i], "({x}, {y}): the slider came out in front of the chrome");

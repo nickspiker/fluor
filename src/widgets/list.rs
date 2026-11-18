@@ -1,6 +1,6 @@
 //! A list of rows — the one shape every app's lists share (photon's contacts and conversations, mahere's layers, areas, places found and turns): a title, a detail line under it when there is one, something at the left (a box to tick, a fold mark, a colour), something at the right (a chevron, a word, a colour), a step in from the edge for a row under a group, and one of them picked. The list scrolls inside its rect with the same spring as a textbox's overscroll, and a tap names its row ([`List::take_click`]) — the app decides what the row means, as it does for a button.
 
-use crate::canvas::{Canvas, PixelRect};
+use crate::canvas::Canvas;
 use crate::coord::Coord;
 use crate::paint::{self, Clip, HitId};
 use crate::region::Region;
@@ -76,6 +76,8 @@ impl ListRow {
 /// The rows in a rect, scrolled, one tapped at a time.
 pub struct List {
     hit_id: HitId,
+    /// Where the last paint showed ([`paint::Shown`]): the hit claim rides it, so the widget claims exactly the pixels it shows on and none it does not.
+    shown: paint::Shown,
     rows: Vec<ListRow>,
     /// The rect's top left, width and height.
     pub x: Coord,
@@ -96,7 +98,7 @@ pub struct List {
 impl List {
     /// Claims one [`HitId`] for the whole list; a tap's row is found by its place.
     pub fn new(hit_counter: &mut HitId, x: Coord, y: Coord, width: Coord, height: Coord, font_size: Coord) -> Self {
-        List { hit_id: crate::host::widget::next_id(hit_counter), rows: Vec::new(), x, y, width, height, font_size, scroll: 0.0, selected: None, clicked: None, hovered: false, pressed: false }
+        List { hit_id: crate::host::widget::next_id(hit_counter), shown: paint::Shown::default(), rows: Vec::new(), x, y, width, height, font_size, scroll: 0.0, selected: None, clicked: None, hovered: false, pressed: false }
     }
 
     pub fn hit_id(&self) -> HitId {
@@ -235,8 +237,8 @@ impl List {
         self.pressed = pressed;
     }
 
-    /// Paint the rows that lie in the rect, topmost first (the picked row's band last, under its text), and stamp the hit id over the rect.
-    pub fn render_content_into<P: Pixel>(&mut self, canvas: &mut Canvas<P>, text: &mut TextRenderer, clip: Option<Clip>, mut hit_map: Option<&mut [HitId]>) {
+    /// Paint the rows that lie in the rect, topmost first (the picked row's band last, under its text), and claim the hit id wherever they show.
+    pub fn render_content_into<P: Pixel>(&mut self, canvas: &mut Canvas<P>, text: &mut TextRenderer, clip: Option<Clip>, hit_map: Option<&mut [HitId]>) {
         let font = self.font_size;
         // Everything this paints stays inside the list's rect, whatever clip the caller brought.
         let (cx0, cy0, cx1, cy1) = (self.x as usize, self.y as usize, (self.x + self.width) as usize, (self.y + self.height) as usize);
@@ -248,6 +250,10 @@ impl List {
         let dimmed = TextStyle::new(font, theme::LABEL_COLOUR);
         let small = TextStyle::new(font * 0.8, theme::LABEL_COLOUR);
         let indent = font * 1.2;
+        // The hits ride the paint: where the α stood before the rows went in (everything they draw stays inside the rect, the clip above).
+        if hit_map.is_some() {
+            self.shown.before(canvas.pixels, canvas.width, canvas.height, crate::canvas::PixelRect::new(cx0, cy0, cx1, cy1));
+        }
         let mut top = self.y - self.scroll;
         for (i, row) in self.rows.iter().enumerate() {
             let h = self.row_height(row);
@@ -294,21 +300,11 @@ impl List {
             }
             top += h;
         }
-        if let Some(map) = hit_map.as_deref_mut() {
-            let rect = PixelRect::new(cx0, cy0, cx1, cy1);
-            let bw = canvas.width;
-            let bh = canvas.height;
-            // WHY/PROOF: the rect is the app's layout, past the canvas when a pane scrolls off an edge — the stamp would index outside the hit map.
-            // A rect wholly past the right edge leaves x0 > x1, and a reversed slice range panics where the loop it replaced ran empty, hence the x0 < x1 test.
-            let x1 = rect.x1.min(bw);
-            let y1 = rect.y1.min(bh);
-            // A pixel something in front already holds stays theirs.
-            if rect.x0 < x1 {
-                for y in rect.y0..y1 {
-                    let base = y * bw;
-                    paint::claim_hits(&mut map[base + rect.x0..base + x1], self.hit_id);
-                }
-            }
+        // Claim where the list showed (its rows' marks, titles, details, swatches and the picked row's band), none of the pixels already opaque before it, and none something in front claimed.
+        // Until 2026-11-17 it claimed its whole rect, the empty space between its marks included.
+        if let Some(map) = hit_map {
+            self.shown.settle(canvas.pixels);
+            self.shown.claim(map, self.hit_id);
         }
     }
 

@@ -17,6 +17,8 @@ use alloc::vec::Vec;
 pub struct Button<P: Pixel = Argb8> {
     /// Allocated at construction; stamped into the host hit map at every opaque pill pixel.
     hit_id: HitId,
+    /// Where the last paint showed ([`paint::Shown`]): the hit claim rides it, so the widget claims exactly the pixels it shows on and none it does not.
+    shown: paint::Shown,
     /// Label text — single line, no editing. Mutate via [`Self::set_label`] so caches invalidate.
     label: String,
     font: &'static str,
@@ -103,6 +105,7 @@ impl<P: Pixel> Button<P> {
     ) -> Self {
         Self {
             hit_id: crate::host::widget::next_id(hit_counter),
+            shown: paint::Shown::default(),
             label: label.into(),
             font: "Open Sans",
             stroke_ru: 1.0 / (1 << 5) as f32,
@@ -370,7 +373,9 @@ impl<P: Pixel> Button<P> {
         combined
     }
 
-    /// Paint the button into `canvas` at its viewport-space `center_*` / `width` / `height`, stamping `hit_id` into `hit_map` at every opaque pill pixel. Same three-step blit as Textbox: text_cache (glyphs) → pill_cache (squircle bg + AA edges) → focus glow on top. No selection rect, no blinkey — just label + pill + optional glow.
+    /// Paint the button into `canvas` at its viewport-space `center_*` / `width` / `height`, claiming `hit_id` in `hit_map` at every pixel it shows on (label, pill, rim, glow) that nothing in front claimed.
+    /// Same three-step blit as Textbox: text_cache (glyphs) → pill_cache (squircle bg + AA edges) → focus glow behind.
+    /// No selection rect, no blinkey: just label + pill + optional glow.
     pub fn render_content_into(
         &mut self,
         canvas: &mut crate::canvas::Canvas<P>,
@@ -484,7 +489,10 @@ impl<P: Pixel> Button<P> {
             self.text_cache_dirty = false;
         }
 
-        // --- Composition: text (topmost) → pill (bottom, stamps hit_map) ---
+        // The hits ride the paint: where the α stood before the label, the pill and the glow, so the button claims exactly the pixels it shows on.
+        let reach = crate::widgets::textbox::reach_of(if self.focused { self.glow_bbox() } else { self.bbox() }, offset_x, offset_y, canvas.width, canvas.height);
+        self.shown.before(canvas.pixels, canvas.width, canvas.height, reach);
+        // --- Composition: text (topmost) → pill (bottom) ---
         blit_cache_to_target(
             &self.text_cache,
             self.text_cache_w,
@@ -492,8 +500,6 @@ impl<P: Pixel> Button<P> {
             pill_x_target,
             pill_y_target,
             canvas,
-            None,
-            0,
             clip,
         );
         blit_cache_to_target(
@@ -503,8 +509,6 @@ impl<P: Pixel> Button<P> {
             pill_x_target,
             pill_y_target,
             canvas,
-            hit_map,
-            hit_id,
             clip,
         );
 
@@ -562,6 +566,11 @@ impl<P: Pixel> Button<P> {
         let viewport_w = canvas.width;
         let viewport_h = canvas.height;
         self.last_painted_bbox = Some(region_to_pixelrect(self.bbox(), viewport_w, viewport_h));
+        // Where the button showed (label, pill, its anti-aliased rim, its glow), settled whether or not a map came with this paint: `stamp_hit_into` claims from the same mask later.
+        self.shown.settle(canvas.pixels);
+        if let Some(map) = hit_map {
+            self.shown.claim(map, hit_id);
+        }
         self.last_painted_focused = self.focused;
         self.last_painted_hovered = self.hovered;
     }
@@ -630,23 +639,15 @@ impl<P: Pixel> Button<P> {
         } else {
             theme::LABEL_COLOUR
         };
-        // THE HIT STAMP RIDES THE PAINT DECISION (photon 2026-10-01): a pixel that is already opaque when this pill arrives belongs to whatever painted first — the chrome's strip or orb, since fluor is front to back — and the under-blend would skip it, so the stamp skips it too. One decision per pixel, taken BEFORE this pill's own paint makes the pixel opaque. Bbox, not silhouette: the whole pill is clickable (the two-tone pass only covers the edge band), and the corners outside the silhouette are inside the pill's slot anyway. A disabled pill passes hit_map = None and stamps nothing.
-        if let Some(hm) = hit_map {
-            // WHY/PROOF: the pill is placed by the app's layout and runs past the buffer when its row scrolls off an edge — the stamp would index outside the hit map; a far edge below 0 just empties the range.
-            let x1 = (x0 + w).min(buf_w as isize);
-            let y1 = (y0 + h).min(buf_h as isize);
-            let sx = x0.max(0);
-            let sy = y0.max(0);
-            for py in sy..y1 {
-                let row = py as usize * buf_w;
-                for px in sx..x1 {
-                    let i = row + px as usize;
-                    // A pixel that is still see-thru claims, unless something in front already holds its hit (a widget whose pixels are not opaque there yet, or not at all).
-                    if canvas.pixels[i].alpha() != P::ONE {
-                        paint::claim_hit(&mut hm[i], hit_id);
-                    }
-                }
-            }
+        // THE HIT CLAIM RIDES THE PAINT (photon 2026-10-01; the owner 2026-11-17: "if it's showing on screen, it NEEDS to be hitting the hitmap, if it's already opaque and won't show? SKIP!").
+        // The α over the pill and its slot before the label and the pill go in, compared after: the pill claims each pixel it shows on (label, fill, two-tone rim), none already opaque before it (the chrome's strip or orb, flattened first), none outside its silhouette, and none something in front claimed.
+        // Until 2026-11-17 it claimed its whole bbox wherever the pixel was not yet opaque, the corners outside the silhouette included.
+        // A disabled pill passes hit_map = None and claims nothing.
+        let mut shown = hit_map.is_some().then(paint::Shown::default);
+        if let Some(s) = shown.as_mut() {
+            // The pill holds its slot (it only grows, centred on it) and the label sits in the slot, so the pill and its rim are the reach.
+            let reach = paint::reach_rect(x0 - 1, y0 - 1, x0 + w + 1, y0 + h + 1, buf_w, buf_h);
+            s.before(canvas.pixels, buf_w, buf_h, reach);
         }
         // Label first (topmost under-blend), centred in the SLOT (not the grown pill) so it stays put.
         text.draw_text_left(
@@ -687,41 +688,24 @@ impl<P: Pixel> Button<P> {
             None,
             0,
         );
+        if let (Some(s), Some(map)) = (shown.as_mut(), hit_map) {
+            s.settle(canvas.pixels);
+            s.claim(map, hit_id);
+        }
     }
 
-    /// Claim this button's `hit_id` in `hit_map` at every pixel its pill (fill + two-tone stroke) touches, the true squircle silhouette, not a bbox rectangle.
-    /// It is the button's hits as a step of their own, for a pass that painted its pixels with `hit_map = None` or wants the anti-aliased rim claimed too: call it at the button's own place in the front-to-back order, right after its paint and before anything behind it.
-    /// A pixel something in front already claimed stays theirs, and a pixel this claims stays the button's against everything after it, so overlap is settled by what is in front, never by which call came last.
-    /// `render_content_into` must have run first this frame to populate `pill_cache`.
-    /// Anything the pill covers claims this id (α > 0 catches the AA edge too), so the whole visible button, including a glyph painted in front of it by the host, dispatches to this button.
-    /// Until 2026-11-17 this overwrote what was there and its doc said to call it after the widgets the button overlaps so it would "re-win" as the last writer, which let any later widget take the button's clicks (the owner: "that's real bad").
+    /// Claim this button's `hit_id` in `hit_map` where its last paint showed: the label, the pill, its anti-aliased rim and its glow, none of the pixels already opaque before it (a layer in front hid it there), none it does not cover.
+    /// It is the button's hits as a step of their own, for a pass that painted it with `hit_map = None`: call it right after that paint, before anything behind it claims, since something drawn behind a translucent part of the button claims there first otherwise.
+    /// A pixel something in front already claimed stays theirs, so overlap is settled by what is in front, never by which call came last.
+    /// Until 2026-11-17 this overwrote what was there and its doc said to call it after the widgets the button overlaps so it would "re-win" as the last writer, which let any later widget take the button's clicks (the owner: "that's real bad"); until the same day's second pass it claimed every pixel the pill's cache covered, shown or not.
     pub fn stamp_hit_into(&self, hit_map: &mut [HitId], buf_w: usize, buf_h: usize, hit_id: HitId) {
-        let pill_x = (self.center_x - self.width * 0.5) as isize;
-        let pill_y = (self.center_y - self.height * 0.5) as isize;
-        let cw = self.pill_cache_w;
-        let ch = self.pill_cache_h;
-        // The cache is resized to cw × ch in the same step that sets cw and ch; 0 means no paint has run yet.
-        if cw == 0 || ch == 0 {
+        // A button never painted has an empty mask (width 0) and shows nowhere, so it claims nothing; otherwise the mask indexes the map at the width the paint drew at, and a map of another width is another frame (fail loud).
+        if self.shown.width() == 0 {
             return;
         }
-        // WHY/PROOF: the pill follows the app's layout past the buffer edge when its row scrolls off — the row and column tests keep the stamp inside the hit map.
-        for cy in 0..ch {
-            let ty = pill_y + cy as isize;
-            if ty < 0 || ty as usize >= buf_h {
-                continue;
-            }
-            for cx in 0..cw {
-                // Any alpha at all = the pill touches this pixel → BOINK.
-                if self.pill_cache[cy * cw + cx].alpha() == 0 {
-                    continue;
-                }
-                let tx = pill_x + cx as isize;
-                if tx < 0 || tx as usize >= buf_w {
-                    continue;
-                }
-                paint::claim_hit(&mut hit_map[ty as usize * buf_w + tx as usize], hit_id);
-            }
-        }
+        assert_eq!(self.shown.width(), buf_w, "stamp_hit_into on a map {buf_w} wide after a paint {} wide", self.shown.width());
+        let _ = buf_h;
+        self.shown.claim(hit_map, hit_id);
     }
 }
 

@@ -1,6 +1,6 @@
 //! Labelled on/off checkbox — a small squircle box (ticked when on) with a label to its right. Toggles its own visual state on click / Space / Enter and exposes a poll-based change edge ([`Checkbox::take_toggle`]), matching the Button family's `take_click` idiom. Same squircle silhouette, two-tone AA edge, and no-floor stroke as Button / Textbox so the three read as one family.
 
-use crate::canvas::{Canvas, PixelRect};
+use crate::canvas::Canvas;
 use crate::coord::Coord;
 use crate::paint::{self, Clip, HitId, HIT_NONE};
 use crate::region::Region;
@@ -13,6 +13,8 @@ use alloc::string::String;
 /// A labelled on/off box. The box sits at the left of the widget's rect; the label is drawn to its right. Click (or Space/Enter while focused) flips `checked` and bumps a change counter the app polls via [`Self::take_toggle`].
 pub struct Checkbox {
     hit_id: HitId,
+    /// Where the last paint showed ([`paint::Shown`]): the hit claim rides it, so the widget claims exactly the pixels it shows on and none it does not.
+    shown: paint::Shown,
     label: String,
     checked: bool,
     /// Centre of the whole widget (box + label) rect.
@@ -44,6 +46,7 @@ impl Checkbox {
     ) -> Self {
         Self {
             hit_id: crate::host::widget::next_id(hit_counter),
+            shown: paint::Shown::default(),
             label: label.into(),
             checked,
             center_x,
@@ -182,6 +185,12 @@ impl Checkbox {
         let box_y0 = self.center_y - side * 0.5;
         let stroke = (self.font_size / 32.0) as isize + 1; // the `+ 1` floor every other widget carries (a floorless ring vanishes under the fill below a 32 px font)
 
+        // The hits ride the paint: where the α stood before the tick, the box and the label, so the checkbox claims exactly the pixels it shows on; a font size round the rect holds the label's glyph overhang.
+        if hit_map.is_some() {
+            let r = self.bbox();
+            let reach = crate::widgets::textbox::reach_of(Region::new(r.x - self.font_size, r.y - self.font_size, r.w + 2. * self.font_size, r.h + 2. * self.font_size), 0., 0., canvas.width, canvas.height);
+            self.shown.before(canvas.pixels, canvas.width, canvas.height, reach);
+        }
         // Tick first (topmost) when checked, then the two-tone edge + fill so the fill claims the rest of the box.
         if self.checked {
             let inset = side * 0.28;
@@ -266,26 +275,11 @@ impl Checkbox {
             }
         }
 
-        // Claim the whole widget rect (box + label) so the entire row is clickable, except where something in front already holds the pixel.
+        // Claim where the checkbox showed (the tick, the box, its rim and the label's glyphs), none of the pixels already opaque before it, and none something in front claimed.
+        // Until 2026-11-17 it claimed its whole rect, the empty space round the box and between the label's glyphs included.
         if let Some(map) = hit_map.as_deref_mut() {
-            let rect = PixelRect::new(
-                (self.center_x - self.width * 0.5) as usize,
-                (self.center_y - self.height * 0.5) as usize,
-                (self.center_x + self.width * 0.5) as usize,
-                (self.center_y + self.height * 0.5) as usize,
-            );
-            let bw = canvas.width;
-            let bh = canvas.height;
-            // WHY/PROOF: the widget rect is the app's layout, past the canvas when the row scrolls off an edge — the stamp would index outside the hit map.
-            // A rect wholly past the right edge leaves x0 > x1, and a reversed slice range panics where the loop it replaced ran empty, hence the x0 < x1 test.
-            let x1 = rect.x1.min(bw);
-            let y1 = rect.y1.min(bh);
-            if rect.x0 < x1 {
-                for y in rect.y0..y1 {
-                    let base = y * bw;
-                    paint::claim_hits(&mut map[base + rect.x0..base + x1], self.hit_id);
-                }
-            }
+            self.shown.settle(canvas.pixels);
+            self.shown.claim(map, self.hit_id);
         }
         let _ = HIT_NONE;
     }

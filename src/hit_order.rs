@@ -1,8 +1,9 @@
-//! The hit map goes front to back with the pixels: the frontmost widget claims its pixels first, a pixel already claimed is never written again, and so whatever is frontmost on screen takes the click.
-//! Each test draws an overlap in front-to-back order and checks every overlapped pixel: the click goes to the frontmost, and the pixel there is the frontmost's own.
+//! The hit map goes front to back with the pixels: at each pixel the frontmost layer that SHOWS there (its own coverage above zero, translucent or not) claims it, a pixel already claimed is never written again, and where the accumulator is already opaque a layer behind neither composes nor claims.
+//! A layer with no id claims nothing, so whatever shows thru it takes the click; a widget's fully transparent pixels claim nothing, and its anti-aliased rim and its own glow claim for it.
+//! The owner (2026-11-17): "if it's showing on screen, it NEEDS to be hitting the hitmap, if it's already opaque and won't show? SKIP!", and of a translucent front: "the frontmost is locking it up".
 //! Until 2026-11-17 every hit write overwrote what was there, so the widget drawn LAST (the one behind) took the clicks of everything it overlapped.
 
-use crate::canvas::{Canvas, Damage};
+use crate::canvas::{Canvas, Damage, PixelRect};
 use crate::paint::{self, HitId, HIT_BLOCK, HIT_NONE};
 use crate::pixel::{Argb8, Blend, BlendMode, Pixel};
 use crate::text::TextRenderer;
@@ -18,7 +19,135 @@ fn frame() -> (Vec<Argb8>, Vec<HitId>, Damage) {
     (vec![0; W * H], vec![HIT_NONE; W * H], Damage::new())
 }
 
-/// An open dropdown's popup drawn first, then a button drawn after it whose pill lies under the popup: at every pixel of the popup the click goes to a row or to the popup's frame, never to the button, and the button keeps the rest of its pill.
+/// A button rendered alone into a fresh frame: its pixels, so a test knows where it shows.
+fn alone(b: &mut Button, text: &mut TextRenderer) -> Vec<Argb8> {
+    let (mut px, mut hit, mut dmg) = frame();
+    {
+        let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+        let id = b.hit_id();
+        b.render_content_into(&mut c, 0., 0., text, None, Some(&mut hit), id);
+    }
+    px
+}
+
+/// A rect over the whole frame's middle, drawn first, at `colour`, claiming `id` wherever it shows (HIT_NONE: a decoration, claiming nothing); then a button behind it.
+/// Returns the frame's pixels and hits, and the button's id.
+fn layer_over_button(colour: u32, id: HitId, text: &mut TextRenderer) -> (Vec<Argb8>, Vec<HitId>, HitId) {
+    let mut ids: HitId = HIT_NONE;
+    let mut b = Button::new(&mut ids, 160., 120., 200., 60., 20., "Behind");
+    let (mut px, mut hit, mut dmg) = frame();
+    {
+        let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+        let mut shown = paint::Shown::default();
+        shown.before(c.pixels, W, H, PixelRect::new(100, 80, 220, 160));
+        paint::fill_rect(&mut c, 100, 80, 120, 80, colour, None, None);
+        shown.settle(c.pixels);
+        if id != HIT_NONE {
+            shown.claim(&mut hit, id);
+        }
+        let bid = b.hit_id();
+        b.render_content_into(&mut c, 0., 0., text, None, Some(&mut hit), bid);
+    }
+    (px, hit, b.hit_id())
+}
+
+/// A translucent wash over a button: with an id (or HIT_BLOCK) the wash is the frontmost that shows and takes the click; with no id it is a decoration and the button behind it takes it.
+#[test]
+fn a_translucent_wash_takes_the_click_only_with_an_id() {
+    let mut text = TextRenderer::new();
+    // A dim blue wash at 3/8 opacity.
+    let wash = paint::pack_argb(40, 60, 120, 0x60);
+    let mut b = Button::new(&mut 0, 160., 120., 200., 60., 20., "Behind");
+    let behind = alone(&mut b, &mut text);
+    let inside = |i: usize| (100..220).contains(&(i % W)) && (80..160).contains(&(i / W));
+    for (id, name) in [(HIT_BLOCK - 1, "an id"), (HIT_BLOCK, "HIT_BLOCK"), (HIT_NONE, "no id")] {
+        let (_, hit, bid) = layer_over_button(wash, id, &mut text);
+        let mut overlapped = 0;
+        for i in (0..W * H).filter(|&i| inside(i) && behind[i].alpha() != 0) {
+            let want = if id == HIT_NONE { bid } else { id };
+            assert_eq!(hit[i], want, "wash with {name}: ({}, {})", i % W, i / W);
+            overlapped += 1;
+        }
+        assert!(overlapped > 0, "the wash does not cover the button");
+        // Inside the wash where the button does not show, the wash claims only with an id.
+        let i = (82 * W) + 102;
+        assert_eq!(behind[i].alpha(), 0);
+        assert_eq!(hit[i], id, "wash with {name}: its own pixel off the button");
+    }
+}
+
+/// An opaque decorative block (no id) over a button: the button does not show behind it, so it claims nothing there and the click is blocked, while the rest of the button keeps its clicks.
+#[test]
+fn an_opaque_block_blocks_the_click() {
+    let mut text = TextRenderer::new();
+    let mut b = Button::new(&mut 0, 160., 120., 200., 60., 20., "Behind");
+    let behind = alone(&mut b, &mut text);
+    let (_, hit, bid) = layer_over_button(crate::theme::BUTTON_FILL, HIT_NONE, &mut text);
+    let mut blocked = 0;
+    let mut kept = 0;
+    for i in (0..W * H).filter(|&i| behind[i].alpha() != 0) {
+        if (100..220).contains(&(i % W)) && (80..160).contains(&(i / W)) {
+            assert_eq!(hit[i], HIT_NONE, "({}, {}) went thru the opaque block", i % W, i / W);
+            blocked += 1;
+        } else {
+            assert_eq!(hit[i], bid, "({}, {}): the button lost a pixel nothing covers", i % W, i / W);
+            kept += 1;
+        }
+    }
+    assert!(blocked > 0 && kept > 0, "{blocked} blocked, {kept} kept");
+}
+
+/// A widget's transparent corner (outside its squircle, inside its box) claims nothing: a click there falls thru to what is behind.
+/// Both pill paths: a retained Button, and the immediate pill, which until 2026-11-17 claimed its whole box.
+#[test]
+fn a_transparent_corner_falls_through() {
+    let mut text = TextRenderer::new();
+    let back_id = HIT_BLOCK - 1;
+    let region = crate::region::Region::new(60., 90., 200., 60.);
+    for immediate in [false, true] {
+        let mut ids: HitId = HIT_NONE;
+        let mut front = Button::new(&mut ids, 160., 120., 200., 60., 20., "Front");
+        let fid = front.hit_id();
+        let paint_front = |front: &mut Button, c: &mut Canvas, text: &mut TextRenderer, hit: &mut [HitId]| {
+            if immediate {
+                Button::draw_pill_immediate(c, text, Some(hit), W, H, region, "Front", "Open Sans", fid, false, false, true, None);
+            } else {
+                front.render_content_into(c, 0., 0., text, None, Some(hit), fid);
+            }
+        };
+        let (mut front_px, mut front_hit, mut dmg) = frame();
+        {
+            let mut c = Canvas::new(&mut front_px, W, H, &mut dmg);
+            paint_front(&mut front, &mut c, &mut text, &mut front_hit);
+        }
+        let (mut px, mut hit, mut dmg) = frame();
+        {
+            let mut c = Canvas::new(&mut px, W, H, &mut dmg);
+            paint_front(&mut front, &mut c, &mut text, &mut hit);
+            // An opaque back layer with an id over the whole button box and beyond.
+            let mut shown = paint::Shown::default();
+            shown.before(c.pixels, W, H, PixelRect::new(40, 70, 280, 170));
+            paint::fill_rect(&mut c, 40, 70, 240, 100, crate::theme::TEXTBOX_FILL, None, None);
+            shown.settle(c.pixels);
+            shown.claim(&mut hit, back_id);
+        }
+        let mut corners = 0;
+        for y in 90..150 {
+            for x in 60..260 {
+                let i = y * W + x;
+                if front_px[i].alpha() == 0 {
+                    assert_eq!(hit[i], back_id, "immediate {immediate}: ({x}, {y}): the button's transparent pixel kept the click");
+                    corners += 1;
+                } else {
+                    assert_eq!(hit[i], fid, "immediate {immediate}: ({x}, {y}): a pixel the button shows on went behind it");
+                }
+            }
+        }
+        assert!(corners > 0, "immediate {immediate}: the button's box has no transparent corner");
+    }
+}
+
+/// An open dropdown's popup drawn first, then a button drawn after it whose pill lies under the popup: wherever the popup shows the click goes to a row or to the popup's frame (HIT_BLOCK, translucent edge included), never to the button; where the popup does not show (its rounded corners) the button behind it takes the click.
 #[test]
 fn an_open_dropdown_keeps_its_clicks_from_a_widget_drawn_after_it() {
     let mut text = TextRenderer::new();
@@ -27,8 +156,9 @@ fn an_open_dropdown_keeps_its_clicks_from_a_widget_drawn_after_it() {
     let mut d = Dropdown::new(&mut ids, 160., 30., 160., 36., 18., options);
     d.open();
     let popup = d.popup_region(H);
-    // A wide button across the popup's middle, reaching past both its sides.
-    let mut b = Button::new(&mut ids, 160., popup.y + popup.h * 0.5, 280., 60., 20., "Behind");
+    // A wide button across the popup's top corners, reaching past both its sides.
+    let mut b = Button::new(&mut ids, 160., popup.y + 10., 280., 60., 20., "Behind");
+    let behind = alone(&mut b, &mut text);
     let (mut px, mut hit, mut dmg) = frame();
     {
         let mut c = Canvas::new(&mut px, W, H, &mut dmg);
@@ -37,45 +167,43 @@ fn an_open_dropdown_keeps_its_clicks_from_a_widget_drawn_after_it() {
         let id = b.hit_id();
         b.render_content_into(&mut c, 0., 0., &mut text, None, Some(&mut hit), id);
     }
+    let (mut popup_px, mut popup_hit, mut dmg2) = frame();
+    {
+        let mut c = Canvas::new(&mut popup_px, W, H, &mut dmg2);
+        d.render_popup_into(&mut c, &mut text, None, Some(&mut popup_hit));
+    }
     let mut rows: Vec<HitId> = Vec::new();
     d.visit_rows(&mut |w| rows.push(w.id()));
     let (x0, y0, x1, y1) = (popup.x as usize, popup.y as usize, (popup.x + popup.w) as usize, (popup.y + popup.h) as usize);
-    let mut overlapped = 0;
+    let (mut shows, mut translucent, mut through) = (0, 0, 0);
     for y in y0..y1 {
         for x in x0..x1 {
-            let h = hit[y * W + x];
-            assert!(h == HIT_BLOCK || rows.contains(&h), "({x}, {y}) in the popup went to {h}, not the popup (rows {rows:?})");
-            overlapped += 1;
+            let i = y * W + x;
+            let a = popup_px[i].alpha();
+            if a != 0 {
+                assert!(hit[i] == HIT_BLOCK || rows.contains(&hit[i]), "({x}, {y}) shows the popup but went to {}, not the popup (rows {rows:?})", hit[i]);
+                shows += 1;
+                translucent += (a != Argb8::ONE) as usize;
+                if a == Argb8::ONE {
+                    assert_eq!(px[i], popup_px[i], "({x}, {y}): the button came out in front of the popup");
+                }
+            } else if behind[i].alpha() != 0 {
+                assert_eq!(hit[i], b.hit_id(), "({x}, {y}): the popup does not show here, so the button behind takes it");
+                through += 1;
+            }
         }
     }
-    assert!(overlapped > 0);
+    assert!(shows > 0 && translucent > 0 && through > 0, "{shows} popup pixels, {translucent} translucent, {through} thru its corners");
     // Each row takes the middle of its own band.
     for (i, &row) in rows.iter().enumerate() {
         let band = popup.h / rows.len() as f32;
         let (x, y) = ((popup.x + popup.w * 0.5) as usize, (popup.y + band * (i as f32 + 0.5)) as usize);
         assert_eq!(hit[y * W + x], row, "row {i} at ({x}, {y})");
     }
-    // The button still takes its pill outside the popup.
-    let (bx, by) = ((b.center_x - b.width * 0.5 + 8.) as usize, b.center_y as usize);
-    assert!(bx < x0, "the button reaches past the popup's left side");
-    assert_eq!(hit[by * W + bx], b.hit_id());
-    // The popup's pixels are its own where they are opaque: the button drawn after went under them.
-    let (mut alone, _, mut dmg2) = frame();
-    {
-        let mut c = Canvas::new(&mut alone, W, H, &mut dmg2);
-        d.render_popup_into(&mut c, &mut text, None, None);
-    }
-    for y in y0..y1 {
-        for x in x0..x1 {
-            if alone[y * W + x].alpha() == Argb8::ONE {
-                assert_eq!(px[y * W + x], alone[y * W + x], "({x}, {y}): the button came out in front of the popup");
-            }
-        }
-    }
 }
 
-/// Two buttons that overlap, the front one drawn first: at every pixel the front one claimed the back one never takes the click, and where the front pill is opaque the pixel is the front pill's.
-/// `stamp_hit_into` at the front button's place in the order claims its anti-aliased rim too; at the back button's place, after the front, it takes nothing of the front's.
+/// Two overlapping buttons, the front one drawn first: at every pixel the front one shows on (its fill, its anti-aliased rim, translucent or not) the front takes the click and the back never does; the back takes the pixels it shows on that the front does not; where the front is opaque the pixel is the front's own.
+/// `stamp_hit_into` at each button's place in the order changes nothing: it claims from the same mask its paint settled.
 #[test]
 fn overlapping_buttons_give_the_click_to_the_front_one() {
     let mut text = TextRenderer::new();
@@ -83,17 +211,8 @@ fn overlapping_buttons_give_the_click_to_the_front_one() {
     let mut front = Button::new(&mut ids, 130., 100., 140., 48., 20., "Front");
     let mut back = Button::new(&mut ids, 190., 120., 140., 48., 20., "Back");
     let (fid, bid) = (front.hit_id(), back.hit_id());
-    // Each alone: where each claims, and the front's pixels.
-    let (mut front_px, mut front_hit, mut dmg) = frame();
-    {
-        let mut c = Canvas::new(&mut front_px, W, H, &mut dmg);
-        front.render_content_into(&mut c, 0., 0., &mut text, None, Some(&mut front_hit), fid);
-    }
-    let (mut back_px, mut back_hit, mut dmg) = frame();
-    {
-        let mut c = Canvas::new(&mut back_px, W, H, &mut dmg);
-        back.render_content_into(&mut c, 0., 0., &mut text, None, Some(&mut back_hit), bid);
-    }
+    let front_px = alone(&mut front, &mut text);
+    let back_px = alone(&mut back, &mut text);
     let (mut px, mut hit, mut dmg) = frame();
     {
         let mut c = Canvas::new(&mut px, W, H, &mut dmg);
@@ -102,28 +221,20 @@ fn overlapping_buttons_give_the_click_to_the_front_one() {
         back.render_content_into(&mut c, 0., 0., &mut text, None, Some(&mut hit), bid);
         back.stamp_hit_into(&mut hit, W, H, bid);
     }
-    let mut overlapped = 0;
+    let (mut overlapped, mut rim) = (0, 0);
     for i in 0..W * H {
-        let in_front = front_hit[i] == fid;
-        if in_front && back_hit[i] == bid {
+        let (fa, ba) = (front_px[i].alpha(), back_px[i].alpha());
+        let want = if fa != 0 { fid } else if ba != 0 { bid } else { HIT_NONE };
+        assert_eq!(hit[i], want, "({}, {})", i % W, i / W);
+        if fa != 0 && ba != 0 {
             overlapped += 1;
+            rim += (fa != Argb8::ONE) as usize;
         }
-        if in_front {
-            assert_eq!(hit[i], fid, "({}, {}): the back button took a pixel the front one claimed", i % W, i / W);
+        if fa == Argb8::ONE {
             assert_eq!(px[i], front_px[i], "({}, {}): the back button's pixels came out in front", i % W, i / W);
-        } else if back_hit[i] == bid && front_px[i] == 0 {
-            assert_eq!(hit[i], bid, "({}, {}): the back button lost a pixel nothing is in front of", i % W, i / W);
         }
     }
-    assert!(overlapped > 64, "the buttons barely overlap ({overlapped} pixels)");
-    // The front pill's anti-aliased rim, wherever it touches the back pill, is the front's.
-    let rim = front_px.iter().zip(&back_hit).filter(|&(&p, &b)| p.alpha() != 0 && p.alpha() != Argb8::ONE && b == bid).count();
-    assert!(rim > 0, "the rims do not cross");
-    for i in 0..W * H {
-        if front_px[i].alpha() != 0 && back_hit[i] == bid {
-            assert_eq!(hit[i], fid, "({}, {}): the front rim went to the back button", i % W, i / W);
-        }
-    }
+    assert!(overlapped > 64 && rim > 0, "the buttons barely overlap ({overlapped} pixels, {rim} on the front's rim)");
 }
 
 /// The caret goes in front of the text it sits in and behind whatever is in front of its textbox: under a front widget's opaque pixels it is hidden and the click is the front widget's; elsewhere every caret pixel is the textbox's to click, its light in front of the field.

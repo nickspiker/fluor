@@ -34,6 +34,8 @@ pub struct MultiTextbox<P: Pixel = Argb8> {
     /// Selection anchor (shift+movement / drag) — selection is the `anchor..cursor` char range, either order.
     pub selection_anchor: Option<usize>,
     hit_id: HitId,
+    /// Where the last paint showed ([`paint::Shown`]): the hit claim rides it, so the widget claims exactly the pixels it shows on and none it does not.
+    shown: paint::Shown,
     focused: bool,
     hovered: bool,
     enabled: bool,
@@ -102,6 +104,7 @@ impl<P: Pixel> MultiTextbox<P> {
             cursor: 0,
             selection_anchor: None,
             hit_id: next_id(hit_counter),
+            shown: paint::Shown::default(),
             focused: false,
             hovered: false,
             enabled: true,
@@ -1178,6 +1181,12 @@ impl<P: Pixel> MultiTextbox<P> {
             self.text_cache_dirty = false;
         }
 
+        // The hits ride the paint: where the α stood before the caret, the text and the pill, so each claims exactly the pixels it shows on.
+        if hit_map.is_some() {
+            let reach = crate::widgets::textbox::reach_of(self.bbox(), offset_x, offset_y, canvas.width, canvas.height);
+            self.shown.before(canvas.pixels, canvas.width, canvas.height, reach);
+        }
+
         // Blinkey first: THE canonical painter (paint::draw_blinkey), at the caret's (line, x), a layer of light in front of the field, so it goes into the accumulator before the text and the pill land under it.
         // The first cut hand-rolled a wave that read as no cursor at all (field, 2026-08-09); until 2026-11-17 the caret was drawn after the field, in front of the finished pixels and so in front of anything drawn before this box too.
         if self.focused && !self.has_selection() && self.blinkey_visible {
@@ -1213,8 +1222,6 @@ impl<P: Pixel> MultiTextbox<P> {
             pill_x_target,
             pill_y_target,
             canvas,
-            None,
-            0,
             clip,
         );
         blit_cache_to_target(
@@ -1224,10 +1231,14 @@ impl<P: Pixel> MultiTextbox<P> {
             pill_x_target,
             pill_y_target,
             canvas,
-            hit_map,
-            hit_id,
             clip,
         );
+
+        // Claim where the box showed (caret, text, pill and its anti-aliased rim), none of the pixels already opaque before it, and none something in front claimed.
+        if let Some(map) = hit_map {
+            self.shown.settle(canvas.pixels);
+            self.shown.claim(map, hit_id);
+        }
 
         self.record_painted(canvas.width, canvas.height);
     }

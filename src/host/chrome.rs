@@ -253,7 +253,7 @@ pub fn draw_status_bar<P: Pixel>(
 ///
 /// Pixel sampling is nearest-neighbour from `icon`'s `width × height` source — the source is square in practice (`vsfimg` doesn't reshape) but the math doesn't assume that. Per-pixel cost is one map index + one `under` composite; total work is `O(diameter²)`, well under a millisecond at typical chrome sizes (~30–100 px orbs).
 ///
-/// Hit-test: every pixel inside `r_outer²` (excluding the AA fringe) claims `hit_id` unless something in front already holds it so the host can route clicks to the chrome's app-icon widget.
+/// Hit-test: every pixel the orb shows on (its icon, its ring, their anti-aliased edges) claims `hit_id` unless something in front already holds it, so the host can route clicks to the chrome's app-icon widget.
 /// Decorative-only consumers can pass `None` for `hit_test_map` to skip the tag (in which case `hit_id` is ignored).
 /// Rasterize the top-left app-icon orb: the icon sampled into a circle of radius `r−1`, wrapped in a thin ring of `ring_colour`. Integer `dist²` bands — same approach as the avatar / window-edge rasterizers: icon interior (`≤ (r−1)²`), then a `stroke_width`-px solid ring, then a 1-px outer AA against the chrome (`(r_aa²−dist²) << 8 / diff`). No floating point, no sqrt.
 ///
@@ -381,11 +381,7 @@ pub fn draw_app_icon<P: Pixel>(
                 continue; // beyond the ring edge — a bbox corner, not part of the disk
             }
             let idx = y * width + x;
-
-            if let Some(map) = htm.as_mut() {
-                // dist2 ≤ r_ring2 here by the continue above; a pixel something in front already claimed stays theirs.
-                crate::paint::claim_hit(&mut map[idx], hit_id);
-            }
+            let before = pixels[idx].alpha();
 
             // Icon, topmost: inward 1-px coverage ramp on r_icon. Sample only fires while a_icon ≠ 0, i.e. dist2 < r_icon² = (r-1)² → sample_icon's |dx|,|dy| ≤ r-2 precondition holds with margin.
             let num_icon = r_icon2 - dist2;
@@ -416,6 +412,10 @@ pub fn draw_app_icon<P: Pixel>(
                             pixels[idx].under(P::from_g2t8(ring).with_alpha(a_ring), BlendMode::Normal);
                     }
                 }
+            }
+            // The orb claims where it showed: its icon or its ring raised the α, so a pixel past the ring's last coverage, or one already opaque before the orb, claims nothing.
+            if let Some(map) = htm.as_mut() {
+                crate::paint::claim_if_shown(&mut map[idx], hit_id, before, pixels[idx].alpha());
             }
         }
     }

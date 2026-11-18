@@ -178,9 +178,30 @@ impl<P: Pixel> Group<P> {
     }
 }
 
-/// The group that takes a click at `(x, y)` among `groups` held in front-to-back order (the order they flatten in): the first whose [`Group::hit`] answers, so the frontmost on screen.
+/// The group that takes a click at `(x, y)` among `groups` held in front-to-back order (the order they flatten in): the walk the pixels take.
+/// A group shows at the point where its composite's α is above zero; the frontmost group that shows there and whose [`Group::hit`] answers takes the click.
+/// A group that shows but does not answer (decorative there) lets the walk go on while it is translucent, and stops it, nothing taking the click, where it is opaque: what is behind it does not show.
+/// A group that does not show there (outside its region, or transparent) is passed over.
+/// Each group's composite is the one its last flatten drew (`StackCompositor::composite`): call it on groups flattened this frame.
 pub fn front_hit<P: Pixel>(groups: &[Group<P>], x: Coord, y: Coord) -> Option<usize> {
-    groups.iter().position(|g| g.hit(x, y))
+    for (i, g) in groups.iter().enumerate() {
+        if !g.region.contains(x, y) {
+            continue;
+        }
+        let lx = (x - g.region.x) as usize;
+        let ly = (y - g.region.y) as usize;
+        let a = g.rpn.composite()[ly * g.region.w as usize + lx].alpha();
+        if a == 0 {
+            continue;
+        }
+        if g.hit(x, y) {
+            return Some(i);
+        }
+        if a == P::ONE {
+            return None;
+        }
+    }
+    None
 }
 
 /// Composite a region-sized premultiplied buffer under `target` at the region's origin, clipped to the target and to `clip`, in every mode thru the premultiplied compose (the buffer's darkness is already attenuated by its α; until 2026-11-07 the modes other than Normal took `flatten`, which applied it a second time).
@@ -371,21 +392,41 @@ mod tests {
         assert!(!g.hit(3.0, 8.0)); // below bbox (exclusive)
     }
 
-    /// Two overlapping groups held front to back: at every overlapped pixel the front one takes the click, as its pixels win the flatten there.
+    /// A group at `region` whose every pixel has α `a` (white light, premultiplied), answering clicks where `hits`; its composite evaluated, as a flatten leaves it.
+    fn solid(region: Region, a: u32, hits: bool) -> Group {
+        let mut g = Group::new(region, BlendMode::Normal);
+        let l = g.new_layer();
+        let n = g.rpn.layers[l].pixels.len();
+        g.rpn.layers[l].pixels = alloc::vec![a << 24; n];
+        g.set_program(alloc::vec![Op::Push(l)]);
+        if hits {
+            g.enable_hitmask();
+            g.hitmask_mut().unwrap().fill(1);
+        }
+        g.rpn.evaluate();
+        g
+    }
+
+    /// Two overlapping groups held front to back, the front in each of its kinds over the same answering back group: at every overlapped pixel the frontmost that shows takes the click, an opaque decorative front blocks it, and a translucent decorative front lets the back take it.
     #[test]
-    fn front_hit_is_the_first_in_order() {
-        let mut front = Group::new(Region::new(0.0, 0.0, 6.0, 6.0), BlendMode::Normal);
-        front.enable_hitmask();
-        front.hitmask_mut().unwrap().fill(1);
-        let mut back = Group::new(Region::new(3.0, 3.0, 6.0, 6.0), BlendMode::Normal);
-        back.enable_hitmask();
-        back.hitmask_mut().unwrap().fill(1);
-        let groups = [front, back];
-        for y in 0..9 {
-            for x in 0..9 {
-                let (xf, yf) = (x as Coord + 0.5, y as Coord + 0.5);
-                let want = if x < 6 && y < 6 { Some(0) } else if x >= 3 && y >= 3 { Some(1) } else { None };
-                assert_eq!(front_hit(&groups, xf, yf), want, "({x}, {y})");
+    fn front_hit_is_the_frontmost_that_shows() {
+        let back = || solid(Region::new(3.0, 3.0, 6.0, 6.0), 0xFF, true);
+        let front = |a, hits| solid(Region::new(0.0, 0.0, 6.0, 6.0), a, hits);
+        // (front α, front answers, what the overlap gives)
+        for (a, hits, overlap) in [(0xFF, true, Some(0)), (0x40, true, Some(0)), (0xFF, false, None), (0x40, false, Some(1)), (0, true, Some(1))] {
+            let groups = [front(a, hits), back()];
+            for y in 0..9 {
+                for x in 0..9 {
+                    let (xf, yf) = (x as Coord + 0.5, y as Coord + 0.5);
+                    let (in_front, in_back) = (x < 6 && y < 6, x >= 3 && y >= 3);
+                    let want = match (in_front, in_back) {
+                        (true, true) => overlap,
+                        (true, false) => (a != 0 && hits).then_some(0),
+                        (false, true) => Some(1),
+                        (false, false) => None,
+                    };
+                    assert_eq!(front_hit(&groups, xf, yf), want, "front α {a:#x}, answers {hits}: ({x}, {y})");
+                }
             }
         }
     }

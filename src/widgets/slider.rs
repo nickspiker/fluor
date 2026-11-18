@@ -26,6 +26,8 @@ const HANDLE_DISABLED: u32 = LEFT_DISABLED;
 pub struct Slider {
     /// Allocated at construction; stamped into the host hit map across the whole grab band.
     hit_id: HitId,
+    /// Where the last paint showed ([`paint::Shown`]): the hit claim rides it, so the widget claims exactly the pixels it shows on and none it does not.
+    shown: paint::Shown,
     pub center_x: Coord,
     pub center_y: Coord,
     /// Full grab-band width; the track spans it edge to edge.
@@ -62,6 +64,7 @@ impl Slider {
     ) -> Self {
         Self {
             hit_id: crate::host::widget::next_id(hit_counter),
+            shown: paint::Shown::default(),
             center_x,
             center_y,
             width,
@@ -175,7 +178,7 @@ impl Slider {
         Some(self.last_painted_bbox.map_or(current, |p| p.union(current)))
     }
 
-    /// Paint the slider into `canvas` and stamp `hit_id` into `hit_map` across the whole grab band.
+    /// Paint the slider into `canvas` and claim `hit_id` in `hit_map` wherever it shows (the track and the handle).
     /// Draws directly (no caches) — two rects and a circle are cheap enough to rasterize per frame.
     pub fn render_content_into<P: Pixel>(
         &mut self,
@@ -203,6 +206,10 @@ impl Slider {
         let handle_x = band_x + (self.value as Coord * self.width) as isize;
         let radius = band_h / 2;
 
+        // The hits ride the paint: where the α stood before the handle and the track, so the slider claims exactly the pixels it shows on; the handle's circle reaches a radius past the band's ends.
+        if hit_map.is_some() {
+            self.shown.before(canvas.pixels, canvas.width, canvas.height, paint::reach_rect(band_x - radius - 1, band_y - 1, band_x + band_w + radius + 1, band_y + band_h + 1, canvas.width, canvas.height));
+        }
         // Handle first: topmost-first doctrine, the circle wins where it overlaps the track.
         paint::circle_filled(
             canvas,
@@ -235,21 +242,11 @@ impl Slider {
             None,
         );
 
-        // Claim the full band so clicks and drags land anywhere on it, except where something in front already holds the pixel.
+        // Claim where the slider showed (the track either side of the handle, the handle and its anti-aliased rim), none of the pixels already opaque before it, and none something in front claimed.
+        // Until 2026-11-17 it claimed its whole grab band, the empty rows above and below the track included.
         if let Some(map) = hit_map {
-            let vw = canvas.width;
-            let vh = canvas.height;
-            // WHY/PROOF: the band is placed by the app's layout and runs past the viewport when the slider scrolls past an edge — the stamp would index outside the hit map.
-            // A band wholly past the right edge leaves x0 > x1, and a reversed slice range panics where the loop it replaced ran empty, hence the x0 < x1 test.
-            let x0 = band_x.max(0) as usize;
-            let y0 = band_y.max(0) as usize;
-            let x1 = ((band_x + band_w).max(0) as usize).min(vw);
-            let y1 = ((band_y + band_h).max(0) as usize).min(vh);
-            if x0 < x1 {
-                for row in y0..y1 {
-                    paint::claim_hits(&mut map[row * vw + x0..row * vw + x1], hit_id);
-                }
-            }
+            self.shown.settle(canvas.pixels);
+            self.shown.claim(map, hit_id);
         }
 
         let vw = canvas.width;

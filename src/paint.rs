@@ -286,7 +286,7 @@ pub type HitId = u16;
 pub const HIT_NONE: HitId = 0;
 
 /// Reserved id for a front surface that takes no click of its own but hides whatever is behind it (an open dropdown's frame round its rows).
-/// It claims its pixels like any id, no widget answers to it, and the overlay table never reaches it, so it is never tinted.
+/// It claims wherever its surface shows, translucent or not, like any id; no widget answers to it, and the overlay table never reaches it, so it is never tinted.
 /// The allocator ([`crate::host::widget::next_id`]) never hands it out.
 pub const HIT_BLOCK: HitId = HitId::MAX;
 
@@ -294,6 +294,7 @@ pub const HIT_BLOCK: HitId = HitId::MAX;
 /// The frontmost thing claims its pixels first and a pixel already claimed is never written again, so whatever is frontmost on screen takes the click, exactly as the pixel kernels' opaque early-out keeps the front pixel.
 /// The map must start the frame empty over what is redrawn: [`crate::host::chrome_widget::DefaultChrome::clear_hits`].
 /// One compare and a select, no branch on the store.
+/// This form trusts the caller that the layer shows at the pixel; a layer that draws as it claims takes [`claim_if_shown`].
 #[inline(always)]
 pub fn claim_hit(slot: &mut HitId, id: HitId) {
     let held = *slot;
@@ -306,6 +307,94 @@ pub fn claim_hits(run: &mut [HitId], id: HitId) {
     for slot in run {
         claim_hit(slot, id);
     }
+}
+
+/// Claim one hit-map pixel for `id` where a layer SHOWS: the accumulator's α rose from `before` to `after` as the layer went under it.
+/// It rises exactly when the layer's own coverage there is above zero and what was in front had not already made the pixel opaque, so the hit walk stops where the pixel walk stops (the opaque early-out), a fully transparent pixel of the layer claims nothing, and its anti-aliased fringe and its own glow claim for it.
+/// The owner (2026-11-17): "if it's showing on screen, it NEEDS to be hitting the hitmap, if it's already opaque and won't show? SKIP!"
+#[inline(always)]
+pub fn claim_if_shown(slot: &mut HitId, id: HitId, before: u32, after: u32) {
+    let held = *slot;
+    *slot = if held == HIT_NONE && after > before { id } else { held };
+}
+
+/// Where a layer drawn with primitives that take no hit map shows: the canvas's α over the layer's reach, taken before it draws and compared after.
+/// `before`, draw the layer (every primitive of the widget, its glow included), `settle`, then `claim`: each pixel where the layer raised the α claims the layer's id, unless something in front already holds it ([`claim_if_shown`]'s rule, a pixel at a time).
+/// A widget keeps one and reuses its allocation frame after frame; a settled mask also lets a widget claim later than it drew ([`crate::widgets::Button::stamp_hit_into`]).
+#[derive(Default)]
+pub struct Shown {
+    /// The reach, cut to the canvas.
+    rect: crate::canvas::PixelRect,
+    /// The canvas width the reach indexes into.
+    width: usize,
+    /// Each reach pixel's α before the layer drew; after `settle`, 1 where the layer shows and 0 where it does not.
+    alpha: alloc::vec::Vec<u32>,
+}
+
+impl Shown {
+    /// Record the α over `reach` (canvas pixels, cut to the canvas here) before the layer draws.
+    pub fn before<P: Pixel>(&mut self, pixels: &[P], width: usize, height: usize, reach: crate::canvas::PixelRect) {
+        // WHY/PROOF: the reach is the widget's layout, which runs past the canvas when it scrolls off an edge; the reads below would index outside the canvas.
+        let r = crate::canvas::PixelRect::new(reach.x0.min(width), reach.y0.min(height), reach.x1.min(width), reach.y1.min(height));
+        // A reach cut away entirely (or handed in empty) is held as the zero rect, so its width and height below are plain differences of ordered ends.
+        let r = if r.is_empty() { crate::canvas::PixelRect::empty() } else { r };
+        let (w, h) = (r.x1 - r.x0, r.y1 - r.y0);
+        self.rect = r;
+        self.width = width;
+        self.alpha.clear();
+        self.alpha.reserve(w * h);
+        for y in r.y0..r.y0 + h {
+            self.alpha.extend(pixels[y * width + r.x0..y * width + r.x0 + w].iter().map(|p| p.alpha()));
+        }
+    }
+
+    /// After the layer drew: mark each reach pixel whose α rose.
+    pub fn settle<P: Pixel>(&mut self, pixels: &[P]) {
+        // The rect is the zero rect or ordered (`before`), so this is a plain difference; an empty reach has no rows, and chunks_exact of width 0 would panic.
+        let w = self.rect.x1 - self.rect.x0;
+        if w == 0 {
+            return;
+        }
+        for (row, before) in self.alpha.chunks_exact_mut(w).enumerate() {
+            let base = (self.rect.y0 + row) * self.width + self.rect.x0;
+            for (b, p) in before.iter_mut().zip(&pixels[base..base + w]) {
+                *b = (p.alpha() > *b) as u32;
+            }
+        }
+    }
+
+    /// Claim `id` wherever the settled layer shows and nothing in front claimed first.
+    pub fn claim(&self, map: &mut [HitId], id: HitId) {
+        self.claim_by(map, |_, _| id);
+    }
+
+    /// [`Self::claim`] with the id picked per pixel (canvas coordinates): a widget whose parts answer to different ids (a popup's rows and its frame).
+    pub fn claim_by(&self, map: &mut [HitId], pick: impl Fn(usize, usize) -> HitId) {
+        let w = self.rect.x1 - self.rect.x0;
+        // An empty reach has no rows; chunks_exact of width 0 would panic.
+        if w == 0 {
+            return;
+        }
+        for (row, shown) in self.alpha.chunks_exact(w).enumerate() {
+            let y = self.rect.y0 + row;
+            let base = y * self.width + self.rect.x0;
+            for (dx, (&s, slot)) in shown.iter().zip(&mut map[base..base + w]).enumerate() {
+                claim_if_shown(slot, pick(self.rect.x0 + dx, y), 0, s);
+            }
+        }
+    }
+
+    /// The canvas width this mask was taken at (a later claim must index the same map).
+    pub fn width(&self) -> usize {
+        self.width
+    }
+}
+
+/// The canvas rect of a signed layout box `[x0, x1) × [y0, y1)`, cut to a `w × h` canvas.
+/// WHY/PROOF: the box is a widget's layout, negative or past the canvas while it scrolls off an edge; the casts would wrap.
+pub fn reach_rect(x0: isize, y0: isize, x1: isize, y1: isize, w: usize, h: usize) -> crate::canvas::PixelRect {
+    let cut = |v: isize, m: usize| (v.max(0) as usize).min(m);
+    crate::canvas::PixelRect::new(cut(x0, w), cut(y0, h), cut(x1, w), cut(y1, h))
 }
 
 /// Compose `src` underneath `dst` where `src` is in *pre-composed* α + darkness form (the result of a chain of `under()` writes starting from empty — so `src.dark` is already attenuated by `src.α`). Unlike [`flatten`] with `BlendMode::Normal`, this kernel scales src's contribution by `(256 − dst.α)` only, NOT by `(256 − dst.α) × src.α`, avoiding the second premult that would dim every AA pixel.

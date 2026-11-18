@@ -43,6 +43,8 @@ impl DropdownRow {
 pub struct Dropdown<P: Pixel = Argb8> {
     /// The pill's hit id (allocated first, then one per row, all from the same counter).
     hit_id: HitId,
+    /// Where the last paint showed ([`paint::Shown`]): the hit claim rides it, so the widget claims exactly the pixels it shows on and none it does not.
+    shown: paint::Shown,
     options: Vec<String>,
     rows: Vec<DropdownRow>,
     selected: usize,
@@ -125,6 +127,7 @@ impl<P: Pixel> Dropdown<P> {
             .collect();
         Self {
             hit_id,
+            shown: paint::Shown::default(),
             options,
             rows,
             selected: 0,
@@ -469,7 +472,7 @@ impl<P: Pixel> Dropdown<P> {
         canvas: &mut crate::canvas::Canvas<P>,
         text: &mut TextRenderer,
         clip: Option<Clip>,
-        mut hit_map: Option<&mut [HitId]>,
+        hit_map: Option<&mut [HitId]>,
     ) {
         if !self.open || !self.enabled {
             // Still reconcile damage bookkeeping on the close frame.
@@ -496,7 +499,12 @@ impl<P: Pixel> Dropdown<P> {
 
         paint::RASTERIZE_OPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
-        // Rows first (topmost-first doctrine): marker dot + label, then hit-band stamp; the pill fill composes under them at the end.
+        // The hits ride the paint: where the α stood before the rows and the popup's pill went in, so the popup claims exactly the pixels it shows on.
+        if hit_map.is_some() {
+            let reach = crate::widgets::textbox::reach_of(region, 0., 0., viewport_w, viewport_h);
+            self.shown.before(canvas.pixels, viewport_w, viewport_h, reach);
+        }
+        // Rows first (topmost-first doctrine): marker dot + label; the pill fill composes under them at the end.
         let text_left = region.x + pad * 2.2;
         for (i, label) in self.options.iter().enumerate() {
             let row_top = region.y + pad + i as Coord * row_h;
@@ -512,37 +520,6 @@ impl<P: Pixel> Dropdown<P> {
                 );
             }
             text.draw_text_left(canvas, label, text_left, row_cy, &TextStyle::new(self.font_size, theme::TEXTBOX_TEXT).font(self.font), clip, None);
-            // Claim the row's hit band (interior of the popup only, clear of the AA edge, so a row's hover tint never lands on the edge).
-            if let Some(map) = hit_map.as_deref_mut() {
-                // WHY/PROOF: the popup follows the app's layout past the viewport edge — a negative start would wrap the index and the far edges would stamp outside the hit map.
-                let x0 = (x + stroke_px).max(0) as usize;
-                let x1 = ((x + w - stroke_px).max(0) as usize).min(viewport_w);
-                let y0 = (row_top as isize).max(0) as usize;
-                let y1 = ((row_top + row_h) as isize).max(0) as usize;
-                let y1 = y1.min(viewport_h);
-                // A popup wholly past the right edge leaves x0 > x1, and a reversed slice range panics where the loop it replaced ran empty.
-                if x0 < x1 {
-                    for yy in y0..y1 {
-                        let base = yy * viewport_w;
-                        paint::claim_hits(&mut map[base + x0..base + x1], self.rows[i].hit_id);
-                    }
-                }
-            }
-        }
-        // The frame round the rows (the padding above and below them, the edge) is popup too: it claims what the rows left with HIT_BLOCK, so a click there reaches nothing behind the popup and no row's tint spreads onto it.
-        // The whole rect, corners outside the squircle included, the same bbox doctrine as a pill's stamp.
-        if let Some(map) = hit_map.as_deref_mut() {
-            // WHY/PROOF: as for the rows, the popup follows the app's layout past the viewport edge; the casts would wrap and the far edges would claim outside the hit map, and a popup wholly past the right edge leaves x0 > x1.
-            let x0 = x.max(0) as usize;
-            let x1 = ((x + w).max(0) as usize).min(viewport_w);
-            let y0 = y.max(0) as usize;
-            let y1 = ((y + h).max(0) as usize).min(viewport_h);
-            if x0 < x1 {
-                for yy in y0..y1 {
-                    let base = yy * viewport_w;
-                    paint::claim_hits(&mut map[base + x0..base + x1], paint::HIT_BLOCK);
-                }
-            }
         }
 
         // Popup pill: opaque fill + two-tone edge, drawn LAST so text/marker won the pixels they need and the fill claims the rest.
@@ -571,6 +548,25 @@ impl<P: Pixel> Dropdown<P> {
             None,
             0,
         );
+
+        // Claim where the popup showed: a row its band (inside the edge, so a row's hover tint never lands on the edge), and the frame round the rows (the padding above and below them, the edge) HIT_BLOCK, so a click there reaches nothing behind the popup.
+        // Translucent or opaque alike: the frontmost layer that shows takes the pixel (the owner, 2026-11-17: "if it's not opaque ... the frontmost is locking it up"); the corners outside the squircle, where it does not show, claim nothing.
+        if let Some(map) = hit_map {
+            self.shown.settle(canvas.pixels);
+            let rows: Vec<HitId> = self.rows.iter().map(|r| r.hit_id).collect();
+            let (band_x0, band_x1) = ((x + stroke_px) as Coord, (x + w - stroke_px) as Coord);
+            let rows_top = region.y + pad;
+            self.shown.claim_by(map, |px, py| {
+                let (px, py) = (px as Coord, py as Coord);
+                // The row whose band holds the pixel, from its distance below the first band: past the bands or beside them is the frame.
+                let k = ((py - rows_top) / row_h).floor();
+                if px >= band_x0 && px < band_x1 && k >= 0. && (k as usize) < rows.len() {
+                    rows[k as usize]
+                } else {
+                    paint::HIT_BLOCK
+                }
+            });
+        }
 
         self.last_painted_popup = Some(region_to_pixelrect(region, viewport_w, viewport_h));
         self.popup_dirty = false;
@@ -702,7 +698,12 @@ impl<P: Pixel> Dropdown<P> {
             self.cache_disabled = !self.enabled;
         }
 
-        // --- Composition: text/chevron (topmost) → pill (stamps hit map). ---
+        // The hits ride the paint: where the α stood before the label, the pill and the glow, so the pill claims exactly the pixels it shows on.
+        if hit_map.is_some() {
+            let reach = crate::widgets::textbox::reach_of(if self.focused { self.glow_bbox() } else { self.bbox() }, offset_x, offset_y, canvas.width, canvas.height);
+            self.shown.before(canvas.pixels, canvas.width, canvas.height, reach);
+        }
+        // --- Composition: text/chevron (topmost) → pill. ---
         blit_cache_to_target(
             &self.text_cache,
             cw,
@@ -710,8 +711,6 @@ impl<P: Pixel> Dropdown<P> {
             pill_x_target,
             pill_y_target,
             canvas,
-            None,
-            0,
             clip,
         );
         blit_cache_to_target(
@@ -721,8 +720,6 @@ impl<P: Pixel> Dropdown<P> {
             pill_x_target,
             pill_y_target,
             canvas,
-            hit_map,
-            self.hit_id,
             clip,
         );
 
@@ -748,6 +745,11 @@ impl<P: Pixel> Dropdown<P> {
             );
         }
 
+        // Claim where the pill showed (label, chevron, pill, its anti-aliased rim, its glow), none of the pixels already opaque before it, and none something in front claimed.
+        if let Some(map) = hit_map {
+            self.shown.settle(canvas.pixels);
+            self.shown.claim(map, self.hit_id);
+        }
         self.last_painted_bbox = Some(region_to_pixelrect(
             self.bbox(),
             canvas.width,

@@ -137,7 +137,7 @@ fn draw_squircle_pill_with_crossings<P: Pixel>(
 ///
 /// Every pixel write composes UNDER the buffer via [`Blend::under`](crate::pixel::Blend::under) (Normal) — same kernel as the single-colour path.
 ///
-/// With a `hit_map`, every solid pixel claims `hit_id` unless something in front already holds it ([`crate::paint::claim_hit`]), the hit map's half of the same front to back.
+/// With a `hit_map`, every pixel the pill shows on (its solid runs and its anti-aliased edge) claims `hit_id`, unless it was already opaque before the pill or something in front already holds it ([`crate::paint::claim_if_shown`]).
 pub fn draw_squircle_pill_two_tone<P: Pixel>(
     canvas: &mut Canvas<P>,
     pill_x: isize,
@@ -275,12 +275,7 @@ fn draw_squircle_pill_two_tone_with_crossings<P: Pixel>(
                 if v_aa_col >= 0 && v_aa_col < buf_w_i {
                     let dx = v_aa_col - pill_x;
                     let dy = v_row - pill_y;
-                    write_aa(
-                        pixels,
-                        row_base + v_aa_col as usize,
-                        pick_rgb(dx, dy),
-                        h_u32,
-                    );
+                    write_aa_hit(pixels, row_base + v_aa_col as usize, pick_rgb(dx, dy), h_u32, hit_map.as_deref_mut(), hit_id);
                 }
                 let (fx_start, fx_end) = if flip_x {
                     (diag_col, v_aa_col)
@@ -294,9 +289,10 @@ fn draw_squircle_pill_two_tone_with_crossings<P: Pixel>(
                 for fx in fs..fe {
                     let idx = row_base + fx;
                     let dx = fx as isize - pill_x;
+                    let before = pixels[idx].alpha();
                     pixels[idx] = pixels[idx].under(pick_solid(dx, dy), BlendMode::Normal);
                     if let Some(hm) = hit_map.as_deref_mut() {
-                        crate::paint::claim_hit(&mut hm[idx], hit_id);
+                        crate::paint::claim_if_shown(&mut hm[idx], hit_id, before, pixels[idx].alpha());
                     }
                 }
             }
@@ -312,12 +308,7 @@ fn draw_squircle_pill_two_tone_with_crossings<P: Pixel>(
                 if h_aa_row >= 0 && h_aa_row < buf_h_i {
                     let dx = h_col - pill_x;
                     let dy = h_aa_row - pill_y;
-                    write_aa(
-                        pixels,
-                        h_aa_row as usize * buf_w + col_us,
-                        pick_rgb(dx, dy),
-                        h_u32,
-                    );
+                    write_aa_hit(pixels, h_aa_row as usize * buf_w + col_us, pick_rgb(dx, dy), h_u32, hit_map.as_deref_mut(), hit_id);
                 }
                 let (fy_start, fy_end) = if flip_y {
                     (diag_row, h_aa_row)
@@ -331,9 +322,10 @@ fn draw_squircle_pill_two_tone_with_crossings<P: Pixel>(
                 for fy in fs..fe {
                     let idx = fy * buf_w + col_us;
                     let dy = fy as isize - pill_y;
+                    let before = pixels[idx].alpha();
                     pixels[idx] = pixels[idx].under(pick_solid(dx, dy), BlendMode::Normal);
                     if let Some(hm) = hit_map.as_deref_mut() {
-                        crate::paint::claim_hit(&mut hm[idx], hit_id);
+                        crate::paint::claim_if_shown(&mut hm[idx], hit_id, before, pixels[idx].alpha());
                     }
                 }
             }
@@ -354,9 +346,10 @@ fn draw_squircle_pill_two_tone_with_crossings<P: Pixel>(
             for fx in cx_start..cx_end {
                 let idx = row_base + fx;
                 let dx = fx as isize - pill_x;
+                let before = pixels[idx].alpha();
                 pixels[idx] = pixels[idx].under(pick_solid(dx, dy), BlendMode::Normal);
                 if let Some(hm) = hit_map.as_deref_mut() {
-                    crate::paint::claim_hit(&mut hm[idx], hit_id);
+                    crate::paint::claim_if_shown(&mut hm[idx], hit_id, before, pixels[idx].alpha());
                 }
             }
         }
@@ -613,6 +606,15 @@ fn write_aa<P: Pixel>(pixels: &mut [P], idx: usize, colour_rgb: P, h_aa: u32) {
     pixels[idx] = pixels[idx].under(new_pixel, BlendMode::Normal);
 }
 
+/// [`write_aa`] for a kernel that claims hits: the edge pixel claims `hit_id` where it shows ([`crate::paint::claim_if_shown`]), so a pill's anti-aliased rim is the pill's to click.
+fn write_aa_hit<P: Pixel>(pixels: &mut [P], idx: usize, colour_rgb: P, h_aa: u32, hit_map: Option<&mut [HitId]>, hit_id: HitId) {
+    let before = pixels[idx].alpha();
+    write_aa(pixels, idx, colour_rgb, h_aa);
+    if let Some(hm) = hit_map {
+        crate::paint::claim_if_shown(&mut hm[idx], hit_id, before, pixels[idx].alpha());
+    }
+}
+
 /// Photon's squircle inset formula — single row, parameterized by `squirdleyness`. Returns the curve's inset (distance from the bbox edge to the leftmost / rightmost inside pixel) for a row at `y_from_center` rows above or below the squircle's vertical center. `y_from_center` must lie within `radius` of the centre: past it the curve has no inside pixel and the result is NaN.
 ///
 /// `squirdleyness = 2` → circle. `squirdleyness = 3` → photon's textbox pill default (slightly flatter than a circle). Higher = more rectangular. Both `draw_textbox_pill` (AA path) and the textbox widget's hard-pixel renderer route thru this so any tweak to the curve math flows thru both code paths.
@@ -834,7 +836,7 @@ fn draw_squircle_rrect_kernel<P: Pixel>(
                     // An empty source pixel (a picture's unpainted block) puts nothing on the curve; every flat-colour caller's solid is opaque.
                     let (rgb, solid) = pick(v_aa_col - x, v_row - y);
                     if solid.alpha() != 0 {
-                        write_aa(pixels, row_base + v_aa_col as usize, rgb, h_u32);
+                        write_aa_hit(pixels, row_base + v_aa_col as usize, rgb, h_u32, hit_map.as_deref_mut(), hit_id);
                     }
                 }
                 let (fx_start, fx_end) = if flip_x { (h_col, v_aa_col) } else { (v_aa_col + 1, h_col + 1) };
@@ -844,9 +846,10 @@ fn draw_squircle_rrect_kernel<P: Pixel>(
                 for fx in fs..fe {
                     let idx = row_base + fx;
                     let (_, solid) = pick(fx as isize - x, v_row - y);
+                    let before = pixels[idx].alpha();
                     pixels[idx] = pixels[idx].under(solid, BlendMode::Normal);
                     if let Some(hm) = hit_map.as_deref_mut() {
-                        crate::paint::claim_hit(&mut hm[idx], hit_id);
+                        crate::paint::claim_if_shown(&mut hm[idx], hit_id, before, pixels[idx].alpha());
                     }
                 }
             }
@@ -856,7 +859,7 @@ fn draw_squircle_rrect_kernel<P: Pixel>(
                 if h_aa_row >= 0 && h_aa_row < buf_h_i {
                     let (rgb, solid) = pick(h_col - x, h_aa_row - y);
                     if solid.alpha() != 0 {
-                        write_aa(pixels, h_aa_row as usize * buf_w + col_us, rgb, h_u32);
+                        write_aa_hit(pixels, h_aa_row as usize * buf_w + col_us, rgb, h_u32, hit_map.as_deref_mut(), hit_id);
                     }
                 }
                 let (fy_start, fy_end) = if flip_y { (v_row, h_aa_row) } else { (h_aa_row + 1, v_row + 1) };
@@ -866,9 +869,10 @@ fn draw_squircle_rrect_kernel<P: Pixel>(
                 for fy in fs..fe {
                     let idx = fy * buf_w + col_us;
                     let (_, solid) = pick(h_col - x, fy as isize - y);
+                    let before = pixels[idx].alpha();
                     pixels[idx] = pixels[idx].under(solid, BlendMode::Normal);
                     if let Some(hm) = hit_map.as_deref_mut() {
-                        crate::paint::claim_hit(&mut hm[idx], hit_id);
+                        crate::paint::claim_if_shown(&mut hm[idx], hit_id, before, pixels[idx].alpha());
                     }
                 }
             }
@@ -890,9 +894,10 @@ fn draw_squircle_rrect_kernel<P: Pixel>(
         for fx in fx0..fx1 {
             let idx = row_base + fx;
             let (_, solid) = pick(fx as isize - x, dy);
+            let before = pixels[idx].alpha();
             pixels[idx] = pixels[idx].under(solid, BlendMode::Normal);
             if let Some(hm) = hit_map.as_deref_mut() {
-                crate::paint::claim_hit(&mut hm[idx], hit_id);
+                crate::paint::claim_if_shown(&mut hm[idx], hit_id, before, pixels[idx].alpha());
             }
         }
     }

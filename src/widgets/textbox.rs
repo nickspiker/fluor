@@ -5,7 +5,7 @@
 use crate::canvas::PixelRect;
 use crate::text::TextStyle;
 use crate::coord::Coord;
-use crate::paint::{self, Clip, HitId, HIT_NONE};
+use crate::paint::{self, Clip, HitId};
 use crate::region::Region;
 use crate::text::TextRenderer;
 use crate::pixel::{Argb8, Pixel};
@@ -18,8 +18,10 @@ pub struct Textbox<P: Pixel = Argb8> {
     pub chars: Vec<char>,
     /// Insertion point in `[0, chars.len()]`. Intentionally public — selection-drag in the app's `CursorMoved` handler mutates it directly each frame as the cursor moves; a setter would require either an opaque "extend-selection-to-pixel-x" API on Textbox (which would force the textbox to know about the drag state machine) or per-event call overhead. Treat as widget-internal otherwise.
     pub cursor: usize,
-    /// Dense hit ID allocated at construction via [`crate::host::widget::next_id`]. Stamped into the host hit map at every opaque pill pixel during `render_content_into` so a click at `(x, y)` resolves to this textbox iff `hit_map[y * w + x] == self.hit_id`.
+    /// Dense hit ID allocated at construction via [`crate::host::widget::next_id`]. Claimed in the host hit map at every pixel `render_content_into` shows on (pill, rim, text, caret, glow) that nothing in front claimed, so a click at `(x, y)` resolves to this textbox iff `hit_map[y * w + x] == self.hit_id`.
     hit_id: HitId,
+    /// Where the last paint showed ([`paint::Shown`]): the hit claim rides it, so the widget claims exactly the pixels it shows on and none it does not.
+    shown: paint::Shown,
     /// `true` while this textbox is the focused-input target — blinkey runs, glow paints, key events route here. Mutate via [`Self::set_focused`] (or the [`crate::host::widget::Focus`] trait method) so the host's full-repaint promotion can fire on focus on/off transitions.
     focused: bool,
     /// `true` while the cursor is hovering over the textbox bbox. Drives the hover fill colour. Mutate via [`Self::set_hovered`] / the [`crate::host::widget::Hover`] trait method.
@@ -101,6 +103,16 @@ fn char_class(c: char) -> u8 {
     }
 }
 
+/// The canvas rect a widget can draw in: its viewport `region` (a pill or its glow box) less the canvas's viewport offset, widened a pixel each way for the anti-aliased edge, cut to the canvas.
+/// The reach of a [`paint::Shown`]: what the widget draws outside it would not claim.
+pub(crate) fn reach_of(region: Region, offset_x: Coord, offset_y: Coord, w: usize, h: usize) -> PixelRect {
+    let x0 = (region.x - offset_x).floor() as isize - 1;
+    let y0 = (region.y - offset_y).floor() as isize - 1;
+    let x1 = (region.x + region.w - offset_x).ceil() as isize + 1;
+    let y1 = (region.y + region.h - offset_y).ceil() as isize + 1;
+    paint::reach_rect(x0, y0, x1, y1, w, h)
+}
+
 /// Convert a viewport-coord `Region` (Coord f32 rectangle, possibly negative or off-buffer) into a `PixelRect` (usize half-open rect) clamped to the viewport bounds. Used by [`Textbox::damage_rect`] / [`Textbox::record_painted`] to express widget bboxes in the host's pixel-rect language for damage union. `pub(crate)` so sibling widgets ([`crate::widgets::button::Button`], future scroll views) share one canonical Region→PixelRect cast rather than duplicating the clamp math.
 pub(crate) fn region_to_pixelrect(
     region: Region,
@@ -122,7 +134,7 @@ pub(crate) fn region_to_pixelrect(
 ///
 /// Composition is [`paint::flatten_premult`]'s kernel, row by row (src is pre-attenuated, so we scale by `(ONE + 1 − dst.α)` only — not by that × src.α): one copy of the maths for every premultiplied blit.
 ///
-/// Hit claim: every opaque cache pixel claims `hit_id` in `hit_map` during the same walk, unless something in front already holds that pixel ([`paint::claim_hit`]): the hit map goes front to back with the colour.
+/// No hit claim here: a widget claims over its whole paint (its text, its pill, its glow) with a [`paint::Shown`] round them all.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn blit_cache_to_target<P: Pixel>(
     cache: &[P],
@@ -131,8 +143,6 @@ pub(crate) fn blit_cache_to_target<P: Pixel>(
     origin_x: isize,
     origin_y: isize,
     canvas: &mut crate::canvas::Canvas<P>,
-    hit_map: Option<&mut [HitId]>,
-    hit_id: HitId,
     clip: Option<paint::Clip>,
 ) {
     let target_w = canvas.width;
@@ -154,7 +164,6 @@ pub(crate) fn blit_cache_to_target<P: Pixel>(
     canvas.damage.add_bounds(dx0, dy0, dx1, dy1);
 
     let target = &mut *canvas.pixels;
-    let mut hit_map = hit_map;
     // Walk only the clipped range: [dx0, dx1) × [dy0, dy1) lies inside the target, the clip and the cache's footprint (dx0 ≥ origin_x, dx1 ≤ origin_x + cache_w), so no per-pixel bounds test.
     let run = dx1 - dx0;
     let cx0 = (dx0 as isize - origin_x) as usize;
@@ -163,13 +172,6 @@ pub(crate) fn blit_cache_to_target<P: Pixel>(
         let src = &cache[cy * cache_w + cx0..cy * cache_w + cx0 + run];
         let target_row = ty * target_w + dx0;
         paint::flatten_premult_chunk(&mut target[target_row..target_row + run], src);
-        if let Some(hm) = hit_map.as_deref_mut() {
-            // An opaque cache pixel claims its hit pixel unless something in front already holds it.
-            for (slot, s) in hm[target_row..target_row + run].iter_mut().zip(src) {
-                let held = *slot;
-                *slot = if s.alpha() == P::ONE && held == HIT_NONE { hit_id } else { held };
-            }
-        }
     }
 }
 
@@ -202,6 +204,7 @@ impl<P: Pixel> Textbox<P> {
             chars: Vec::new(),
             cursor: 0,
             hit_id: crate::host::widget::next_id(hit_counter),
+            shown: paint::Shown::default(),
             focused: false,
             hovered: false,
             enabled: true,
@@ -1064,6 +1067,12 @@ impl<P: Pixel> Textbox<P> {
         self.pill_cache_origin_x = pill_x_target;
         self.pill_cache_origin_y = pill_y_target;
 
+        // The hits ride the paint: where the α stood before the caret, the text, the pill and the glow, so each claims exactly the pixels it shows on.
+        if hit_map.is_some() {
+            let reach = reach_of(if self.focused { self.glow_bbox() } else { self.bbox() }, offset_x, offset_y, canvas.width, canvas.height);
+            self.shown.before(canvas.pixels, canvas.width, canvas.height, reach);
+        }
+
         // The blinkey first: THE canonical painter (paint::draw_blinkey), a layer of light in front of the field, so it goes into the accumulator before the text and the pill land under it.
         // Until 2026-11-07 this was a hand-rolled copy that subtracted the wave from the finished darkness, painter's order; until 2026-11-17 the canonical one was still drawn after the field, in front of the finished pixels and so in front of anything drawn before the textbox too.
         if self.focused && !self.has_selection() && self.blinkey_visible {
@@ -1078,7 +1087,9 @@ impl<P: Pixel> Textbox<P> {
             }
         }
 
-        // --- Three-layer composition via under() — topmost first (fluor front-to-back) --- Step 1: text glyphs (topmost). Opaque glyph pixels claim their cells in target; surrounding empties don't write (α=0 in text_cache). No hit_map writes — pill layer stamps that.
+        // Three-layer composition via under(), topmost first (fluor front-to-back).
+        // Step 1: text glyphs (topmost).
+        // Opaque glyph pixels claim their cells in target; surrounding empties don't write (α=0 in text_cache).
         blit_cache_to_target(
             &self.text_cache,
             self.text_cache_w,
@@ -1086,12 +1097,11 @@ impl<P: Pixel> Textbox<P> {
             pill_x_target,
             pill_y_target,
             canvas,
-            None,
-            0,
             clip,
         );
 
-        // Step 2: pill background + AA edges (bottom). Fills the remaining empty cells inside the pill silhouette and stamps hit_map at every opaque pill pixel — so the hit area follows the pill silhouette exactly, regardless of whether each pixel ended up as glyph / selection / pill bg.
+        // Step 2: pill background + AA edges (bottom).
+        // Fills the remaining empty cells inside the pill silhouette.
         blit_cache_to_target(
             &self.pill_cache,
             self.pill_cache_w,
@@ -1099,8 +1109,6 @@ impl<P: Pixel> Textbox<P> {
             pill_x_target,
             pill_y_target,
             canvas,
-            hit_map,
-            hit_id,
             clip,
         );
 
@@ -1154,6 +1162,12 @@ impl<P: Pixel> Textbox<P> {
                 vert_factor,
                 clip,
             );
+        }
+
+        // Claim where the box showed: its caret (light inside the pill, never opaque), text, pill, anti-aliased rim and glow, none of the pixels already opaque before it, and none something in front claimed.
+        if let Some(map) = hit_map {
+            self.shown.settle(canvas.pixels);
+            self.shown.claim(map, hit_id);
         }
 
         // Record what we just painted so the next frame's damage_rect can union prev∪current bboxes (handles moves, hover-only changes, focus-on/off).
