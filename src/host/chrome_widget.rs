@@ -188,6 +188,8 @@ pub struct DefaultChrome<P: Pixel = Argb8> {
     pub orb_inset_px: (Coord, Coord),
     /// The orb's vertical slide from its rest place, pixels (negative = up) — see [`Self::set_orb_dy`].
     pub orb_dy: Coord,
+    /// The orb's place chosen by the host, `(cx, cy, r)` in the frame's pixels, in place of the corner rule ([`orb_layout`]) — see [`Self::set_orb_place`]. None = the corner rule.
+    pub orb_place: Option<(Coord, Coord, Coord)>,
     /// DEVICE-GLASS CORNERS (photon on Android, Nick 2026-09-16): the physical display's corner radius in pixels, when the platform reports one. Set, it overrides the span-derived squircle sizes — the small (TR/BL) corners take the glass radius, the big (TL/BR) diagonal takes TWICE it, the same 2:1 the desktop window wears — and the perimeter draws EVEN in full-edge mode so the hairline can be lined up against the glass by eye. None = the desktop rule (span/4, span/2, no perimeter when full-edge).
     pub glass_radius_px: Option<Coord>,
     /// "Full edge" / maximized mode. When `true`, [`Self::rasterize_chrome`] skips [`chrome::draw_window_edges_and_mask`] entirely: no perimeter hairline, no corner cutout in `clip_mask`, no AA fringe — the chrome flows straight to the four screen edges. The OS surface is fullscreen anyway, the WM can't show a shadow against the screen border, and AA on a corner that's flush with the screen is wasted work. Buttons / title / app icon still rasterize as usual. Toggle via [`Self::set_full_edge`]; sync from [`super::app::Context::is_maximized`].
@@ -312,6 +314,7 @@ impl<P: Pixel> DefaultChrome<P> {
             glass_radius_px: None,
             orb_inset_px: (0.0, 0.0),
             orb_dy: 0.0,
+            orb_place: None,
             viewport,
             layer_bg,
             layer_chrome,
@@ -349,10 +352,32 @@ impl<P: Pixel> DefaultChrome<P> {
         if !orb_present {
             return None;
         }
+        let (cx, cy, r) = self.orb_rest();
+        Some((cx, cy + self.orb_dy as isize, r))
+    }
+
+    /// The orb's place before the blind's slide: the host's own (`orb_place`), else the corner rule at the current zoom.
+    fn orb_rest(&self) -> (isize, isize, isize) {
+        if let Some((cx, cy, r)) = self.orb_place {
+            let near = |v: Coord| crate::math::floor(v + 0.5) as isize;
+            return (near(cx), near(cy), near(r));
+        }
         let span = self.viewport.effective_span();
         let button_size = crate::math::ceil(span / 32.0) as usize;
-        let (cx, cy, r) = orb_layout(button_size, self.orb_inset_px.0 as isize, self.orb_inset_px.1 as isize);
-        Some((cx, cy + self.orb_dy as isize, r))
+        orb_layout(button_size, self.orb_inset_px.0 as isize, self.orb_inset_px.1 as isize)
+    }
+
+    /// Put the orb at the host's own place, `(cx, cy, r)` in the frame's pixels, in place of the corner rule; None goes back to the corner rule.
+    /// For a host whose glass has its own room for it (photon on ferros, owner 2026-11-18: the orb hangs at the top of the safe circle, centred under the camera).
+    /// Its ring, press glow, hits and the blind's slide follow it, and the title starts past its right edge as it does in the corner.
+    /// Returns whether it changed.
+    pub fn set_orb_place(&mut self, place: Option<(Coord, Coord, Coord)>) -> bool {
+        if self.orb_place == place {
+            return false;
+        }
+        self.orb_place = place;
+        self.group.rpn.layers[self.layer_chrome].dirty = true;
+        true
     }
 
 
@@ -586,8 +611,8 @@ impl<P: Pixel> DefaultChrome<P> {
         let span = self.viewport.effective_span();
         // Span-relative: button height is span/32, where span is the harmonic mean of viewport dims times zoom. Strip layout bails downstream if the result is too small to render glyphs.
         let button_size = crate::math::ceil(span / 32.0) as usize;
-        // The orb insets are read HERE, before the chrome buffer is borrowed: reading self the buffer borrow stays live to the end of the pass (E0502 on every target at a4a3090). All three are pure reads, so taking them ahead of the size guard below changes nothing.
-        let orb_inset = (self.orb_inset_px.0 as isize, self.orb_inset_px.1 as isize);
+        // The orb's place is read HERE, before the chrome buffer is borrowed: reading self the buffer borrow stays live to the end of the pass (E0502 on every target at a4a3090). It is a pure read, so taking it ahead of the size guard below changes nothing.
+        let orb_rest = self.orb_rest();
 
         let chrome_buf = &mut self.group.rpn.layers[self.layer_chrome].pixels;
         // α + darkness: transparent init (α=0, dark=0) so the bg shows thru everywhere except the hairline + AA pixels.
@@ -613,16 +638,16 @@ impl<P: Pixel> DefaultChrome<P> {
         // Orb slot is also reserved when `OrbTint::Custom` is active even without an icon — that's the "status badge" use case (network indicator, recording light, presence). `draw_app_icon`'s no-icon path fills the disk with `ring_colour`, so the slot reads as a coloured dot.
         let orb_present = self.app_icon.is_some()
             || matches!(self.orb_tint, chrome::OrbTint::Custom { .. });
-        // Geometry lives in `orb_layout` (one source for this pass and `orb_geometry()`); the title-margin math below tracks the orb's actual right edge automatically.
+        // Geometry lives in `orb_rest` (one source for this pass and `orb_geometry()`: the host's place, else `orb_layout`); the title-margin math below tracks the orb's actual right edge automatically.
         let (orb_cx, orb_cy, orb_radius) = if orb_present {
-            orb_layout(button_size, orb_inset.0, orb_inset.1)
+            orb_rest
         } else {
             (0, 0, 0)
         };
         // Title clears the orb's actual right edge. `draw_title_text`'s base left margin is `button_size/2`, so `left_extra` is the extra push needed to land the title just past `orb_cx + orb_radius` (plus a `button_size/4` gap). Tracks the orb wherever it sits, so moving the orb right keeps the title from sliding under it.
         let title_left_extra = if orb_present {
-            // orb_layout puts the centre at least 2.4 buttons in, so the orb's right edge is always past half a button.
-            (orb_cx + orb_radius) as usize + button_size / 4 - button_size / 2
+            // WHY/PROOF: the corner rule puts the centre at least 2.4 buttons in, but a host's own place (`orb_place`) can put the orb's right edge within a quarter button of the left edge, or past it; the unsigned sum less half a button would wrap there, so it is taken signed and a title there starts at its base margin.
+            (orb_cx + orb_radius + button_size as isize / 4 - button_size as isize / 2).max(0) as usize
         } else {
             0
         };
@@ -1307,6 +1332,31 @@ mod tests {
         assert!(under_chrome > 0 && under_popup > 0, "nothing overlapped ({under_chrome} under the chrome, {under_popup} of the chrome under the popup)");
         let (cx, cy, _) = chrome.orb_geometry().unwrap();
         assert_eq!(chrome.hit_at(cx as Coord, cy as Coord), chrome.app_icon_btn.id(), "the orb");
+    }
+
+    /// A host's own place for the orb (photon on ferros: the top of the safe circle, under the camera) moves its pixels, its hits and its reach there, and None puts it back in the corner.
+    #[test]
+    fn the_orb_goes_where_the_host_places_it() {
+        let (w, h) = (900usize, 700usize);
+        let (mut text, mut clip_mask, mut counter) = (TextRenderer::new(), alloc::vec![255u8; w * h], HIT_NONE);
+        let mut chrome = DefaultChrome::new(Viewport::new(w as u32, h as u32), "", None, None, &mut counter);
+        chrome.set_orb_tint(chrome::OrbTint::Custom { ring: 0xFF20_4060, brighten: false });
+        let corner = chrome.orb_geometry().unwrap();
+        assert!(chrome.set_orb_place(Some((450.0, 120.0, 60.0))));
+        assert!(!chrome.set_orb_place(Some((450.0, 120.0, 60.0))), "the same place is no change");
+        assert_eq!(chrome.orb_geometry(), Some((450, 120, 60)));
+        let mut frame = alloc::vec![0u32; w * h];
+        chrome.clear_hits(crate::canvas::PixelRect::new(0, 0, w, h));
+        chrome.rasterize_chrome(&mut crate::canvas::Damage::new(), &mut text, &mut clip_mask);
+        chrome.flatten_chrome_into(&mut frame, w, h, None);
+        let orb = chrome.app_icon_btn.id();
+        assert_eq!(chrome.hit_at(450.0, 120.0), orb, "the placed orb takes its tap");
+        assert_ne!(chrome.hit_at(corner.0 as Coord, corner.1 as Coord), orb, "the corner is empty");
+        assert_ne!(frame[120 * w + 450].alpha(), 0, "the placed orb shows");
+        let reach = chrome.chrome_reach();
+        assert!(reach.x0 <= 450 - 60 && reach.x1 > 450 + 60 && reach.y0 <= 120 - 60 && reach.y1 > 120 + 60, "the damage reaches the placed orb: {reach:?}");
+        assert!(chrome.set_orb_place(None));
+        assert_eq!(chrome.orb_geometry(), Some(corner), "None is the corner rule again");
     }
 
     #[test]
