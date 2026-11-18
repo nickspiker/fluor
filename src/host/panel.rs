@@ -23,6 +23,11 @@ pub trait PanelPixel: Pixel {
     fn to_baked(src: &[Self], dst: &mut [u64], bake: &Bake);
 }
 
+/// Whether a frame must be drawn whole: the first, one the host asked for (back in front), or the first after the app stopped baking its own frame into the surface (`FluorApp::bakes_own`): while it baked, the scratch was neither cleared nor drawn, so its pixels outside a partial damage are stale, and the surface holds the app's frame rather than the scratch's (a scroll would move it as though it were).
+pub(crate) fn whole_frame(first: bool, asked: bool, baked_last: bool, bakes_now: bool) -> bool {
+    first || asked || (baked_last && !bakes_now)
+}
+
 /// The bake a ferros display's `BAKED` surface is made with (display op 65, ferros_sys `window::bake`): per channel of a working value v (VSF RGB, gamma 2, white at 1), the light l = tanh²(k·v); the panel's light p = m·l (its rows the panel's red, green and blue); its code p^g × 65472 in Q16, held at the field's ends. A fluor code c (g2t, light atanh(c / 2ⁿ)²) is the working value atanh(c / 2ⁿ), so its light is tanh²(k · atanh(c / 2¹⁶)): one table over every 16-bit code (an 8-bit code is its 16-bit `c × 2⁸`). The panel's part is the display's own NEON kernels (ferros payloads/display neon.rs `matrix8`, `code16`, odt.rs `odt_tables`), carried here: fluor does not depend on ferros.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub struct Bake {
@@ -466,5 +471,16 @@ mod tests {
             bake.row(|i| (codes[i], 2), &mut app);
             assert_eq!(host, app, "{n} pixels");
         }
+    }
+
+    /// The frame after an app stops baking its own frame is drawn whole; so are the first and one the host asks for; otherwise the app's damage stands.
+    #[test]
+    fn the_first_frame_after_the_app_baked_is_whole() {
+        assert!(whole_frame(true, false, false, false));
+        assert!(whole_frame(false, true, false, false));
+        assert!(whole_frame(false, false, true, false), "baking stopped: the scratch is stale");
+        assert!(!whole_frame(false, false, true, true), "still baking: the app writes its own damage");
+        assert!(!whole_frame(false, false, false, true), "baking starts: the app writes its damage straight into the surface");
+        assert!(!whole_frame(false, false, false, false));
     }
 }

@@ -437,6 +437,8 @@ pub struct FerrosShell<A: FluorApp<P>, P: PanelPixel = Argb8> {
     pub display_bakes: bool,
     /// This frame the app bakes its changed rects into the surface itself (`FluorApp::bakes_own`): the scratch was neither cleared nor rendered.
     app_bakes: bool,
+    /// The last frame drawn was baked by the app (`app_bakes`): the next one that is not is drawn whole (`panel::whole_frame`).
+    baked_last: bool,
 }
 
 impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
@@ -486,6 +488,7 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             own: false,
             display_bakes: false,
             app_bakes: false,
+            baked_last: false,
         };
         shell.with_context(|app, ctx| app.init(ctx));
         shell.with_context(|app, ctx| app.on_resize(width, height, ctx));
@@ -613,8 +616,9 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         }
         let (win_w, win_h) = (self.viewport.width_px as usize, self.viewport.height_px as usize);
         let viewport_rect = PixelRect::new(0, 0, win_w, win_h);
-        // The first frame is the whole frame, whatever the app says is dirty: nothing has been shown yet. So is the first back in front: what changed while behind was never drawn.
-        let forced = self.frames == 0 || core::mem::take(&mut self.full_next);
+        // The first frame is the whole frame, whatever the app says is dirty: nothing has been shown yet. So is the first back in front: what changed while behind was never drawn. So is the first after the app stopped baking its own frame (`whole_frame`).
+        let bakes_now = self.display_bakes && self.app.bakes_own();
+        let forced = crate::host::panel::whole_frame(self.frames == 0, core::mem::take(&mut self.full_next), self.baked_last, bakes_now);
         // The app's damage as the rects it named, cut at the frame (None from the app is the whole frame, as before); their bounding box is the render's clip.
         let whole = crate::canvas::DamageRects::one(viewport_rect);
         let rects = if forced { whole } else { crate::host::app::app_damage(&mut self.app, self.viewport).map_or(whole, |d| d.cut(win_w, win_h)) };
@@ -659,12 +663,14 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         self.with_context_render(rects, |app, _, ctx| own = app.render_own(ctx));
         self.own = own;
         if own {
+            self.baked_last = false;
             self.changed = whole;
             self.shift = None;
             return true;
         }
         // The app bakes its own frame into the surface (`FluorApp::bakes_own`): nothing to clear or render here, the present hands it the changed rects. A scroll hint's move of the scratch above was the scratch path's; this path redraws the whole damage.
-        self.app_bakes = self.display_bakes && self.app.bakes_own();
+        self.app_bakes = bakes_now;
+        self.baked_last = bakes_now;
         if self.app_bakes {
             self.shift = None;
             return true;
