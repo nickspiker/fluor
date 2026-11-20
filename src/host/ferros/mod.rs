@@ -214,6 +214,10 @@ struct BellState {
     safe: Option<SafeArea>,
     /// The display's bake changed since the last take (`EV_BAKE`).
     bake: bool,
+    /// A show failed: the display that took it ended (the kernel fails the calls a server that ended had taken). Set by the frame loop, cleared by the watch's next answer, which comes from the display after it (ferros WINDOWS.md "A display started again"); meanwhile the window is held behind. Not taken: it stands until a display answers.
+    lost: bool,
+    /// The watch has ended (`watch`): no display answers this window any more (two failed calls in a row, or a display without op 62), or there never was a watch. A lost display is then gone for good.
+    gone: bool,
     rung: bool,
 }
 
@@ -224,6 +228,8 @@ struct Rung {
     inset: Option<u16>,
     safe: Option<SafeArea>,
     bake: bool,
+    lost: bool,
+    gone: bool,
 }
 
 /// `EV_SAFE`'s payload as a [`SafeArea`] of the window's own pixels (the window is the app's frame).
@@ -251,11 +257,11 @@ impl Bell {
         self.cv.notify_all();
     }
 
-    /// Whether the window is behind, the keys and text since the last take, the keyboard's place if it moved since, and whether the display's bake changed since.
+    /// Whether the window is behind, the keys and text since the last take, the keyboard's place if it moved since, whether the display's bake changed since, and whether a display that took a show ended (`lost`) or none answers any more (`gone`).
     fn take(&self) -> Rung {
         let mut s = self.state.lock().unwrap();
         s.rung = false;
-        Rung { behind: s.behind, typed: core::mem::take(&mut s.typed), inset: s.inset.take(), safe: s.safe.take(), bake: core::mem::take(&mut s.bake) }
+        Rung { behind: s.behind, typed: core::mem::take(&mut s.typed), inset: s.inset.take(), safe: s.safe.take(), bake: core::mem::take(&mut s.bake), lost: s.lost, gone: s.gone }
     }
 
     /// Asleep until anything rings since the last take, or until `at` (the app's own deadline, when it has one ahead).
@@ -277,7 +283,13 @@ impl Bell {
 }
 
 /// The window's events (ferros display op 62, a held call: answered only when the display puts the window behind, brings it to the front or hands it a key), rung into `bell`. On a thread of its own: the call waits. Ends when the display has no such op (an older display answers at once with one byte), or when two calls in a row fail (a token that is no display's); a display that ended holding the call fails it once, and the next call waits for the display that comes after it.
+/// Every answer clears `lost` (a display answers again); its end rings `gone`, so a frame loop waiting on a lost display ends rather than waits for one that is not coming.
 fn watch(display: u64, base: u64, bell: Arc<Bell>) {
+    watch_events(display, base, &bell);
+    bell.ring(|s| s.gone = true);
+}
+
+fn watch_events(display: u64, base: u64, bell: &Bell) {
     let mut seen = 0u32;
     let mut failed = false;
     let mut r = [0u8; EVENTS_REPLY];
@@ -306,6 +318,7 @@ fn watch(display: u64, base: u64, bell: Arc<Bell>) {
         let mut p = 7 + 2 * k;
         bell.ring(|s| {
             s.behind = behind;
+            s.lost = false;
             for i in 0..k {
                 let (low, kind) = (r[7 + 2 * i], r[7 + 2 * i + 1]);
                 // A payload's bytes, stepped over whatever the kind (one this host does not know is passed over by its length); None for one the reply was cut inside.
@@ -1072,7 +1085,11 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
     let bell = shell.bell.clone();
     {
         let bell = bell.clone();
-        let _ = std::thread::Builder::new().name(String::from("fluor-window")).stack_size(1 << 16).spawn(move || watch(display, base, bell));
+        let watching = bell.clone();
+        if std::thread::Builder::new().name(String::from("fluor-window")).stack_size(1 << 16).spawn(move || watch(display, base, watching)).is_err() {
+            // No watch: nothing would ever say a display answers again, so a lost display is gone (a failed show ends the app, as before).
+            bell.ring(|s| s.gone = true);
+        }
     }
     let mut behind = false;
     // The app's keyboard wish not yet sent to the display (`keyboard_wish`, op 68).
@@ -1088,8 +1105,6 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
     // Contacts that entered on another window or a corner: not this app's until they leave (a bit per contact id).
     let mut foreign = 0u16;
     let (mut shown, mut touched, mut last_line) = (0u64, 0u64, sys::now());
-    // Whether the last show failed (a display that ended holding it): a second failure in a row ends the app.
-    let mut show_failed = false;
     // Where the frames of the last ten seconds went, in counter ticks: the draw (the app's tick and render), the present (the conversion into the surface), the show (op 22): sums and the longest, and how many frames.
     let (mut t_draw, mut t_present, mut t_show, mut t_max, mut n_frames) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let us = |ticks: u64| ticks * 1_000_000 / sys::freq();
@@ -1115,7 +1130,13 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             (t_draw, t_present, t_show, t_max, n_frames) = (0, 0, 0, 0, 0);
         }
         // What the display said of this window since the last pass (`watch`): behind or in front, the keys and text it handed over, the keyboard's place, and whether its bake changed (a brightness change: the bake asked again, and the next frame drawn and baked whole).
-        let Rung { behind: now_behind, typed, inset, safe, bake: rebake } = bell.take();
+        let Rung { behind: now_behind, typed, inset, safe, bake: rebake, lost, gone } = bell.take();
+        // A display that took a show ended, and none answers this window any more (the watch has ended): nothing will ever show it again.
+        if lost && gone {
+            return Err(String::from("the display ended, and none answers this window"));
+        }
+        // A display that took a show ended: the window is held behind (no touch read, nothing drawn or shown) until the watch hears the display after it, which says where the window stands there (behind, until the deck brings it to the front).
+        let now_behind = now_behind || lost;
         // The safe area (the display's word at the window's first show and as its full screen turns): where the app keeps its own controls, the system's in front of the corners.
         if let Some(a) = safe {
             println!("fluor: the safe area is the circle at ({}, {}) radius {}, the system holding {}", a.cx, a.cy, a.r, match (a.top, a.bottom) { (true, true) => "both halves outside it", (false, true) => "the bottom half outside it", (true, false) => "the top half outside it", (false, false) => "nothing" });
@@ -1240,15 +1261,12 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             }
             let len = if own.is_some() { 36 } else { 28 };
             let mut rr = [0u8; 4];
-            // A show answered ERR once is a display that ended holding it (the kernel fails the calls a server that ended had taken): the frame is lost, and the app runs on. The next show waits for the display that comes after it, and the window's watch hears that one say the window is behind (ferros WINDOWS.md "A display started again"), so the app draws again only once it is brought to the front. Two in a row are no display behind the grant: the app ends, as before (2026-11-20: a display restarted under an app ended it, or left it hung).
+            // A show answered ERR is a display that ended holding it (the kernel fails the calls a server that ended had taken): the frame is lost and the app runs on, its window held behind (`lost`) until the watch hears the display after it, which says where the window stands there (ferros WINDOWS.md "A display started again": behind, until the deck brings it to the front). The app ends only when the watch has ended too (`gone`: no display answers any more), never by counting failures (2026-11-20: a display restarted under an app ended it).
+            // The display after it starts in tens of milliseconds at least, so this is set long before its first answer, which clears it.
             if sys::call(display, &m[..len], &mut rr) == sys::ERR {
-                if show_failed {
-                    return Err(String::from("the display refused the frame"));
-                }
-                show_failed = true;
-                println!("fluor: the display ended holding a frame; the next one goes to the display after it");
+                println!("fluor: the display ended holding a frame; held behind until a display answers again");
+                bell.ring(|s| s.lost = true);
             } else {
-                show_failed = false;
                 let t_shown = sys::now();
                 if !shell.own {
                     shell.stages[shell.bucket].show += t_shown - t_presented;
