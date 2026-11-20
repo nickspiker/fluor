@@ -512,10 +512,19 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         self.viewport.ru
     }
 
-    /// The RU multiplier set from outside the app (an input hook following the person's app scale, ferros preference 14), the layout run again about the frame's centre exactly as a pinch's step runs it.
+    /// The RU multiplier set from outside the app (an input hook following the person's app scale, ferros preference 14), and the layout run again: the app hears it as a set, not a gesture (`FluorApp::on_zoom_set`, whose default is a pinch step about the centre), then its resize.
     pub fn set_zoom(&mut self, ru: Coord) {
-        let (w, h) = (self.viewport.width_px as Coord, self.viewport.height_px as Coord);
-        self.set_zoom_and_relayout(ru, w * 0.5, h * 0.5);
+        let ru_before = self.viewport.ru;
+        self.viewport.set_zoom(ru);
+        self.window.mark_dirty();
+        let (w, h) = (self.viewport.width_px, self.viewport.height_px);
+        let factor = self.viewport.ru / ru_before;
+        self.with_context(|app, ctx| {
+            if factor != 1.0 {
+                app.on_zoom_set(factor, ctx);
+            }
+            app.on_resize(w, h, ctx)
+        });
     }
 
     /// Whether a pinch is under way (two fingers down and moving): a hook that writes a pinch's scale somewhere waits for its end.

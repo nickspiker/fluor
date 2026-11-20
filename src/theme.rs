@@ -557,7 +557,7 @@ pub fn look() -> Look {
     Look { text: w(0), label: w(1), field: w(2), field_hover: w(3), field_active: w(4), light_edge: w(5), shadow_edge: w(6), selection: w(7), button: w(8), button_hover: w(9), button_active: w(10), button_held: w(11), ground: w(12), accent: w(13), ring: w(14) }
 }
 
-/// Draw in `l` from the next paint on; a look equal to the one in effect changes nothing (so a host may set it every frame).
+/// Draw in `l` from the next paint on; a look equal to the one in effect changes nothing (so a host may set it every frame). For the UI thread (the host's loop or the app's frame): the words are stored one by one, so a second writer at once could mix two looks; a reader on another thread sees a whole look once it has seen the new generation.
 pub fn set_look(l: Look) {
     use core::sync::atomic::Ordering::Relaxed;
     if look() == l {
@@ -566,12 +566,13 @@ pub fn set_look(l: Look) {
     for (slot, v) in LOOK.iter().zip(look_words(&l)) {
         slot.store(v, Relaxed);
     }
-    LOOK_GENERATION.fetch_add(1, Relaxed);
+    // Release: a widget that reads this generation (Acquire) sees every colour of the look stored above, never part of the old one under the new generation.
+    LOOK_GENERATION.fetch_add(1, core::sync::atomic::Ordering::Release);
 }
 
 /// Moves each time the look changes: a widget that caches pixels drawn in it redraws them when this is not what it drew under.
 pub fn look_generation() -> u32 {
-    LOOK_GENERATION.load(core::sync::atomic::Ordering::Relaxed)
+    LOOK_GENERATION.load(core::sync::atomic::Ordering::Acquire)
 }
 
 // Cursor (blinkey).
