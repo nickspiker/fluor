@@ -1088,6 +1088,8 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
     // Contacts that entered on another window or a corner: not this app's until they leave (a bit per contact id).
     let mut foreign = 0u16;
     let (mut shown, mut touched, mut last_line) = (0u64, 0u64, sys::now());
+    // Whether the last show failed (a display that ended holding it): a second failure in a row ends the app.
+    let mut show_failed = false;
     // Where the frames of the last ten seconds went, in counter ticks: the draw (the app's tick and render), the present (the conversion into the surface), the show (op 22): sums and the longest, and how many frames.
     let (mut t_draw, mut t_present, mut t_show, mut t_max, mut n_frames) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let us = |ticks: u64| ticks * 1_000_000 / sys::freq();
@@ -1238,21 +1240,28 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             }
             let len = if own.is_some() { 36 } else { 28 };
             let mut rr = [0u8; 4];
+            // A show answered ERR once is a display that ended holding it (the kernel fails the calls a server that ended had taken): the frame is lost, and the app runs on. The next show waits for the display that comes after it, and the window's watch hears that one say the window is behind (ferros WINDOWS.md "A display started again"), so the app draws again only once it is brought to the front. Two in a row are no display behind the grant: the app ends, as before (2026-11-20: a display restarted under an app ended it, or left it hung).
             if sys::call(display, &m[..len], &mut rr) == sys::ERR {
-                return Err(String::from("the display refused the frame"));
-            }
-            let t_shown = sys::now();
-            if !shell.own {
-                shell.stages[shell.bucket].show += t_shown - t_presented;
-            }
-            t_draw += t_drawn - t;
-            t_present += t_presented - t_drawn;
-            t_show += t_shown - t_presented;
-            t_max = t_max.max(t_shown - t);
-            n_frames += 1;
-            shown += 1;
-            if shown == 1 {
-                println!("fluor: the first frame is on the panel");
+                if show_failed {
+                    return Err(String::from("the display refused the frame"));
+                }
+                show_failed = true;
+                println!("fluor: the display ended holding a frame; the next one goes to the display after it");
+            } else {
+                show_failed = false;
+                let t_shown = sys::now();
+                if !shell.own {
+                    shell.stages[shell.bucket].show += t_shown - t_presented;
+                }
+                t_draw += t_drawn - t;
+                t_present += t_presented - t_drawn;
+                t_show += t_shown - t_presented;
+                t_max = t_max.max(t_shown - t);
+                n_frames += 1;
+                shown += 1;
+                if shown == 1 {
+                    println!("fluor: the first frame is on the panel");
+                }
             }
         }
         // The keyboard (ferros WINDOWS.md "The keyboard"): a text field that gained focus asks the display for it, one that lost it lets it go (op 68). Asked after the frame's show, so a field focused on the first frame asks once the window is the app in front (the display gives the keyboard to that window alone); a wish made before any frame waits for the first.
