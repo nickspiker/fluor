@@ -68,6 +68,8 @@ pub struct Textbox<P: Pixel = Argb8> {
     pill_cache_origin_y: isize,
     /// `true` → pill squircle needs re-rasterize on the next render. Set by `set_rect` / `set_font_size`.
     pill_cache_dirty: bool,
+    /// The look generation the caches were drawn under ([`crate::theme::look_generation`]): a new look redraws them.
+    look_gen: u32,
     /// Pre-rasterized text glyphs in α + darkness. Bbox-sized (same dims as pill_cache). Glyph pixels are opaque; surrounding cells are α = 0 so under()-blits expose whatever's below (selection bg or pill bg).
     text_cache: Vec<P>,
     text_cache_w: usize,
@@ -236,6 +238,7 @@ impl<P: Pixel> Textbox<P> {
             pill_cache_origin_x: 0,
             pill_cache_origin_y: 0,
             pill_cache_dirty: true,
+            look_gen: crate::theme::look_generation(),
             text_cache: Vec::new(),
             text_cache_w: 0,
             text_cache_h: 0,
@@ -898,6 +901,13 @@ impl<P: Pixel> Textbox<P> {
         }
         let cw = pill_w as usize;
         let ch = pill_h as usize;
+        // A look changed since the caches were drawn (a platform theme set: the device's, as the person changed it): drawn again in it.
+        let look_gen = crate::theme::look_generation();
+        if look_gen != self.look_gen {
+            self.look_gen = look_gen;
+            self.pill_cache_dirty = true;
+            self.text_cache_dirty = true;
+        }
         let squirdleyness = paint::SHAPE_POWER;
         let stroke_px = (self.stroke_ru * self.font_size) as isize + 1;
 
@@ -927,7 +937,7 @@ impl<P: Pixel> Textbox<P> {
                         inner_y,
                         inner_w,
                         inner_h,
-                        theme::TEXTBOX_FILL,
+                        crate::theme::look().field,
                         paint::asymmetric_radii(pill_h as f32 * 0.5 - stroke_px as f32),
                         squirdleyness,
                     );
@@ -959,8 +969,8 @@ impl<P: Pixel> Textbox<P> {
                     0,
                     pill_w,
                     pill_h,
-                    theme::TEXTBOX_LIGHT_EDGE,
-                    theme::TEXTBOX_SHADOW_EDGE,
+                    crate::theme::look().light_edge,
+                    crate::theme::look().shadow_edge,
                     paint::asymmetric_radii(pill_h as f32 * 0.5),
                     squirdleyness,
                     None,
@@ -1054,7 +1064,7 @@ impl<P: Pixel> Textbox<P> {
 
             // Front-to-back: TOPMOST paints FIRST in fluor's model. Glyphs are visually topmost (the things you read), so they claim their cells before the selection bg paints into the surrounding empties. Anchor x is the LEFT edge of the visible substring (derived from cumulative widths up to first_padded), not the substring's centre — keeps the substring's first char locked to the same local x regardless of where the substring boundary falls during scroll.
             if let Some((ref text_str, anchor_x)) = s {
-                text.draw_text_left(&mut text_canvas, text_str, anchor_x, local_y_center, &TextStyle::new(self.font_size, theme::TEXTBOX_TEXT).font(self.font), None, Some(&mask_buffer));
+                text.draw_text_left(&mut text_canvas, text_str, anchor_x, local_y_center, &TextStyle::new(self.font_size, crate::theme::look().text).font(self.font), None, Some(&mask_buffer));
             }
 
             // Selection background (painted AFTER text so it goes UNDER glyphs via under()'s opaque-top early-out — glyph cells stay glyph colour, non-glyph cells inside the selection range get the selection bg). Same mask as text → selection ends fade along the same squircle curve.
@@ -1065,7 +1075,7 @@ impl<P: Pixel> Textbox<P> {
                     sy,
                     sw,
                     sh,
-                    theme::TEXTBOX_SELECTION_BG,
+                    crate::theme::look().selection,
                     None,
                     Some(&mask_buffer),
                 );
@@ -1346,13 +1356,13 @@ mod widget_impls {
             // Three states per the docstring contract on `render_content_into`: * focused → land at `TEXTBOX_ACTIVE` (pure black interior — strongest contrast for the typing field, primary signal for keyboard-only users) * hovered (not focused) → land at `TEXTBOX_HOVER` * neither → no tint Focus dominates hover so a focused-and-hovered textbox stays at ACTIVE rather than flipping to HOVER while the cursor passes over.
             if self.is_focused() {
                 crate::paint::wrap_sub_rgb(
-                    crate::theme::TEXTBOX_ACTIVE,
-                    crate::theme::TEXTBOX_FILL,
+                    crate::theme::look().field_active,
+                    crate::theme::look().field,
                 )
             } else if self.is_hovered() {
                 crate::paint::wrap_sub_rgb(
-                    crate::theme::TEXTBOX_HOVER,
-                    crate::theme::TEXTBOX_FILL,
+                    crate::theme::look().field_hover,
+                    crate::theme::look().field,
                 )
             } else {
                 0

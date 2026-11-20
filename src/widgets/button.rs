@@ -67,6 +67,8 @@ pub struct Button<P: Pixel = Argb8> {
     pill_cache_w: usize,
     pill_cache_h: usize,
     pill_cache_dirty: bool,
+    /// The look generation the caches were drawn under ([`crate::theme::look_generation`]): a new look redraws them.
+    look_gen: u32,
     text_cache: Vec<P>,
     text_cache_w: usize,
     text_cache_h: usize,
@@ -133,6 +135,7 @@ impl<P: Pixel> Button<P> {
             pill_cache_w: 0,
             pill_cache_h: 0,
             pill_cache_dirty: true,
+            look_gen: crate::theme::look_generation(),
             text_cache: Vec::new(),
             text_cache_w: 0,
             text_cache_h: 0,
@@ -197,18 +200,18 @@ impl<P: Pixel> Button<P> {
     /// The pill fill for the button's CURRENT state, precedence pressed → focused → hovered → idle.
     /// Each state prefers its explicit override; an unset override on a *custom-idle* button derives from the idle fill (so a coloured button gets a matching ramp), while a default button (no idle override) falls back to the exact `theme::BUTTON_*` constants — pixel-identical to today.
     fn effective_fill(&self) -> u32 {
-        let idle = self.fill.unwrap_or(theme::BUTTON_FILL);
+        let idle = self.fill.unwrap_or(crate::theme::look().button);
         if self.pressed {
             self.held_fill.unwrap_or_else(|| match self.fill {
                 Some(_) => crate::paint::scale_brightness(idle, Self::HELD_FACTOR.0, Self::HELD_FACTOR.1),
-                None => theme::BUTTON_HELD,
+                None => crate::theme::look().button_held,
             })
         } else if self.focused {
-            theme::BUTTON_ACTIVE
+            crate::theme::look().button_active
         } else if self.hovered {
             self.hover_fill.unwrap_or_else(|| match self.fill {
                 Some(_) => crate::paint::scale_brightness(idle, Self::HOVER_FACTOR.0, Self::HOVER_FACTOR.1),
-                None => theme::BUTTON_HOVER,
+                None => crate::theme::look().button_hover,
             })
         } else {
             idle
@@ -408,6 +411,13 @@ impl<P: Pixel> Button<P> {
         }
         let cw = pill_w as usize;
         let ch = pill_h as usize;
+        // A look changed since the caches were drawn (a platform theme set: the device's, as the person changed it): drawn again in it.
+        let look_gen = crate::theme::look_generation();
+        if look_gen != self.look_gen {
+            self.look_gen = look_gen;
+            self.pill_cache_dirty = true;
+            self.text_cache_dirty = true;
+        }
         // Fractional squirdleyness — slots between an ellipse (2) and a diamond (1). `1.5` reads as a noticeably-rounder, slightly-faceted pill: distinctly more curved than the textbox's `3.0` "slightly squared" but not as soft as a full ellipse. Routes thru paint's `_f` (powf) variant; the textbox / chrome keep the integer (powi) fast path. Adjustable per-instance via this constant; future API could expose it as a Button field if more shapes are desired.
         let squirdleyness = if self.round { 2. } else { paint::SHAPE_POWER as f32 };
         // The corners at a radius: the house split (TL+BR deep, TR+BL half), or every corner at it for a circle.
@@ -420,7 +430,7 @@ impl<P: Pixel> Button<P> {
         let pill_fill = if self.bake_states {
             self.effective_fill()
         } else {
-            self.fill.unwrap_or(theme::BUTTON_FILL)
+            self.fill.unwrap_or(crate::theme::look().button)
         };
         if self.bake_states && self.last_baked_fill != Some(pill_fill) {
             self.pill_cache_dirty = true;
@@ -471,8 +481,8 @@ impl<P: Pixel> Button<P> {
                     0,
                     pill_w,
                     pill_h,
-                    theme::TEXTBOX_LIGHT_EDGE,
-                    theme::TEXTBOX_SHADOW_EDGE,
+                    crate::theme::look().light_edge,
+                    crate::theme::look().shadow_edge,
                     radii(pill_h as f32 * 0.5),
                     squirdleyness,
                     None,
@@ -499,7 +509,7 @@ impl<P: Pixel> Button<P> {
                     crate::canvas::Canvas::new(&mut self.text_cache, cw, ch, &mut text_damage);
                 let mask_buffer = paint::AlphaMask::new(&self.inner_pill_mask, cw, ch);
                 // Disabled buttons dim their label to the secondary grey (inert, still legible) — the hand-rolled pills did this and callers expect it.
-                let label_colour = if self.enabled { theme::TEXTBOX_TEXT } else { theme::LABEL_COLOUR };
+                let label_colour = if self.enabled { crate::theme::look().text } else { crate::theme::look().label };
                 text.draw_text_left(&mut text_canvas, &self.label, local_text_left, local_y_center, &TextStyle::new(self.font_size, label_colour).font(self.font), None, Some(&mask_buffer));
             }
             self.text_cache_dirty = false;
@@ -613,17 +623,17 @@ impl<P: Pixel> Button<P> {
         if rect.w <= 0.0 || rect.h <= 0.0 {
             return;
         }
-        let idle = fill.map(|f| f.0).unwrap_or(theme::BUTTON_FILL);
+        let idle = fill.map(|f| f.0).unwrap_or(crate::theme::look().button);
         // State fill — same precedence and factors as effective_fill (no focus for immediate pills). Only an enabled pill lights up; a disabled one stays at idle.
         let state_fill = if pressed && enabled {
             fill.map(|f| f.1).unwrap_or_else(|| match fill {
                 Some(_) => paint::scale_brightness(idle, Self::HELD_FACTOR.0, Self::HELD_FACTOR.1),
-                None => theme::BUTTON_HELD,
+                None => crate::theme::look().button_held,
             })
         } else if hovered && enabled {
             match fill {
                 Some(_) => paint::scale_brightness(idle, Self::HOVER_FACTOR.0, Self::HOVER_FACTOR.1),
-                None => theme::BUTTON_HOVER,
+                None => crate::theme::look().button_hover,
             }
         } else {
             idle
@@ -651,9 +661,9 @@ impl<P: Pixel> Button<P> {
         let stroke = (font_size * (1.0 / (1u32 << 5) as f32)) as isize + 1;
         // Disabled dims the label to the secondary grey (inert, still legible) — same fill and edges, so the pill reads "present but inert" rather than vanished. Matches a retained Button's disabled label.
         let label_colour = if enabled {
-            theme::TEXTBOX_TEXT
+            crate::theme::look().text
         } else {
-            theme::LABEL_COLOUR
+            crate::theme::look().label
         };
         // THE HIT CLAIM RIDES THE PAINT (photon 2026-10-01; the owner 2026-11-17: "if it's showing on screen, it NEEDS to be hitting the hitmap, if it's already opaque and won't show? SKIP!").
         // The α over the pill before the label and the pill go in, compared after: the pill claims its declared shape, its silhouette, which is exactly what it draws (fill and two-tone rim, the label inside it), so the pixels it showed on are that shape; none already opaque before it (the chrome's strip or orb, flattened first), none outside its silhouette, and none something in front claimed.
@@ -697,8 +707,8 @@ impl<P: Pixel> Button<P> {
             y0,
             w,
             h,
-            theme::TEXTBOX_LIGHT_EDGE,
-            theme::TEXTBOX_SHADOW_EDGE,
+            crate::theme::look().light_edge,
+            crate::theme::look().shadow_edge,
             paint::asymmetric_radii(h as f32 * 0.5),
             paint::SHAPE_POWER as f32,
             None,
@@ -830,7 +840,7 @@ mod widget_impls {
             }
             // Otherwise the pill baked its RESTING fill and the host overlay wrap-adds this delta on the hovered/pressed pixels. `effective_fill()` picks the state colour (held > focused > hover >
             // idle) honouring per-instance overrides + the derived ramp; the delta carries it there off the resting fill, so `idle` yields a zero delta (no tint).
-            let idle = self.fill.unwrap_or(crate::theme::BUTTON_FILL);
+            let idle = self.fill.unwrap_or(crate::theme::look().button);
             crate::paint::wrap_sub_rgb(self.effective_fill(), idle)
         }
         fn hover_bbox(

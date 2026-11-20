@@ -507,6 +507,22 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         self.window.mark_dirty();
     }
 
+    /// The RU multiplier in effect: what the app started at, times any pinch since.
+    pub fn zoom(&self) -> Coord {
+        self.viewport.ru
+    }
+
+    /// The RU multiplier set from outside the app (an input hook following the person's app scale, ferros preference 14), the layout run again about the frame's centre exactly as a pinch's step runs it.
+    pub fn set_zoom(&mut self, ru: Coord) {
+        let (w, h) = (self.viewport.width_px as Coord, self.viewport.height_px as Coord);
+        self.set_zoom_and_relayout(ru, w * 0.5, h * 0.5);
+    }
+
+    /// Whether a pinch is under way (two fingers down and moving): a hook that writes a pinch's scale somewhere waits for its end.
+    pub fn pinching(&self) -> bool {
+        self.pinch_scaled
+    }
+
     /// What the background threads sent since the last frame, delivered; a zoom the app asked for applied; the app ticked.
     fn take_events(&mut self) {
         let events: Vec<A::UserEvent> = core::mem::take(&mut *self.wake.queue.lock().unwrap());

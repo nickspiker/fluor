@@ -6,7 +6,6 @@ use crate::paint::{self, Clip, HitId};
 use crate::region::Region;
 use crate::text::{TextRenderer, TextStyle};
 use crate::pixel::Pixel;
-use crate::theme;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -246,9 +245,9 @@ impl List {
             Some(c) => Clip::new(c.x_start.max(cx0), c.y_start.max(cy0), c.x_end.min(cx1), c.y_end.min(cy1)),
             None => Clip::new(cx0, cy0, cx1, cy1),
         });
-        let title = TextStyle::new(font, theme::TEXTBOX_TEXT);
-        let dimmed = TextStyle::new(font, theme::LABEL_COLOUR);
-        let small = TextStyle::new(font * 0.8, theme::LABEL_COLOUR);
+        let title = TextStyle::new(font, crate::theme::look().text);
+        let dimmed = TextStyle::new(font, crate::theme::look().label);
+        let small = TextStyle::new(font * 0.8, crate::theme::look().label);
         let indent = font * 1.2;
         // The hits ride the paint: where the α stood before the rows went in (everything they draw stays inside the rect, the clip above).
         if hit_map.is_some() {
@@ -295,7 +294,7 @@ impl List {
                 }
                 // The picked row's band under its text.
                 if self.selected == Some(i) {
-                    paint::fill_rect(canvas, self.x as isize, top as isize, self.width as isize, h as isize, theme::BUTTON_ACTIVE, clip, None);
+                    paint::fill_rect(canvas, self.x as isize, top as isize, self.width as isize, h as isize, crate::theme::look().button_active, clip, None);
                 }
             }
             top += h;
@@ -322,16 +321,16 @@ impl List {
             let cx = x0 + side * 0.5;
             // A bare line stroke with no fill behind it keeps a pixel so it does not vanish sub-pixel.
             let seg = (side / 15.0).max(1.0);
-            paint::draw_rect_rotated(canvas, cx - side * 0.14, mid + side * 0.14, side * 0.32, seg, core::f32::consts::FRAC_PI_4, theme::TEXTBOX_TEXT, clip);
-            paint::draw_rect_rotated(canvas, cx + side * 0.06, mid - side * 0.02, side * 0.5, seg, -core::f32::consts::FRAC_PI_4, theme::TEXTBOX_TEXT, clip);
+            paint::draw_rect_rotated(canvas, cx - side * 0.14, mid + side * 0.14, side * 0.32, seg, core::f32::consts::FRAC_PI_4, crate::theme::look().text, clip);
+            paint::draw_rect_rotated(canvas, cx + side * 0.06, mid - side * 0.02, side * 0.5, seg, -core::f32::consts::FRAC_PI_4, crate::theme::look().text, clip);
         }
-        let fill = if on { theme::BUTTON_FILL } else { theme::TEXTBOX_FILL };
+        let fill = if on { crate::theme::look().button } else { crate::theme::look().field };
         let inner = side as isize - 2 * stroke;
         let big = side * 0.32;
         if inner > 0 {
             paint::draw_squircle_rrect_f(canvas, x0 as isize + stroke, y0 as isize + stroke, inner, inner, fill, paint::asymmetric_radii(big - stroke as f32), paint::SHAPE_POWER as f32);
         }
-        paint::draw_squircle_rrect_two_tone_f(canvas, x0 as isize, y0 as isize, side as isize, side as isize, theme::TEXTBOX_SHADOW_EDGE, theme::TEXTBOX_LIGHT_EDGE, paint::asymmetric_radii(big), paint::SHAPE_POWER as f32, None, 0);
+        paint::draw_squircle_rrect_two_tone_f(canvas, x0 as isize, y0 as isize, side as isize, side as isize, crate::theme::look().shadow_edge, crate::theme::look().light_edge, paint::asymmetric_radii(big), paint::SHAPE_POWER as f32, None, 0);
     }
 }
 

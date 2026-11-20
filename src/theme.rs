@@ -477,6 +477,103 @@ pub const BUTTON_ACTIVE: u32 = dark(fmt(vsf(0x00_0C_10_31)));
 // Held: a finger/button is DOWN on this control and a release here will fire it (press-hold-release — see host::pointer). A brighter, more-saturated azure than HOVER so touch-down visibly LIGHTS UP the control (distinct from ACTIVE's darker "pressed-in" focus reading); slides back to FILL if the pointer drags off before release. Also the fill used for photon's non-widget stamped elements (pills, contact/nav rows, orb) while held.
 pub const BUTTON_HELD: u32 = dark(fmt(vsf(0x00_3B_4A_93)));
 
+/// The colours the widgets draw in (button, textbox, list), as the buffer stores them: fluor's own palette above by default ([`DEFAULT_LOOK`]), or a platform's own theme when the app or its host sets one ([`set_look`]: ferros's device theme, the person's preference 5, so a kist matches the deck's look; a desktop's theme later).
+/// A process-wide value read at every paint, so a theme changed while the app runs shows at its next frame; each change moves [`look_generation`], which the widgets' cached pills watch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Look {
+    /// Words on a control or a row; words greyed or secondary.
+    pub text: u32,
+    pub label: u32,
+    /// A textbox's fill at rest, hovered, and while it has the keyboard.
+    pub field: u32,
+    pub field_hover: u32,
+    pub field_active: u32,
+    /// The two-tone edge round every control, lit from the top left.
+    pub light_edge: u32,
+    pub shadow_edge: u32,
+    pub selection: u32,
+    /// A button's fill at rest, hovered, pressed in (focus), and held under a finger (a list's picked row is `button_active`).
+    pub button: u32,
+    pub button_hover: u32,
+    pub button_active: u32,
+    pub button_held: u32,
+    /// What an app stands its page on (opaque), the colour it marks what is live or armed with, and the ring of a circle at rest: for the app's own drawing beside the widgets'.
+    pub ground: u32,
+    pub accent: u32,
+    pub ring: u32,
+}
+
+/// fluor's own palette, the look every app has unless it sets another.
+pub const DEFAULT_LOOK: Look = Look {
+    text: TEXTBOX_TEXT,
+    label: LABEL_COLOUR,
+    field: TEXTBOX_FILL,
+    field_hover: TEXTBOX_HOVER,
+    field_active: TEXTBOX_ACTIVE,
+    light_edge: TEXTBOX_LIGHT_EDGE,
+    shadow_edge: TEXTBOX_SHADOW_EDGE,
+    selection: TEXTBOX_SELECTION_BG,
+    button: BUTTON_FILL,
+    button_hover: BUTTON_HOVER,
+    button_active: BUTTON_ACTIVE,
+    button_held: BUTTON_HELD,
+    ground: dark(fmt(vsf(0x00_0C_14_0E))),
+    accent: BUTTON_HELD,
+    ring: TEXTBOX_LIGHT_EDGE,
+};
+
+/// The look as words: one atomic a colour (no lock, no_std), in [`Look`]'s field order, and the generation after them.
+static LOOK: [core::sync::atomic::AtomicU32; 15] = {
+    use core::sync::atomic::AtomicU32;
+    let l = DEFAULT_LOOK;
+    [
+        AtomicU32::new(l.text),
+        AtomicU32::new(l.label),
+        AtomicU32::new(l.field),
+        AtomicU32::new(l.field_hover),
+        AtomicU32::new(l.field_active),
+        AtomicU32::new(l.light_edge),
+        AtomicU32::new(l.shadow_edge),
+        AtomicU32::new(l.selection),
+        AtomicU32::new(l.button),
+        AtomicU32::new(l.button_hover),
+        AtomicU32::new(l.button_active),
+        AtomicU32::new(l.button_held),
+        AtomicU32::new(l.ground),
+        AtomicU32::new(l.accent),
+        AtomicU32::new(l.ring),
+    ]
+};
+static LOOK_GENERATION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn look_words(l: &Look) -> [u32; 15] {
+    [l.text, l.label, l.field, l.field_hover, l.field_active, l.light_edge, l.shadow_edge, l.selection, l.button, l.button_hover, l.button_active, l.button_held, l.ground, l.accent, l.ring]
+}
+
+/// The look the widgets draw in now.
+pub fn look() -> Look {
+    use core::sync::atomic::Ordering::Relaxed;
+    let w = |i: usize| LOOK[i].load(Relaxed);
+    Look { text: w(0), label: w(1), field: w(2), field_hover: w(3), field_active: w(4), light_edge: w(5), shadow_edge: w(6), selection: w(7), button: w(8), button_hover: w(9), button_active: w(10), button_held: w(11), ground: w(12), accent: w(13), ring: w(14) }
+}
+
+/// Draw in `l` from the next paint on; a look equal to the one in effect changes nothing (so a host may set it every frame).
+pub fn set_look(l: Look) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if look() == l {
+        return;
+    }
+    for (slot, v) in LOOK.iter().zip(look_words(&l)) {
+        slot.store(v, Relaxed);
+    }
+    LOOK_GENERATION.fetch_add(1, Relaxed);
+}
+
+/// Moves each time the look changes: a widget that caches pixels drawn in it redraws them when this is not what it drew under.
+pub fn look_generation() -> u32 {
+    LOOK_GENERATION.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 // Cursor (blinkey).
 pub const CURSOR_BRIGHTNESS: f32 = 100.0;
 
