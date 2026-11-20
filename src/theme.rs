@@ -557,7 +557,8 @@ pub fn look() -> Look {
     Look { text: w(0), label: w(1), field: w(2), field_hover: w(3), field_active: w(4), light_edge: w(5), shadow_edge: w(6), selection: w(7), button: w(8), button_hover: w(9), button_active: w(10), button_held: w(11), ground: w(12), accent: w(13), ring: w(14) }
 }
 
-/// Draw in `l` from the next paint on; a look equal to the one in effect changes nothing (so a host may set it every frame). For the UI thread (the host's loop or the app's frame): the words are stored one by one, so a second writer at once could mix two looks; a reader on another thread sees a whole look once it has seen the new generation.
+/// Draw in `l` from the next paint on; a look equal to the one in effect changes nothing (so a host may set it every frame).
+/// For the UI thread (the host's loop or the app's frame): the words are stored one by one, so a second writer at once could mix two looks; a reader on another thread sees a whole look once it has seen the new generation.
 pub fn set_look(l: Look) {
     use core::sync::atomic::Ordering::Relaxed;
     if look() == l {

@@ -711,7 +711,9 @@ pub trait FluorApp<P: crate::pixel::Pixel = crate::pixel::Argb8> {
         let _ = (factor, anchor_x, anchor_y, ctx);
     }
 
-    /// The `ru` was SET from outside the app (a platform's scale preference changed: ferros's app scale, preference 14, followed by the ferros host's `FerrosShell::set_zoom`): no gesture, so nothing is under a finger and no point need hold still. `factor` = new `ru` ÷ old `ru`; fires before the `on_resize` that carries it. Default: as a pinch step about the frame's centre ([`Self::on_zoom`]), so an app that never heard of it behaves as before; an app whose panes rest where they are (photon) relayouts them at rest instead.
+    /// The `ru` was SET from outside the app (a platform's scale preference changed: ferros's app scale, preference 14, followed by the ferros host's `FerrosShell::set_zoom`): no gesture, so nothing is under a finger and no point need hold still.
+    /// `factor` = new `ru` ÷ old `ru`; fires before the `on_resize` that carries it.
+    /// Default: as a pinch step about the frame's centre ([`Self::on_zoom`]), so an app that never heard of it behaves as before; an app whose panes rest where they are (photon) relayouts them at rest instead.
     fn on_zoom_set(&mut self, factor: f32, ctx: &mut Context) {
         let (w, h) = (ctx.viewport.width_px as Coord, ctx.viewport.height_px as Coord);
         self.on_zoom(factor, w * 0.5, h * 0.5, ctx);
