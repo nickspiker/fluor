@@ -214,9 +214,12 @@ struct BellState {
     safe: Option<SafeArea>,
     /// The display's bake changed since the last take (`EV_BAKE`).
     bake: bool,
-    /// A show failed: the display that took it ended (the kernel fails the calls a server that ended had taken). Set by the frame loop, cleared by the watch's next answer, which comes from the display after it (ferros WINDOWS.md "A display started again"); meanwhile the window is held behind. Not taken: it stands until a display answers.
+    /// A show failed: the display that took it ended (the kernel fails the calls a server that ended had taken).
+    /// Set by the frame loop, cleared by the watch's next answer, which comes from the display after it (ferros WINDOWS.md "A display started again"); meanwhile the window is held behind.
+    /// Not taken: it stands until a display answers.
     lost: bool,
-    /// The watch has ended (`watch`): no display answers this window any more (two failed calls in a row, or a display without op 62), or there never was a watch. A lost display is then gone for good.
+    /// The watch has ended (`watch`): no display answers this window any more (two failed calls in a row, or a display without op 62), or there never was a watch.
+    /// A lost display is then gone for good.
     gone: bool,
     rung: bool,
 }
@@ -1261,7 +1264,8 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             }
             let len = if own.is_some() { 36 } else { 28 };
             let mut rr = [0u8; 4];
-            // A show answered ERR is a display that ended holding it (the kernel fails the calls a server that ended had taken): the frame is lost and the app runs on, its window held behind (`lost`) until the watch hears the display after it, which says where the window stands there (ferros WINDOWS.md "A display started again": behind, until the deck brings it to the front). The app ends only when the watch has ended too (`gone`: no display answers any more), never by counting failures (2026-11-20: a display restarted under an app ended it).
+            // A show answered ERR is a display that ended holding it (the kernel fails the calls a server that ended had taken): the frame is lost and the app runs on, its window held behind (`lost`) until the watch hears the display after it, which says where the window stands there (ferros WINDOWS.md "A display started again": behind, until the deck brings it to the front).
+            // The app ends only when the watch has ended too (`gone`: no display answers any more), never by counting failures (2026-11-20: a display restarted under an app ended it).
             // The display after it starts in tens of milliseconds at least, so this is set long before its first answer, which clears it.
             if sys::call(display, &m[..len], &mut rr) == sys::ERR {
                 println!("fluor: the display ended holding a frame; held behind until a display answers again");
