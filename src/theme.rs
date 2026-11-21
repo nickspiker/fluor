@@ -387,6 +387,7 @@ const fn dark_rgb_only(trgb: u32) -> u32 {
 }
 
 // Background texture (organic noise, scrollable). Three NOISE-MATH constants: an additive BASE colour, and two bit-MASKS the noise function ANDs random bits into (`rng & BG_MASK`, `>>8 & BG_SPECKLE`) — the masks carve variance into the channels, they are NOT colours, so a colour-space matrix on them is meaningless and they stay as-authored. Only BG_BASE is a real colour.
+// The noise (paint/noise.rs) walks at 16 bits: each mask byte becomes its lane's top byte over a low byte of ones, and the base byte its lane's top byte, so the walk wraps at the same codes with 2⁸ steps inside each.
 // COLOUR DOCTRINE: every literal in this file is AUTHORED VSF RGB `g2t` (diffuse white = 0xC2) and goes thru [`vsf`] — a compile-time bake (identity on macOS's ICC-tagged surface, the γ2/matrix/γ2 conversion everywhere else), so the noise still never takes a runtime matrix and each platform gets the right buffer value instead of one shared compromise.
 // The noise function does its math then flips the result to stored darkness at the store site (`result ^ 0x00FFFFFF`) — so these are NOT wrapped with `dark()`.
 #[cfg(not(feature = "amber"))]

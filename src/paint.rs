@@ -6,7 +6,6 @@
 //!
 //! Every blending primitive accepts an optional [`Clip`] (defaults to full buffer when `None`) and an optional [`AlphaMask`] (full-frame, multiplies into per-pixel alpha for soft clipping — rounded textboxes, squircle pane corners, scroll fades). The clip is resolved once at entry into `(x_min, y_min, x_max, y_max)` loop bounds, so the inner loops carry **zero per-pixel bounds checks** — the math at the entry is the proof. AlphaMask dimensions must equal the buffer's `(buf_w, buf_h)`; mismatches panic per AGENT.md "fail loud."
 
-use alloc::vec::Vec;
 use crate::canvas::Canvas;
 #[cfg(feature = "text")]
 use crate::text::TextStyle;
@@ -16,6 +15,7 @@ use crate::coord::Coord;
 pub mod argb8;
 pub mod finalize;
 pub mod glow;
+pub mod noise;
 pub mod ring;
 pub mod shadow;
 pub mod edge;
@@ -25,6 +25,7 @@ pub use argb8::*;
 pub use edge::*;
 pub use finalize::*;
 pub use glow::*;
+pub use noise::*;
 pub use shadow::*;
 pub use shape::*;
 pub use squircle::*;
@@ -465,7 +466,7 @@ pub fn flatten_premult_mode<P: Pixel>(dst: &mut [P], src: &[P], mode: BlendMode)
 }
 
 pub use crate::pixel::BlendMode;
-use crate::pixel::{Argb8, G2t16, Pixel};
+use crate::pixel::Pixel;
 
 /// Flatten `src` underneath `dst` across the whole slice, pixel-by-pixel, via [`Blend::under`](crate::pixel::Blend::under). `dst` is the partial composite already accumulated above (its α-byte = accumulated opacity); `src` is the new layer going behind. Per-pixel early-out fires when `dst.α == 0xFF`. Both slices must be the same length (a shorter `src` panics: a size mismatch is a bug upstream, never something to paper over).
 ///
@@ -619,349 +620,6 @@ pub fn stroke_rect<P: Pixel>(
     // Damage accumulates via the four fill_rect calls, each reporting its own clipped bbox.
     for &(ex, ey, ew, eh) in &edges {
         fill_rect(canvas, ex, ey, ew, eh, colour, clip, mask);
-    }
-}
-
-/// Fill the buffer with photon's signature procedural background — symmetric organic noise. Rows are RNG-independent (each row reseeds from `logical_row`), so the outer loop parallelizes cleanly via [`crate::par::par_rows`]. Mirrored left/right halves like photon. Set `fullscreen=true` to fill the whole buffer; `false` leaves a 1px border for the window edge stroke. `shimmer` is mixed into each row's starting colour so animating it cycles the colour bias across rows without changing the noise topology; `scroll_offset` shifts the texture vertically (for content scroll integration). The speckle gate (the rare bright/dim flash branch inside each row) fires at a constant 1/256 rate independent of `shimmer`.
-///
-/// SIMD inside a row is intentionally not done — the per-pixel RNG (`rng ^= rng.rotate_left(13).wrapping_add(const)`) is a serial dependency chain; vectorizing it would require N independent RNG streams per lane and would change photon's visual pattern. If profiling shows the per-row scalar work still dominating after Rayon, that's the next lever.
-///
-/// Clip restricts the row range. Mask isn't supported here (background is bg — masking it would mean "draw nothing where mask is zero" which is the same as just clearing afterward; if you need that, do it explicitly).
-pub fn background_noise<P: Pixel>(
-    canvas: &mut Canvas<P>,
-    shimmer: usize,
-    fullscreen: bool,
-    scroll_offset: isize,
-    clip: Option<Clip>,
-    base: Option<u32>,
-) {
-    background_noise_split(canvas, shimmer, fullscreen, scroll_offset, None, None, clip, base)
-}
-
-/// [`background_noise`] with an explicit texture ORIGIN and independent per-half scroll.
-/// The noise mirrors left/right around `split_x` (the "texture origin"); `None` = the buffer centre `width/2` (what plain [`background_noise`] uses).
-/// `left_scroll = None` scrolls both halves together by `scroll_offset` (the chat / single-pane case); `Some(v)` scrolls the LEFT half by `v` while the right half keeps `scroll_offset` — so a split pane (e.g. the settings rail vs content) scrolls each half with its own pane, with the origin sitting on the divider between them.
-#[allow(clippy::too_many_arguments)]
-pub fn background_noise_split<P: Pixel>(
-    canvas: &mut Canvas<P>,
-    shimmer: usize,
-    fullscreen: bool,
-    scroll_offset: isize,
-    split_x: Option<usize>,
-    left_scroll: Option<isize>,
-    clip: Option<Clip>,
-    base: Option<u32>,
-) {
-    let buf_w = canvas.width;
-    let buf_h = canvas.height;
-    if buf_w < 2 || buf_h < 2 {
-        return;
-    }
-    // Texture origin: the left/right mirror axis + each half's inner edge. Default = buffer centre; `background_row` clamps it into the paint range.
-    let split_x = split_x.unwrap_or(buf_w / 2);
-    // Right half keeps `scroll_offset`; the left half tracks its own pane when given, else moves with the right (a single unified scroll → the two halves stay mirror-locked).
-    let left_scroll = left_scroll.unwrap_or(scroll_offset);
-    let clip = Clip::resolve(clip, buf_w, buf_h);
-    // Clip first, then `fullscreen` further insets by 1 px for the edge hairline.
-    let (row_start, row_end, x_start, x_end) = if fullscreen {
-        (clip.y_start, clip.y_end, clip.x_start, clip.x_end)
-    } else {
-        // The 1 px inset crosses itself on a clip under 3 px tall or wide (and would underflow at 0), so it runs signed and an empty result returns here.
-        let (ys, ye) = (clip.y_start as isize + 1, clip.y_end as isize - 1);
-        let (xs, xe) = (clip.x_start as isize + 1, clip.x_end as isize - 1);
-        if ys >= ye || xs >= xe {
-            return;
-        }
-        (ys as usize, ye as usize, xs as usize, xe as usize)
-    };
-    if row_start >= row_end || x_start >= x_end {
-        return;
-    }
-    canvas.damage.add_bounds(x_start, row_start, x_end, row_end);
-    let pixels: &mut [P] = canvas.pixels;
-    let resolved_base = base.unwrap_or(crate::theme::BG_BASE);
-    crate::par::par_rows(pixels, buf_w, row_start, row_end, |row_idx, row_pixels| {
-        background_row(
-            row_pixels,
-            buf_w,
-            row_idx as isize,
-            buf_h,
-            x_start,
-            x_end,
-            split_x,
-            left_scroll,
-            scroll_offset,
-            shimmer,
-            resolved_base,
-        );
-    });
-}
-
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn background_row<P: Pixel>(
-    row_pixels: &mut [P],
-    _width: usize,
-    row: isize,
-    height: usize,
-    x_start: usize,
-    x_end: usize,
-    split_x: usize,
-    left_scroll: isize,
-    right_scroll: isize,
-    shimmer: usize,
-    base: u32,
-) {
-    use crate::theme::{BG_MASK, BG_SPECKLE};
-    // Noise math runs in visible-RGB space (matching photon's reference), on the 8-bit authored palette (BG_BASE, BG_MASK, BG_SPECKLE are bytes). At the store site we flip the visible result to stored darkness via XOR, then OR α=0xFF for opaque, and widen the 8-bit pixel to the canvas's depth. Mask off the top byte first to strip any carry from `wrapping_add`.
-    const VISIBLE_TO_DARK_FLIP: u32 = Argb8::RGB_MASK;
-    const RGB_MASK: u32 = Argb8::RGB_MASK;
-    const OPAQUE_ALPHA: u32 = Argb8::OPAQUE;
-    // Hybrid 2-pass: pass 1 fills `noise_buf` with the row's chunk of noise values via the serial RNG/colour chain (branches stay scalar — predicating the speckle gate would cost as much as it saves). Pass 2 hands the chunk to the depth's under-blend chunk kernel (`Pixel::under_chunk_normal`, 8-wide SIMD for Argb8), which composites it into row_pixels at ~1 cycle/pixel amortized. Output is bit-identical to the old straight-scalar version.
-    const CHUNK: usize = 64;
-    let mut noise_buf = [P::EMPTY; CHUNK];
-    let ones = 0x0001_0101u32;
-    // RNG chain is explicitly u64 (not usize) so the noise pattern is bit-identical on 32-bit targets (wasm32 browser renderer) and 64-bit desktops — same seed, same wrap points.
-    // Each half's seed is keyed by its OWN scrolled row, so equal scroll → identical seed → the two halves stay mirror-locked (the chat case); different scroll → each half's texture tracks its pane (the split settings case).
-    let seed_for = |logical_row: isize| -> u64 {
-        0xDEAD_BEEF_0123_4567u64
-            ^ (logical_row as i64 as u64)
-                .wrapping_sub(height as u64 / 2)
-                .wrapping_mul(0x9E37_79B9_4517_B397)
-    };
-    // The mirror axis: both halves grow outward from here, clamped into the paint range.
-    // WHY/PROOF: split_x is the app's pane split, which the damage clip can leave outside [x_start, x_end) — the halves would index the row outside the paint range.
-    let origin = split_x.clamp(x_start, x_end);
-
-    // Right half — origin to right edge, ADD step, scrolled by `right_scroll`. Noise composes UNDER existing content (topmost-first): an empty pixel gets the noise; a non-empty pixel (e.g. a topmost rect already painted) has the noise blended behind it.
-    let mut rng = seed_for(row - right_scroll);
-    let mut colour = rng.wrapping_add(shimmer as u64) as u32 & BG_MASK;
-    let mut x = origin;
-    while x < x_end {
-        let chunk_len = (x_end - x).min(CHUNK);
-        for i in 0..chunk_len {
-            rng ^= rng.rotate_left(13).wrapping_add(12_345_678_942);
-            let adder = rng as u32 & ones;
-            if rng < u64::MAX / 256 {
-                colour = (rng as u32 >> 8) & BG_SPECKLE;
-            } else {
-                colour = colour.wrapping_add(adder) & BG_MASK;
-                let subtractor = (rng >> 5) as u32 & ones;
-                colour = colour.wrapping_sub(subtractor) & BG_MASK;
-            }
-            noise_buf[i] =
-                P::from_g2t8(((colour.wrapping_add(base) & RGB_MASK) ^ VISIBLE_TO_DARK_FLIP) | OPAQUE_ALPHA);
-        }
-        P::under_chunk_normal(&mut row_pixels[x..x + chunk_len], &noise_buf[..chunk_len]);
-        x += chunk_len;
-    }
-
-    // Left half — origin leftward, SUB instead of ADD on the rng step, scrolled by `left_scroll` (its own seed). Within each chunk the RNG iterates rightmost-pixel-first; we store into `noise_buf` in left-to-right order (`i = chunk_len-1` down to 0) so the chunk dispatch can scan the buffer sequentially.
-    rng = seed_for(row - left_scroll);
-    let mut colour = rng.wrapping_add(shimmer as u64) as u32 & BG_MASK;
-    let mut x_hi = origin;
-    while x_hi > x_start {
-        let chunk_len = (x_hi - x_start).min(CHUNK);
-        let chunk_lo = x_hi - chunk_len;
-        for i in (0..chunk_len).rev() {
-            rng ^= rng.rotate_left(13).wrapping_sub(12_345_678_942);
-            let adder = rng as u32 & ones;
-            if rng < u64::MAX / 256 {
-                colour = (rng as u32 >> 8) & BG_SPECKLE;
-            } else {
-                colour = colour.wrapping_add(adder) & BG_MASK;
-                let subtractor = (rng >> 5) as u32 & ones;
-                colour = colour.wrapping_sub(subtractor) & BG_MASK;
-            }
-            noise_buf[i] =
-                P::from_g2t8(((colour.wrapping_add(base) & RGB_MASK) ^ VISIBLE_TO_DARK_FLIP) | OPAQUE_ALPHA);
-        }
-        P::under_chunk_normal(&mut row_pixels[chunk_lo..x_hi], &noise_buf[..chunk_len]);
-        x_hi = chunk_lo;
-    }
-}
-
-/// The background noise generated once and rolled (owner, 2026-11-08: "keep a background buffer that you generate once ... and just rotate it vertically"): [`background_noise_split`]'s texture kept as two strips, generated for a viewport size and base colour and then never again, and laid under a frame at any scroll by reading its rows at an offset, wrapping at the bottom. A scroll costs nothing but the compose, which is one pass of [`Pixel::under_chunk_normal`] over what the frame repaints.
-/// The strips are made at 8 bits (the noise's own math) and kept at the depth the frames are drawn at: under a 16-bit frame they are widened once, at the first frame that lays them, and the 8-bit strips let go (8 bytes a pixel kept instead of 4 for both; owner + photon-02, 2026-11-17: widening each pixel as it was laid down was 8.8 ms of the workers a full frame on the Pro). A frame at the other depth after that makes them again at its own.
-/// The strips hold what each half of the mirror grows from its axis: `right` the pixels going right from the origin (the ADD stream), `left` those going left (the SUB stream), stored right-aligned so a frame's left half reads forward. Any origin up to the strips' reach shows the same texture [`background_noise_split`] draws there, so a split screen (settings: the axis on the rail divider, each half with its own pane's scroll) and a centred one share the one field.
-/// Rows are independent (each seeds from its own row number), so the field tiles vertically with no seam: row `t` of a `h`-row field is the row the texture has at logical row `t`, and a scroll `s` shows row `(y − s) mod h` at `y`. Where `0 ≤ y − s < h` that is exactly [`background_noise_split`]'s pixel at scroll `s` with no shimmer; the shimmer (a colour bias the old path cycled while scrolling) is gone: the field moves, it does not change.
-pub struct NoiseField {
-    width: usize,
-    height: usize,
-    base: u32,
-    right_w: usize,
-    left_w: usize,
-    /// The strips at 8 bits; empty while they are kept at 16 (`right16`, `left16`).
-    right: Vec<Argb8>,
-    left: Vec<Argb8>,
-    /// The strips at 16 bits; empty until a 16-bit frame lays them, and again whenever they are made anew at 8.
-    right16: Vec<G2t16>,
-    left16: Vec<G2t16>,
-}
-
-impl Default for NoiseField {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl NoiseField {
-    /// An empty field; the first [`Self::ensure`] generates it.
-    pub const fn new() -> Self {
-        Self { width: 0, height: 0, base: 0, right_w: 0, left_w: 0, right: Vec::new(), left: Vec::new(), right16: Vec::new(), left16: Vec::new() }
-    }
-
-    /// Make the field cover a `width × height` frame with its mirror axis at `origin` (≤ `width`) in colour `base` (`None` = [`crate::theme::BG_BASE`]). Generates only when the size or the base changed, or the axis needs a strip longer than the one kept (the reach only grows, so a screen that moves the axis back and forth generates once per size). True when it generated.
-    pub fn ensure(&mut self, width: usize, height: usize, origin: usize, base: Option<u32>) -> bool {
-        let base = base.unwrap_or(crate::theme::BG_BASE);
-        let same = self.width == width && self.height == height && self.base == base;
-        // The strips each half needs at this axis; a kept strip at least that long serves.
-        let (need_r, need_l) = (width - origin, origin);
-        if same && need_r <= self.right_w && need_l <= self.left_w {
-            return false;
-        }
-        // The new reach: what this axis needs, and what the old field already reached for this same frame (so returning to the other axis does not generate again).
-        let (right_w, left_w) = if same { (need_r.max(self.right_w), need_l.max(self.left_w)) } else { (need_r, need_l) };
-        self.width = width;
-        self.height = height;
-        self.base = base;
-        self.right_w = right_w;
-        self.left_w = left_w;
-        self.right16 = Vec::new();
-        self.left16 = Vec::new();
-        self.make8();
-        true
-    }
-
-    /// The strips made at 8 bits for the kept size, reach and base.
-    fn make8(&mut self) {
-        let (right_w, left_w, height, base) = (self.right_w, self.left_w, self.height, self.base);
-        self.right.clear();
-        self.right.resize(right_w * height, 0);
-        self.left.clear();
-        self.left.resize(left_w * height, 0);
-        if right_w > 0 {
-            crate::par::par_rows(&mut self.right, right_w, 0, height, |t, row| noise_strip(row, t, height, base, false));
-        }
-        if left_w > 0 {
-            crate::par::par_rows(&mut self.left, left_w, 0, height, |t, row| noise_strip(row, t, height, base, true));
-        }
-    }
-
-    /// The strips at the depth `P` lays them at: at 16 bits widened from the 8-bit strips once (and those let go), at 8 made again if they were let go. A no-op while they are already there.
-    fn hold_at<P: Pixel>(&mut self) {
-        let wide = P::of_g2t16(&[]).is_some();
-        let (rn, ln) = (self.right_w * self.height, self.left_w * self.height);
-        if wide && (self.right16.len() != rn || self.left16.len() != ln) {
-            for (narrow, w16) in [(&mut self.right, &mut self.right16), (&mut self.left, &mut self.left16)] {
-                let src: &[Argb8] = narrow;
-                *w16 = alloc::vec![0; src.len()];
-                crate::par::par_chunks(w16, 1 << 12, |at, out| {
-                    let n = out.len();
-                    for (o, &c) in out.iter_mut().zip(&src[at..at + n]) {
-                        *o = G2t16::from_g2t8(c);
-                    }
-                });
-                *narrow = Vec::new();
-            }
-        } else if !wide && (self.right.len() != rn || self.left.len() != ln) {
-            self.right16 = Vec::new();
-            self.left16 = Vec::new();
-            self.make8();
-        }
-    }
-
-    /// Lay the field under `canvas` (the frame [`Self::ensure`] was given): mirror axis at `origin`, the left half scrolled by `left_scroll` and the right by `right_scroll` (equal for a centred screen, each half's pane on a split one), the whole frame or (`fullscreen` false) all but its 1-pixel edge, inside `clip`. One pass over the rows in one dispatch to the workers, reading the strips at the frame's own depth (`hold_at`): no widening per pixel.
-    #[allow(clippy::too_many_arguments)]
-    pub fn under_into<P: Pixel>(&mut self, canvas: &mut Canvas<P>, origin: usize, left_scroll: isize, right_scroll: isize, fullscreen: bool, clip: Option<Clip>) {
-        // A frame of another size than the field's is a bug in the caller (ensure was skipped): fail here, not in a slice somewhere.
-        assert!(canvas.width == self.width && canvas.height == self.height, "the noise field is {} x {}, the frame {} x {}", self.width, self.height, canvas.width, canvas.height);
-        assert!(self.width - origin <= self.right_w && origin <= self.left_w, "the noise field does not reach the axis at {origin}: ensure it first");
-        let (w, h) = (self.width, self.height);
-        // Under 2 × 2 there is no inside to the 1-pixel edge ([`background_noise_split`] draws nothing there either).
-        if w < 2 || h < 2 {
-            return;
-        }
-        let clip = Clip::resolve(clip, w, h);
-        let inset = if fullscreen { 0 } else { 1 };
-        // The 1-pixel edge left for the window's hairline: the clip cut to the inside of it (a clip thinner than the edge comes out empty below).
-        let (ys, ye) = (clip.y_start.max(inset), clip.y_end.min(h - inset));
-        let (xs, xe) = (clip.x_start.max(inset), clip.x_end.min(w - inset));
-        if ys >= ye || xs >= xe {
-            return;
-        }
-        canvas.damage.add_bounds(xs, ys, xe, ye);
-        self.hold_at::<P>();
-        let (rw, lw) = (self.right_w, self.left_w);
-        // The strips at this depth: the 16-bit ones as they are, else the 8-bit ones, which only an 8-bit frame reads (`hold_at` made them for it); a 16-bit frame never reaches the widening path.
-        match (P::of_g2t16(&self.right16), P::of_g2t16(&self.left16)) {
-            (Some(right), Some(left)) => crate::par::par_rows(canvas.pixels, w, ys, ye, |y, row| {
-                let tr = (y as isize - right_scroll).rem_euclid(h as isize) as usize;
-                let tl = (y as isize - left_scroll).rem_euclid(h as isize) as usize;
-                // The row splits at the axis: [max(xs, origin), xe) is the right half's part of the clip, [xs, min(xe, origin)) the left's. These are the clip's two pieces, not a clamp; an axis outside the clip leaves one piece empty.
-                if xe > origin {
-                    let a = xs.max(origin);
-                    P::under_chunk_normal(&mut row[a..xe], &right[tr * rw + (a - origin)..tr * rw + (xe - origin)]);
-                }
-                if xs < origin {
-                    let b = xe.min(origin);
-                    P::under_chunk_normal(&mut row[xs..b], &left[tl * lw + (lw - origin + xs)..tl * lw + (lw - origin + b)]);
-                }
-            }),
-            _ => {
-                let (right, left) = (&self.right, &self.left);
-                crate::par::par_rows(canvas.pixels, w, ys, ye, |y, row| {
-                    // The texture rows this frame row shows, each half by its own scroll, wrapping at the field's height.
-                    let tr = (y as isize - right_scroll).rem_euclid(h as isize) as usize;
-                    let tl = (y as isize - left_scroll).rem_euclid(h as isize) as usize;
-                    if xe > origin {
-                        let a = xs.max(origin);
-                        under_widened(&mut row[a..xe], &right[tr * rw + (a - origin)..tr * rw + (xe - origin)]);
-                    }
-                    if xs < origin {
-                        let b = xe.min(origin);
-                        under_widened(&mut row[xs..b], &left[tl * lw + (lw - origin + xs)..tl * lw + (lw - origin + b)]);
-                    }
-                });
-            }
-        }
-    }
-}
-
-/// `src` (8-bit pixels) under `dst` at `dst`'s depth: a run of 64 widened on the stack, then the depth's chunk kernel, as [`background_row`] composes its noise. At 8 bits the widening is the identity.
-#[inline]
-fn under_widened<P: Pixel>(dst: &mut [P], src: &[Argb8]) {
-    const CHUNK: usize = 64;
-    let mut buf = [P::EMPTY; CHUNK];
-    for (d, s) in dst.chunks_mut(CHUNK).zip(src.chunks(CHUNK)) {
-        for (b, &c) in buf.iter_mut().zip(s) {
-            *b = P::from_g2t8(c);
-        }
-        P::under_chunk_normal(d, &buf[..d.len()]);
-    }
-}
-
-/// One strip row of [`NoiseField`]: row `t` of the texture, going right from the axis (`left` false: `out[k]` is the k-th pixel right of it) or left (`left` true: right-aligned, `out[len − 1 − k]` the k-th pixel left of it). The same seed, steps and speckle gate as [`background_row`], so the pixels are the same.
-fn noise_strip(out: &mut [Argb8], t: usize, height: usize, base: u32, left: bool) {
-    use crate::theme::{BG_MASK, BG_SPECKLE};
-    const VISIBLE_TO_DARK_FLIP: u32 = Argb8::RGB_MASK;
-    const RGB_MASK: u32 = Argb8::RGB_MASK;
-    const OPAQUE_ALPHA: u32 = Argb8::OPAQUE;
-    let ones = 0x0001_0101u32;
-    let mut rng = 0xDEAD_BEEF_0123_4567u64 ^ (t as u64).wrapping_sub(height as u64 / 2).wrapping_mul(0x9E37_79B9_4517_B397);
-    let mut colour = rng as u32 & BG_MASK;
-    let n = out.len();
-    for k in 0..n {
-        rng ^= if left { rng.rotate_left(13).wrapping_sub(12_345_678_942) } else { rng.rotate_left(13).wrapping_add(12_345_678_942) };
-        let adder = rng as u32 & ones;
-        if rng < u64::MAX / 256 {
-            colour = (rng as u32 >> 8) & BG_SPECKLE;
-        } else {
-            colour = colour.wrapping_add(adder) & BG_MASK;
-            let subtractor = (rng >> 5) as u32 & ones;
-            colour = colour.wrapping_sub(subtractor) & BG_MASK;
-        }
-        out[if left { n - 1 - k } else { k }] = ((colour.wrapping_add(base) & RGB_MASK) ^ VISIBLE_TO_DARK_FLIP) | OPAQUE_ALPHA;
     }
 }
 
@@ -1299,7 +957,7 @@ pub fn circle_filled<P: Pixel>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pixel::Blend;
+    use crate::pixel::{Argb8, Blend};
 
     #[test]
     fn pack_unpack_round_trip() {
@@ -1658,86 +1316,5 @@ mod tests {
         assert_eq!(big, 320);
         // 10 px font: ceil(π × 10) = 32.
         assert_eq!(small, 32);
-    }
-}
-
-#[cfg(test)]
-mod noise_field_tests {
-    use super::*;
-    use crate::canvas::Damage;
-
-    fn old(w: usize, h: usize, split: usize, left_scroll: isize, right_scroll: isize, fullscreen: bool) -> Vec<Argb8> {
-        let mut px = vec![0u32; w * h];
-        let mut d = Damage::new();
-        let mut c = Canvas::new(&mut px, w, h, &mut d);
-        background_noise_split(&mut c, 0, fullscreen, right_scroll, Some(split), Some(left_scroll), None, None);
-        px
-    }
-
-    fn new(field: &mut NoiseField, w: usize, h: usize, split: usize, left_scroll: isize, right_scroll: isize, fullscreen: bool) -> Vec<Argb8> {
-        field.ensure(w, h, split, None);
-        let mut px = vec![0u32; w * h];
-        let mut d = Damage::new();
-        let mut c = Canvas::new(&mut px, w, h, &mut d);
-        field.under_into(&mut c, split, left_scroll, right_scroll, fullscreen, None);
-        px
-    }
-
-    /// The field is the old texture: centred and split, with the edge and without, and at any scroll on every row the old path drew from inside the field's height.
-    #[test]
-    fn the_field_is_the_old_noise() {
-        let (w, h) = (96, 64);
-        let mut field = NoiseField::new();
-        for (split, ls, rs, full) in [(w / 2, 0, 0, true), (w / 3, 0, 0, true), (w / 2, 0, 0, false), (w / 3, 5, 17, true), (w / 2, 9, 9, false)] {
-            let (a, b) = (old(w, h, split, ls, rs, full), new(&mut field, w, h, split, ls, rs, full));
-            for y in 0..h {
-                for x in 0..w {
-                    let s = if x < split { ls } else { rs };
-                    if (y as isize) >= s {
-                        assert_eq!(a[y * w + x], b[y * w + x], "split {split} scroll {ls}/{rs} full {full} at {x},{y}");
-                    }
-                }
-            }
-        }
-        // Back at the centre after the split: no new generation, and the same pixels.
-        assert!(!field.ensure(w, h, w / 2, None));
-    }
-
-    /// At 16 bits the widened field is the old noise drawn at 16 bits.
-    #[test]
-    fn the_field_widens_like_the_old_noise() {
-        use crate::pixel::G2t16;
-        let (w, h) = (72, 40);
-        let mut a = vec![0u64; w * h];
-        let mut d = Damage::new();
-        background_noise_split(&mut Canvas::<G2t16>::new(&mut a, w, h, &mut d), 0, true, 0, Some(w / 3), None, None, None);
-        let mut field = NoiseField::new();
-        field.ensure(w, h, w / 3, None);
-        let mut b = vec![0u64; w * h];
-        field.under_into(&mut Canvas::<G2t16>::new(&mut b, w, h, &mut d), w / 3, 0, 0, true, None);
-        assert_eq!(a, b);
-        // Kept at 16 bits now; a 16-bit frame again reads the same, and an 8-bit frame after it gets the field made again at 8.
-        let mut c = vec![0u64; w * h];
-        field.under_into(&mut Canvas::<G2t16>::new(&mut c, w, h, &mut d), w / 3, 0, 0, true, None);
-        assert_eq!(a, c);
-        let mut e = vec![0u32; w * h];
-        background_noise_split(&mut Canvas::<Argb8>::new(&mut e, w, h, &mut d), 0, true, 0, Some(w / 3), None, None, None);
-        let mut f = vec![0u32; w * h];
-        field.under_into(&mut Canvas::<Argb8>::new(&mut f, w, h, &mut d), w / 3, 0, 0, true, None);
-        assert_eq!(e, f);
-    }
-
-    /// Rolled by its own height the field is where it started, and every scroll shows every texture row once.
-    #[test]
-    fn the_field_wraps() {
-        let (w, h) = (40, 24);
-        let mut field = NoiseField::new();
-        let a = new(&mut field, w, h, w / 2, 0, 0, true);
-        let b = new(&mut field, w, h, w / 2, h as isize, h as isize, true);
-        assert_eq!(a, b);
-        let c = new(&mut field, w, h, w / 2, -7, -7, true);
-        for y in 0..h {
-            assert_eq!(c[y * w..(y + 1) * w], a[((y + 7) % h) * w..((y + 7) % h + 1) * w]);
-        }
     }
 }

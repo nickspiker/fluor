@@ -150,6 +150,9 @@ pub trait Pixel: Blend + Copy + Eq + Send + Sync + core::fmt::Debug + 'static {
     fn cov(v: f32) -> u32;
     /// A colour authored as an 8-bit `g2t` α + darkness pixel (the theme's palette, `theme::dark(fmt(vsf(..)))`) at this depth: the same light, widened.
     fn from_g2t8(c: u32) -> Self;
+    /// A finished 16-bit pixel at this depth: itself at 16 bits, and each field's top byte at 8.
+    /// The background noise is made at 16 bits and taken thru here ([`crate::paint::noise_under`]), so the 8-bit picture is the 16-bit one with its low bytes dropped.
+    fn from_g2t16(c: G2t16) -> Self;
     /// An 8-bit α (`0..=255`, a coverage byte a rasterizer computed) as this depth's α: the same fraction, `a × ONE / 255`, which is how [`Pixel::from_g2t8`] widens α (× 1 at 8 bits, × 257 at 16).
     #[inline(always)]
     fn alpha_from8(a8: u32) -> u32 {
@@ -179,11 +182,6 @@ pub trait Pixel: Blend + Copy + Eq + Send + Sync + core::fmt::Debug + 'static {
         for i in 0..dst.len() {
             dst[i] = dst[i].under(src, BlendMode::Normal);
         }
-    }
-    /// A run of 16-bit pixels as this depth's own when this depth is [`G2t16`], None at any other: lets generic code read a cache kept at 16 bits (the noise field, widened once: [`crate::paint::NoiseField`]) without a copy.
-    #[inline(always)]
-    fn of_g2t16(_run: &[G2t16]) -> Option<&[Self]> {
-        None
     }
 }
 
@@ -227,6 +225,12 @@ impl Pixel for Argb8 {
     #[inline(always)]
     fn from_g2t8(c: u32) -> Self {
         c
+    }
+    /// Each 16-bit field's top byte in its 8-bit place.
+    #[inline(always)]
+    fn from_g2t16(c: G2t16) -> Self {
+        let top = |s: u32| ((c >> (s + 8)) & 0xFF) as u32;
+        (top(48) << 24) | (top(32) << 16) | (top(16) << 8) | top(0)
     }
 
     #[inline]
@@ -328,14 +332,14 @@ impl Pixel for G2t16 {
     /// In darkness that is `65535 − 256·(255 − d) = 256·d + 255`.
     /// α is a fraction of full, not a code: `α × 257` takes 255 to 65535 and every byte to the same fraction.
     #[inline(always)]
-    fn of_g2t16(run: &[G2t16]) -> Option<&[Self]> {
-        Some(run)
-    }
-    #[inline(always)]
     fn from_g2t8(c: u32) -> Self {
         let wide = |d: u32| (d << 8) | ((1 << 8) - 1);
         let [r, g, b] = Argb8::channels(c);
         Self::from_channels((c >> 24) * 257, [wide(r), wide(g), wide(b)])
+    }
+    #[inline(always)]
+    fn from_g2t16(c: G2t16) -> Self {
+        c
     }
 
     #[inline]

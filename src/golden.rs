@@ -361,7 +361,7 @@ fn golden_compositing() {
     check("stack", &stack::<Argb8>(), 0x7877_7aae_c493_5bff);
 }
 
-/// The background noise field, its own base and a given one, scrolled.
+/// The background noise, its own base and a given one, scrolled and shimmered.
 fn noise<P: Pixel>() -> (Vec<P>, Vec<P>) {
     let (mut px, mut dmg) = scene::<P>();
     {
@@ -379,8 +379,8 @@ fn noise<P: Pixel>() -> (Vec<P>, Vec<P>) {
 #[test]
 fn golden_background_noise() {
     let (px, px2) = noise::<Argb8>();
-    check("noise", &px, 0xe5d4_3657_bbf2_f4cd);
-    check("noise_based_clipped", &px2, 0xdec6_5eba_0ebb_1243);
+    check("noise", &px, 0x4264_b97d_3e3a_5dee);
+    check("noise_based_clipped", &px2, 0x247c_5ea3_7823_01aa);
 }
 
 #[cfg(feature = "text")]
@@ -641,7 +641,8 @@ fn agreement(p8: &[u32], p16: &[u64]) -> Agreement {
 /// The cross-check: every depth-generic golden scene rendered at both depths, the 16-bit one narrowed to the nearest 8-bit codes and compared byte for byte with the 8-bit render.
 ///
 /// The bar the plan set (within one step, under 0.1 % of bytes differing) is not reachable while the 8-bit kernels stay bit-identical, and the differences all point one way: the 16-bit render, narrowed, is at or above the 8-bit one.
-/// The 8-bit `under` takes `>> 8` for `÷ 255` and floors, so an opaque colour laid into an empty pixel deposits `(d × 255) >> 8 = d − 1` (the noise scenes: every byte off by exactly one, none by more); partial cover floors twice more (paint_rects, shapes, squircles, stack, up to 3–4); the rotated rect's four coverage bytes floor before they multiply; and the glow's α table floors at every step of its decay, drifting up to 7 steps low over a ray (glow_rays).
+/// The 8-bit `under` takes `>> 8` for `÷ 255` and floors, so an opaque colour laid into an empty pixel deposits `(d × 255) >> 8 = d − 1`; partial cover floors twice more (paint_rects, shapes, squircles, stack, up to 3–4); the rotated rect's four coverage bytes floor before they multiply; and the glow's α table floors at every step of its decay, drifting up to 7 steps low over a ray (glow_rays).
+/// The noise scenes are the exception: the noise is made at 16 bits and stored, not laid under, and its 8-bit picture is the 16-bit one's top bytes, so the 16-bit render narrowed to the nearest code sits on the 8-bit one or one step below it, never above it.
 /// At 16 bits each of those floors costs 1/256 of a step, so the 16-bit render is the nearer one to the exact composite, and what this test can hold is the shape of the difference: no byte where the 16-bit render falls more than one step below the 8-bit one (a kernel still thinking in bytes would lose light or coverage at 16 bits, and it lands far below, not one step), and the excess above it within each scene's floors.
 #[test]
 fn crosscheck_g2t16_against_argb8() {
@@ -659,8 +660,8 @@ fn crosscheck_g2t16_against_argb8() {
         ("glow".into(), glow8, glow16, (-1, 3)),
         ("glow_rays".into(), rays8, rays16, (-1, 7)),
         ("stack".into(), stack(), stack(), (-1, 2)),
-        ("noise".into(), noise8, noise16, (-1, 1)),
-        ("noise_based_clipped".into(), noise_b8, noise_b16, (-1, 1)),
+        ("noise".into(), noise8, noise16, (-1, 0)),
+        ("noise_based_clipped".into(), noise_b8, noise_b16, (-1, 0)),
     ];
     let (modes8, modes16) = (flatten_modes::<Argb8>(), flatten_modes::<G2t16>());
     for (i, mode) in MODES.into_iter().enumerate() {

@@ -272,7 +272,7 @@ fluor (lib)
 ├── group       : Group { region, rpn: StackCompositor, blend: BlendMode, hitmask, text_clip }.
 │                 flatten_into walks the bbox calling dst.under(src, blend) per pixel
 ├── paint       : flatten(dst, src, mode). fill_rect_solid, fill_rect_blend, stroke_rect,
-│                 circle_filled, glyph::*, background_noise. Clip / AlphaMask / Transform.
+│                 circle_filled, glyph::*, background_noise, noise_under. Clip / AlphaMask / Transform.
 │                 quantize_rotation + snap_rotation. ALL primitives route thru Blend::under.
 │                 No painter's algorithm path exists.
 ├── pane        : Pane, PaneId, Compositor (tree + hit-test + focus + z-order + render).
