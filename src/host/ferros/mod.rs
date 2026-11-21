@@ -1134,8 +1134,8 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
     } else {
         (1.0, 1.0)
     };
-    // Op 5's byte 13, the display's features (absent from a display before them): bit 0, it reads a ring named in op 22's 50-byte form.
-    let ring_ok = sys::call(display, &[5], &mut r) >= 14 && r[13] & 1 != 0;
+    // Op 5's byte 14, the display's features (absent from a display before them; byte 13 is the Escapes count, forge 2026-11-20): bit 0, it reads a ring named in op 22's 50-byte form.
+    let ring_ok = sys::call(display, &[5], &mut r) >= 15 && r[14] & 1 != 0;
     println!("fluor: ferros host up, a {w} x {h} frame at ({fx}, {fy}) on a {pw} x {ph} panel; {}", if ring_ok { "a scroll moves the pane's ring, not its pixels" } else { "the display reads no ring: a scroll moves the pane" });
     let mut shell = FerrosShell::new(app, w as u32, h as u32, ru);
     shell.ring_ok = ring_ok;
