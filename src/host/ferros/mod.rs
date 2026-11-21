@@ -677,9 +677,11 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         // The first frame is the whole frame, whatever the app says is dirty: nothing has been shown yet. So is the first back in front: what changed while behind was never drawn. So is the first after the app stopped baking its own frame (`whole_frame`).
         let bakes_now = self.display_bakes && self.app.bakes_own();
         let forced = crate::host::panel::whole_frame(self.frames == 0, core::mem::take(&mut self.full_next), self.baked_last, bakes_now);
-        // The app's damage as the rects it named, cut at the frame (None from the app is the whole frame, as before); their bounding box is the render's clip.
+        // The app's damage as the rects it named, cut at the frame; their bounding box is the render's clip.
+        // None from the app is nothing changed, so nothing is drawn (`panel::frame_rects`): a wake that changed nothing on screen is not a frame.
         let whole = crate::canvas::DamageRects::one(viewport_rect);
-        let rects = if forced { whole } else { crate::host::app::app_damage(&mut self.app, self.viewport).map_or(whole, |d| d.cut(win_w, win_h)) };
+        let app_rects = if forced { None } else { crate::host::app::app_damage(&mut self.app, self.viewport) };
+        let rects = crate::host::panel::frame_rects(forced, app_rects, win_w, win_h);
         let damage_clip = rects.bbox();
         if forced {
             self.forced_whole += 1;

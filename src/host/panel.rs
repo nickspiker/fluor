@@ -28,6 +28,18 @@ pub(crate) fn whole_frame(first: bool, asked: bool, baked_last: bool, bakes_now:
     first || asked || (baked_last && !bakes_now)
 }
 
+/// The rects a `w × h` frame draws: the whole frame when it must be (`whole_frame`), else the app's own, cut at the frame.
+/// The app naming none (`FluorApp::damage_rect`'s `None`: nothing changed since the last frame) draws nothing, as on the desktop host.
+/// Until 2026-11-21 the ferros host drew the whole frame there, so every wake with nothing to show (a pong, a beacon, a history page that held nothing new) was a whole frame: about four a second on the Pro, screen off, nobody touching it.
+pub(crate) fn frame_rects(forced: bool, app: Option<crate::canvas::DamageRects>, w: usize, h: usize) -> crate::canvas::DamageRects {
+    let whole = crate::canvas::DamageRects::one(crate::canvas::PixelRect::new(0, 0, w, h));
+    match (forced, app) {
+        (true, _) => whole,
+        (false, Some(d)) => d.cut(w, h),
+        (false, None) => crate::canvas::DamageRects::EMPTY,
+    }
+}
+
 /// The bake a ferros display's `BAKED` surface is made with (display op 65, ferros_sys `window::bake`): per channel of a working value v (VSF RGB, gamma 2, white at 1), the light l = tanh²(k·v); the panel's light p = m·l (its rows the panel's red, green and blue); its code p^g × 65472 in Q16, held at the field's ends. A fluor code c (g2t, light atanh(c / 2ⁿ)²) is the working value atanh(c / 2ⁿ), so its light is tanh²(k · atanh(c / 2¹⁶)): one table over every 16-bit code (an 8-bit code is its 16-bit `c × 2⁸`). The panel's part is the display's own NEON kernels (ferros payloads/display neon.rs `matrix8`, `code16`, odt.rs `odt_tables`), carried here: fluor does not depend on ferros.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub struct Bake {
@@ -482,5 +494,19 @@ mod tests {
         assert!(!whole_frame(false, false, true, true), "still baking: the app writes its own damage");
         assert!(!whole_frame(false, false, false, true), "baking starts: the app writes its damage straight into the surface");
         assert!(!whole_frame(false, false, false, false));
+    }
+
+    /// A wake whose app names no damage draws nothing; a forced frame is whole whatever the app says; the app's own rects are cut at the frame.
+    #[test]
+    fn a_wake_with_nothing_changed_draws_nothing() {
+        use crate::canvas::{DamageRects, PixelRect};
+        let (w, h) = (1 << 7, 1 << 6);
+        assert!(frame_rects(false, None, w, h).as_slice().is_empty(), "nothing changed: no frame");
+        assert_eq!(frame_rects(true, None, w, h).bbox(), PixelRect::new(0, 0, w, h));
+        let ring = PixelRect::new(1 << 3, 1 << 3, 1 << 4, 1 << 4);
+        assert_eq!(frame_rects(true, Some(DamageRects::one(ring)), w, h).bbox(), PixelRect::new(0, 0, w, h), "forced wins over the app's rects");
+        assert_eq!(frame_rects(false, Some(DamageRects::one(ring)), w, h).as_slice(), &[ring]);
+        let over = PixelRect::new(w - 1, h - 1, w + (1 << 3), h + (1 << 3));
+        assert_eq!(frame_rects(false, Some(DamageRects::one(over)), w, h).as_slice(), &[PixelRect::new(w - 1, h - 1, w, h)]);
     }
 }
