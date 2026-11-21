@@ -334,6 +334,11 @@ pub fn draw_orb_press_glow<P: Pixel>(
     }
 }
 
+/// The orb ring's outer radius for an orb of `radius`: where [`draw_app_icon`]'s ring stroke ends, the orb's whole extent (an app placing something on the orb's edge, such as an unread dot, measures from here, not from the icon).
+pub fn orb_ring_outer(radius: isize) -> isize {
+    radius - 1 + (radius >> 5) + 2
+}
+
 pub fn draw_app_icon<P: Pixel>(
     pixels: &mut [P],
     hit_test_map: Option<&mut [HitId]>,
@@ -352,14 +357,13 @@ pub fn draw_app_icon<P: Pixel>(
     if r < 2 {
         return; // Contract relied on by chrome_widget.rs:309 — degenerate sizes pass thru without drawing, so the layout needs no min-size guard. r ≥ 2 keeps (r-2) non-negative below.
     }
-    let stroke_width = (r >> 5) + 2;
     // TOP-DOWN, not partitioned. The icon is the top layer; the ring sits beneath it. Paint the icon FIRST with a soft edge, then fill the ring as a FULL disk underneath. Under-blend is "topmost paints first, the layer beneath shows thru", so the ring bleeds thru the icon's partial-alpha rim → the icon↔ring boundary anti-aliases with no hard step; the background, painted under the whole orb afterward, gives the outer AA.
     //
     // Each edge is a 1-px coverage ramp biased INWARD, not centred and not a band tacked outside. From d ≈ R + (dist²−R²)/2R, coverage = (R²−dist²)/(2R−1): full (ONE, the depth's opaque α) at dist²=(R−1)², zero at dist²=R², the single AA pixel landing at R. Biasing inward (rather than half-straddling R) lands the edge cleanly on the grid with no 50%-at-the-radius pixel and pulls the solid radius in by 1. BOTH edges are biased the same way so the icon reaches 0 exactly where the ring is still solid — two straddling ramps would overlap into a translucent dip (a see-thru ring) at the boundary. The icon image is unchanged: same sampling, just a clean AA rim.
     let r_icon = r - 1;
     let r_icon2 = r_icon * r_icon;
     let two_icon = 2 * r_icon - 1; // ramp denominator for the icon edge: (R²)−(R−1)²
-    let r_ring = r - 1 + stroke_width;
+    let r_ring = orb_ring_outer(r);
     let r_ring2 = r_ring * r_ring;
     let two_ring = 2 * r_ring - 1; // ramp denominator for the ring edge
     let r_bbox = r_ring; // the inward ramp reaches 0 at r_ring², so the disk never paints beyond r_ring
