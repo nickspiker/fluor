@@ -267,6 +267,12 @@ impl Bell {
         Rung { behind: s.behind, typed: core::mem::take(&mut s.typed), inset: s.inset.take(), safe: s.safe.take(), bake: core::mem::take(&mut s.bake), lost: s.lost, gone: s.gone }
     }
 
+    /// Whether the window is behind now, as the display last said (or held behind on a lost display), without taking anything: the one gate the frame's draw reads (`FerrosShell::draw`).
+    fn behind(&self) -> bool {
+        let s = self.state.lock().unwrap();
+        s.behind || s.lost
+    }
+
     /// Asleep until anything rings since the last take, or until `at` (the app's own deadline, when it has one ahead).
     fn sleep(&self, at: Option<Instant>) {
         let mut s = self.state.lock().unwrap();
@@ -545,6 +551,7 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
     /// Behind, the new ru is only kept: the app is not told, nothing is laid out or drawn, and the change reaches it once when it is in front again (`set_behind`).
     /// A pinch in another kist steps the global scale many times a second, and a window behind that relaid and drew on each step took 90 to 130 ms a step from the one in front (2026-11-21, Photon behind Lumis on the Pro: 11 to 27 frames a second shown).
     pub fn set_zoom(&mut self, ru: Coord) {
+        self.follow_bell();
         let ru_before = self.viewport.ru;
         if self.behind {
             self.zoom_owed.hold(ru_before);
@@ -598,7 +605,19 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
 
     /// Behind or in front again (the display's op 62). Behind: the finger let go (no touch reaches this window until it is back), and the app told it lost focus (`Focused(false)`, `on_focus_changed(false)`: draw nothing, play nothing but notifications). In front: focus back, `on_window_shown`, and the next frame drawn whole.
     /// A scale set while behind (`set_zoom`) reaches the app here, in front again: one `on_zoom_set` for the whole change and one relayout, before the whole frame.
+    /// Behind or in front as the bell says now (`Bell::behind`), the change said to the app once (`set_behind`): read by every path that would lay out or draw, whatever loop calls it.
+    fn follow_bell(&mut self) {
+        let held = self.bell.behind();
+        if held != self.behind {
+            self.set_behind(held);
+        }
+    }
+
+    /// Said once a change: the frame loop and the draw (`draw`, from the bell) may both bring the same change, and the second is nothing.
     pub fn set_behind(&mut self, behind: bool) {
+        if behind == self.behind {
+            return;
+        }
         self.behind = behind;
         if !behind {
             if let Some(factor) = self.zoom_owed.take(self.viewport.ru) {
@@ -691,6 +710,8 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
 
     /// Tick the app and, when anything is dirty, render into the scratch buffer. True when a frame was drawn.
     pub fn draw(&mut self) -> bool {
+        // Behind or in front as the display says now, before anything is laid out (`follow_bell`).
+        self.follow_bell();
         // What the background threads sent since the last frame, delivered first.
         self.take_events();
         if let Some(at) = self.app.wake_at() {
@@ -698,7 +719,8 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
                 self.window.mark_dirty();
             }
         }
-        // Behind, nothing is drawn whatever marked the window dirty (a scale step, a resize, a safe area, a bake): the dirt is kept, and the first frame in front is drawn whole (`set_behind`).
+        // Behind, nothing is drawn whatever marked the window dirty (a scale step, a resize, a safe area, a bake, a message): no render work at all, the dirt kept, and the first frame in front drawn whole (`set_behind`).
+        // The bell is read at the top as well as by the frame loop, so whatever loop calls the draw, the display's word (behind, the screen off, a lost display) is the one gate.
         if self.behind {
             return false;
         }
