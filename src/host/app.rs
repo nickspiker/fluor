@@ -607,6 +607,10 @@ pub struct Context<'a> {
     pub damage_clip: crate::canvas::PixelRect,
     /// The frame's damage as the rects the host cleared and will present (`damage_clip` is their bounding box): what the app may draw this frame, and nothing outside them ([`FluorApp::damage_rects`]). Read it thru [`Context::damage_rects`]: empty here means `damage_clip` alone. Several only when the app named several and the host takes them apart (ferros and Android do; the desktop host takes their bounding box as the one rect).
     pub damage_rects: crate::canvas::DamageRects,
+    /// The app's scroll hint ([`FluorApp::scroll_hint`]) as the host applied it this frame: the frame outside `damage_rects` holds last frame's pixels moved by it.
+    /// None when the host moved nothing, so the frame outside the damage is last frame's as it was (outside a render, always None).
+    /// An app that armed a hint reads here whether it was taken, not the damage's shape: a hint's frame may name rects whose box is the whole frame (a scrolling pane with fixed bands above and below it to draw again), and the host still moves the pane.
+    pub scroll: Option<(crate::canvas::PixelRect, i32)>,
     /// App-facing window handle. `WindowHandle` is intentionally minimal — only `request_redraw` lives there because it's the only window operation real apps invoke from the trait surface. Cursor / drag / maximize / minimize flow thru [`EventResponse`] variants instead, so the host's window state stays the single source of truth.
     pub window: &'a dyn WindowHandle,
     /// Latest tracked modifier state (shift / ctrl / alt / super) in fluor-native form. Hosts translate from platform input (winit `ModifiersState`, Android JNI mod-key flags) before constructing this.
@@ -1818,6 +1822,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             let mut ctx = Context {
                 pressed_hit: self.pointer.held_id(),
                 damage_rects: crate::canvas::DamageRects::EMPTY,
+                scroll: None,
                 viewport: self.viewport,
                 text,
                 clip_mask: &mut self.clip_mask,
@@ -1934,6 +1939,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
                 let mut ctx = Context {
                     pressed_hit: self.pointer.held_id(),
                     damage_rects: crate::canvas::DamageRects::EMPTY,
+                    scroll: None,
                     viewport: vp,
                     text: &mut *text,
                     clip_mask: clip_mask.as_mut_slice(),
@@ -1952,6 +1958,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
                 let mut ctx = Context {
                     pressed_hit: self.pointer.held_id(),
                     damage_rects: crate::canvas::DamageRects::EMPTY,
+                    scroll: None,
                     viewport: vp,
                     text: &mut *text,
                     clip_mask: clip_mask.as_mut_slice(),
@@ -1975,6 +1982,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             let mut ctx = Context {
                 pressed_hit: self.pointer.held_id(),
                 damage_rects: crate::canvas::DamageRects::EMPTY,
+                scroll: None,
                 viewport: self.viewport,
                 text,
                 clip_mask: &mut self.clip_mask,
@@ -2480,6 +2488,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
                     let mut ctx = Context {
                         pressed_hit: self.pointer.held_id(),
                         damage_rects: crate::canvas::DamageRects::EMPTY,
+                        scroll: None,
                         viewport: self.viewport,
                         text,
                         clip_mask: &mut self.clip_mask,
@@ -2649,6 +2658,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
         let mut ctx = Context {
             pressed_hit: self.pointer.held_id(),
             damage_rects: crate::canvas::DamageRects::EMPTY,
+            scroll: scroll_hint,
             viewport: self.viewport,
             text,
             clip_mask: &mut self.clip_mask,
@@ -3452,6 +3462,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
                 let mut ctx = Context {
                     pressed_hit: self.pointer.held_id(),
                     damage_rects: crate::canvas::DamageRects::EMPTY,
+                    scroll: None,
                     viewport: self.viewport,
                     text,
                     clip_mask: &mut self.clip_mask,
@@ -3632,6 +3643,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
                 let mut ctx = Context {
                     pressed_hit: self.pointer.held_id(),
                     damage_rects: crate::canvas::DamageRects::EMPTY,
+                    scroll: None,
                     viewport: self.viewport,
                     text,
                     clip_mask: &mut self.clip_mask,
@@ -3817,6 +3829,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> ApplicationHandler<A::UserEvent> for
             let mut ctx = Context {
                 pressed_hit: self.pointer.held_id(),
                 damage_rects: crate::canvas::DamageRects::EMPTY,
+                scroll: None,
                 viewport: self.viewport,
                 text,
                 clip_mask: &mut self.clip_mask,
@@ -3907,6 +3920,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> ApplicationHandler<A::UserEvent> for
                 let mut ctx = Context {
                     pressed_hit: self.pointer.held_id(),
                     damage_rects: crate::canvas::DamageRects::EMPTY,
+                    scroll: None,
                     viewport: self.viewport,
                     text,
                     clip_mask: &mut self.clip_mask,
@@ -3944,6 +3958,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> ApplicationHandler<A::UserEvent> for
             let mut ctx = Context {
                 pressed_hit: self.pointer.held_id(),
                 damage_rects: crate::canvas::DamageRects::EMPTY,
+                scroll: None,
                 viewport: self.viewport,
                 text,
                 clip_mask: &mut self.clip_mask,
@@ -4088,6 +4103,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> ApplicationHandler<A::UserEvent> for
                     let mut ctx = Context {
                         pressed_hit: self.pointer.held_id(),
                         damage_rects: crate::canvas::DamageRects::EMPTY,
+                        scroll: None,
                         viewport: self.viewport,
                         text,
                         clip_mask: &mut self.clip_mask,
@@ -4355,6 +4371,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> ApplicationHandler<A::UserEvent> for
         let mut ctx = Context {
             pressed_hit: self.pointer.held_id(),
             damage_rects: crate::canvas::DamageRects::EMPTY,
+            scroll: None,
             viewport: self.viewport,
             text,
             clip_mask: &mut self.clip_mask,
@@ -4414,6 +4431,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> DesktopShell<A, P> {
                 let mut ctx = Context {
                     pressed_hit: self.pointer.held_id(),
                     damage_rects: crate::canvas::DamageRects::EMPTY,
+                    scroll: None,
                     viewport: self.viewport,
                     text,
                     clip_mask: &mut self.clip_mask,
@@ -4455,6 +4473,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> DesktopShell<A, P> {
             let mut ctx = Context {
                 pressed_hit: self.pointer.held_id(),
                 damage_rects: crate::canvas::DamageRects::EMPTY,
+                scroll: None,
                 viewport: self.viewport,
                 text,
                 clip_mask: &mut self.clip_mask,
@@ -4511,6 +4530,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> DesktopShell<A, P> {
             let mut ctx = Context {
                 pressed_hit: crate::paint::HIT_NONE,
                 damage_rects: crate::canvas::DamageRects::EMPTY,
+                scroll: None,
                 viewport: self.viewport,
                 text,
                 clip_mask: &mut self.clip_mask,
@@ -4541,6 +4561,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> DesktopShell<A, P> {
             let mut ctx = Context {
                 pressed_hit: self.pointer.held_id(),
                 damage_rects: crate::canvas::DamageRects::EMPTY,
+                scroll: None,
                 viewport: self.viewport,
                 text,
                 clip_mask: &mut self.clip_mask,

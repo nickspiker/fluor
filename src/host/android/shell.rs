@@ -143,16 +143,16 @@ impl<A: FluorApp<P>, P: Finalize> AndroidShell<A, P> {
             let damage_clip = rects.bbox();
             if !damage_clip.is_empty() {
                 // SCROLL AS A MEMMOVE (photon 2026-10-06): the app's rigid-shift hint moves the scratch rows BEFORE the damage clear (the clear would otherwise zero the memmove's source band) — the same step the desktop host takes in `render_frame`; Android has no persistent screen, so scratch is the only buffer to shift and the present finalizes it whole or by damage as it always did.
-                if damage_clip != viewport_rect {
-                    if let Some((rect, dy)) = self.app.scroll_hint(self.viewport) {
-                        crate::paint::scroll_copy_rect(&mut self.scratch, win_w, win_h, rect.x0, rect.y0, rect.x1, rect.y1, dy);
-                    }
+                // Taken unless the frame is drawn whole as one rect: a hint's frame may name rects whose box is the whole frame (a pane with fixed bands above and below it drawn again), and the pane between them is still only moved.
+                let scroll = if rects.as_slice() == [viewport_rect] { None } else { self.app.scroll_hint(self.viewport) };
+                if let Some((rect, dy)) = scroll {
+                    crate::paint::scroll_copy_rect(&mut self.scratch, win_w, win_h, rect.x0, rect.y0, rect.x1, rect.y1, dy);
                 }
                 for &r in rects.as_slice() {
                     clear_scratch_rect(&mut self.scratch, win_w, r);
                 }
                 self.pending_damage.clear();
-                self.with_context_render(rects, |app, scratch, ctx| {
+                self.with_context_render(rects, scroll, |app, scratch, ctx| {
                     app.render(scratch, ctx);
                 });
             }
@@ -429,6 +429,7 @@ impl<A: FluorApp<P>, P: Finalize> AndroidShell<A, P> {
         let mut ctx = Context {
             pressed_hit: self.pointer.held_id(),
             damage_rects: crate::canvas::DamageRects::EMPTY,
+            scroll: None,
             viewport: self.viewport,
             text,
             clip_mask: &mut self.clip_mask,
@@ -452,6 +453,7 @@ impl<A: FluorApp<P>, P: Finalize> AndroidShell<A, P> {
     fn with_context_render(
         &mut self,
         damage_rects: crate::canvas::DamageRects,
+        scroll: Option<(PixelRect, i32)>,
         f: impl FnOnce(&mut A, &mut [P], &mut Context),
     ) {
         let text = self
@@ -461,6 +463,7 @@ impl<A: FluorApp<P>, P: Finalize> AndroidShell<A, P> {
         let mut ctx = Context {
             pressed_hit: self.pointer.held_id(),
             damage_rects,
+            scroll,
             viewport: self.viewport,
             text,
             clip_mask: &mut self.clip_mask,
