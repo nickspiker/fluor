@@ -41,6 +41,10 @@ use crate::paint::{HitId, HIT_NONE};
 use crate::pixel::Argb8;
 use crate::text::TextRenderer;
 
+/// Whether the host sends the layered show to a display that reads layers (GPU-COMPOSE §3); off until the path has been watched on a device.
+/// The display on forge already sets the feature bit, so this is the one switch: true sends layers, false keeps the flattened op 22 show every display reads today.
+pub const LAYERED_SHOW: bool = false;
+
 /// The kernel, as a ferros process reaches it (KERNEL.md, process ABI).
 mod sys {
     use core::arch::asm;
@@ -1321,7 +1325,7 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
         None => println!("fluor: the display does not bake: frames in this depth's own format"),
     }
     // A display that composes layers (ferros docs/GPU-COMPOSE.md 3.2), baked ones only, from a depth whose pixels see through (at 8 bits a layer would hide the ones behind it): the chrome gets a surface of its own and the noise is handed over as parameters, so neither is drawn into the frame.
-    if features & layered::FEATURE_LAYERS != 0 && bake.is_some() && P::SEES_THROUGH {
+    if LAYERED_SHOW && features & layered::FEATURE_LAYERS != 0 && bake.is_some() && P::SEES_THROUGH {
         let mut token = [0u8; 32];
         match sys::surface_ask(sys::cap(caps.surface), &mut token) {
             Some(chrome) => {
