@@ -9,6 +9,17 @@
 //! The safe area (ferros WINDOWS.md "Drawn under the controls", owner 2026-11-12: "Should we draw under the controls?", then "Agreed. Build it!"): the window fills the glass and the system's controls float in front of its corners, so the display tells the window where they are not (`EV_SAFE`, on the same held op 62): the app's circle and which halves outside it the system holds, at the window's first show and as its full screen turns. The host hands it to the app as `FluorApp::on_safe_area` ([`SafeArea`]), so it keeps its own buttons and text inside.
 //!
 //! Pixels: the shell renders at the app's depth (`FluorApp<P>`: 8-bit unless the app names `G2t16`) and [`crate::host::panel`] turns the scratch into the display's working values. At 8 bits: fluor's `0xααRRGGBB` darkness buffer becomes the display's working values — gamma 2 encoded, white = 16384 (Q14), R, G, B in bits 0-15, 16-31, 32-47 of a u64 — through one 256-entry table: fluor's bytes are VSF `g2t` codes (theme.rs, since 2026-10-20: 194 diffuse white, 255 9.7× white), whose light is atanh(c/256)², so the display's gamma 2 (√light) is atanh(c/256), 255 landing at 3.1 of the surface's 4.0. Opacity composites over black. The whole frame is converted and shown each time the app drew; the damage rect narrows that later.
+//!
+//! Layers (ferros docs/GPU-COMPOSE.md 3, 2026-11-22): to a display whose op 5 feature byte says it composes layers (bit 1, [`layered::FEATURE_LAYERS`]), that bakes, from a 16-bit app (its pixels see through), the window is shown as its layers rather than one flattened frame.
+//! The app's noise call (`Context::lay_noise`) is taken as parameters and its chrome call (`Context::lay_chrome`) flattens the chrome into a frame of its own ([`crate::host::app::Layers`]), baked into a second surface of the process's (`surface_ask`) where the frame changed; the scratch holds the content alone.
+//! Each show is op 22's 50-byte form and its layers after it ([`layered::tail`]): the chrome's surface over its box, the window's own surface (the rows above its ring, the ring, the rows below), the noise last; and each surface's coverage bytes, a byte a 64 × 64 tile past its pixels, are classed again where the present wrote it.
+//! To any other display, and on the desktop and Android, the two calls draw into the frame exactly as `noise_under` and `flatten_chrome_into` over each rect did.
+//! A ring here is only a pane as wide as the frame (the display reads a ring over a layer's own rows); a narrower pane is moved as without a ring.
+//!
+//! WHAT THE STRIP NEEDS (GPU-COMPOSE 3.2 and migration step 4's other half, not built): the content rendered ahead of the viewport into a ringed strip taller than the pane, so a scroll inside what is rendered is a new origin and no render.
+//! The display first: a pixel layer's ring that is not its own rows (a source y and height of its own past the layer's rect, the strip, read at `(y − y0 + origin) mod H`); today layered.rs refuses any other.
+//! Here: a strip surface of its own (the content's surface is the screen's size; a process holds four surfaces at most, its own among them, so the window's, the chrome's and the strip's leave one for a mailbox), the app's pane rendered in strip coordinates (a `FluorApp` hook naming the strip's rows and the rows it owes, so a scroll inside them asks no render), its rows baked thru the strip's ring, and the show naming the strip's origin for the pane's offset.
+//! And the frame's other parts (the header, the compose bar) stay a layer of the screen's rows, as now.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -24,6 +35,7 @@ use crate::geom::Viewport;
 use crate::host::app::{Context, FluorApp, SafeArea};
 use crate::host::wake::{WakeError, WakeSender};
 use crate::host::{EventResponse, WindowHandle};
+use crate::host::layered;
 use crate::host::panel::PanelPixel;
 use crate::paint::{HitId, HIT_NONE};
 use crate::pixel::Argb8;
@@ -68,6 +80,12 @@ mod sys {
 
     pub fn dma(cap: u64) -> u64 {
         svc(DMA, cap, 0, 0, 0, 0)
+    }
+
+    /// Another surface of the process's own (SYS_DMA x1 = 10 on a surface it holds, ferros_sys `surface_ask`; at most four a process): its token written into `token`, its base past the porch answered, or None.
+    pub fn surface_ask(held: u64, token: &mut [u8; 32]) -> Option<u64> {
+        let n = svc(DMA, held, 10, off(token.as_mut_ptr()), 0, 0);
+        (n != ERR && n != 0).then_some(n)
     }
 
     pub fn now() -> u64 {
@@ -472,6 +490,12 @@ pub struct FerrosShell<A: FluorApp<P>, P: PanelPixel = Argb8> {
     pub ring: Option<crate::paint::ring::Ring>,
     /// The display reads a ring (op 5's feature bits): without it a scroll frame moves the surface's pane as before.
     pub ring_ok: bool,
+    /// The display composes this window's layers (ferros docs/GPU-COMPOSE.md 3.2; op 5's feature bit 1, a display that bakes, a depth whose pixels see through, a surface of its own for the chrome): the app's noise and chrome are taken here ([`Context::lay_noise`], [`Context::lay_chrome`]), not drawn into the scratch, and each show names the layers. None: the frame is flattened as before.
+    pub layers: Option<crate::host::app::Layers>,
+    /// The two surfaces of a layered window, by their `dma` bases: its own (the content) and the chrome's (0 while `layers` is None).
+    surfaces: (u64, u64),
+    /// The rects of each surface (content, chrome) the last present wrote, in its own pixels: where their coverage tiles are classed again.
+    written: (Vec<PixelRect>, Vec<PixelRect>),
 }
 
 impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
@@ -526,6 +550,9 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             baked_last: false,
             ring: None,
             ring_ok: false,
+            layers: None,
+            surfaces: (0, 0),
+            written: (Vec::new(), Vec::new()),
         };
         shell.with_context(|app, ctx| app.init(ctx));
         shell.with_context(|app, ctx| app.on_resize(width, height, ctx));
@@ -797,6 +824,13 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         for &r in rects.as_slice() {
             clear_scratch_rect(&mut self.scratch, win_w, r);
         }
+        // A layered window's chrome layer is cleared where the frame draws, as the scratch is, so a frame that lays no chrome leaves none there; outside its box it has always been empty.
+        if let Some(l) = self.layers.as_mut() {
+            let b = l.chrome_box;
+            for &r in rects.as_slice() {
+                clear_scratch_rect(l.chrome::<P>(), win_w, meet(r, b));
+            }
+        }
         let t_cleared = sys::now();
         self.with_context_render(rects, scroll, |app, scratch, ctx| app.render(scratch, ctx));
         let t_rendered = sys::now();
@@ -819,12 +853,63 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
     pub fn present(&mut self, surface: &mut [u64], stride: usize, fx: usize, fy: usize, bake: Option<&crate::host::panel::Bake>) {
         let t0 = sys::now();
         self.present_rows(surface, stride, fx, fy, bake);
+        if let (true, false, false, Some(b)) = (self.layers.is_some(), self.own, self.app_bakes, bake) {
+            self.present_layers(surface, stride, fx, fy, b);
+        }
         // The stages of a scratch frame (an own frame is neither drawn nor counted in them).
         if !self.own {
             let s = &mut self.stages[self.bucket];
             s.move_surface += self.t_moved - t0;
             s.convert += sys::now() - self.t_moved;
         }
+    }
+
+    /// A layered window's own part of the present (ferros docs/GPU-COMPOSE.md 3.2): the chrome layer baked into its own surface where the frame changed, inside the box it may hold anything in (outside it that surface is see-through from the start), and each surface's coverage tiles classed again where this present wrote it.
+    fn present_layers(&mut self, surface: &mut [u64], stride: usize, fx: usize, fy: usize, bake: &crate::host::panel::Bake) {
+        use rayon::prelude::*;
+        let (w, h) = (self.viewport.width_px as usize, self.viewport.height_px as usize);
+        let rows = surface.len() / stride;
+        let (content, chrome_at) = self.surfaces;
+        // SAFETY: the chrome's surface is this process's own (`surface_ask`), a full screen at the panel's stride as `surface` is, and no other slice of it lives while this one does.
+        let chrome = unsafe { core::slice::from_raw_parts_mut(chrome_at as *mut u64, stride * rows) };
+        let changed = self.changed.cut(w, h);
+        let Some(l) = self.layers.as_mut() else { return };
+        let b = l.chrome_box;
+        let src = l.chrome::<P>();
+        self.written.1.clear();
+        for c in changed.as_slice() {
+            let r = meet(*c, b);
+            if r.is_empty() {
+                continue;
+            }
+            let dst = &mut chrome[(fy + r.y0) * stride..(fy + r.y1) * stride];
+            dst.par_chunks_mut(stride).zip(src[r.y0 * w..r.y1 * w].par_chunks(w)).for_each(|(d, s)| P::to_baked(&s[r.x0..r.x1], &mut d[fx + r.x0..fx + r.x1], bake));
+            self.written.1.push(PixelRect::new(fx + r.x0, fy + r.y0, fx + r.x1, fy + r.y1));
+        }
+        // SAFETY: each surface's tiles lie in its own slot past its pixels (`tiles_of`), apart from both pixel slices.
+        crate::host::layered::coverage::classify(unsafe { tiles_of(content, stride, rows) }, surface, stride, &self.written.0);
+        crate::host::layered::coverage::classify(unsafe { tiles_of(chrome_at, stride, rows) }, chrome, stride, &self.written.1);
+    }
+
+    /// The layers after a show's 50-byte head (ferros docs/GPU-COMPOSE.md 3.1, `layered::tail`): the chrome's surface in front over the box it may hold anything in, the window's own surface (round its ring, `layered::content`), the noise last. The show's length.
+    fn layered_tail(&self, m: &mut [u8; crate::host::layered::SHOW_MOST], fx: usize, fy: usize) -> usize {
+        use crate::host::layered::{self, coverage, Background, PixLayer, PIX_MOST};
+        let (w, h) = (self.viewport.width_px as usize, self.viewport.height_px as usize);
+        let Some(l) = self.layers.as_ref() else { return layered::HEAD };
+        let (content, chrome) = self.surfaces;
+        let tiles = coverage::AT as u32;
+        let mut pix = [PixLayer { source: chrome, opaque: false, rect: PixelRect::empty(), ring: None, tiles }; PIX_MOST];
+        let mut n = 0;
+        let b = l.chrome_box;
+        if !b.is_empty() {
+            pix[0].rect = PixelRect::new(fx + b.x0, fy + b.y0, fx + b.x1, fy + b.y1);
+            n = 1;
+        }
+        let mut c = [pix[0]; 3];
+        let k = layered::content(content, PixelRect::new(fx, fy, fx + w, fy + h), self.ring, tiles, &mut c);
+        pix[n..n + k].copy_from_slice(&c[..k]);
+        let bg = l.noise.as_ref().and_then(|z| Background::of(z, fx, fy, w, h));
+        layered::tail(m, &pix[..n + k], bg.as_ref())
     }
 
     fn present_rows(&mut self, surface: &mut [u64], stride: usize, fx: usize, fy: usize, bake: Option<&crate::host::panel::Bake>) {
@@ -835,21 +920,31 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         // A scroll frame: the surface's copy of the pane moved by the same rows as the scratch was (`draw`), so what is converted is the damage alone. The rect cut at the frame first, as below, so the move never reaches another part of the screen.
         // With a display that reads a ring (`ring_ok`), nothing moves: the pane's ring takes the scroll as a new origin (ferros DISPLAY-SCROLL.md option B, 2026-11-17: the move was 2.5 to 2.7 ms of the four A715s a scroll frame on the Pro).
         // A pane other than the ring's: the old ring's rows rotated home once (origin 0), then a new ring over this pane.
+        // The surface rects this present writes, for a layered window's coverage tiles (`present_layers`).
+        self.written.0.clear();
         if let Some((r, dy)) = self.shift {
             let (sx0, sy0, sx1, sy1) = (r.x0.min(w), r.y0.min(h), r.x1.min(w), r.y1.min(h));
-            if self.ring_ok {
-                let pane = PixelRect::new(fx + sx0, fy + sy0, fx + sx1, fy + sy1);
+            let pane = PixelRect::new(fx + sx0, fy + sy0, fx + sx1, fy + sy1);
+            // A layered window's ring is a layer's own rows (ferros display layered.rs), so only a pane as wide as the frame rings there; a narrower one is moved as without a ring.
+            if self.ring_ok && (self.layers.is_none() || crate::host::layered::ring_fits(PixelRect::new(fx, fy, fx + w, fy + h), pane)) {
                 let ring = match self.ring.take() {
                     Some(g) if g.rect == pane => g,
                     Some(mut g) => {
                         g.home(surface, stride);
+                        self.written.0.push(g.rect);
                         crate::paint::ring::Ring::new(pane)
                     }
                     None => crate::paint::ring::Ring::new(pane),
                 };
                 self.ring = Some(ring.scrolled(dy));
             } else {
+                // A ring over another pane goes home first (none without a display that reads one).
+                if let Some(mut g) = self.ring.take() {
+                    g.home(surface, stride);
+                    self.written.0.push(g.rect);
+                }
                 crate::paint::scroll_copy_rect(surface, stride, surface.len() / stride, fx + sx0, fy + sy0, fx + sx1, fy + sy1, dy);
+                self.written.0.push(pane);
             }
             self.shown = PixelRect::new(sx0, sy0, sx1, sy1);
         }
@@ -904,6 +999,7 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
                 // The piece in frame coordinates (the scratch's), and its rows' first row in the surface.
                 let (x0, y0, x1, y1) = (p.x0 - fx, p.y0 - fy, p.x1 - fx, p.y1 - fy);
                 let dst = &mut surface[at * stride..(at + (y1 - y0)) * stride];
+                self.written.0.push(PixelRect::new(p.x0, at, p.x1, at + (y1 - y0)));
                 match bake {
                     Some(b) => dst.par_chunks_mut(stride).zip(src[y0 * w..y1 * w].par_chunks(w)).for_each(|(d, s)| P::to_baked(&s[x0..x1], &mut d[fx + x0..fx + x1], b)),
                     None => dst.par_chunks_mut(stride).zip(src[y0 * w..y1 * w].par_chunks(w)).for_each(|(d, s)| P::to_panel(&s[x0..x1], &mut d[fx + x0..fx + x1])),
@@ -1097,6 +1193,7 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
     fn with_context<R>(&mut self, f: impl FnOnce(&mut A, &mut Context) -> R) -> R {
         let mut ctx = Context {
             pressed_hit: self.pointer.held_id(),
+            layers: None,
             damage_rects: crate::canvas::DamageRects::EMPTY,
             scroll: None,
             viewport: self.viewport,
@@ -1118,6 +1215,7 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         let damage_clip = damage_rects.bbox();
         let mut ctx = Context {
             pressed_hit: self.pointer.held_id(),
+            layers: self.layers.as_mut(),
             damage_rects,
             scroll,
             viewport: self.viewport,
@@ -1197,8 +1295,9 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
     } else {
         (1.0, 1.0)
     };
-    // Op 5's byte 14, the display's features (absent from a display before them; byte 13 is the Escapes count, forge 2026-11-20): bit 0, it reads a ring named in op 22's 50-byte form.
-    let ring_ok = sys::call(display, &[5], &mut r) >= 15 && r[14] & 1 != 0;
+    // Op 5's byte 14, the display's features (absent from a display before them; byte 13 is the Escapes count, forge 2026-11-20): bit 0, it reads a ring named in op 22's 50-byte form; bit 1, the layers after it (`layered`).
+    let features = if sys::call(display, &[5], &mut r) > layered::FEATURES_AT as u64 { r[layered::FEATURES_AT] } else { 0 };
+    let ring_ok = features & layered::FEATURE_RING != 0;
     println!("fluor: ferros host up, a {w} x {h} frame at ({fx}, {fy}) on a {pw} x {ph} panel; {}", if ring_ok { "a scroll moves the pane's ring, not its pixels" } else { "the display reads no ring: a scroll moves the pane" });
     let mut shell = FerrosShell::new(app, w as u32, h as u32, ru);
     shell.ring_ok = ring_ok;
@@ -1220,6 +1319,28 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
     match &bake {
         Some(b) => println!("fluor: the display bakes (generation {}): frames baked here, shown as the panel's codes", b.generation),
         None => println!("fluor: the display does not bake: frames in this depth's own format"),
+    }
+    // A display that composes layers (ferros docs/GPU-COMPOSE.md 3.2), baked ones only, from a depth whose pixels see through (at 8 bits a layer would hide the ones behind it): the chrome gets a surface of its own and the noise is handed over as parameters, so neither is drawn into the frame.
+    if features & layered::FEATURE_LAYERS != 0 && bake.is_some() && P::SEES_THROUGH {
+        let mut token = [0u8; 32];
+        match sys::surface_ask(sys::cap(caps.surface), &mut token) {
+            Some(chrome) => {
+                // The tiles lie past the pixels: a panel whose pixels reach them is a ferros the coverage was not laid out for.
+                assert!(pw * ph * 8 <= layered::coverage::AT - layered::coverage::PORCH, "the panel's pixels reach the coverage tiles");
+                // SAFETY: the surface the kernel just gave this process, a full screen of the panel's pixels, read by nothing here yet.
+                let cs = unsafe { core::slice::from_raw_parts_mut(chrome as *mut u64, pw * ph) };
+                // See-through over the window: a surface comes from the pool wiped to 0, which is a baked opaque black.
+                for y in fy..fy + h {
+                    cs[y * pw + fx..y * pw + fx + w].fill(crate::host::panel::SEE_THROUGH);
+                }
+                // SAFETY: the chrome surface's own tiles, past its pixels (checked above).
+                layered::coverage::classify(unsafe { tiles_of(chrome, pw, ph) }, cs, pw, &[PixelRect::new(fx, fy, fx + w, fy + h)]);
+                shell.layers = Some(crate::host::app::Layers::new::<P>(w, h));
+                shell.surfaces = (base, chrome);
+                println!("fluor: the display composes layers: the noise handed over as parameters, the chrome on a surface of its own");
+            }
+            None => println!("fluor: the display composes layers, but no surface was given for the chrome: the frame is flattened as before"),
+        }
     }
     let frame = sys::freq() / 120;
     let mut contacts: Vec<Contact> = Vec::with_capacity(16);
@@ -1357,8 +1478,8 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             let t_presented = sys::now();
             // The window (ferros WINDOWS.md): the frame's part of the screen, this surface, the app level, and what its pixels are (`PanelPixel::FORMAT`: at 16 bits fluor's own, which the display decodes).
             // An opaque app (`FluorApp::opaque`) says so in the mode byte: the display then never reads what the window covers (ferros_sys `window::show_full`, mode bit 3).
-            let mut m = [0u8; 50];
-            m[0] = 22;
+            let mut m = [0u8; layered::SHOW_MOST];
+            m[0] = layered::OP_SHOW;
             m[1..3].copy_from_slice(&(fx as u16).to_le_bytes());
             m[3..5].copy_from_slice(&(fy as u16).to_le_bytes());
             m[5..7].copy_from_slice(&(w as u16).to_le_bytes());
@@ -1381,17 +1502,19 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             if let Some(b) = own {
                 m[28..36].copy_from_slice(&b.to_le_bytes());
             }
-            // To a display that reads a ring, every show is the 50-byte form: the 40-byte one (the buffer, 0 for the surface itself; the frame's own time, its draw and present) and the ring, [x u16][y u16][w u16][h u16][origin u16], a height of 0 for none.
+            // A layered window's frame drawn from the scratch and baked here names its layers after the 50-byte form (`layered_tail`); an app's own frame is the plain show it always was.
+            let layers_now = shell.layers.is_some() && bake.is_some() && !shell.own && !shell.app_bakes;
+            // To a display that reads a ring, every show is the 50-byte form: the 40-byte one (the buffer, 0 for the surface itself; the frame's own time, its draw and present) and the ring, [x u16][y u16][w u16][h u16][origin u16], a height of 0 for none (a layered show's ring is its layer's).
             // Stated with every show, so the display holds nothing of it the host did not just say.
-            let len = if ring_ok {
+            let len = if ring_ok || layers_now {
                 m[36..40].copy_from_slice(&(us(t_presented - t) as u32).to_le_bytes());
-                if let Some(g) = shell.ring {
+                if let (Some(g), false) = (shell.ring, layers_now) {
                     let g16 = [g.rect.x0, g.rect.y0, g.rect.width(), g.rect.height(), g.origin];
                     for (i, v) in g16.iter().enumerate() {
                         m[40 + 2 * i..42 + 2 * i].copy_from_slice(&(*v as u16).to_le_bytes());
                     }
                 }
-                50
+                if layers_now { shell.layered_tail(&mut m, fx, fy) } else { layered::HEAD }
             } else if own.is_some() {
                 36
             } else {
@@ -1437,4 +1560,17 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
         }
         sys::sleep_until(t + frame);
     }
+}
+
+/// Where two rects overlap (empty where they do not): the two rects' intersection, not a clamp.
+fn meet(a: PixelRect, b: PixelRect) -> PixelRect {
+    PixelRect::new(a.x0.max(b.x0), a.y0.max(b.y0), a.x1.min(b.x1), a.y1.min(b.y1))
+}
+
+/// A surface's coverage tiles (`layered::coverage`): a byte a tile, in its slot past its pixels, `coverage::AT` bytes from the slot's start, which is `PORCH` bytes before the surface's `dma` base.
+/// SAFETY: `base` is a surface of this process's (a full screen of `stride × rows` pixels, which end before the tiles: checked when the window turns layered), and no other slice of its tiles lives while this one does.
+unsafe fn tiles_of<'a>(base: u64, stride: usize, rows: usize) -> &'a mut [u8] {
+    use crate::host::layered::coverage;
+    let n = coverage::tiles_across(stride) * coverage::tiles_across(rows);
+    unsafe { core::slice::from_raw_parts_mut((base as usize + coverage::AT - coverage::PORCH) as *mut u8, n) }
 }

@@ -927,6 +927,36 @@ impl<P: Pixel> DefaultChrome<P> {
         self.group.flatten_layer_into(self.layer_chrome, target, target_w, target_h, Some(clip));
     }
 
+    /// The chrome layer over a frame's damage `rects` (`Context::lay_chrome`, ferros docs/GPU-COMPOSE.md 3.2): [`Self::flatten_chrome_into`] over each rect into `target` (`layer` None), or into a layer of its own (`layer`, a `w × h` frame a host shows in front of the app's when its display composes layers).
+    /// In a layer of its own the chrome stays behind what the app drew before it (an open popup, the unread dot on the orb): inside the chrome's box that is moved from `target` into the layer first, and outside it `target` keeps it, since nothing of the chrome lies behind it there.
+    /// So every pixel is either in the layer as this call would have left it in `target` (and `target` empty there) or in `target` as it would have been (and the layer empty there), and the hits are claimed against the same pixels in front of the chrome.
+    /// The layer must be empty over `rects` inside the chrome's box (the host clears it each frame); the box written is returned, empty when the chrome holds nothing in `rects` or `layer` is None.
+    pub fn lay_into(&mut self, target: &mut [P], w: usize, h: usize, rects: &[crate::canvas::PixelRect], layer: Option<&mut [P]>) -> crate::canvas::PixelRect {
+        let Some(layer) = layer else {
+            for r in rects {
+                self.flatten_chrome_into(target, w, h, Some(crate::paint::Clip::new(r.x0, r.y0, r.x1, r.y1)));
+            }
+            return crate::canvas::PixelRect::empty();
+        };
+        let mut wrote = crate::canvas::PixelRect::empty();
+        for r in rects {
+            let c = self.chrome_clip(Some(crate::paint::Clip::new(r.x0, r.y0, r.x1, r.y1)), w, h);
+            // WHY/PROOF: a rect that misses the chrome's box comes out reversed (`chrome_clip`), and a reversed slice range panics where an empty loop would not.
+            if c.x_start >= c.x_end || c.y_start >= c.y_end {
+                continue;
+            }
+            for y in c.y_start..c.y_end {
+                let row = y * w + c.x_start..y * w + c.x_end;
+                layer[row.clone()].copy_from_slice(&target[row.clone()]);
+                target[row].fill(P::EMPTY);
+            }
+            self.claim_chrome_hits(c, layer);
+            self.group.flatten_layer_into(self.layer_chrome, layer, w, h, Some(c));
+            wrote = wrote.union(crate::canvas::PixelRect::new(c.x_start, c.y_start, c.x_end, c.y_end));
+        }
+        wrote
+    }
+
     /// `clip` (the whole target when `None`) cut to where the chrome layer holds anything: the rest of it is empty, an empty pixel under anything leaves it as it was, and the box covers the chrome's hits too (found with its pixels after each re-raster), so the claim needs nothing outside it.
     /// An empty intersection comes out with its start at or past its end, which the blit and the claim cover nothing of.
     fn chrome_clip(&mut self, clip: Option<crate::paint::Clip>, target_w: usize, target_h: usize) -> crate::paint::Clip {
@@ -1434,5 +1464,61 @@ mod tests {
         assert!(!chrome.group.rpn.layers[chrome.layer_chrome].dirty);
         let bbox = chrome.chrome_bbox.unwrap();
         assert!(bbox.x1 - bbox.x0 < w || bbox.y1 - bbox.y0 < h, "the box is the whole frame: {bbox:?}");
+    }
+
+    /// The chrome laid over a frame's rects: into the target it is [`DefaultChrome::flatten_chrome_into`] over each rect, pixel for pixel and hit for hit; into a layer of its own, every pixel lands in the layer or in the target exactly as the target alone would hold it (the layer inside the chrome's box, with what the app drew in front of the chrome there; the target outside it), and the hits are the same.
+    #[test]
+    fn the_chrome_laid_in_its_own_layer_is_the_chrome_laid_in_the_frame() {
+        let (w, h) = (900, 700);
+        let (mut text, mut clip_mask) = (TextRenderer::new(), alloc::vec![255u8; w * h]);
+        let (mut counter_a, mut counter_b, mut counter_c) = (HIT_NONE, HIT_NONE, HIT_NONE);
+        let (mut a, _) = settled(w, h, "Peers 3", &mut text, &mut clip_mask, &mut counter_a);
+        let (mut b, _) = settled(w, h, "Peers 3", &mut text, &mut clip_mask, &mut counter_b);
+        let (mut c, _) = settled(w, h, "Peers 3", &mut text, &mut clip_mask, &mut counter_c);
+        let (ox, oy, or) = a.orb_geometry().unwrap();
+        // Two of the frame's rects, one across the orb and one below it; between them a band the frame does not draw.
+        let rects = [crate::canvas::PixelRect::new(0, 0, w, (oy + 2 * or) as usize), crate::canvas::PixelRect::new(0, (oy + 3 * or) as usize, w, h)];
+        // What the app drew before the chrome: a dot half over the orb's edge, a translucent one beside it, and one far from the chrome.
+        let front = || {
+            let mut f = alloc::vec![0u32; w * h];
+            let mut d = crate::canvas::Damage::new();
+            let mut canvas = crate::canvas::Canvas::new(&mut f, w, h, &mut d);
+            crate::paint::draw_circle(&mut canvas, (ox - or) as Coord, (oy - or) as Coord, (or / 2) as Coord, 0xFF_C0_20_20, None);
+            crate::paint::draw_circle(&mut canvas, (ox + or) as Coord, oy as Coord, (or / 2) as Coord, 0x80_40_40_40, None);
+            crate::paint::draw_circle(&mut canvas, (w / 2) as Coord, (h - 60) as Coord, 20., 0xFF_20_C0_20, None);
+            f
+        };
+        let (mut fa, mut fb, mut fc, f0) = (front(), front(), front(), front());
+        for ch in [&mut a, &mut b, &mut c] {
+            for r in &rects {
+                ch.clear_hits(*r);
+            }
+        }
+        // Today's call, rect by rect.
+        for r in &rects {
+            a.flatten_chrome_into(&mut fa, w, h, Some(crate::paint::Clip::new(r.x0, r.y0, r.x1, r.y1)));
+        }
+        assert!(b.lay_into(&mut fb, w, h, &rects, None).is_empty());
+        assert!(fa == fb, "laid into the frame, the chrome is flatten_chrome_into over each rect");
+        assert!(a.hit_test_map == b.hit_test_map);
+        let mut layer = alloc::vec![0u32; w * h];
+        let wrote = c.lay_into(&mut fc, w, h, &rects, Some(&mut layer));
+        assert!(!wrote.is_empty() && wrote != crate::canvas::PixelRect::new(0, 0, w, h), "the chrome's layer is its own box, not the frame: {wrote:?}");
+        let mut moved = 0;
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                let inside = (wrote.x0..wrote.x1).contains(&x) && (wrote.y0..wrote.y1).contains(&y) && rects.iter().any(|r| (r.x0..r.x1).contains(&x) && (r.y0..r.y1).contains(&y));
+                if inside {
+                    assert_eq!((layer[i], fc[i]), (fa[i], 0), "inside the chrome's box at {x}, {y}");
+                    moved += (f0[i] != 0) as usize;
+                } else {
+                    assert_eq!((layer[i], fc[i]), (0, fa[i]), "outside the chrome's box at {x}, {y}");
+                }
+            }
+        }
+        assert!(moved > 0, "what the app drew in front of the chrome inside its box went into the layer");
+        assert!(fc[(h - 60) * w + w / 2] != 0, "the dot far from the chrome stays in the frame");
+        assert!(a.hit_test_map == c.hit_test_map, "the hits are claimed against the same pixels in front of the chrome");
     }
 }

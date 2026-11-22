@@ -624,6 +624,33 @@ pub struct Context<'a> {
     pub window_origin: (i32, i32),
     /// The hit id currently held DOWN under the pointer and eligible to fire on release — the host's [`crate::host::pointer::PointerArbiter`] state, surfaced so the app can paint that element in its "held" colour (see [`crate::theme::BUTTON_HELD`]). `HIT_NONE` when nothing is pressed, or when a press has been dragged off its target. Consult it in `render` for custom hit-stamped elements; widget trees get it applied automatically via [`crate::host::widget::apply_pressed`].
     pub pressed_hit: crate::paint::HitId,
+    /// What a host whose display composes the window's layers takes from the frame in place of pixels ([`Context::lay_noise`], [`Context::lay_chrome`]; ferros docs/GPU-COMPOSE.md 3.2).
+    /// None on every host that lays them into the frame: the desktop, Android, and ferros under a display without the layers feature.
+    pub layers: Option<&'a mut Layers>,
+}
+
+/// The layers a frame hands over instead of drawing them into its target (ferros docs/GPU-COMPOSE.md 3.1): the noise as parameters, the chrome in a frame of its own.
+/// The host owns it and lends it to the render ([`Context::layers`]); the app never names it, only calls [`Context::lay_noise`] and [`Context::lay_chrome`], which draw into the target wherever it is absent.
+pub struct Layers {
+    /// The noise the frame laid: kept from frame to frame, since a frame that lays none leaves on the screen the noise laid before it, as a host that draws it keeps last frame's pixels outside the damage.
+    pub noise: Option<crate::paint::NoiseLayer>,
+    /// The chrome layer's frame: a `Vec<P>` of the app's depth, the frame's size, empty wherever the chrome is not.
+    chrome: alloc::boxed::Box<dyn core::any::Any + Send>,
+    /// Where the chrome layer may hold anything: every box [`Context::lay_chrome`] wrote into it, together (outside it the layer has always been empty).
+    pub chrome_box: crate::canvas::PixelRect,
+}
+
+impl Layers {
+    /// For a `w × h` frame of depth `P`, nothing laid yet.
+    pub fn new<P: crate::pixel::Pixel>(w: usize, h: usize) -> Self {
+        Self { noise: None, chrome: alloc::boxed::Box::new(alloc::vec![P::EMPTY; w * h]), chrome_box: crate::canvas::PixelRect::empty() }
+    }
+
+    /// The chrome layer's frame.
+    /// A depth other than the one it was made for is the host's bug, and panics.
+    pub fn chrome<P: crate::pixel::Pixel>(&mut self) -> &mut [P] {
+        self.chrome.downcast_mut::<alloc::vec::Vec<P>>().expect("the chrome layer is made at the app's depth")
+    }
 }
 
 /// The app's damage this frame ([`FluorApp::damage_rects`]): None when it changed nothing (its count 0), else its rects, the empty ones left out.
@@ -639,6 +666,43 @@ impl Context<'_> {
         match self.damage_rects.as_slice() {
             [] => core::slice::from_ref(&self.damage_clip),
             r => r,
+        }
+    }
+
+    /// The frame's rects as a value of their own ([`Self::damage_rects`]), so a canvas may borrow the context's damage while they are walked.
+    fn rects(&self) -> crate::canvas::DamageRects {
+        match self.damage_rects.as_slice() {
+            [] => crate::canvas::DamageRects::one(self.damage_clip),
+            _ => self.damage_rects,
+        }
+    }
+
+    /// THE NOISE, the last thing of the frame and under everything in it (ferros docs/GPU-COMPOSE.md 3.2, `ctx.lay_noise`).
+    /// Laid under `target` over each of the frame's rects inside its clip ([`crate::paint::NoiseLayer::lay_over`]: over each rect the pixels [`crate::paint::noise_under`] lays there); handed to the host as parameters instead where the display composes layers ([`Self::layers`]), which then generates it under the window.
+    pub fn lay_noise<P: crate::pixel::Pixel>(&mut self, target: &mut [P], noise: crate::paint::NoiseLayer) {
+        if let Some(l) = self.layers.as_deref_mut() {
+            l.noise = Some(noise);
+            return;
+        }
+        let (w, h) = (self.viewport.width_px as usize, self.viewport.height_px as usize);
+        let rects = self.rects();
+        noise.lay_over(&mut crate::canvas::Canvas::new(target, w, h, self.damage), rects.as_slice());
+    }
+
+    /// THE CHROME LAYER, put in where the frame has drawn only what is in front of it (ferros docs/GPU-COMPOSE.md 3.2, `ctx.lay_chrome`): over each of the frame's rects, its pixels under `target` and its hits claimed ([`crate::host::chrome_widget::DefaultChrome::lay_into`]).
+    /// Where the display composes layers ([`Self::layers`]) it goes into a layer of its own instead, shown in front of the app's.
+    #[cfg(feature = "icon")]
+    pub fn lay_chrome<P: crate::pixel::Pixel>(&mut self, target: &mut [P], chrome: &mut crate::host::chrome_widget::DefaultChrome<P>) {
+        let (w, h) = (self.viewport.width_px as usize, self.viewport.height_px as usize);
+        let rects = self.rects();
+        match self.layers.as_deref_mut() {
+            None => {
+                chrome.lay_into(target, w, h, rects.as_slice(), None);
+            }
+            Some(l) => {
+                let wrote = chrome.lay_into(target, w, h, rects.as_slice(), Some(l.chrome::<P>()));
+                l.chrome_box = l.chrome_box.union(wrote);
+            }
         }
     }
 }
@@ -1821,6 +1885,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
         if let (Some(window), Some(text)) = (self.home_window(), self.text.as_mut()) {
             let mut ctx = Context {
                 pressed_hit: self.pointer.held_id(),
+                layers: None,
                 damage_rects: crate::canvas::DamageRects::EMPTY,
                 scroll: None,
                 viewport: self.viewport,
@@ -1938,6 +2003,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             {
                 let mut ctx = Context {
                     pressed_hit: self.pointer.held_id(),
+                    layers: None,
                     damage_rects: crate::canvas::DamageRects::EMPTY,
                     scroll: None,
                     viewport: vp,
@@ -1957,6 +2023,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             {
                 let mut ctx = Context {
                     pressed_hit: self.pointer.held_id(),
+                    layers: None,
                     damage_rects: crate::canvas::DamageRects::EMPTY,
                     scroll: None,
                     viewport: vp,
@@ -1981,6 +2048,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
         if let Some(text) = self.text.as_mut() {
             let mut ctx = Context {
                 pressed_hit: self.pointer.held_id(),
+                layers: None,
                 damage_rects: crate::canvas::DamageRects::EMPTY,
                 scroll: None,
                 viewport: self.viewport,
@@ -2487,6 +2555,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
                 if let (Some(window), Some(text)) = (self.home_window(), self.text.as_mut()) {
                     let mut ctx = Context {
                         pressed_hit: self.pointer.held_id(),
+                        layers: None,
                         damage_rects: crate::canvas::DamageRects::EMPTY,
                         scroll: None,
                         viewport: self.viewport,
@@ -2657,6 +2726,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
 
         let mut ctx = Context {
             pressed_hit: self.pointer.held_id(),
+            layers: None,
             damage_rects: crate::canvas::DamageRects::EMPTY,
             scroll: scroll_hint,
             viewport: self.viewport,
@@ -3461,6 +3531,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             if let Some(text) = self.text.as_mut() {
                 let mut ctx = Context {
                     pressed_hit: self.pointer.held_id(),
+                    layers: None,
                     damage_rects: crate::canvas::DamageRects::EMPTY,
                     scroll: None,
                     viewport: self.viewport,
@@ -3642,6 +3713,7 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
             if let Some(text) = self.text.as_mut() {
                 let mut ctx = Context {
                     pressed_hit: self.pointer.held_id(),
+                    layers: None,
                     damage_rects: crate::canvas::DamageRects::EMPTY,
                     scroll: None,
                     viewport: self.viewport,
@@ -3828,6 +3900,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> ApplicationHandler<A::UserEvent> for
             let text = self.text.as_mut().expect("text renderer initialized");
             let mut ctx = Context {
                 pressed_hit: self.pointer.held_id(),
+                layers: None,
                 damage_rects: crate::canvas::DamageRects::EMPTY,
                 scroll: None,
                 viewport: self.viewport,
@@ -3919,6 +3992,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> ApplicationHandler<A::UserEvent> for
             if let (Some(window), Some(text)) = (self.home_window(), self.text.as_mut()) {
                 let mut ctx = Context {
                     pressed_hit: self.pointer.held_id(),
+                    layers: None,
                     damage_rects: crate::canvas::DamageRects::EMPTY,
                     scroll: None,
                     viewport: self.viewport,
@@ -3957,6 +4031,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> ApplicationHandler<A::UserEvent> for
         {
             let mut ctx = Context {
                 pressed_hit: self.pointer.held_id(),
+                layers: None,
                 damage_rects: crate::canvas::DamageRects::EMPTY,
                 scroll: None,
                 viewport: self.viewport,
@@ -4102,6 +4177,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> ApplicationHandler<A::UserEvent> for
                 {
                     let mut ctx = Context {
                         pressed_hit: self.pointer.held_id(),
+                        layers: None,
                         damage_rects: crate::canvas::DamageRects::EMPTY,
                         scroll: None,
                         viewport: self.viewport,
@@ -4370,6 +4446,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> ApplicationHandler<A::UserEvent> for
         };
         let mut ctx = Context {
             pressed_hit: self.pointer.held_id(),
+            layers: None,
             damage_rects: crate::canvas::DamageRects::EMPTY,
             scroll: None,
             viewport: self.viewport,
@@ -4430,6 +4507,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> DesktopShell<A, P> {
             if let (Some(window), Some(text)) = (self.home_window(), self.text.as_mut()) {
                 let mut ctx = Context {
                     pressed_hit: self.pointer.held_id(),
+                    layers: None,
                     damage_rects: crate::canvas::DamageRects::EMPTY,
                     scroll: None,
                     viewport: self.viewport,
@@ -4472,6 +4550,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> DesktopShell<A, P> {
         if let (Some(window), Some(text)) = (self.home_window(), self.text.as_mut()) {
             let mut ctx = Context {
                 pressed_hit: self.pointer.held_id(),
+                layers: None,
                 damage_rects: crate::canvas::DamageRects::EMPTY,
                 scroll: None,
                 viewport: self.viewport,
@@ -4529,6 +4608,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> DesktopShell<A, P> {
             let mods = winit_compat::from_winit_mods(self.modifiers);
             let mut ctx = Context {
                 pressed_hit: crate::paint::HIT_NONE,
+                layers: None,
                 damage_rects: crate::canvas::DamageRects::EMPTY,
                 scroll: None,
                 viewport: self.viewport,
@@ -4560,6 +4640,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> DesktopShell<A, P> {
         if let (Some(window), Some(text)) = (self.home_window(), self.text.as_mut()) {
             let mut ctx = Context {
                 pressed_hit: self.pointer.held_id(),
+                layers: None,
                 damage_rects: crate::canvas::DamageRects::EMPTY,
                 scroll: None,
                 viewport: self.viewport,

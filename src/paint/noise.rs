@@ -18,6 +18,13 @@
 //! Generating is faster on every core type, holds no 32 MB field, reads no 32 MB a frame from memory (bandwidth the camera and the GPU share, and DRAM reads cost battery), and leaves nothing to split or roll out of step with the frame.
 //!
 //! Each worker takes four rows at a time and interleaves their walks, so each row's serial chain of dependent steps overlaps the other three's.
+//!
+//! THE GENERATOR'S NUMBERS ARE PUBLIC (ferros docs/GPU-COMPOSE.md 3.4, 2026-11-22): a display that generates this noise itself (a GPU kernel recorded on the host, the noise handed over as parameters by `Context::lay_noise`, fluor host/app.rs) reads them from here rather than copying them.
+//! The walk, as this file runs it, for a texture `height` rows tall, a base colour `base` and a `shimmer`, all of it in the four 16-bit lanes of a `u64`:
+//! - each texture row `t` starts its generator at [`seed`]`(t, height)` and its colour at `(seed + (shimmer << 8)) & widen_mask(BG_MASK)`, the same start for both halves of the row;
+//! - each step going right is `r = rng.rotate_left(ROTATE); rng ^= r + STIR`, going left `rng ^= r − STIR` (wrapping), the first step for the pixel at the axis going right and at `axis − 1` going left;
+//! - after a step the colour is a speckle, `(rng >> 8) & widen_mask(BG_SPECKLE)`, when `rng < SPECKLE_BELOW`, else `((colour + (rng & STEP)) & mask − ((rng >> DOWN) & STEP)) & mask` (wrapping), mask being `widen_mask(BG_MASK)`;
+//! - the pixel is `((colour + widen_base(base)) & RGB) ^ RGB` with α whole ([`G2t16`]: darkness in the colour lanes), the theme's masks and base those of [`crate::theme`].
 
 use super::{BlendMode, Clip};
 use crate::canvas::Canvas;
@@ -27,29 +34,31 @@ use crate::pixel::{G2t16, Pixel};
 const GROUP: usize = 1 << 2;
 /// Pixels a row's walk writes to the stack before they go into the frame.
 const CHUNK: usize = 1 << 6;
+/// The generator's stir: each step rotates the generator left by this many bits.
+pub const ROTATE: u32 = 13;
 /// The generator's step constant (the texture's own, unchanged since the 8-bit walk).
-const STIR: u64 = 12_345_678_942;
+pub const STIR: u64 = 12_345_678_942;
 /// A step whose generator lands below this (its top byte zero, one step in 2⁸) is a speckle.
-const SPECKLE_BELOW: u64 = u64::MAX >> 8;
+pub const SPECKLE_BELOW: u64 = u64::MAX >> 8;
 /// The three colour lanes, α's lane excluded.
 const LANES: u64 = G2t16::RGB_MASK;
 /// The walk's step in each colour lane: up by one draw of this many bits and down by another, each uniform over `0 .. 2⁹`.
 /// Bit 8 of each draw is the 8-bit walk's step exactly (one code, 2⁸ at 16 bits, at even odds), and the low byte under it is the 16-bit grain: today's look, with 2⁸ steps inside each code.
 /// Measured over a 1344 × 2992 frame, the mean change of each channel across 16, 64 and 256 pixels is the 8-bit walk's to within 13 % (R and G within 4 %), the look kept; one draw of 2⁸ (grain alone, no code step) moved 20 to 40 % less across 16 pixels, and its streaks ran longer.
 /// The 8-bit walk's variance is only 3/4 of this one's on paper, but each of its borrows between lanes moved the next channel a whole code, where a 16-bit lane's borrow moves it 1/2⁸ of one.
-const STEP: u64 = 0x0000_01FF_01FF_01FF;
+pub const STEP: u64 = 0x0000_01FF_01FF_01FF;
 /// Where the down draw is taken from: the 9 bits above the up draw's in each lane.
 /// B's down draw reaches 2 bits into G's lane and G's into R's (the up draws' two lowest bits there); 3 lanes of two 9-bit draws need 54 of the 64 bits, and with α's lane free the only overlap is those low bits, a correlation under 1/2⁸ between neighbouring channels.
-const DOWN: u32 = 9;
+pub const DOWN: u32 = 9;
 
 /// A theme mask (a byte a channel) as the walk's 16-bit lanes: each channel's byte the lane's top byte and its low byte all ones, so a lane wraps at the same codes as the 8-bit walk with 2⁸ steps inside each.
-fn widen_mask(m8: u32) -> u64 {
+pub fn widen_mask(m8: u32) -> u64 {
     let lane = |s: u32| ((((m8 >> s) & 0xFF) as u64) << 8) | 0xFF;
     (lane(16) << 32) | (lane(8) << 16) | lane(0)
 }
 
 /// A base colour (a byte a channel, visible) as the walk's 16-bit lanes: 8-bit code `c` is 16-bit code `c × 2⁸`, the same light ([`Pixel::from_g2t8`]).
-fn widen_base(b8: u32) -> u64 {
+pub fn widen_base(b8: u32) -> u64 {
     let lane = |s: u32| (((b8 >> s) & 0xFF) as u64) << 8;
     (lane(16) << 32) | (lane(8) << 16) | lane(0)
 }
@@ -72,7 +81,7 @@ impl Walk {
     /// The lanes wrap: a lane's step carries into or borrows from the next lane's low bits and the mask takes it back off, which is the walk's wrap at its mask and the 8-bit walk's own packed arithmetic.
     #[inline(always)]
     fn step<const LEFT: bool>(&self, rng: &mut u64, colour: &mut u64) {
-        let r = rng.rotate_left(13);
+        let r = rng.rotate_left(ROTATE);
         *rng ^= if LEFT { r.wrapping_sub(STIR) } else { r.wrapping_add(STIR) };
         *colour = if *rng < SPECKLE_BELOW {
             (*rng >> 8) & self.speckle
@@ -88,10 +97,15 @@ impl Walk {
     }
 }
 
-/// Texture row `t`'s seed in a texture `height` rows tall.
+/// Every texture row's seed starts from this, before its row number goes in ([`seed`]).
+pub const SEED_BASE: u64 = 0xDEAD_BEEF_0123_4567;
+/// A texture row's number, counted from the texture's middle row, is multiplied by this into its seed ([`seed`]).
+pub const SEED_MUL: u64 = 0x9E37_79B9_4517_B397;
+
+/// Texture row `t`'s seed in a texture `height` rows tall: `SEED_BASE ^ (t − height / 2) × SEED_MUL`, wrapping.
 #[inline(always)]
-fn seed(t: usize, height: usize) -> u64 {
-    0xDEAD_BEEF_0123_4567u64 ^ (t as u64).wrapping_sub(height as u64 / 2).wrapping_mul(0x9E37_79B9_4517_B397)
+pub fn seed(t: usize, height: usize) -> u64 {
+    SEED_BASE ^ (t as u64).wrapping_sub(height as u64 / 2).wrapping_mul(SEED_MUL)
 }
 
 /// A run of noise into the frame: a store where the frame is empty (front to back, nothing is in front of it there), else `under` what is in front.
@@ -155,6 +169,45 @@ pub fn noise_under<P: Pixel>(canvas: &mut Canvas<P>, axis: usize, scroll: isize,
 pub fn background_noise<P: Pixel>(canvas: &mut Canvas<P>, shimmer: usize, fullscreen: bool, scroll_offset: isize, clip: Option<Clip>, base: Option<u32>) {
     let axis = canvas.width / 2;
     lay(canvas, axis, scroll_offset, shimmer, fullscreen, clip, base);
+}
+
+/// The noise as a layer of its own (ferros docs/GPU-COMPOSE.md 3.1, the background): the parameters [`noise_under`] and [`background_noise`] take, which a host whose display composes layers hands over in place of the pixels (`Context::lay_noise`), and every other host lays under the frame as those two do ([`NoiseLayer::lay_over`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NoiseLayer {
+    /// The mirror column, frame pixels (the frame's centre for [`background_noise`]).
+    pub axis: usize,
+    /// The texture's row offset: frame row `y` shows texture row `(y − scroll) mod height`.
+    pub scroll: isize,
+    /// The colour, a byte a channel as the theme authors it; None is [`crate::theme::BG_BASE`].
+    pub base: Option<u32>,
+    /// Added to each row's starting colour, in 8-bit codes of blue ([`background_noise`]'s `shimmer`).
+    pub shimmer: u16,
+    /// False leaves the frame's 1-pixel edge for the window's hairline.
+    pub full: bool,
+    /// Where the noise lies in the frame, None all of it; a host lays it inside the frame's damage alone.
+    pub clip: Option<Clip>,
+    /// The twinkle's frame (GPU-COMPOSE knob 9): 0, a still noise.
+    /// Carried to a display that generates the noise; this walk has no twinkle, so a host that lays it here draws frame 0's texture whatever it says.
+    pub frame: u32,
+}
+
+impl NoiseLayer {
+    /// [`noise_under`]'s noise: mirrored about `axis`, no shimmer, still.
+    pub fn new(axis: usize, scroll: isize, full: bool, clip: Option<Clip>, base: Option<u32>) -> Self {
+        Self { axis, scroll, base, shimmer: 0, full, clip, frame: 0 }
+    }
+
+    /// The noise laid under `canvas` over each of `rects` (the frame's damage), inside its own clip: over each rect exactly what [`noise_under`] (or [`background_noise`], with a shimmer) lays with that rect for its clip.
+    pub fn lay_over<P: Pixel>(&self, canvas: &mut Canvas<P>, rects: &[crate::canvas::PixelRect]) {
+        for r in rects {
+            let c = match self.clip {
+                None => Clip::new(r.x0, r.y0, r.x1, r.y1),
+                // The rect's part of the clip: the two rects' overlap, not a clamp (an empty one lays nothing, `lay`'s own test).
+                Some(c) => Clip::new(c.x_start.max(r.x0), c.y_start.max(r.y0), c.x_end.min(r.x1), c.y_end.min(r.y1)),
+            };
+            lay(canvas, self.axis, self.scroll, self.shimmer as usize, self.full, Some(c), self.base);
+        }
+    }
 }
 
 fn lay<P: Pixel>(canvas: &mut Canvas<P>, axis: usize, scroll: isize, shimmer: usize, fullscreen: bool, clip: Option<Clip>, base: Option<u32>) {
@@ -261,5 +314,43 @@ mod tests {
         assert_eq!(px[3], opaque);
         assert_eq!(px[w + 30], half_on.under(bare[w + 30], BlendMode::Normal));
         assert_eq!(px[4], bare[4]);
+    }
+
+    /// A noise layer laid over a frame's rects is, rect by rect, what `noise_under` lays there (and with a shimmer and the centre for its axis, `background_noise`): the same pixels under what the frame already holds, the same damage.
+    #[test]
+    fn a_noise_layer_laid_is_noise_under_rect_by_rect() {
+        fn check<P: Pixel + core::fmt::Debug>() {
+            let (w, h) = (96, 41);
+            let rects = [crate::canvas::PixelRect::new(0, 0, w, 9), crate::canvas::PixelRect::new(5, 20, 70, 41), crate::canvas::PixelRect::new(80, 12, 200, 30)];
+            // What the frame holds before the noise: an opaque pixel and a partly covered one.
+            let start = || {
+                let mut px = vec![P::EMPTY; w * h];
+                px[3] = P::from_g2t16(G2t16::OPAQUE | 0x1234_5678_9ABC);
+                px[25 * w + 30] = P::from_g2t16((G2t16::ONE as u64 / 2) << 48 | 0x0400_0500_0600);
+                px
+            };
+            for layer in [NoiseLayer::new(w / 3, 7, false, None, None), NoiseLayer { axis: w / 2, scroll: -3, base: Some(crate::theme::BUTTON_FILL), shimmer: 5, full: true, clip: Some(Clip::new(10, 4, 90, 35)), frame: 0 }] {
+                let (mut a, mut b) = (start(), start());
+                let (mut da, mut db) = (Damage::new(), Damage::new());
+                layer.lay_over(&mut Canvas::new(&mut a, w, h, &mut da), &rects);
+                for r in &rects {
+                    let c = match layer.clip {
+                        None => Clip::new(r.x0, r.y0, r.x1, r.y1),
+                        Some(c) => Clip::new(c.x_start.max(r.x0), c.y_start.max(r.y0), c.x_end.min(r.x1), c.y_end.min(r.y1)),
+                    };
+                    let mut canvas = Canvas::new(&mut b, w, h, &mut db);
+                    if layer.shimmer == 0 {
+                        noise_under(&mut canvas, layer.axis, layer.scroll, layer.full, Some(c), layer.base);
+                    } else {
+                        background_noise(&mut canvas, layer.shimmer as usize, layer.full, layer.scroll, Some(c), layer.base);
+                    }
+                }
+                assert!(a == b, "{layer:?}");
+                assert_eq!(da.bbox(), db.bbox());
+                assert!(a.iter().any(|&p| p != P::EMPTY) && a.iter().any(|&p| p == P::EMPTY), "laid inside the rects alone");
+            }
+        }
+        check::<G2t16>();
+        check::<Argb8>();
     }
 }

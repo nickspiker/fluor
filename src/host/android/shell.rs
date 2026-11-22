@@ -428,6 +428,7 @@ impl<A: FluorApp<P>, P: Finalize> AndroidShell<A, P> {
             .expect("TextRenderer must be initialized in AndroidShell::new");
         let mut ctx = Context {
             pressed_hit: self.pointer.held_id(),
+            layers: None,
             damage_rects: crate::canvas::DamageRects::EMPTY,
             scroll: None,
             viewport: self.viewport,
@@ -462,6 +463,7 @@ impl<A: FluorApp<P>, P: Finalize> AndroidShell<A, P> {
             .expect("TextRenderer must be initialized in AndroidShell::new");
         let mut ctx = Context {
             pressed_hit: self.pointer.held_id(),
+            layers: None,
             damage_rects,
             scroll,
             viewport: self.viewport,

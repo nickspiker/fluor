@@ -17,6 +17,8 @@ pub const BAKED: u8 = 2;
 pub trait PanelPixel: Pixel {
     /// The surface format op 22 names (ferros `window::WORKING` 0, `window::G2T16` 1) when the display does not bake.
     const FORMAT: u8;
+    /// A pixel this depth bakes from α 0 carries the see-through bit ([`SEE_THROUGH`]): what is behind it shows. At 8 bits a pixel bakes opaque (over black), so a layer of that depth would hide every layer behind it.
+    const SEES_THROUGH: bool;
     /// `dst[i]` from `src[i]`; the slices are the same length.
     fn to_panel(src: &[Self], dst: &mut [u64]);
     /// `dst[i]` from `src[i]` baked (`BAKED`): each channel's code over black, α − darkness, its light by `bake`'s table, then the panel's matrix and code (`Bake::row`). The transparency in bits 49-62 (Q14), exactly the see-through bit where α is 0, as the display's own decode of a fluor surface has it.
@@ -282,6 +284,7 @@ fn q14_from_g2t8() -> &'static [u16; 256] {
 
 impl PanelPixel for Argb8 {
     const FORMAT: u8 = 0;
+    const SEES_THROUGH: bool = false;
     /// The 8-bit present: the visible code over black, `α − darkness` (no subtraction can underflow: fluor's own buffer, where `under` keeps darkness ≤ α), thru the 256-entry table. A transparent pixel is black (no see-through bit at this depth).
     fn to_panel(src: &[Self], dst: &mut [u64]) {
         let lut = q14_from_g2t8();
@@ -306,6 +309,7 @@ impl PanelPixel for Argb8 {
 
 impl PanelPixel for G2t16 {
     const FORMAT: u8 = 1;
+    const SEES_THROUGH: bool = true;
     /// The pixels as drawn: the display decodes them (`G2T16`).
     fn to_panel(src: &[Self], dst: &mut [u64]) {
         dst.copy_from_slice(src);
