@@ -40,6 +40,24 @@ pub(crate) fn frame_rects(forced: bool, app: Option<crate::canvas::DamageRects>,
     }
 }
 
+/// The app scale set while a window is behind: only the ru from before the first set is held, so the app hears the whole change once, in front, as one factor (the ferros host's `set_zoom` and `set_behind`).
+#[derive(Default)]
+pub(crate) struct OwedZoom {
+    before: Option<crate::Coord>,
+}
+
+impl OwedZoom {
+    /// A set behind, with the ru the viewport had before it: the first one's is kept, the later ones' are passed over.
+    pub(crate) fn hold(&mut self, ru_before: crate::Coord) {
+        self.before.get_or_insert(ru_before);
+    }
+
+    /// In front again: the factor from the ru before the first set behind to the ru now, once; None when nothing was set behind.
+    pub(crate) fn take(&mut self, ru_now: crate::Coord) -> Option<crate::Coord> {
+        self.before.take().map(|before| ru_now / before)
+    }
+}
+
 /// The bake a ferros display's `BAKED` surface is made with (display op 65, ferros_sys `window::bake`): per channel of a working value v (VSF RGB, gamma 2, white at 1), the light l = tanh²(k·v); the panel's light p = m·l (its rows the panel's red, green and blue); its code p^g × 65472 in Q16, held at the field's ends. A fluor code c (g2t, light atanh(c / 2ⁿ)²) is the working value atanh(c / 2ⁿ), so its light is tanh²(k · atanh(c / 2¹⁶)): one table over every 16-bit code (an 8-bit code is its 16-bit `c × 2⁸`). The panel's part is the display's own NEON kernels (ferros payloads/display neon.rs `matrix8`, `code16`, odt.rs `odt_tables`), carried here: fluor does not depend on ferros.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub struct Bake {
@@ -508,5 +526,18 @@ mod tests {
         assert_eq!(frame_rects(false, Some(DamageRects::one(ring)), w, h).as_slice(), &[ring]);
         let over = PixelRect::new(w - 1, h - 1, w + (1 << 3), h + (1 << 3));
         assert_eq!(frame_rects(false, Some(DamageRects::one(over)), w, h).as_slice(), &[PixelRect::new(w - 1, h - 1, w, h)]);
+    }
+
+    /// Scale steps set behind are held as one change: in front, the app hears the factor from the scale before the first step to the last, once, and nothing when no step came.
+    #[test]
+    fn a_scale_set_behind_reaches_the_app_once_in_front() {
+        let mut owed = OwedZoom::default();
+        assert_eq!(owed.take(1.), None, "nothing set behind: nothing to tell");
+        let steps = [1., 1.25, 1.5, 2.];
+        for w in steps.windows(2) {
+            owed.hold(w[0]);
+        }
+        assert_eq!(owed.take(*steps.last().unwrap()), Some(2.), "the first step's ru to the last's");
+        assert_eq!(owed.take(2.), None, "told once");
     }
 }

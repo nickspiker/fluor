@@ -449,6 +449,10 @@ pub struct FerrosShell<A: FluorApp<P>, P: PanelPixel = Argb8> {
     bell: Arc<Bell>,
     /// Back in front: the next frame is drawn whole, whatever the app says is dirty.
     full_next: bool,
+    /// Behind (home, or another kist in front; `set_behind`): no frame is drawn, whatever marks the window dirty, and a scale set meanwhile is only kept (`zoom_owed`).
+    behind: bool,
+    /// The app scale set while behind (`set_zoom`): the viewport takes each new ru at once, and the app hears the change once, in front again (`set_behind`), with one relayout.
+    zoom_owed: crate::host::panel::OwedZoom,
     /// The last draw was the app's own frame (`FluorApp::render_own`), not the scratch.
     own: bool,
     /// The display bakes (op 65 answered): set by the frame loop before each draw, so `draw` knows whether the app may bake its own frame.
@@ -508,6 +512,8 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             wake,
             bell,
             full_next: false,
+            behind: false,
+            zoom_owed: crate::host::panel::OwedZoom::default(),
             own: false,
             display_bakes: false,
             app_bakes: false,
@@ -536,8 +542,15 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
     }
 
     /// The RU multiplier set from outside the app (an input hook following the person's app scale, ferros preference 14), and the layout run again: the app hears it as a set, not a gesture (`FluorApp::on_zoom_set`, whose default is a pinch step about the centre), then its resize.
+    /// Behind, the new ru is only kept: the app is not told, nothing is laid out or drawn, and the change reaches it once when it is in front again (`set_behind`).
+    /// A pinch in another kist steps the global scale many times a second, and a window behind that relaid and drew on each step took 90 to 130 ms a step from the one in front (2026-11-21, Photon behind Lumis on the Pro: 11 to 27 frames a second shown).
     pub fn set_zoom(&mut self, ru: Coord) {
         let ru_before = self.viewport.ru;
+        if self.behind {
+            self.zoom_owed.hold(ru_before);
+            self.viewport.set_zoom(ru);
+            return;
+        }
         self.viewport.set_zoom(ru);
         self.window.mark_dirty();
         let (w, h) = (self.viewport.width_px, self.viewport.height_px);
@@ -564,10 +577,13 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             }
             self.window.mark_dirty();
         }
-        if let Some(ru) = self.app.take_zoom_request() {
-            if ru.is_finite() && ru > 0.0 {
-                let (w, h) = (self.viewport.width_px as Coord, self.viewport.height_px as Coord);
-                self.set_zoom_and_relayout(ru, w / 2.0, h / 2.0);
+        // The app's own zoom is left with it while behind: taken, laid out and drawn at the first frame in front.
+        if !self.behind {
+            if let Some(ru) = self.app.take_zoom_request() {
+                if ru.is_finite() && ru > 0.0 {
+                    let (w, h) = (self.viewport.width_px as Coord, self.viewport.height_px as Coord);
+                    self.set_zoom_and_relayout(ru, w / 2.0, h / 2.0);
+                }
             }
         }
         if self.with_context(|app, ctx| app.tick(ctx)) {
@@ -581,7 +597,20 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
     }
 
     /// Behind or in front again (the display's op 62). Behind: the finger let go (no touch reaches this window until it is back), and the app told it lost focus (`Focused(false)`, `on_focus_changed(false)`: draw nothing, play nothing but notifications). In front: focus back, `on_window_shown`, and the next frame drawn whole.
+    /// A scale set while behind (`set_zoom`) reaches the app here, in front again: one `on_zoom_set` for the whole change and one relayout, before the whole frame.
     pub fn set_behind(&mut self, behind: bool) {
+        self.behind = behind;
+        if !behind {
+            if let Some(factor) = self.zoom_owed.take(self.viewport.ru) {
+                let (w, h) = (self.viewport.width_px, self.viewport.height_px);
+                self.with_context(|app, ctx| {
+                    if factor != 1.0 {
+                        app.on_zoom_set(factor, ctx);
+                    }
+                    app.on_resize(w, h, ctx)
+                });
+            }
+        }
         if behind && self.finger.take().is_some() && !self.pinch_muted {
             self.on_pointer(&[FEvent::CursorLeft]);
         }
@@ -668,6 +697,10 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             if at <= Instant::now() {
                 self.window.mark_dirty();
             }
+        }
+        // Behind, nothing is drawn whatever marked the window dirty (a scale step, a resize, a safe area, a bake): the dirt is kept, and the first frame in front is drawn whole (`set_behind`).
+        if self.behind {
+            return false;
         }
         if !self.window.take_dirty() {
             return false;
