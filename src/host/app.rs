@@ -880,6 +880,11 @@ pub trait FluorApp<P: crate::pixel::Pixel = crate::pixel::Argb8> {
         None
     }
 
+    /// The part of [`Self::own_surface`]'s frame that differs from the frame shown before it (in viewport pixels), which the host's show names as changed so the display composes that part alone (ferros, 2026-11-22: Lumis's camera screen showed its whole surface as changed for every counter's tick, about 27 shows a second at about 20 ms of the display's each, and the display's render thread held the X3 at 100 % until it throttled). `None` (the default): the whole frame, as always.
+    fn own_changed(&self) -> Option<crate::canvas::PixelRect> {
+        None
+    }
+
     /// The frame [`Self::render_own`] put in a surface itself is already in the ferros display's own codes (`BAKED`: the host's [`crate::host::panel::Bake`], which the ferros host hands out as `host::ferros::bake`), so the window is shown that way and the display only dithers it. False (the default): the frame is in the host's pixel depth's own format.
     fn own_baked(&self) -> bool {
         false

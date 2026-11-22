@@ -1497,7 +1497,8 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
             let opaque = shell.app.opaque();
             // An app that drew into a buffer of its own (`FluorApp::own_surface`) says which, in the 36-byte form: the display shows that buffer and answers once it has taken it (ferros GPU-KISTS.md 1.4, the mailbox).
             let own = if shell.own { shell.app.own_surface() } else { None };
-            let c = if shell.own { PixelRect::new(0, 0, w, h) } else { shell.shown };
+            // An app's own frame names what it says changed (`FluorApp::own_changed`), the whole frame where it says nothing.
+            let c = if shell.own { shell.app.own_changed().unwrap_or(PixelRect::new(0, 0, w, h)) } else { shell.shown };
             m[19..21].copy_from_slice(&((fx + c.x0) as u16).to_le_bytes());
             m[21..23].copy_from_slice(&((fy + c.y0) as u16).to_le_bytes());
             m[23..25].copy_from_slice(&(c.width() as u16).to_le_bytes());
