@@ -94,7 +94,7 @@ impl Checkbox {
         if self.label.is_empty() {
             return Vec::new();
         }
-        let style = TextStyle::new(self.font_size, theme::TEXTBOX_TEXT);
+        let style = TextStyle::new(self.font_size, theme::look().text);
         let max_w = (self.width - self.box_side() - self.font_size * 0.8).max(self.font_size);
         let mut lines = Vec::new();
         let mut cur = String::new();
@@ -205,7 +205,7 @@ impl Checkbox {
                 side * 0.32,
                 seg_th,
                 core::f32::consts::FRAC_PI_4,
-                theme::TEXTBOX_TEXT,
+                theme::look().text,
                 clip,
             );
             paint::draw_rect_rotated(
@@ -215,17 +215,17 @@ impl Checkbox {
                 side * 0.5,
                 seg_th,
                 -core::f32::consts::FRAC_PI_4,
-                theme::TEXTBOX_TEXT,
+                theme::look().text,
                 clip,
             );
             let _ = inset;
         }
 
-        // Fill colour: ticked = action-blue, empty = textbox-dark, so on/off reads at a glance.
+        // Fill colour from the look in effect (a host's device theme, else fluor's own): ticked = the button colour, empty = the field colour, so on/off reads at a glance.
         let fill = if self.checked {
-            theme::BUTTON_FILL
+            theme::look().button
         } else {
-            self.empty_fill.unwrap_or(theme::TEXTBOX_FILL)
+            self.empty_fill.unwrap_or(theme::look().field)
         };
         // Asymmetric corners like the textbox, button and window perimeter (Nick 2026-09-10): TL+BR at the box's deep radius, TR+BL at half — the inner fill's corners sit one stroke inside the outer ring's.
         let inner = side as isize - 2 * stroke;
@@ -248,8 +248,8 @@ impl Checkbox {
             box_y0 as isize,
             side as isize,
             side as isize,
-            theme::TEXTBOX_SHADOW_EDGE,
-            theme::TEXTBOX_LIGHT_EDGE,
+            theme::look().shadow_edge,
+            theme::look().light_edge,
             paint::asymmetric_radii(big),
             paint::SHAPE_POWER as f32,
             None,
@@ -265,7 +265,7 @@ impl Checkbox {
             let first_y = self.center_y - step * (lines.len() as Coord - 1.0) * 0.5;
             for (i, line) in lines.iter().enumerate() {
                 let (lx, ly) = (box_x0 + side + self.font_size * 0.5, first_y + step * i as Coord);
-                let style = TextStyle::new(self.font_size, theme::TEXTBOX_TEXT);
+                let style = TextStyle::new(self.font_size, theme::look().text);
                 text.draw_text_left(canvas, line, lx, ly, &style, clip, None);
                 label_boxes.push((lx, ly - step * 0.5, lx + text.measure_text(line, &style), ly + step * 0.5));
             }
@@ -371,7 +371,7 @@ mod widget_impls {
         }
         fn tint_delta(&self) -> u32 {
             if self.is_hovered() {
-                crate::paint::wrap_sub_rgb(theme::BUTTON_HOVER, theme::BUTTON_FILL)
+                crate::paint::wrap_sub_rgb(theme::look().button_hover, theme::look().button)
             } else {
                 0
             }
