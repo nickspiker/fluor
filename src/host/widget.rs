@@ -331,6 +331,17 @@ pub fn apply_pressed(root: &mut dyn Container, held: HitId) {
     });
 }
 
+/// Sync every widget's hover to the hit id under the cursor: the one whose id it is is hovered, every other widget with a [`Hover`] capability is not. One walk, as [`apply_pressed`]; the host's overlay then tints the hovered widget's claimed pixels from [`build_overlay_deltas`].
+/// The app's cursor handler, every widget at once, so none is left out: `let hit = chrome.hit_at(x, y); if chrome.set_hover(hit) { apply_hover(self, hit); request_redraw }` on `CursorMoved`, and `HIT_NONE` on `CursorLeft`. (`set_hover` says when the hit changed, so the walk runs only then.)
+pub fn apply_hover(root: &mut dyn Container, hit: HitId) {
+    root.visit(&mut |w| {
+        let on = hit != HIT_NONE && w.id() == hit;
+        if let Some(h) = w.hover() {
+            h.set_hovered(on);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
