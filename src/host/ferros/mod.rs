@@ -806,6 +806,15 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
                 self.hinted += 1;
             }
         }
+        // The hit map's frame boundary is the scratch's, on every path below (the app's own frame, its baked one, the scratch): moved with the same scroll, then cleared over the same rects, so the frame starts with an empty map there and only claims, front to back.
+        if let Some((map, hw, hh)) = self.app.hit_test_map() {
+            if let Some((rect, dy)) = scroll {
+                crate::paint::scroll_hits(map, hw, hh, rect, dy);
+            }
+            for &r in rects.as_slice() {
+                crate::paint::clear_hits(map, hw, hh, r);
+            }
+        }
         let t_moved = sys::now();
         self.pending_damage.clear();
         // A frame the app made itself (its GPU's layer): the scratch is neither cleared nor drawn, and the present takes the app's frame whole.
@@ -1111,20 +1120,23 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
             }
             match ev {
                 FEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-                    self.pointer.on_down(self.hit_under_cursor());
+                    let hit = self.hit_under_cursor();
+                    self.pointer.on_down(hit);
                     self.touch_down = true;
                     self.touch_last_x = self.cursor_x;
                     self.touch_last_y = self.cursor_y;
                     self.touch_travel = 0.0;
                 }
                 FEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
-                    if let Some(id) = self.pointer.on_up(self.hit_under_cursor()) {
+                    let hit = self.hit_under_cursor();
+                    if let Some(id) = self.pointer.on_up(hit) {
                         self.dispatch_activate(id);
                     }
                     self.touch_down = false;
                 }
                 FEvent::CursorMoved { .. } => {
-                    if self.pointer.on_move(self.hit_under_cursor()) {
+                    let hit = self.hit_under_cursor();
+                    if self.pointer.on_move(hit) {
                         self.window.mark_dirty();
                     }
                 }
@@ -1157,7 +1169,7 @@ impl<A: FluorApp<P>, P: PanelPixel> FerrosShell<A, P> {
         self.window.mark_dirty();
     }
 
-    fn hit_under_cursor(&self) -> HitId {
+    fn hit_under_cursor(&mut self) -> HitId {
         let (x, y) = (self.cursor_x as i32, self.cursor_y as i32);
         if x < 0 || y < 0 {
             return HIT_NONE;

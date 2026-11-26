@@ -4,10 +4,12 @@
 //!
 //! Built on the verbatim photon primitives in [`super::chrome`] — `draw_window_controls`, `draw_window_edges_and_mask`, `draw_button_hairlines`, `draw_button_hover_by_pixels`, `pixels_for_button`. Those stay; this module is a stateful wrapper that schedules them against the chrome group's dirty layers.
 //!
-//! Pattern: `chrome.rasterize_bg(|bg, w, h| { /* paint into bg */ });` → `chrome.rasterize_chrome(text);` → `chrome.flatten_into(target, w, h);`. Each rasterize_* checks the layer's dirty bit internally and is a no-op on clean. Hover / focus tint is NOT rasterized — it's applied by the host's post-finalize overlay pass against `persistent_screen` via [`super::widget::build_overlay_deltas`] reading [`Hover::tint_delta`] off each chrome button.
+//! Each rasterize_* checks the layer's dirty bit internally and is a no-op on clean. Hover / focus tint is NOT rasterized — it's applied by the host's post-finalize overlay pass against `persistent_screen` via [`super::widget::build_overlay_deltas`] reading [`Hover::tint_delta`] off each chrome button.
 //!
-//! The frame, front to back, for pixels and hits alike: `clear_hits` over each damage rect (the host has cleared the scratch there), `rasterize_perimeter` and `rasterize_chrome` (no claims), anything in front of the chrome (an open dropdown's popup), `flatten_chrome_into` (the chrome's pixels and its hits), the app's widgets in front-to-back order, each claiming only what nothing in front claimed, and `flatten_bg_into` last.
-//! The hit map is never last-writer-wins: every write into it is a claim ([`crate::paint::claim_hit`]), or a clear or a scroll's move made before the frame's first claim.
+//! **The frame, front to back, for pixels and hits alike. No painter's order anywhere: what is in front goes in first.**
+//! Before `render` the host clears the scratch AND the hit map over the frame's damage (moving both first with a scroll), so both start every frame empty; an app hands the host its map through [`super::app::FluorApp::hit_test_map`] and never clears or moves it itself.
+//! Then in `render`: `rasterize_bg`, `rasterize_perimeter` and `rasterize_chrome` (no claims), anything in front of the chrome (an open dropdown's popup), `flatten_chrome_into` (the chrome's pixels and its hits: the window controls are the front of the window), the app's content and widgets in front-to-back order, each going `under` what is there and claiming only what nothing in front claimed, and `flatten_bg_into` LAST, behind everything.
+//! The hit map is never last-writer-wins: every write into it is a claim ([`crate::paint::claim_hit`]), or the host's clear or scroll's move made before the frame's first claim. There is no one-call flatten of the whole chrome group at the end of the frame (`flatten_into`, gone 2026-11-26): it put the window controls behind every app that used it.
 
 use super::EventResponse;
 use super::chrome::{self, HIT_BLOCK, HIT_NONE, HitId};
@@ -162,9 +164,9 @@ pub struct DefaultChrome<P: Pixel = Argb8> {
     /// The frame's hit map, shared: the chrome's buttons and every widget the app draws claim their pixels here front to back ([`crate::paint::claim_hit`]), so whatever is frontmost on screen takes the click.
     /// Per pixel `HIT_NONE` (0) where nothing claimed it, otherwise the dense `HitId` of what did (the chrome's min / max / close / app-icon, each allocated at construction via [`super::widget::next_id`], or the app's own).
     /// Sized to `width * height` pixels of the current viewport.
-    /// A frame clears it over its damage first ([`Self::clear_hits`]), as the host clears the scratch.
+    /// The host clears it over each frame's damage before `render` ([`crate::paint::clear_hits`], reached through [`Self::hit_map_mut`]), as it clears the scratch.
     pub hit_test_map: Vec<HitId>,
-    /// The chrome's own hits, a layer like its pixels: written by each re-raster, and claimed into [`Self::hit_test_map`] when the chrome layer goes into the frame ([`Self::flatten_chrome_into`], [`Self::flatten_into`]), so the chrome's hits take the same place in the front-to-back order as its pixels.
+    /// The chrome's own hits, a layer like its pixels: written by each re-raster, and claimed into [`Self::hit_test_map`] when the chrome layer goes into the frame ([`Self::flatten_chrome_into`]), so the chrome's hits take the same place in the front-to-back order as its pixels.
     /// [`HIT_BLOCK`] marks a pixel outside the window's silhouette, claimed before any button so none takes it, and never claimed into the frame's map.
     chrome_hits: Vec<HitId>,
     /// Where the chrome layer holds anything (the bounding box of its non-empty pixels and of its own hits), found by one scan after each re-raster and kept until the next: the per-frame flatten covers only this, not the whole viewport (2026-11-08: on a phone the chrome is an orb in a corner, and the full-frame blit of its empty rest cost a pass over every pixel each frame).
@@ -451,37 +453,15 @@ impl<P: Pixel> DefaultChrome<P> {
         paint(&mut canvas);
     }
 
-    /// The same shift for the per-pixel hit map: a scrolled pane's hit zones travel with its pixels, so the rows inside `rect` memmove by `dy` and only the exposed band waits for the pane's own re-stamp. Without this a memmoved frame would leave every hit zone one shift behind the pixels.
-    /// Call it before anything claims in the frame, with the scratch's own move.
-    pub fn scroll_hit_map(&mut self, rect: crate::canvas::PixelRect, dy: i32) {
+    /// The hit map, writable, with its size: what an app's [`super::app::FluorApp::hit_test_map`] hands the host, which moves it with a scroll and clears it over the frame's damage before `render`, as it does the scratch. Apps never clear or move it themselves.
+    pub fn hit_map_mut(&mut self) -> (&mut [HitId], usize, usize) {
         let (w, h) = self.dims();
-        // WHY/PROOF: rect is the app's scroll hint, which can overhang the hit map — the row copies would index past it.
-        let (x0, x1, y0, y1) = (rect.x0.min(w), rect.x1.min(w), rect.y0.min(h), rect.y1.min(h));
-        if dy == 0 || x1 <= x0 || y1 <= y0 {
-            return;
-        }
-        let n = dy.unsigned_abs() as usize;
-        if n >= y1 - y0 {
-            return;
-        }
-        // WHY/PROOF that order cannot matter: the move runs before the frame's first claim, so what it overwrites is last frame's settled claims, each replaced by the claim of the pixel that scrolled there.
-        let span = x1 - x0;
-        if dy > 0 {
-            for dst in (y0 + n..y1).rev() {
-                let s = (dst - n) * w + x0;
-                self.hit_test_map.copy_within(s..s + span, dst * w + x0);
-            }
-        } else {
-            for dst in y0..y1 - n {
-                let s = (dst + n) * w + x0;
-                self.hit_test_map.copy_within(s..s + span, dst * w + x0);
-            }
-        }
+        (&mut self.hit_test_map, w, h)
     }
 
     /// Paint the window-perimeter hairline DIRECTLY into the consumer's `target` buffer and (re)carve the window-shape `clip_mask` — the first writer of the frame, run BEFORE the consumer paints any content into `target`.
     ///
-    /// **Why this is split out of [`rasterize_chrome`]:** fluor is under-blend only ("topmost paints first wins"). The chrome group composites UNDER `target` at [`flatten_into`](Self::flatten_into) time (`target.under(chrome)`), so any content the consumer draws directly into `target` ALWAYS wins over chrome at shared edge pixels — burying the perimeter hairline wherever full-bleed content reaches the window edge. Painting the hairline into `target` first makes it the top of the under-chain at those edge pixels: content then composes UNDER it and the hairline survives. Buttons / orb / controls-strip / title stay in the chrome group (they never sit at the window edge, so no content conflicts there) and keep compositing under content as before.
+    /// **Why this is split out of [`rasterize_chrome`]:** fluor is under-blend only ("topmost paints first wins"). The hairline goes straight into `target` as the frame's first writer, so it is the front of the under-chain at the window's edge pixels: content composes UNDER it, full-bleed content included, and it survives. The buttons, orb, controls strip and title are the chrome layer, which goes in next at [`Self::flatten_chrome_into`], still ahead of all content.
     ///
     /// **clip_mask ownership moved here.** The `clip_mask.fill(255)` reset and the corner cutout carve (a side effect of [`chrome::draw_window_edges_and_mask`]) are inseparable — same pixels, one pass — so they MUST stay on the same cycle. This pass owns BOTH now and runs **every frame** (not dirty-gated): the consumer overwrites `target`'s edge pixels each frame, so the hairline must be repainted each frame, and the mask is recomputed identically each frame (it's a pure function of viewport + zoom), keeping it coherent with the dirty-gated `hit_test_map` that [`rasterize_chrome`] stamps against it. The single window-shape α-trim still happens exactly once, at the OS boundary in [`crate::paint::finalize_for_os`] — this pass only writes the mask, never multiplies it into α.
     ///
@@ -894,25 +874,7 @@ impl<P: Pixel> DefaultChrome<P> {
         // Hover paint moved to the host overlay path; chrome_buf is intentionally tint-free here.
     }
 
-    /// Composite the chrome group (bg + chrome layers via internal Stack `Push chrome, Push bg, Under(Normal)`) and flatten it under `target`.
-    /// Front to back: the group goes under whatever is already in `target`, so content drawn before this call is in front of the chrome, the chrome is in front of the bg, and the bg shows thru where the chrome is transparent.
-    /// The chrome's hits are claimed into [`Self::hit_test_map`] at the same step, over the same clip, so they too land behind what the content already claimed.
-    /// For a chrome in front of the content use [`Self::flatten_chrome_into`] before the content and [`Self::flatten_bg_into`] after it.
-    ///
-    /// `clip`: optional damage-clip in target pixel coords; passed straight thru to [`Group::flatten_into`]. `None` = full target (current behavior).
-    pub fn flatten_into(
-        &mut self,
-        target: &mut [P],
-        target_w: usize,
-        target_h: usize,
-        clip: Option<crate::paint::Clip>,
-    ) {
-        let boxed = self.chrome_clip(clip, target_w, target_h);
-        self.claim_chrome_hits(boxed, target);
-        self.group.flatten_into(target, target_w, target_h, clip);
-    }
-
-    /// Flatten ONLY the chrome layer (buttons, orb, controls strip, title) into `target`. Call it BEFORE painting content: fluor is front-to-back, so the chrome then sits on top of everything the app draws — content scrolled up under the title strip, or a full-screen panel, can never bury the window controls. Pair with [`Self::flatten_bg_into`] after the content, in place of [`Self::flatten_into`].
+    /// Flatten ONLY the chrome layer (buttons, orb, controls strip, title) into `target`. Call it BEFORE painting content: fluor is front-to-back, so the chrome then sits on top of everything the app draws — content scrolled up under the title strip, or a full-screen panel, can never bury the window controls. Pair with [`Self::flatten_bg_into`] after the content.
     /// The chrome's hits are claimed into [`Self::hit_test_map`] at the same step and over the same clip as its pixels, so the controls take the click wherever they show, and what the app draws after claims only what they left.
     /// Anything the app put in front of the chrome (an open dropdown's popup, drawn before this call) keeps both its pixels and its hits.
     pub fn flatten_chrome_into(
@@ -984,17 +946,6 @@ impl<P: Pixel> DefaultChrome<P> {
                 map[i] = if held == HIT_NONE && mine[i] != HIT_BLOCK && shows { mine[i] } else { held };
             }
         }
-    }
-
-    /// Start the frame's hits over one damage rect: everything claimed there last frame is cleared, so this frame's front-to-back claims (the popups, the chrome at its flatten, the widgets in order) settle every pixel afresh.
-    /// The hit map's half of the host clearing the scratch over the damage: call it for each of the frame's rects ([`super::app::Context::damage_rects`]) at the top of `render`, before anything claims.
-    /// Outside the damage the map keeps last frame's claims, as the frame keeps last frame's pixels.
-    pub fn clear_hits(&mut self, rect: crate::canvas::PixelRect) {
-        let (w, h) = self.dims();
-        // WHY/PROOF: the rect is the app's damage, which may overhang the frame (`DamageRects::cut` cuts it the same way for the hosts); the fill would index past the map.
-        let r = crate::canvas::PixelRect::new(rect.x0.min(w), rect.y0.min(h), rect.x1.min(w), rect.y1.min(h));
-        // WHY/PROOF that order cannot matter: this is the frame's first write to these pixels, called before anything claims, so it overwrites only last frame's claims.
-        fill_rect(&mut self.hit_test_map, w, r, HIT_NONE);
     }
 
     /// Flatten ONLY the bg layer (panes + background noise) into `target`: the LAST paint of the frame, under all content. See [`Self::flatten_chrome_into`].
@@ -1313,7 +1264,7 @@ mod tests {
         let mut frame = alloc::vec![0u32; w * h];
         // Last frame's claims everywhere: the clear must take them all.
         chrome.hit_test_map.fill(sid);
-        chrome.clear_hits(crate::canvas::PixelRect::new(0, 0, w, h));
+        crate::paint::clear_hits(&mut chrome.hit_test_map, w, h, crate::canvas::PixelRect::new(0, 0, w, h));
         chrome.rasterize_perimeter(&mut frame, w, h, &mut clip_mask);
         chrome.rasterize_chrome(&mut crate::canvas::Damage::new(), &mut text, &mut clip_mask);
         // A popup in front of the chrome, over the close button's end of the strip.
@@ -1376,7 +1327,7 @@ mod tests {
         assert!(!chrome.set_orb_place(Some((450.0, 120.0, 60.0))), "the same place is no change");
         assert_eq!(chrome.orb_geometry(), Some((450, 120, 60)));
         let mut frame = alloc::vec![0u32; w * h];
-        chrome.clear_hits(crate::canvas::PixelRect::new(0, 0, w, h));
+        crate::paint::clear_hits(&mut chrome.hit_test_map, w, h, crate::canvas::PixelRect::new(0, 0, w, h));
         chrome.rasterize_chrome(&mut crate::canvas::Damage::new(), &mut text, &mut clip_mask);
         chrome.flatten_chrome_into(&mut frame, w, h, None);
         let orb = chrome.app_icon_btn.id();
@@ -1422,9 +1373,10 @@ mod tests {
     fn set_hover_does_not_dirty_chrome_layer() {
         let mut counter: HitId = HIT_NONE;
         let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "", None, None, &mut counter);
-        // Run a flatten cycle so StackCompositor::evaluate clears all initial-dirty flags.
+        // Run a frame's flattens (chrome first, bg last) so both layers settle their initial-dirty flags.
         let mut target = alloc::vec![0u32; 100 * 100];
-        chrome.flatten_into(&mut target, 100, 100, None);
+        chrome.flatten_chrome_into(&mut target, 100, 100, None);
+        chrome.flatten_bg_into(&mut target, 100, 100, None);
         assert!(!chrome.group.rpn.layers[chrome.layer_chrome].dirty);
         chrome.set_hover(chrome.close_btn.id());
         // Hover tint lives entirely in the host overlay pass against persistent_screen; no scratch repaint is needed, so the chrome layer must stay clean.
@@ -1436,7 +1388,8 @@ mod tests {
         let mut counter: HitId = HIT_NONE;
         let mut chrome = DefaultChrome::new(Viewport::new(100, 100), "", None, None, &mut counter);
         let mut target = alloc::vec![0u32; 100 * 100];
-        chrome.flatten_into(&mut target, 100, 100, None);
+        chrome.flatten_chrome_into(&mut target, 100, 100, None);
+        chrome.flatten_bg_into(&mut target, 100, 100, None);
         chrome.resize(Viewport::new(200, 150));
         assert_eq!(chrome.dims(), (200, 150));
         assert_eq!(chrome.hit_test_map.len(), 200 * 150);
@@ -1491,7 +1444,7 @@ mod tests {
         let (mut fa, mut fb, mut fc, f0) = (front(), front(), front(), front());
         for ch in [&mut a, &mut b, &mut c] {
             for r in &rects {
-                ch.clear_hits(*r);
+                crate::paint::clear_hits(&mut ch.hit_test_map, w, h, *r);
             }
         }
         // Today's call, rect by rect.

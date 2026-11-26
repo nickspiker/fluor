@@ -294,13 +294,51 @@ pub const HIT_BLOCK: HitId = HitId::MAX;
 
 /// Claim one hit-map pixel for `id`: the hit map's half of front to back (AGENT.md, "Compositing: Front to Back").
 /// The frontmost thing claims its pixels first and a pixel already claimed is never written again, so whatever is frontmost on screen takes the click, exactly as the pixel kernels' opaque early-out keeps the front pixel.
-/// The map must start the frame empty over what is redrawn: [`crate::host::chrome_widget::DefaultChrome::clear_hits`].
+/// The map starts the frame empty over what is redrawn: the host clears it ([`clear_hits`]) where it clears the scratch.
 /// One compare and a select, no branch on the store.
 /// This form trusts the caller that the layer shows at the pixel; a layer that draws as it claims takes [`claim_if_shown`].
 #[inline(always)]
 pub fn claim_hit(slot: &mut HitId, id: HitId) {
     let held = *slot;
     *slot = if held == HIT_NONE { id } else { held };
+}
+
+/// Start a frame's hits over `rect` of a `w × h` hit map: last frame's claims there are cleared, so this frame's front-to-back claims settle every pixel afresh.
+/// The host does it, where it clears the scratch and over the same rects, so the hit map starts every frame empty exactly as the pixels do and no app clears it (or forgets to: until 2026-11-26 apps did, and the ones that did not kept their first frames' claims, which a resize then read at the new width, scattered over the wrong pixels).
+/// Outside the damage the map keeps last frame's claims, as the frame keeps last frame's pixels.
+pub fn clear_hits(map: &mut [HitId], w: usize, h: usize, rect: crate::canvas::PixelRect) {
+    // WHY/PROOF: the rect is the frame's damage, which may overhang the map (`DamageRects::cut` cuts it the same way); the fill would index past it.
+    let (x0, x1) = (rect.x0.min(w), rect.x1.min(w));
+    for y in rect.y0.min(h)..rect.y1.min(h) {
+        map[y * w + x0..y * w + x1].fill(HIT_NONE);
+    }
+}
+
+/// A scroll's move of a `w × h` hit map: the rows inside `rect` move by `dy`, so a scrolled pane's hit zones travel with its pixels, and only the exposed band waits for the frame's claims.
+/// The host runs it with the scratch's own move ([`scroll_copy_rect`]), before [`clear_hits`], as it moves the scratch before clearing it.
+pub fn scroll_hits(map: &mut [HitId], w: usize, h: usize, rect: crate::canvas::PixelRect, dy: i32) {
+    // WHY/PROOF: rect is the app's scroll hint, which can overhang the hit map — the row copies would index past it.
+    let (x0, x1, y0, y1) = (rect.x0.min(w), rect.x1.min(w), rect.y0.min(h), rect.y1.min(h));
+    if dy == 0 || x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let n = dy.unsigned_abs() as usize;
+    if n >= y1 - y0 {
+        return;
+    }
+    // WHY/PROOF that order cannot matter: the move runs before the frame's first claim, so what it overwrites is last frame's settled claims, each replaced by the claim of the pixel that scrolled there.
+    let span = x1 - x0;
+    if dy > 0 {
+        for dst in (y0 + n..y1).rev() {
+            let s = (dst - n) * w + x0;
+            map.copy_within(s..s + span, dst * w + x0);
+        }
+    } else {
+        for dst in y0..y1 - n {
+            let s = (dst + n) * w + x0;
+            map.copy_within(s..s + span, dst * w + x0);
+        }
+    }
 }
 
 /// [`claim_hit`] over a run of pixels; branch free, so the compiler widens it.

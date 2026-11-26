@@ -940,8 +940,10 @@ pub trait FluorApp<P: crate::pixel::Pixel = crate::pixel::Argb8> {
         Vec::new()
     }
 
-    /// Read-only handle to the consumer's hit-test map so the host's overlay diff pass can walk it. Returns `Some((&map, win_w, win_h))` where `map.len() >= win_w * win_h` (one [`crate::paint::HitId`] per pixel — `u16` since the v0.0 widening). Default `None` = no overlay walk, no hover support.
-    fn hit_test_map(&self) -> Option<(&[crate::paint::HitId], usize, usize)> {
+    /// The consumer's hit-test map, handed to the host: `Some((map, win_w, win_h))` where `map.len() >= win_w * win_h` (one [`crate::paint::HitId`] per pixel). With a [`super::chrome_widget::DefaultChrome`] it is `Some(self.chrome.hit_map_mut())`.
+    /// The host owns its frame boundary as it owns the scratch's: before every `render` it moves the map with the frame's scroll and clears it over the frame's damage ([`crate::paint::scroll_hits`], [`crate::paint::clear_hits`]), so the map starts each frame empty and `render` only claims, front to back. An app never clears or moves it. Between frames the host reads it for the pointer and the hover overlay.
+    /// Default `None` = no hit map: no clicks routed by pixel, no hover overlay.
+    fn hit_test_map(&mut self) -> Option<(&mut [crate::paint::HitId], usize, usize)> {
         None
     }
 
@@ -2722,6 +2724,13 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
         }
 
         clear_scratch_rect(&mut self.scratch, win_w, damage_clip);
+        // The hit map's frame boundary is the scratch's: moved with the same scroll, then cleared over the same damage, so `render` starts with an empty map there and only claims, front to back.
+        if let Some((map, hw, hh)) = self.app.hit_test_map() {
+            if let Some((rect, dy)) = scroll_hint {
+                crate::paint::scroll_hits(map, hw, hh, rect, dy);
+            }
+            crate::paint::clear_hits(map, hw, hh, damage_clip);
+        }
 
         let (ccx, ccy) = self.win_cursor_px();
         let wo = self.ctx_window_origin();
@@ -4139,7 +4148,8 @@ impl<A: FluorApp<P> + 'static, P: Finalize> ApplicationHandler<A::UserEvent> for
                     // The press becomes a drag only past the user's OS drag threshold (0 where the OS publishes none — then the first pixel commits). Until then it is still a click on whatever it pressed, so the arbiter keeps tracking it below.
                     let t = crate::host::os_input::drag_threshold_px();
                     if !self.is_dragging_move && dx.unsigned_abs() <= t && dy.unsigned_abs() <= t {
-                        if self.pointer.on_move(self.hit_under_cursor()) {
+                        let hit = self.hit_under_cursor();
+                        if self.pointer.on_move(hit) {
                             if let Some(window) = self.home_window() {
                                 window.request_redraw();
                             }
@@ -4165,7 +4175,8 @@ impl<A: FluorApp<P> + 'static, P: Finalize> ApplicationHandler<A::UserEvent> for
                 }
 
                 // Press-hold-release: while a press is in flight, track whether the pointer is still over the armed target. A drag off (or back on) toggles the held colour — request a redraw so it appears/clears. Runs before the app dispatch so ctx.pressed_hit below reflects this move.
-                if self.pointer.on_move(self.hit_under_cursor()) {
+                let hit = self.hit_under_cursor();
+                if self.pointer.on_move(hit) {
                     if let Some(window) = self.home_window() {
                         window.request_redraw();
                     }
@@ -4311,7 +4322,8 @@ impl<A: FluorApp<P> + 'static, P: Finalize> ApplicationHandler<A::UserEvent> for
                 ..
             } => {
                 // Press-hold-release: arm the element under the pointer. The action does NOT fire here — it waits for a release over the same element (drag-off cancels). The raw press is still forwarded so the app can do its press-time work (focus, textbox cursor, drag-select arm, window-drag / resize). Redraw so the "held" colour appears.
-                self.pointer.on_down(self.hit_under_cursor());
+                let hit = self.hit_under_cursor();
+                self.pointer.on_down(hit);
                 // Raise-on-click: a press that reached our surface means the pointer is over the visible app, so bring it to the front if it isn't already. Without this, clicking the app on a fullscreen-surface model didn't raise the OS window — it could stay behind another window the WM had stacked above.
                 // Gated on `!is_focused` so an already-front window never re-requests activation (no WM flicker/fight).
                 if !self.is_focused {
@@ -4330,7 +4342,8 @@ impl<A: FluorApp<P> + 'static, P: Finalize> ApplicationHandler<A::UserEvent> for
                 ..
             } => {
                 // Press-hold-release: a release over the SAME element the press armed is a validated activation; a release after a drag-off fires nothing. Emit the activation BEFORE forwarding the raw release so the app's release-time bookkeeping sees a consistent world.
-                let activate = self.pointer.on_up(self.hit_under_cursor());
+                let hit = self.hit_under_cursor();
+                let activate = self.pointer.on_up(hit);
                 // Captured BEFORE the end-blocks clear the flags: a committed move or an active resize ending on THIS release is the geometry-persistence edge.
                 let gesture_ended = self.is_dragging_resize || self.is_dragging_move;
                 // Windows: hand the mouse back the moment any gesture's press ends (no-op when nothing was captured).
@@ -4587,7 +4600,7 @@ impl<A: FluorApp<P> + 'static, P: Finalize> DesktopShell<A, P> {
 
     /// Helper: dispatch a generic event to `app.on_event`, applying any returned [`EventResponse`].
     /// Hit id under the cursor right now, read from the app's [`FluorApp::hit_test_map`] at the window-local cursor position — the same map + indexing the overlay pass uses. `HIT_NONE` when the app exposes no map, or the cursor is out of bounds. Feeds the [`crate::host::pointer::PointerArbiter`] on every down / move / up.
-    fn hit_under_cursor(&self) -> crate::paint::HitId {
+    fn hit_under_cursor(&mut self) -> crate::paint::HitId {
         // Window-relative pass-0 PIXELS (the hit map's space) — on macOS that's points × window_scale, elsewhere the plain subtraction.
         let (cx, cy) = self.win_cursor_px();
         let x = cx as i32;

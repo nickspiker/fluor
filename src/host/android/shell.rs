@@ -151,6 +151,15 @@ impl<A: FluorApp<P>, P: Finalize> AndroidShell<A, P> {
                 for &r in rects.as_slice() {
                     clear_scratch_rect(&mut self.scratch, win_w, r);
                 }
+                // The hit map's frame boundary is the scratch's: moved with the same scroll, then cleared over the same rects, so `render` starts with an empty map there and only claims, front to back.
+                if let Some((map, hw, hh)) = self.app.hit_test_map() {
+                    if let Some((rect, dy)) = scroll {
+                        crate::paint::scroll_hits(map, hw, hh, rect, dy);
+                    }
+                    for &r in rects.as_slice() {
+                        crate::paint::clear_hits(map, hw, hh, r);
+                    }
+                }
                 self.pending_damage.clear();
                 self.with_context_render(rects, scroll, |app, scratch, ctx| {
                     app.render(scratch, ctx);
@@ -217,7 +226,8 @@ impl<A: FluorApp<P>, P: Finalize> AndroidShell<A, P> {
             // Feed the press-hold-release arbiter (identical semantics to the desktop host). Down arms the element under the finger; a drag off toggles the held colour; a release over the same element is the validated activation (`on_activate`); ACTION_CANCEL (→ CursorLeft) disarms. Arbiter runs BEFORE `dispatch(ev)` so a release's activation is delivered ahead of the raw Released, matching desktop ordering.
             match ev {
                 FEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-                    self.pointer.on_down(self.hit_under_cursor());
+                    let hit = self.hit_under_cursor();
+                    self.pointer.on_down(hit);
                     // Arm touch-drag scroll from the press position (the DOWN's CursorMoved already updated cursor_y just above).
                     self.touch_down = true;
                     self.touch_last_x = self.cursor_x;
@@ -225,13 +235,15 @@ impl<A: FluorApp<P>, P: Finalize> AndroidShell<A, P> {
                     self.touch_travel = 0.0;
                 }
                 FEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
-                    if let Some(id) = self.pointer.on_up(self.hit_under_cursor()) {
+                    let hit = self.hit_under_cursor();
+                    if let Some(id) = self.pointer.on_up(hit) {
                         self.dispatch_activate(id);
                     }
                     self.touch_down = false;
                 }
                 FEvent::CursorMoved { .. } => {
-                    if self.pointer.on_move(self.hit_under_cursor()) {
+                    let hit = self.hit_under_cursor();
+                    if self.pointer.on_move(hit) {
                         self.window.mark_dirty();
                     }
                 }
@@ -275,7 +287,7 @@ impl<A: FluorApp<P>, P: Finalize> AndroidShell<A, P> {
     }
 
     /// Hit id under the finger right now, from the app's [`FluorApp::hit_test_map`] at the surface-local cursor (Android's surface IS the window, so cursor coords need no origin offset). `HIT_NONE` when there is no map or the point is out of bounds. Feeds the [`crate::host::pointer::PointerArbiter`].
-    fn hit_under_cursor(&self) -> HitId {
+    fn hit_under_cursor(&mut self) -> HitId {
         let x = self.cursor_x as i32;
         let y = self.cursor_y as i32;
         if x < 0 || y < 0 {

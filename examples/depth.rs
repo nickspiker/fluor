@@ -87,16 +87,17 @@ impl<P: Finalize> FluorApp<P> for Demo<P> {
         self.chrome.rasterize_perimeter(target, w, h, ctx.clip_mask);
         self.chrome.rasterize_chrome(ctx.damage, ctx.text, ctx.clip_mask);
         self.chrome.rasterize_bg(ctx.damage, |c| ramps(c));
-        self.chrome.flatten_into(target, w, h, None);
+        // Front to back: the chrome first (the window controls are the front), the ramps' bg last.
+        self.chrome.flatten_chrome_into(target, w, h, None);
+        self.chrome.flatten_bg_into(target, w, h, None);
     }
 
     fn cursor_for(&self, _x: Coord, _y: Coord, _ctx: &Context) -> CursorIcon {
         CursorIcon::Default
     }
 
-    fn hit_test_map(&self) -> Option<(&[HitId], usize, usize)> {
-        let (w, h) = self.chrome.dims();
-        Some((self.chrome.hit_test_map(), w, h))
+    fn hit_test_map(&mut self) -> Option<(&mut [HitId], usize, usize)> {
+        Some(self.chrome.hit_map_mut())
     }
 
     fn overlay_deltas(&mut self) -> Vec<u32> {
