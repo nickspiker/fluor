@@ -50,6 +50,7 @@ pub struct Slider {
     last_painted_value: f32,
     last_painted_enabled: bool,
     last_painted_focused: bool,
+    last_painted_hovered: bool,
 }
 
 impl Slider {
@@ -80,6 +81,7 @@ impl Slider {
             last_painted_value: -1.0,
             last_painted_enabled: true,
             last_painted_focused: false,
+            last_painted_hovered: false,
         }
     }
 
@@ -169,7 +171,8 @@ impl Slider {
     pub fn damage_rect(&self, viewport_w: usize, viewport_h: usize) -> Option<PixelRect> {
         let dirty = self.value != self.last_painted_value
             || self.enabled != self.last_painted_enabled
-            || self.focused != self.last_painted_focused;
+            || self.focused != self.last_painted_focused
+            || self.hovered != self.last_painted_hovered;
         if !dirty && self.last_painted_bbox.is_some() {
             return None;
         }
@@ -194,8 +197,9 @@ impl Slider {
             return;
         }
 
+        // Hovered or focused, the handle takes the look's accent: a slider says it is the one under the pointer (or the keys) by its own paint, since its pixels span white to black, where an overlay's constant delta would wrap, and its touch band reaches past them over whatever is behind.
         let (left_fill, right_fill, handle_fill) = if self.enabled {
-            (LEFT_FILL, RIGHT_FILL, HANDLE_FILL)
+            (LEFT_FILL, RIGHT_FILL, if self.hovered || self.focused { crate::theme::look().accent } else { HANDLE_FILL })
         } else {
             (LEFT_DISABLED, RIGHT_DISABLED, HANDLE_DISABLED)
         };
@@ -270,6 +274,7 @@ impl Slider {
         self.last_painted_value = self.value;
         self.last_painted_enabled = self.enabled;
         self.last_painted_focused = self.focused;
+        self.last_painted_hovered = self.hovered;
     }
 }
 
@@ -372,7 +377,7 @@ mod widget_impls {
             Slider::set_hovered(self, hovered);
         }
         fn tint_delta(&self) -> u32 {
-            // The slider repaints directly on value changes; no overlay tint needed.
+            // The slider shows hover in its own paint (the handle takes the accent, render_content_into), so the overlay adds nothing.
             0
         }
     }
