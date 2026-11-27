@@ -90,6 +90,10 @@ pub struct Textbox<P: Pixel = Argb8> {
     last_painted_bbox: Option<PixelRect>,
     /// `focused` value at the time of the last paint — tracks whether the glow was painted last frame, so [`Textbox::damage_rect`] can expand to `glow_bbox` on focus on/off transitions.
     last_painted_focused: bool,
+    /// The glow colour painted last frame, `None` when no glow was: a change either way (lit, dark, or another colour) repaints the whole halo.
+    last_painted_glow: Option<u32>,
+    /// A status glow the app sets ([`Self::set_glow_colour`]): lit in this colour whether or not the box has focus, over the focus glow's default.
+    glow_colour: Option<u32>,
     /// Selection range `(start, end)` that was painted last frame (or `None` if no selection was visible). Used by [`Textbox::damage_rect`] to detect range changes — selection extends/contracts during drag don't dirty either cache (text content unchanged, pill unchanged), but they DO need the bbox repainted so the selection rect reflects the new range. Compared against the current `selection_range()`; if different, treat as pill-dirty so the host clears + re-renders the bbox.
     last_painted_selection: Option<(usize, usize)>,
 }
@@ -247,6 +251,8 @@ impl<P: Pixel> Textbox<P> {
             last_painted_bbox: None,
             last_painted_selection: None,
             last_painted_focused: false,
+            last_painted_glow: None,
+            glow_colour: None,
             last_painted_blinkey_on: false,
             last_painted_blinkey_bbox: None,
         }
@@ -263,6 +269,8 @@ impl<P: Pixel> Textbox<P> {
     /// Picks the right bbox flavor: `glow_bbox` if glow is currently OR was previously painted; `bbox` for the bare-pill steady state. Hover transitions never report damage here — the tint lives in the host overlay pass.
     pub fn damage_rect(&self, viewport_w: usize, viewport_h: usize) -> Option<PixelRect> {
         let focus_changed = self.focused != self.last_painted_focused;
+        let glow = self.glow();
+        let glow_changed = glow != self.last_painted_glow;
         // Selection range change (extend / contract / new / clear) doesn't dirty either cache — pill unchanged, glyphs unchanged — but DOES require the bbox to repaint so the selection rect reflects the new range. Treat as pill-dirty for damage purposes.
         let selection_changed = self.selection_range() != self.last_painted_selection;
         // Position change since the last paint: a textbox that SCROLLS with its block (the contacts search box riding `contacts_scroll`) moves without dirtying either cache or its focus — the pill cache is position-independent (rasterized at local coords, blit-translated). Without noticing the move, damage narrows to nothing and the box (and its glow) smears a trail up the pane. Compared against the bare pill rect the same way `record_painted` stores it.
@@ -272,6 +280,7 @@ impl<P: Pixel> Textbox<P> {
         let pill_dirty = self.pill_cache_dirty
             || self.text_cache_dirty
             || focus_changed
+            || glow_changed
             || selection_changed
             || moved;
 
@@ -301,8 +310,8 @@ impl<P: Pixel> Textbox<P> {
 
         // Pill bbox (current + prev) — contributes only when pill is dirty. Glow padding is included ONLY when the glow itself is changing this frame: focus transition (paint or clear glow), or pill geometry change (glow moves with the pill). Steady-state text editing while focused keeps the glow exactly where it was last frame — glow rays source from the pill silhouette which doesn't move with text edits — so damage stays inside the bare pill `bbox` and the glow region in `persistent_screen` is untouched. Cuts damage area ~3× on every keystroke compared to including the glow envelope.
         if pill_dirty {
-            // Glow envelope enters damage on a focus transition, a pill-geometry change, OR a move while focused (the glow rode along and left a halo at the old spot). Steady-state text editing keeps damage inside the bare pill (the ~3× keystroke saving).
-            let need_glow_damage = focus_changed || self.pill_cache_dirty || (moved && self.focused);
+            // Glow envelope enters damage on a glow change (focus, or the app's status colour), a pill-geometry change, OR a move while glowing (the glow rode along and left a halo at the old spot). Steady-state text editing keeps damage inside the bare pill (the ~3× keystroke saving).
+            let need_glow_damage = glow_changed || self.pill_cache_dirty || (moved && glow.is_some());
             let current_region = if need_glow_damage {
                 self.glow_bbox()
             } else {
@@ -312,7 +321,7 @@ impl<P: Pixel> Textbox<P> {
             union_in(&mut combined, current_rect);
             if let Some(prev) = self.last_painted_bbox {
                 // The previous painted rect is the BARE pill; if the box was glowing when it moved, its old halo reached `glow_pad` past that rect — inflate so the trail is fully cleared.
-                let prev_region = if moved && self.focused {
+                let prev_region = if moved && self.last_painted_glow.is_some() {
                     let (hp, vp) = self.glow_pad();
                     // WHY/PROOF: the inflated halo runs past the viewport for a pill at its edge — the far edges stay inside the buffers the damage clears (the near edges saturate to 0 in the f32 → usize cast).
                     PixelRect::new(
@@ -358,6 +367,7 @@ impl<P: Pixel> Textbox<P> {
         let rect = region_to_pixelrect(region, viewport_w, viewport_h);
         self.last_painted_bbox = if rect.is_empty() { None } else { Some(rect) };
         self.last_painted_focused = self.focused;
+        self.last_painted_glow = self.glow();
         self.last_painted_selection = self.selection_range();
 
         let blinkey_want = self.focused && !self.has_selection() && self.blinkey_visible;
@@ -1136,10 +1146,10 @@ impl<P: Pixel> Textbox<P> {
             self.shown.settle(canvas.pixels);
         }
 
-        // --- Focus glow on target (NOT cached — paints fresh each frame against current chrome) ---
+        // --- Focus or status glow on target (NOT cached — paints fresh each frame against current chrome) ---
         //
         // RU-invariant exponential falloff matching the chrome shadow: horizontal rays reach `1.5 × font_size` (half-life-ish), vertical rays half that (`0.75 × font_size`) so the top/bottom halo is more contained without changing per-pixel intensity. Same curve as paint_shadow; emitted at 0°/180° (left/right) and 90°/270° (top/bottom) instead of 45° diagonals, and white instead of black. Vertical passes also use half-density seed (0x40 vs horizontal 0x80) so the top/bottom halo reads softer.
-        if self.focused {
+        if let Some(colour) = self.glow() {
             let horiz_factor = Self::glow_factor_256(self.font_size, 1.5);
             let vert_factor = Self::glow_factor_256(self.font_size, 0.75);
             paint::apply_textbox_glow_right(
@@ -1148,7 +1158,7 @@ impl<P: Pixel> Textbox<P> {
                 pill_y_target,
                 pill_w,
                 pill_h,
-                theme::GLOW_DEFAULT,
+                colour,
                 0x80,
                 horiz_factor,
                 clip,
@@ -1159,7 +1169,7 @@ impl<P: Pixel> Textbox<P> {
                 pill_y_target,
                 pill_w,
                 pill_h,
-                theme::GLOW_DEFAULT,
+                colour,
                 0x80,
                 horiz_factor,
                 clip,
@@ -1170,7 +1180,7 @@ impl<P: Pixel> Textbox<P> {
                 pill_y_target,
                 pill_w,
                 pill_h,
-                theme::GLOW_DEFAULT,
+                colour,
                 0x40,
                 vert_factor,
                 clip,
@@ -1181,7 +1191,7 @@ impl<P: Pixel> Textbox<P> {
                 pill_y_target,
                 pill_w,
                 pill_h,
-                theme::GLOW_DEFAULT,
+                colour,
                 0x40,
                 vert_factor,
                 clip,
@@ -1248,6 +1258,22 @@ impl<P: Pixel> Textbox<P> {
         } else {
             self.blinkey_visible = false;
         }
+    }
+
+    /// Light the glow in a status colour (a `theme::GLOW_*`, RGB only), focused or not, or `None` to leave only the focus glow; returns whether it changed.
+    /// The status outranks focus while set: a search under way, then how it went, stays on the box until the app clears it.
+    /// The next [`Self::damage_rect`] covers the whole halo on any change, so the caller only wakes the host.
+    pub fn set_glow_colour(&mut self, colour: Option<u32>) -> bool {
+        if colour == self.glow_colour {
+            return false;
+        }
+        self.glow_colour = colour;
+        true
+    }
+
+    /// The glow this frame paints: the status colour if one is set, else the default while focused, else none.
+    fn glow(&self) -> Option<u32> {
+        self.glow_colour.or(if self.focused { Some(theme::GLOW_DEFAULT) } else { None })
     }
 
     /// `true` while the cursor is hovering over this textbox.

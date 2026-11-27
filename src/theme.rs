@@ -583,6 +583,8 @@ pub const CURSOR_BRIGHTNESS: f32 = 100.0;
 // Textbox glow colours (RGB only — α-byte is set per-pixel by the glow function).
 pub const GLOW_DEFAULT: u32 = dark_rgb_only(fmt(vsf(0x00_C2_C2_C2)));
 pub const GLOW_SUCCESS: u32 = dark_rgb_only(fmt(vsf(0x00_3E_C2_3E)));
+/// Something under way whose outcome is not in yet (a search in flight).
+pub const GLOW_PENDING: u32 = dark_rgb_only(fmt(vsf(0x00_C2_C2_3E)));
 pub const GLOW_ERROR: u32 = dark_rgb_only(fmt(vsf(0x00_C2_5C_5C)));
 /// Black halo — the rays add darkness instead of brightness, drawing the surrounding pixels toward 0. Used by [`crate::widgets::Button`] so its focus motif reads as a "deepening shadow / pressing into the surface" rather than the textbox glow's "lit-from-within" feel. Distinct visual vocabulary at the same pixel cost.
 pub const GLOW_DARK: u32 = dark_rgb_only(fmt(vsf(0x00_00_00_00)));
