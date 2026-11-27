@@ -284,6 +284,7 @@ mod x11_atomic {
     /// (which repeats throughout a session, not just at connect). Returns `false` off X11.
     pub fn watch_screen_changes() -> bool {
         use x11rb::protocol::randr::{ConnectionExt as _, NotifyMask};
+        use x11rb::protocol::xproto::{ChangeWindowAttributesAux, ConnectionExt as _, EventMask};
         let Some(conn) = conn() else { return false };
         let Some(root) = conn.setup().roots.first().map(|s| s.root) else {
             return false;
@@ -294,9 +295,17 @@ mod x11_atomic {
                 NotifyMask::SCREEN_CHANGE | NotifyMask::CRTC_CHANGE | NotifyMask::OUTPUT_CHANGE,
             )
             .is_ok();
+        // The work area changes on its own clock: the window manager rewrites `_NET_WORKAREA` once it has laid its panels out on the new screen, after the RandR change, so a layout rebuilt at the RandR event read the OLD work area (Nick 2026-11-27: a maximized window kept the old resolution's size). Its property change is the second signal.
+        if let Some(atom) = conn.intern_atom(false, b"_NET_WORKAREA").ok().and_then(|c| c.reply().ok()).map(|r| r.atom) {
+            let _ = WORKAREA_ATOM.set(atom);
+            let _ = conn.change_window_attributes(root, &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE));
+        }
         let _ = conn.flush();
         ok
     }
+
+    /// `_NET_WORKAREA`'s atom, interned once by [`watch_screen_changes`], for [`drain`] to pick its change out of every root property change (the active window's among them, on each focus change).
+    static WORKAREA_ATOM: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
     /// The active monitors as RandR reports them right now (`RRGetMonitors`), primary first, as `(x, y, w, h)`.
     /// Asked on fluor's own connection, the one that just saw the change: winit caches its monitor list and drops the cache only when ITS connection processes the same event, so reading winit here could return the old layout and the rebuild would wrongly decide nothing moved.
@@ -364,6 +373,8 @@ mod x11_atomic {
     /// What one drain of fluor's own X queue found: whether a RandR layout change arrived, and the raw keys in order as (X keycode, pressed).
     pub struct Drained {
         pub screen_changed: bool,
+        /// The window manager rewrote `_NET_WORKAREA`: the panels moved, or settled on a new screen.
+        pub work_area_changed: bool,
         pub keys: Vec<(u32, bool)>,
     }
 
@@ -372,11 +383,12 @@ mod x11_atomic {
     /// event-loop cycle costs nothing while nothing happens — no timer, no polling.
     pub fn drain() -> Drained {
         use x11rb::protocol::Event;
-        let mut d = Drained { screen_changed: false, keys: Vec::new() };
+        let mut d = Drained { screen_changed: false, work_area_changed: false, keys: Vec::new() };
         let Some(conn) = conn() else { return d };
         while let Ok(Some(ev)) = conn.poll_for_event() {
             match ev {
                 Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_) => d.screen_changed = true,
+                Event::PropertyNotify(p) if WORKAREA_ATOM.get() == Some(&p.atom) => d.work_area_changed = true,
                 Event::XinputRawKeyPress(k) => d.keys.push((k.detail, true)),
                 Event::XinputRawKeyRelease(k) => d.keys.push((k.detail, false)),
                 _ => {}
@@ -1736,6 +1748,22 @@ impl<A: FluorApp<P>, P: Finalize> DesktopShell<A, P> {
         let x = r.x.max(wx).min(wx + ww as i32 - w as i32);
         let y = r.y.max(wy).min(wy + wh as i32 - h as i32);
         WindowRect { x, y, w, h }
+    }
+
+    /// The window manager rewrote `_NET_WORKAREA` (its panels moved, or settled after a screen change): every monitor's and surface's work area is read again, and a maximized window refills its monitor's new one. A window that is not maximized keeps its rect.
+    #[cfg(target_os = "linux")]
+    fn refit_work_areas(&mut self) {
+        for m in self.monitors.iter_mut() {
+            m.work_area = monitor_work_area(m.origin, m.size);
+        }
+        for s in self.surfaces.iter_mut() {
+            s.work_area = monitor_work_area(s.origin, s.size);
+        }
+        log::info!("FLUOR-MON: work area changed → {:?}", self.window_monitor().work_area);
+        if self.saved_rect_for_maximize.is_some() {
+            self.pending_full_repaint = true;
+            self.apply_window_rect(self.maximized_rect());
+        }
     }
 
     /// Re-derive the desktop-spanning surface after a RandR layout change (monitor hotplug, or the
@@ -3958,6 +3986,9 @@ impl<A: FluorApp<P> + 'static, P: Finalize> ApplicationHandler<A::UserEvent> for
             let drained = x11_atomic::drain();
             if drained.screen_changed {
                 self.rebuild_span(event_loop);
+            }
+            if drained.work_area_changed {
+                self.refit_work_areas();
             }
             for (code, down) in drained.keys {
                 self.raw_key(code, down);
