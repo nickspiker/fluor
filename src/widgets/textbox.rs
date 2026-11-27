@@ -145,7 +145,7 @@ pub(crate) fn region_to_pixelrect(
 ///
 /// Composition is [`paint::flatten_premult`]'s kernel, row by row (src is pre-attenuated, so we scale by `(ONE + 1 − dst.α)` only — not by that × src.α): one copy of the maths for every premultiplied blit.
 ///
-/// No hit claim here: a widget claims over its whole paint (its text, its pill, its glow) with a [`paint::Shown`] round them all.
+/// No hit claim here: a widget claims over its body's paint (its text, its pill) with a [`paint::Shown`] round them; its glow is light and claims nothing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn blit_cache_to_target<P: Pixel>(
     cache: &[P],
@@ -1086,9 +1086,10 @@ impl<P: Pixel> Textbox<P> {
         self.pill_cache_origin_x = pill_x_target;
         self.pill_cache_origin_y = pill_y_target;
 
-        // The hits ride the paint: where the α stood before the caret, the text, the pill and the glow, so each claims exactly the pixels it shows on.
+        // The hits ride the paint: where the α stood before the caret, the text and the pill, so each claims exactly the pixels the box's body shows on.
+        // Not the glow: a glow is light, not the box, and carries as far as its falloff does; a tap or a hover tint on it would end at an edge the light has not reached (owner, 2026-11-26).
         if hit_map.is_some() {
-            let reach = reach_of(if self.focused { self.glow_bbox() } else { self.bbox() }, offset_x, offset_y, canvas.width, canvas.height);
+            let reach = reach_of(self.bbox(), offset_x, offset_y, canvas.width, canvas.height);
             self.shown.before(canvas.pixels, canvas.width, canvas.height, reach);
         }
 
@@ -1130,6 +1131,10 @@ impl<P: Pixel> Textbox<P> {
             canvas,
             clip,
         );
+        // Where the body showed (caret, text, pill, anti-aliased rim), settled before the glow goes under it.
+        if hit_map.is_some() {
+            self.shown.settle(canvas.pixels);
+        }
 
         // --- Focus glow on target (NOT cached — paints fresh each frame against current chrome) ---
         //
@@ -1183,9 +1188,8 @@ impl<P: Pixel> Textbox<P> {
             );
         }
 
-        // Claim where the box showed: its caret (light inside the pill, never opaque), text, pill, anti-aliased rim and glow, none of the pixels already opaque before it, and none something in front claimed.
+        // Claim where the box showed: its caret (light inside the pill, never opaque), text, pill and anti-aliased rim, none of the pixels already opaque before it, and none something in front claimed.
         if let Some(map) = hit_map {
-            self.shown.settle(canvas.pixels);
             self.shown.claim_shape(map, hit_id, crate::widgets::textbox::cache_covers(&self.pill_cache, self.pill_cache_w, self.pill_cache_h, pill_x_target, pill_y_target));
         }
 

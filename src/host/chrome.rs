@@ -260,7 +260,18 @@ pub fn draw_status_bar<P: Pixel>(
 /// `stroke_width = (r >> 5) + 2`: the additive floor was +1 (the textbox minimum-stroke idiom) and read too skinny against the +1px-fattened avatar rings — Nick bumped it to match (2026-09-02); `r >> 5` still adds a proportional pixel only on large / zoomed orbs.
 ///
 /// Precondition: the orb is the fixed top-left chrome badge, always fully on-screen (`cx, cy ≥ r_aa` and `cx+r_aa, cy+r_aa < dims` for the chrome's `button_size/2`-centred, `button_size/4`-radius orb), so the bbox is in-bounds by construction — no clamping. A violated precondition wraps a `usize` and panics on the index (fail loud). Without an `icon`, the interior fills with `ring_colour` as a solid disk; `hit_test_map` (when present) tags every pixel inside the solid ring with `hit_id`.
-/// The orb's press glow: the wordmark-family light, disk form. Rasterize the disk's coverage at the glow grey into a full-width band scratch, run the soft IIR blurs (horizontal factor 3/4, vertical 1/2 — the same character as photon's wordmark + text halos), then composite as a WHITE light layer via real `under()` — called AFTER the orb paints, so earliest-wins layering keeps every opaque disk pixel untouched and the bloom lands only in the transparent surround.
+/// The orb's press glow at the disk: the wordmark-family grey 0xB0, in the halo's Q24 coverage.
+const ORB_GLOW_Q24: u32 = 0xB0 << 16;
+
+/// How far the orb's press glow carries past its disk before its light is under one step of a `depth`-bit frame: (pixels sideways, rows up and down).
+/// The glow's scratch and the chrome's reach both read it, so the glow is never cut by a box drawn short of its light (owner, 2026-11-26: "glows technically extend forever").
+pub fn orb_glow_extent(depth: u32) -> (isize, isize) {
+    let (h, v) = crate::paint::halo_extent(ORB_GLOW_Q24, depth);
+    (h as isize, v as isize)
+}
+
+/// The orb's press glow: the wordmark-family light, disk form. The disk's coverage at the glow grey, blurred as the wordmark's halo is ([`crate::paint::halo_blur`], at 24 bits), then composited as WHITE light under what is there, called AFTER the orb paints, so every opaque disk pixel stays untouched and the bloom lands only in the transparent surround.
+/// The scratch reaches as far past the disk as the light carries at this frame's depth ([`orb_glow_extent`]), so the falloff, not a box, ends it.
 pub fn draw_orb_press_glow<P: Pixel>(
     pixels: &mut [P],
     width: usize,
@@ -269,69 +280,29 @@ pub fn draw_orb_press_glow<P: Pixel>(
     cy: isize,
     radius: isize,
 ) {
-    const GLOW_GREY: u8 = 0xB0;
-    let r_out = radius * 2;
-    // WHY/PROOF: the host slides the orb partly or wholly off the buffer (photon's conversation blind) — the band and column clips keep every write inside it, and band_h saturates to 0 for an orb wholly below the buffer.
-    let band_top = (cy - r_out).max(0) as usize;
-    let band_bot = (((cy + r_out + 1).max(0)) as usize).min(height);
-    let band_h = band_bot.saturating_sub(band_top);
-    if band_h < 2 || width == 0 {
+    let (eh, ev) = orb_glow_extent(P::DEPTH);
+    // WHY/PROOF: the host slides the orb partly or wholly off the buffer (photon's conversation blind); the scratch is cut to the buffer so every write lands inside it, and the light past the cut is off the screen.
+    let x0 = (cx - radius - eh).max(0) as usize;
+    let x1 = ((cx + radius + eh + 1).max(0) as usize).min(width);
+    let y0 = (cy - radius - ev).max(0) as usize;
+    let y1 = ((cy + radius + ev + 1).max(0) as usize).min(height);
+    if x1 <= x0 || y1 <= y0 {
         return;
     }
-    let mut scratch = vec![0u8; width * band_h];
+    let (w, h) = (x1 - x0, y1 - y0);
+    let mut scratch = vec![0u32; w * h];
     let rim2 = radius * radius;
-    for y in band_top..band_bot {
+    for y in y0..y1 {
         let dy = y as isize - cy;
-        let row = (y - band_top) * width;
-        let x0 = (cx - radius).max(0) as usize;
-        let x1 = (((cx + radius + 1).max(0)) as usize).min(width);
         for x in x0..x1 {
             let dx = x as isize - cx;
             if dx * dx + dy * dy <= rim2 {
-                scratch[row + x] = GLOW_GREY;
+                scratch[(y - y0) * w + (x - x0)] = ORB_GLOW_Q24;
             }
         }
     }
-    // Soft IIR blurs, forward + backward per axis (verbatim character-match with photon_logo's halo blurs).
-    {
-        let buf = &mut scratch;
-        let len = buf.len();
-        let mut prev = buf[0];
-        for i in 1..len {
-            prev = (((buf[i] as u16 + prev as u16 * 3) >> 2) as u8).max(buf[i]);
-            buf[i] = prev;
-        }
-        let mut prev = buf[len - 1];
-        for i in (0..len).rev() {
-            prev = (((buf[i] as u16 + prev as u16 * 3) >> 2) as u8).max(buf[i]);
-            buf[i] = prev;
-        }
-        for x in 0..width {
-            let mut prev = buf[x];
-            for y in 1..band_h {
-                let idx = y * width + x;
-                prev = (((buf[idx] as u16 + prev as u16) >> 1) as u8).max(buf[idx]);
-                buf[idx] = prev;
-            }
-        }
-        for x in 0..width {
-            let last_idx = (band_h - 1) * width + x;
-            let mut prev = buf[last_idx];
-            for y in (0..band_h - 1).rev() {
-                let idx = y * width + x;
-                prev = (((buf[idx] as u16 + prev as u16) >> 1) as u8).max(buf[idx]);
-                buf[idx] = prev;
-            }
-        }
-    }
-    for (i, &grey) in scratch.iter().enumerate() {
-        if grey == 0 {
-            continue;
-        }
-        let idx = i + band_top * width;
-        // White light: diffuse white (theme::WHITE, not darkness 0, which is a 9.7× glow on HDR), α = blurred coverage. under() on the already-opaque disk pixels no-ops — the orb art protects itself.
-        pixels[idx] = pixels[idx].under(P::from_g2t8(crate::theme::white_at(grey as u32)), BlendMode::Normal);
-    }
+    crate::paint::halo_blur(&mut scratch, w, h);
+    crate::paint::halo_under_white(pixels, width, x0, y0 as isize, w, &scratch, (0, height));
 }
 
 /// The orb ring's outer radius for an orb of `radius`: where [`draw_app_icon`]'s ring stroke ends, the orb's whole extent (an app placing something on the orb's edge, such as an unread dot, measures from here, not from the icon).

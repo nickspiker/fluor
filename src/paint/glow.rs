@@ -11,26 +11,31 @@ use crate::pixel::{BlendMode, Pixel};
 #[allow(dead_code)]
 fn _unused_hit_id_ref(_: HitId) {}
 
-/// Precompute the per-step α decay table for a ray, in the depth's α scale. `alphas[0] = seed`; `alphas[k] = (alphas[k-1] * factor_256) >> 8`. Returns the populated prefix length. Replaces the per-step mul on the hot path with an array lookup. 1024 entries cover the worst case (seed 0x40, factor 254 → ~528 non-zero steps).
-/// `seed` is an 8-bit α (the callers' 0x80 / 0x40) and the ray's length is always the 8-bit decay's, so [`ray_reach_px`] sizes the damage exactly at every depth; at 16 bits the values run the same recurrence from `seed × 257`, keeping the fraction each floor drops at 8 bits, so the ray fades in 2⁸ times the steps over the same reach.
-#[inline]
-fn compute_alphas<P: Pixel>(seed: u32, factor_256: u32) -> ([u32; 1024], usize) {
-    let mut alphas = [0u32; 1024];
-    // ONE / 255 is 1 at 8 bits (so `a` is `a8` there, step for step) and 257 at 16.
-    let mut a = seed * (P::ONE / 255);
-    alphas[0] = a;
-    let mut a8 = seed;
-    let mut len = 1;
-    while len < 1024 {
-        a8 = (a8 * factor_256) >> 8;
-        if a8 == 0 {
-            break;
+/// A ray's level at each step, in Q24 of an 8-bit α (`seed << 16`): each step keeps the bits under the field's last, so the light falls by exactly `factor_256 / 256` a step and floors only where it is drawn, never a byte at a time.
+/// It ends when the level reaches zero, which a factor under 256 always brings it to.
+fn decay_q24(seed: u32, factor_256: u32) -> impl Iterator<Item = u32> {
+    let mut a = seed << 16;
+    core::iter::from_fn(move || {
+        if a == 0 {
+            return None;
         }
-        a = (a * factor_256) >> 8;
-        alphas[len] = a;
-        len += 1;
-    }
-    (alphas, len)
+        let v = a;
+        a = ((a as u64 * factor_256 as u64) >> 8) as u32;
+        Some(v)
+    })
+}
+
+/// A Q24 level of an 8-bit α as the α of a field whose full value is `one`: `a × one / 255`, the field's floor (× 1 at 8 bits, × 257 at 16, as [`Pixel::alpha_from8`] widens).
+#[inline(always)]
+fn alpha_at(a_q24: u32, one: u32) -> u32 {
+    ((a_q24 as u64 * (one / 255) as u64) >> 16) as u32
+}
+
+/// The per-step α of a ray at the depth's own scale, as long as it holds a step of that depth: a 16-bit frame carries the light eight bits further than an 8-bit one (owner, 2026-11-26: "glows technically extend forever").
+/// `seed` is an 8-bit α (the callers' 0x80 / 0x40); the length is the ray's, not a table's, so no glow is cut at a fixed count.
+#[inline]
+fn compute_alphas<P: Pixel>(seed: u32, factor_256: u32) -> alloc::vec::Vec<u32> {
+    decay_q24(seed, factor_256).map(|a| alpha_at(a, P::ONE)).take_while(|&a| a > 0).collect()
 }
 
 /// The silhouette scan's "inside": α full to 8 bits.
@@ -40,21 +45,12 @@ fn interior<P: Pixel>(p: P) -> bool {
     p.alpha() >> (P::DEPTH - 8) == (1 << 8) - 1
 }
 
-/// Same decay iteration as [`compute_alphas`] but returns only the length (`alpha_len`). Callers that need the per-ray pixel reach to pre-size damage rects (textbox focus glow padding, chrome shadow extent) use this so the geometry the host clears + finalizes matches *exactly* what the rasterizer will paint — no early cutoff at the bbox edge, no over-clearing past where rays actually decay to zero.
+/// How many pixels a ray reaches at the deepest frame fluor draws (16 bits), from the same recurrence [`compute_alphas`] walks: a ray at any depth ends at or before it, so a damage rect sized by it holds the whole glow.
 pub fn ray_reach_px(seed: u32, factor_256: u32) -> usize {
     if seed == 0 || factor_256 == 0 || factor_256 >= 256 {
         return 0;
     }
-    let mut a = seed;
-    let mut len = 1usize;
-    while len < 1024 {
-        a = (a * factor_256) >> 8;
-        if a == 0 {
-            break;
-        }
-        len += 1;
-    }
-    len
+    decay_q24(seed, factor_256).take_while(|&a| alpha_at(a, (1 << 16) - 1) > 0).count()
 }
 
 /// Right-edge glow ray pass. Per row in the pill's vertical span, scans the buffer's α byte from the right end of the bbox leftward to find that row's first fully-opaque pixel (α=0xFF — the pill's interior, set by the squircle's writes), then walks rightward writing a glow pixel each step whose α decays exponentially from `seed` via `factor_256` — same curve as [`crate::paint::paint_shadow`], just emitting white at 0°/180° instead of black at 45°. Each write composes UNDER the existing target via [`Blend::under`](crate::pixel::Blend::under) (Normal).
@@ -89,7 +85,8 @@ pub fn apply_textbox_glow_right<P: Pixel>(
         return;
     }
 
-    let (alphas, alpha_len) = compute_alphas::<P>(seed, factor_256);
+    let alphas = compute_alphas::<P>(seed, factor_256);
+    let alpha_len = alphas.len();
     {
         let dx0 = scan_left;
         let dx1 = (scan_right + alpha_len).min(clip_rect.x_end);
@@ -155,7 +152,8 @@ pub fn apply_textbox_glow_left<P: Pixel>(
         return;
     }
 
-    let (alphas, alpha_len) = compute_alphas::<P>(seed, factor_256);
+    let alphas = compute_alphas::<P>(seed, factor_256);
+    let alpha_len = alphas.len();
     {
         let dx0 = (scan_left as isize - alpha_len as isize).max(clip_rect.x_start as isize) as usize;
         let dx1 = scan_right;
@@ -229,7 +227,8 @@ pub fn apply_textbox_glow_top<P: Pixel>(
         return;
     }
 
-    let (alphas, alpha_len) = compute_alphas::<P>(seed, factor_256);
+    let alphas = compute_alphas::<P>(seed, factor_256);
+    let alpha_len = alphas.len();
     {
         let dy0 = (scan_top as isize - alpha_len as isize).max(clip_rect.y_start as isize) as usize;
         let dy1 = scan_bot;
@@ -300,7 +299,8 @@ pub fn apply_textbox_glow_bottom<P: Pixel>(
         return;
     }
 
-    let (alphas, alpha_len) = compute_alphas::<P>(seed, factor_256);
+    let alphas = compute_alphas::<P>(seed, factor_256);
+    let alpha_len = alphas.len();
     {
         let dy0 = scan_top;
         let dy1 = (scan_bot + alpha_len).min(clip_rect.y_end);
@@ -513,6 +513,77 @@ pub fn apply_textbox_glow<P: Pixel>(
                 let new_pixel = glow_rgb.with_alpha(intensity);
                 pixels[idx] = pixels[idx].under(new_pixel, BlendMode::Normal);
             }
+        }
+    }
+}
+
+/// The soft halo's coverage bits: the wordmark's and the orb's light, blurred at 24 bits so the tail keeps the bits under a 16-bit field's last step (a coverage, not a pixel layout).
+pub const HALO_BITS: u32 = 24;
+/// The soft halo's whole pixel in its coverage.
+pub const HALO_ONE: u32 = 1 << HALO_BITS;
+
+/// The soft halo (the Photon wordmark's light, and the orb's press glow): each row blurred forward and back by a one-pole step of ×3/4 a pixel, then each column by ×1/2 a row, the source's own level kept where it stands.
+/// On Q24 coverage (`HALO_ONE` the whole pixel) in a `w`-wide scratch, so the light falls by those factors exactly and reaches zero only below every field's step; each row is its own run, so no light wraps from one row's end into the next.
+pub fn halo_blur(buf: &mut [u32], w: usize, h: usize) {
+    for row in buf.chunks_exact_mut(w) {
+        let mut prev = 0u32;
+        for v in row.iter_mut() {
+            prev = ((*v + 3 * prev) >> 2).max(*v);
+            *v = prev;
+        }
+        let mut prev = 0u32;
+        for v in row.iter_mut().rev() {
+            prev = ((*v + 3 * prev) >> 2).max(*v);
+            *v = prev;
+        }
+    }
+    for x in 0..w {
+        let mut prev = 0u32;
+        for y in 0..h {
+            let v = &mut buf[y * w + x];
+            prev = ((*v + prev) >> 1).max(*v);
+            *v = prev;
+        }
+        let mut prev = 0u32;
+        for y in (0..h).rev() {
+            let v = &mut buf[y * w + x];
+            prev = ((*v + prev) >> 1).max(*v);
+            *v = prev;
+        }
+    }
+}
+
+/// How far a halo of level `peak_q24` at its source carries before its light is under one step of a `depth`-bit α: (pixels sideways, rows up and down), the two falloffs of [`halo_blur`] walked until they are.
+/// A scratch that reaches this far past the source holds the whole glow at that depth, so the glow's extent comes from its falloff, never a fixed box (owner, 2026-11-26).
+pub fn halo_extent(peak_q24: u32, depth: u32) -> (usize, usize) {
+    let step = HALO_ONE >> depth;
+    let walk = |num: u32, shift: u32| {
+        let (mut v, mut n) = (peak_q24, 0usize);
+        while v >= step {
+            v = (v * num) >> shift;
+            n += 1;
+        }
+        n
+    };
+    (walk(3, 2), walk(1, 1))
+}
+
+/// The halo under `pixels` as white light (diffuse white, [`crate::theme::WHITE`]) at its coverage: the scratch's row r, column c lands on pixel (`x0` + c, `y0` + r), rows outside `rows` (the frame's band) left as they are.
+/// The coverage goes in at the field's own depth ([`Pixel::from_cov`]), so a 16-bit frame keeps what an 8-bit one floors away; a pixel already opaque stays as it is (`under`), so the source's own art is untouched.
+pub fn halo_under_white<P: Pixel>(pixels: &mut [P], buf_w: usize, x0: usize, y0: isize, w: usize, scratch: &[u32], rows: (usize, usize)) {
+    let white = P::from_g2t8(crate::theme::WHITE).rgb();
+    for (r, row) in scratch.chunks_exact(w).enumerate() {
+        let y = y0 + r as isize;
+        if y < rows.0 as isize || y >= rows.1 as isize {
+            continue;
+        }
+        let base = y as usize * buf_w + x0;
+        for (c, &v) in row.iter().enumerate() {
+            let cov = v >> 8;
+            if cov >> (16 - P::DEPTH) == 0 {
+                continue;
+            }
+            pixels[base + c] = pixels[base + c].under(P::from_cov(white, cov), BlendMode::Normal);
         }
     }
 }

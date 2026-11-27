@@ -515,8 +515,9 @@ impl<P: Pixel> Button<P> {
             self.text_cache_dirty = false;
         }
 
-        // The hits ride the paint: where the α stood before the label, the pill and the glow, so the button claims exactly the pixels it shows on.
-        let reach = crate::widgets::textbox::reach_of(if self.focused { self.glow_bbox() } else { self.bbox() }, offset_x, offset_y, canvas.width, canvas.height);
+        // The hits ride the paint: where the α stood before the label and the pill, so the button claims exactly the pixels its body shows on.
+        // Not the glow: a glow is light, not the button, and it carries as far as its falloff does; a tap or a hover tint on it would end at an edge the light has not reached (owner, 2026-11-26).
+        let reach = crate::widgets::textbox::reach_of(self.bbox(), offset_x, offset_y, canvas.width, canvas.height);
         self.shown.before(canvas.pixels, canvas.width, canvas.height, reach);
         // --- Composition: text (topmost) → pill (bottom) ---
         blit_cache_to_target(
@@ -537,6 +538,8 @@ impl<P: Pixel> Button<P> {
             canvas,
             clip,
         );
+        // Where the body showed (label, pill, its anti-aliased rim), settled before the glow goes under it, whether or not a map came with this paint: `stamp_hit_into` claims from the same mask later.
+        self.shown.settle(canvas.pixels);
 
         // --- Focus glow on target, paints fresh each frame. Same four-direction RU-invariant decay as Textbox. ---
         if self.focused {
@@ -592,8 +595,6 @@ impl<P: Pixel> Button<P> {
         let viewport_w = canvas.width;
         let viewport_h = canvas.height;
         self.last_painted_bbox = Some(region_to_pixelrect(self.bbox(), viewport_w, viewport_h));
-        // Where the button showed (label, pill, its anti-aliased rim, its glow), settled whether or not a map came with this paint: `stamp_hit_into` claims from the same mask later.
-        self.shown.settle(canvas.pixels);
         if let Some(map) = hit_map {
             self.shown.claim_shape(map, hit_id, crate::widgets::textbox::cache_covers(&self.pill_cache, self.pill_cache_w, self.pill_cache_h, pill_x_target, pill_y_target));
         }

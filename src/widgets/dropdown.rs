@@ -700,9 +700,10 @@ impl<P: Pixel> Dropdown<P> {
             self.cache_disabled = !self.enabled;
         }
 
-        // The hits ride the paint: where the α stood before the label, the pill and the glow, so the pill claims exactly the pixels it shows on.
+        // The hits ride the paint: where the α stood before the label and the pill, so the pill claims exactly the pixels its body shows on.
+        // Not the glow: a glow is light, not the pill, and carries as far as its falloff does; a tap or a hover tint on it would end at an edge the light has not reached (owner, 2026-11-26).
         if hit_map.is_some() {
-            let reach = crate::widgets::textbox::reach_of(if self.focused { self.glow_bbox() } else { self.bbox() }, offset_x, offset_y, canvas.width, canvas.height);
+            let reach = crate::widgets::textbox::reach_of(self.bbox(), offset_x, offset_y, canvas.width, canvas.height);
             self.shown.before(canvas.pixels, canvas.width, canvas.height, reach);
         }
         // --- Composition: text/chevron (topmost) → pill. ---
@@ -724,6 +725,10 @@ impl<P: Pixel> Dropdown<P> {
             canvas,
             clip,
         );
+        // Where the body showed (label, chevron, pill, its anti-aliased rim), settled before the glow goes under it.
+        if hit_map.is_some() {
+            self.shown.settle(canvas.pixels);
+        }
 
         // --- Focus glow, Button-identical. ---
         if self.focused {
@@ -747,9 +752,8 @@ impl<P: Pixel> Dropdown<P> {
             );
         }
 
-        // Claim where the pill showed (label, chevron, pill, its anti-aliased rim, its glow), none of the pixels already opaque before it, and none something in front claimed.
+        // Claim where the body showed (label, chevron, pill, its anti-aliased rim), none of the pixels already opaque before it, and none something in front claimed.
         if let Some(map) = hit_map {
-            self.shown.settle(canvas.pixels);
             self.shown.claim_shape(map, self.hit_id, crate::widgets::textbox::cache_covers(&self.pill_cache, self.pill_cache_w, self.pill_cache_h, pill_x_target, pill_y_target));
         }
         self.last_painted_bbox = Some(region_to_pixelrect(

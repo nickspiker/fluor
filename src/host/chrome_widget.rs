@@ -689,13 +689,8 @@ impl<P: Pixel> DefaultChrome<P> {
                 );
                 if self.orb_pressed {
                     // Press glow — painted AFTER the orb+ring, so under()'s earliest-wins layering puts the halo BENEATH them: the opaque disk pixels early-out untouched and the bloom lands only in the transparent surround. Same pipeline as photon's text halos (disk coverage at the glow grey → soft h+v blurs → white-under), here with real under() because the chrome layer is still building.
-                    // The glow is the orb's own light, so it claims for the orb wherever it shows (the same reach `chrome_reach` gives it, twice the radius).
-                    let (gx, gy, reach) = (orb_cx, orb_cy + self.orb_dy as isize, 2 * orb_radius + 2);
-                    let mut shown = crate::paint::Shown::default();
-                    shown.before(chrome_buf, buf_w, buf_h, crate::paint::reach_rect(gx - reach, gy - reach, gx + reach + 1, gy + reach + 1, buf_w, buf_h));
-                    chrome::draw_orb_press_glow(chrome_buf, buf_w, buf_h, gx, gy, orb_radius);
-                    shown.settle(chrome_buf);
-                    shown.claim(&mut self.chrome_hits, self.app_icon_btn.id());
+                    // The glow is light and claims nothing: the orb's taps and its hover lift stay on the orb, and the light carries as far as its falloff does (owner, 2026-11-26; from 2026-11-17 it claimed every pixel it reached, and the lift drew a hard-edged oval round the orb).
+                    chrome::draw_orb_press_glow(chrome_buf, buf_w, buf_h, orb_cx, orb_cy + self.orb_dy as isize, orb_radius);
                 }
             }
             {
@@ -999,7 +994,7 @@ impl<P: Pixel> DefaultChrome<P> {
         }
     }
 
-    /// Everything `rasterize_chrome` can draw at the current geometry, from the same layout it draws with: the orb with its ring and press glow (twice its radius), the title's band (the text block stays inside the two-button strip round the orb's row; a button's height either side is room for its glyphs' overhang), the controls strip unless it is skipped, and the status bar. Cut to the viewport. A test holds every raster's content inside it.
+    /// Everything `rasterize_chrome` can draw at the current geometry, from the same layout it draws with: the orb with its ring and press glow (as far as the light carries at the frame's depth, `chrome::orb_glow_extent`), the title's band (the text block stays inside the two-button strip round the orb's row; a button's height either side is room for its glyphs' overhang), the controls strip unless it is skipped, and the status bar. Cut to the viewport. A test holds every raster's content inside it.
     fn chrome_reach(&self) -> crate::canvas::PixelRect {
         use crate::canvas::PixelRect;
         let (w, h) = self.dims();
@@ -1015,8 +1010,11 @@ impl<P: Pixel> DefaultChrome<P> {
         let orb = self.orb_geometry();
         let title_cy = match orb {
             Some((cx, cy, rad)) => {
-                let reach = 2 * rad + 2;
-                r = r.union(rect(cx - reach, cy - reach, cx + reach + 1, cy + reach + 1));
+                // The orb's ring, and its press glow as far as the light carries at this frame's depth (`orb_glow_extent`, the same the glow's scratch reads).
+                let (eh, ev) = chrome::orb_glow_extent(P::DEPTH);
+                let ring = chrome::orb_ring_outer(rad);
+                let (rx, ry) = ((rad + eh).max(ring), (rad + ev).max(ring));
+                r = r.union(rect(cx - rx, cy - ry, cx + rx + 1, cy + ry + 1));
                 cy
             }
             None => b / 2,

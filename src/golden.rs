@@ -190,7 +190,7 @@ fn golden_glow() {
     assert_ne!(px, pill, "the glow painted nothing");
     assert_ne!(rays, pill, "the ray glows painted nothing");
     check("glow", &px, 0xbb0c_f158_2b71_398d);
-    check("glow_rays", &rays, 0x9f2c_8327_2e06_eceb);
+    check("glow_rays", &rays, 0x4fed_71e8_5bdb_ca9d);
 }
 
 /// The window drop shadow's diagonal rays, cast from a squircle-cornered window already finalized into a screen buffer.
@@ -450,7 +450,7 @@ mod text_scenes {
         for i in 1..frames.len() {
             assert_ne!(frames[i], frames[i - 1], "button frame {i} repeats the one before it");
         }
-        check("button", &frames.concat(), 0x3229_eb3a_da1c_bc4c);
+        check("button", &frames.concat(), 0x6f67_afe4_735f_d802);
     }
 
     /// A textbox with text, unfocused, then focused with a selection (glow, selection band), then its blinkey.
@@ -492,7 +492,7 @@ mod text_scenes {
         for i in 1..frames.len() {
             assert_ne!(frames[i], frames[i - 1], "textbox frame {i} repeats the one before it");
         }
-        check("textbox", &frames.concat(), 0x5bb9_fae3_3104_3831);
+        check("textbox", &frames.concat(), 0xaee1_f43f_e7fa_fbcd);
     }
 
     /// A dropdown closed, then open with its popup painted first.
@@ -610,7 +610,7 @@ fn orb_scene<P: Pixel>() -> Vec<P> {
 #[cfg(all(feature = "text", feature = "icon"))]
 #[test]
 fn golden_orb() {
-    check("orb", &orb_scene::<Argb8>(), 0xe61d_7d15_318b_fe24);
+    check("orb", &orb_scene::<Argb8>(), 0x9252_d1fe_5948_a02e);
 }
 
 /// How far a G2t16 render, narrowed to the nearest 8-bit codes ([`crate::pixel::narrow_to_8`]), sits from the Argb8 render of the same scene, byte by byte (α and each channel), signed as 16-bit minus 8-bit: the extremes, the share of bytes that differ at all, and the share that differ by more than one step.
