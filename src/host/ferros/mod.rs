@@ -107,6 +107,56 @@ mod sys {
     pub fn sleep_until(deadline: u64) {
         svc(SLEEP, deadline, 0, 0, 0, 0);
     }
+
+    /// A run another process gave this one (ferros SYS_SHARE 49, op 3; ferros_sys `share::view`): its address and bytes. None when it is not a run this process holds (taken back, its server ended, or a kernel from before).
+    pub fn share_view(id: u64) -> Option<(u64, u64)> {
+        let mut b = [0u8; 16];
+        let a = svc(49, 3, id, off(b.as_mut_ptr()), 0, 0);
+        (a != ERR).then(|| (a, u64::from_le_bytes(b[..8].try_into().unwrap())))
+    }
+}
+
+/// The app's hit plane (ferros docs/HITMAP.md): the display's run, given this process by op 88, that its hit ids go into so the display sees every widget on the glass (the debug view, the accessibility and test lists). A head of `PLANE_HEAD` bytes, its first u32 the plane that goes with the frame shown, then two planes of u16 ids in screen coordinates, `bytes` apart: the next frame's ids go into the one not shown, then the head names it.
+struct HitPlane {
+    at: u64,
+    bytes: usize,
+}
+
+/// The plane's head (ferros payloads/display hit.rs `PLANE_HEAD`).
+const PLANE_HEAD: usize = 64;
+
+impl HitPlane {
+    /// The display's plane for the surface at `base`: None from a display without op 88 or when it refused (the app then shows as one id, its window, as before).
+    fn ask(display: u64, base: u64) -> Option<HitPlane> {
+        let mut m = [0u8; 9];
+        m[0] = 88;
+        m[1..9].copy_from_slice(&base.to_le_bytes());
+        let mut r = [0u8; 17];
+        if sys::call(display, &m, &mut r) != 17 || r[0] != 0 {
+            return None;
+        }
+        let id = u64::from_le_bytes(r[1..9].try_into().unwrap());
+        let bytes = u32::from_le_bytes(r[9..13].try_into().unwrap()) as usize;
+        let (at, _) = sys::share_view(id)?;
+        Some(HitPlane { at, bytes })
+    }
+
+    /// The app's map (`map`, `mw` by `mh`, frame-local) into the plane not shown, at the frame's place (`fx`, `fy`) on a panel `pw` wide, then named in the head as the one that goes with the frame about to be shown.
+    fn write(&self, map: &[crate::paint::HitId], mw: usize, mh: usize, w: usize, h: usize, pw: usize, fx: usize, fy: usize) {
+        // SAFETY: the head's first word, the display's run given this process; only this thread writes it.
+        let shown = unsafe { core::ptr::read_volatile(self.at as *const u32) } as usize & 1;
+        let next = 1 - shown;
+        let dst = (self.at as usize + PLANE_HEAD + next * self.bytes) as *mut u16;
+        // WHY the bounds: the map's size is the app's own; rows or columns past the frame would land past the frame's place on the plane, and past the plane at the panel's edge.
+        let (cw, ch) = (mw.min(w), mh.min(h));
+        for y in 0..ch {
+            // SAFETY: row fy + y of a plane the panel's size, columns fx..fx + cw, inside the frame's place (cw <= w, ch <= h, and the frame fits the panel, `run_app_with`).
+            unsafe { core::ptr::copy_nonoverlapping(map[y * mw..y * mw + cw].as_ptr(), dst.add((fy + y) * pw + fx), cw) };
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+        // SAFETY: as above.
+        unsafe { core::ptr::write_volatile(self.at as *mut u32, next as u32) };
+    }
 }
 
 /// The grant slots a fluor app on ferros is spawned with: `--use display --use touch --dma surface`, in whatever order the spawner chose.
@@ -1304,6 +1354,8 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
     }
     // The whole screen: an app's surface is a full panel, and the window covers the frame's part of it.
     let surface = unsafe { core::slice::from_raw_parts_mut(base as *mut u64, pw * ph) };
+    // Its hit plane, asked once (ferros docs/HITMAP.md): the app's ids beside its pixels, for the display to see each widget.
+    let plane = HitPlane::ask(display, base);
     // The touch panel's coordinate range, scaled to the panel's pixels.
     let (sx, sy) = if sys::call(touch, &[2], &mut r) >= 4 {
         let (xm, ym) = (u16::from_le_bytes([r[0], r[1]]) as f32, u16::from_le_bytes([r[2], r[3]]) as f32);
@@ -1491,6 +1543,11 @@ pub fn run_app_with<P: PanelPixel, A: FluorApp<P> + 'static>(app: A, caps: Caps,
         if shell.draw() {
             let t_drawn = sys::now();
             shell.present(surface, pw, fx, fy, bake.as_deref());
+            if let Some(p) = &plane {
+                if let Some((map, mw, mh)) = shell.app.hit_test_map() {
+                    p.write(map, mw, mh, w, h, pw, fx, fy);
+                }
+            }
             let t_presented = sys::now();
             // The window (ferros WINDOWS.md): the frame's part of the screen, this surface, the app level, and what its pixels are (`PanelPixel::FORMAT`: at 16 bits fluor's own, which the display decodes).
             // An opaque app (`FluorApp::opaque`) says so in the mode byte: the display then never reads what the window covers (ferros_sys `window::show_full`, mode bit 3).
